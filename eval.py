@@ -107,3 +107,62 @@ async def three_way_rows(
             {"repo": repo, "pr": pr, "ours": our_verdict, "quinn": quinn_state, "coderabbit_reviews": rabbit_reviews}
         )
     return rows
+
+
+def render_report_markdown(summary: dict, rows: list[dict] | None = None) -> str:
+    """The human rendering — what the eval command/endpoint returns. `rows` is the
+    three-way comparison (optional: telemetry-only callers skip the GitHub reads)."""
+    lat = summary.get("latency_s") or {}
+    completion = summary.get("completion_rate")
+    lines = [
+        "## PR-review eval",
+        "",
+        f"- **Dispatches:** {summary.get('dispatches', 0)} · **verdicts posted:** "
+        f"{summary.get('reviews_posted', 0)} · **completion:** "
+        f"{f'{completion:.1%}' if completion is not None else 'n/a'} (Quinn's floor: 99.4%)",
+        f"- **Verdict mix:** {summary.get('verdict_mix') or {}} · **recipes:** {summary.get('recipe_mix') or {}}",
+        f"- **Latency:** p50 {lat.get('p50')}s / p90 {lat.get('p90')}s over {lat.get('n', 0)} review(s) "
+        f"(Quinn's floor: 44.7s median — the lite recipe is the lever)",
+        f"- **Reaffirmed (unchanged head):** {summary.get('reaffirmed', 0)} · **delta re-reviews:** "
+        f"{summary.get('delta_reviews', 0)} · **findings/review:** {summary.get('findings_per_review')}",
+        f"- **Exhaustions (fail-closed, no verdict):** {summary.get('exhaustions', 0)}",
+        f"- **Typed drops:** {summary.get('drops') or {}}",
+        f"- **Promotion decisions:** {summary.get('promotion_decisions') or {}}",
+    ]
+    if rows is not None:
+        lines += ["", "### Three-way comparison (ours vs Quinn vs CodeRabbit, same PRs)", ""]
+        if not rows:
+            lines.append("_No posted verdicts yet — the comparison universe is empty._")
+        else:
+            lines += [
+                "| PR | ours | Quinn | CodeRabbit reviews |",
+                "|---|---|---|---|",
+            ]
+            for r in sorted(rows, key=lambda x: (x["repo"], x["pr"])):
+                quinn = r.get("quinn") or "—"
+                lines.append(f"| {r['repo']}#{r['pr']} | {r['ours']} | {quinn} | {r.get('coderabbit_reviews', 0)} |")
+            overlap = sum(1 for r in rows if r.get("quinn"))
+            lines += ["", f"_{overlap}/{len(rows)} PRs also carry a Quinn verdict (the dual-layer overlap)._"]
+    return "\n".join(lines)
+
+
+def get_eval_tools(telemetry, run_gh_fn) -> list:
+    """The agent-facing eval command (registered when the machinery wires up).
+
+    Keep the docstring a PLAIN string literal (an f-string docstring ships no
+    description)."""
+    from langchain_core.tools import tool
+
+    @tool
+    async def pr_review_eval(three_way: bool = True) -> str:
+        """Render the PR-review eval report: completion rate, verdict/recipe mix, latency percentiles, typed drops, promotion decisions — and (three_way=True, default) the per-PR three-way comparison of our verdicts vs Quinn's review states vs CodeRabbit activity on the same PRs. Reads the plugin's telemetry; the three-way section also reads each PR's reviews from GitHub. Use it to check how the shadow reviewer is performing or to assemble the stage-1 report."""
+        summary = build_report(telemetry.read_all())
+        rows = None
+        if three_way:
+            try:
+                rows = await three_way_rows(telemetry.read_all(), run_gh_fn)
+            except Exception as exc:  # noqa: BLE001 — degrade to the telemetry-only report
+                return render_report_markdown(summary) + f"\n\n_(three-way rows unavailable: {exc})_"
+        return render_report_markdown(summary, rows)
+
+    return [pr_review_eval]

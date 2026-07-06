@@ -40,6 +40,14 @@ DROP_SELF_AUTHORED = "self-authored"
 DROP_PR_NOT_ELIGIBLE = "pr-not-eligible"  # closed, draft, or facts unreadable
 DROP_NO_RUNNER = "no-workflow-runner"
 
+HOLD_PROMOTE_BACKOFF = "hold:promote-backoff"
+# Consecutive APPROVE failures on one repo#pr@head before the sweep stops retrying
+# (issue #6): a promotion GitHub keeps refusing (422, persistent 5xx) otherwise
+# re-attempts every tick forever. A NEW head is a new key, so a real fix always
+# re-enters; in-memory, so a restart retries once more — fail-open by one attempt,
+# same posture as the chokepoint.
+PROMOTE_MAX_FAILURES = 3
+
 _NON_TERMINAL = {"queued", "in_progress", "waiting", "requested", "pending"}
 _GREEN = {"success", "neutral", "skipped"}
 
@@ -56,6 +64,7 @@ class Dispatcher:
         self._workflow_run = workflow_run  # None → resolve STATE.workflow_run lazily
         self._inbox_add = inbox_add  # None → resolve STATE.inbox_store lazily
         self._viewer: str | None = None
+        self._promote_failures: dict[str, int] = {}  # repo#pr@head -> consecutive APPROVE failures
 
     # ── plumbing ──────────────────────────────────────────────────────────────
 
@@ -345,6 +354,10 @@ class Dispatcher:
             verdict_promoted=promoted,
             promotion_owner=self.promotion_owner and not self.shadow,
         )
+        backoff_key = f"{repo}#{pr}@{head}"
+        if self._promote_failures.get(backoff_key, 0) >= PROMOTE_MAX_FAILURES:
+            self.telemetry.emit("promotion", repo=repo, pr=pr, sha=head, decision=HOLD_PROMOTE_BACKOFF)
+            return HOLD_PROMOTE_BACKOFF
         decision = promotion_decision(obs)
         self.telemetry.emit("promotion", repo=repo, pr=pr, sha=head, decision=decision)
         if decision != PROMOTE:
@@ -360,8 +373,26 @@ class Dispatcher:
             timeout=60,
         )
         if rc != 0:
-            log.warning("[pr-reviewer] promotion APPROVE on %s#%s failed: %s", repo, pr, err[-300:])
+            failures = self._promote_failures.get(backoff_key, 0) + 1
+            self._promote_failures[backoff_key] = failures
+            if len(self._promote_failures) > 1024:  # bounded, like the chokepoint
+                self._promote_failures = dict(list(self._promote_failures.items())[-512:])
+            log.warning(
+                "[pr-reviewer] promotion APPROVE on %s#%s failed (%d/%d): %s",
+                repo,
+                pr,
+                failures,
+                PROMOTE_MAX_FAILURES,
+                err[-300:],
+            )
+            if failures >= PROMOTE_MAX_FAILURES:
+                self._escalate(
+                    f"pr-reviewer: promotion APPROVE keeps failing on {repo}#{pr} @{head[:7]} "
+                    f"({failures}× — backing off until a new head). Last error: {err[-200:]}",
+                    dedup_key=f"pr-reviewer-promote-backoff:{backoff_key[:64]}",
+                )
             return "error:approve-failed"
+        self._promote_failures.pop(backoff_key, None)
         armed = False
         if str(facts.get("base_ref") or "") == "main":
             # Quinn's last step: arm native squash auto-merge — but only onto main

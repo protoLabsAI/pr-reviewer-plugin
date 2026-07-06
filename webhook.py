@@ -27,10 +27,14 @@ from .chokepoint import verify_signature
 log = logging.getLogger("protoagent.plugins.pr_reviewer")
 
 
-def build_routers(dispatcher, telemetry, get_secret):
+def build_routers(dispatcher, telemetry, get_secret, run_gh_fn=None):
     """(public_router, api_router). `get_secret` is a callable so a webhook-secret
-    edit in Settings applies without a restart (live_config pattern)."""
+    edit in Settings applies without a restart (live_config pattern). `run_gh_fn`
+    serves the three-way eval's GitHub reads (tests inject; None = the real gh)."""
     from fastapi import APIRouter, Body, HTTPException, Request
+
+    if run_gh_fn is None:
+        from .gh_cli import run_gh as run_gh_fn
 
     public = APIRouter()
     api = APIRouter()
@@ -85,5 +89,16 @@ def build_routers(dispatcher, telemetry, get_secret):
         from .eval import build_report
 
         return build_report(telemetry.read_all())
+
+    @api.get("/eval/three-way")
+    async def _eval_three_way():
+        """The stage-1 comparison: telemetry summary + per-PR rows (ours vs Quinn vs
+        CodeRabbit) + the rendered markdown report."""
+        from .eval import build_report, render_report_markdown, three_way_rows
+
+        events = telemetry.read_all()
+        summary = build_report(events)
+        rows = await three_way_rows(events, run_gh_fn)
+        return {"summary": summary, "rows": rows, "markdown": render_report_markdown(summary, rows)}
 
     return public, api
