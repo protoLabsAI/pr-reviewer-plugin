@@ -1,23 +1,36 @@
 """pr-reviewer plugin — the deterministic PR-review machinery (protoAgent ADR 0078).
 
-`register(registry)` is the ONLY place plugin code runs. Phase B2 scope: the
-`protopatch_review` tool (a budgeted, checkout-cached protoPatch structural pass with
-findings mapped into the ADR 0077 contract) and the `structural-finder` subagent that
-seats it on the review panel. The `workflows/code-review-structural.yaml` recipe is
-data — the host auto-discovers the conventional `workflows/` dir.
+`register(registry)` is the ONLY place plugin code runs. Phase B2 shipped the
+structural seat (`protopatch_review` + `structural-finder` + the
+`code-review-structural` recipe, auto-discovered from `workflows/`). Phase C adds
+the reviewer machinery around the panel:
 
-Later phases add the webhook chokepoint, structural-trigger dispatch, the
-approve-on-green pure function + sweep, and the review eval (ADR 0078 Phase C).
+  - webhook ingress (public path, HMAC-authed) → the dispatch chokepoint (typed
+    drops) → structural-trigger recipe selection → `STATE.workflow_run` → pure
+    verdict mapping → posted review (shadow: always COMMENT);
+  - the approve-on-green pure function + a 3-minute sweep surface (promotion stays
+    OFF until `promotion_owner: true` AND `shadow_mode: false` — two promoters
+    racing is how double-merges happen);
+  - JSONL telemetry + the eval that reads it (`GET /api/plugins/pr-reviewer/eval`).
 
-Host-only imports stay LAZY (SubagentConfig inside subagents.get_subagents) so the
-test suite imports these modules with no protoAgent host present.
+Host-only imports stay LAZY so the test suite imports these modules with no
+protoAgent host present.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import os
+from pathlib import Path
 
 log = logging.getLogger("protoagent.plugins.pr_reviewer")
+
+
+def _state_home(cfg: dict) -> Path:
+    return Path(
+        cfg.get("state_root") or os.environ.get("PR_REVIEWER_HOME") or Path.home() / ".protoagent" / "pr-reviewer"
+    )
 
 
 def register(registry) -> None:
@@ -44,8 +57,47 @@ def register(registry) -> None:
         except Exception:  # noqa: BLE001
             log.exception("[pr-reviewer] registering subagents failed")
 
+    # ── Phase C machinery: telemetry + dispatcher + routers + sweep surface ──
+    machinery = False
+    try:
+        from .dispatch import Dispatcher, sweep_loop
+        from .telemetry import Telemetry
+        from .webhook import build_routers
+
+        telemetry = Telemetry(_state_home(cfg))
+        dispatcher = Dispatcher(cfg, telemetry)
+
+        live = registry.live_config if hasattr(registry, "live_config") else (lambda: cfg)
+
+        def _secret() -> str:
+            try:
+                return str((live() or {}).get("webhook_secret") or "")
+            except Exception:  # noqa: BLE001
+                return str(cfg.get("webhook_secret") or "")
+
+        public, api = build_routers(dispatcher, telemetry, _secret)
+        registry.register_router(public, prefix="/plugins/pr-reviewer")
+        registry.register_router(api, prefix="/api/plugins/pr-reviewer")
+
+        if hasattr(registry, "register_surface"):
+            stop_event = asyncio.Event()
+            interval = int(cfg.get("sweep_interval_s") or 180)
+
+            def _start():
+                # Runs in the server's startup hook — the loop exists here.
+                return asyncio.get_running_loop().create_task(sweep_loop(dispatcher, interval, stop_event))
+
+            def _stop():
+                stop_event.set()
+
+            registry.register_surface(_start, _stop, name="pr-reviewer-sweep")
+        machinery = True
+    except Exception:  # noqa: BLE001
+        log.exception("[pr-reviewer] registering the reviewer machinery failed")
+
     log.info(
-        "[pr-reviewer] registered %d tool(s) + %d subagent(s); workflows/ is host-discovered",
+        "[pr-reviewer] registered %d tool(s) + %d subagent(s)%s; workflows/ is host-discovered",
         n_tools,
         n_subagents,
+        " + webhook/dispatch/sweep machinery" if machinery else "",
     )
