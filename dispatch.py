@@ -212,7 +212,11 @@ class Dispatcher:
             return f"drop:{DROP_PR_NOT_ELIGIBLE}"
         viewer = await self._viewer_login()
         author = str(facts.get("author") or "").lower()
-        if viewer and (author == viewer or author.removesuffix("[bot]") == viewer.removesuffix("[bot]")):
+        if (
+            viewer
+            and not bool(self.cfg.get("allow_self_review", False))
+            and (author == viewer or author.removesuffix("[bot]") == viewer.removesuffix("[bot]"))
+        ):
             self.telemetry.emit("drop", repo=repo, pr=pr, reason=DROP_SELF_AUTHORED, author=author)
             return f"drop:{DROP_SELF_AUTHORED}"
 
@@ -354,7 +358,14 @@ class Dispatcher:
         if rc != 0:
             log.warning("[pr-reviewer] promotion APPROVE on %s#%s failed: %s", repo, pr, err[-300:])
             return "error:approve-failed"
-        self.telemetry.emit("promoted", repo=repo, pr=pr, sha=head)
+        armed = False
+        if str(facts.get("base_ref") or "") == "main":
+            # Quinn's last step: arm native squash auto-merge — but only onto main
+            # (stacked PRs excluded; #901's scope lesson). Best-effort: a repo with
+            # auto-merge disabled just declines.
+            rc2, _o, _e = await self._run_gh(["pr", "merge", str(pr), "--repo", repo, "--auto", "--squash"], timeout=30)
+            armed = rc2 == 0
+        self.telemetry.emit("promoted", repo=repo, pr=pr, sha=head, auto_merge_armed=armed)
         return PROMOTE
 
     async def _map_checks_for_promotion(self, repo: str, sha: str) -> str | None:
