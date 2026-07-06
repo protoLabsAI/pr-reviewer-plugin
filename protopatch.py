@@ -195,6 +195,25 @@ class ProtoPatchRunner:
         rc, out, _err = await run_gh(["auth", "token"], timeout=10)
         return out.strip() if rc == 0 and out.strip() else None
 
+    def _gateway_creds(self) -> tuple[str, str]:
+        """(api_key, base_url) for clawpatch's gateway provider. Env wins; inside a
+        host, the agent's own model config (`model.api_key` / `model.api_base`) is
+        the fallback — wizard-configured deployments keep the key in config, not
+        env, so env-only resolution would starve the subprocess. Host-free (tests,
+        standalone) the lazy import just fails and env is all there is."""
+        key = os.environ.get("GATEWAY_API_KEY") or os.environ.get("OPENAI_API_KEY") or ""
+        base = self.gateway_base_url
+        if not key or not base:
+            try:
+                from graph.sdk import config as host_config
+
+                hc = host_config()
+                key = key or str(getattr(hc, "api_key", "") or "")
+                base = base or str(getattr(hc, "api_base", "") or "")
+            except Exception:  # noqa: BLE001 — no host present
+                pass
+        return key, base
+
     async def _changed_files(self, checkout: Path, base_sha: str) -> set[str] | None:
         from .checkout_cache import _default_run_git
 
@@ -209,8 +228,11 @@ class ProtoPatchRunner:
         or an `unavailable(...)` degradation message. Never raises."""
         if err := bad_repo(repo):
             return unavailable(err)
-        if not (os.environ.get("GATEWAY_API_KEY") or os.environ.get("OPENAI_API_KEY")):
-            return unavailable("no gateway credentials (GATEWAY_API_KEY / OPENAI_API_KEY unset)")
+        gateway_key, gateway_base = self._gateway_creds()
+        if not gateway_key:
+            return unavailable(
+                "no gateway credentials (GATEWAY_API_KEY / OPENAI_API_KEY unset, no model.api_key in host config)"
+            )
 
         refs = await resolve_pr_refs(repo, pr)
         if isinstance(refs, str):
@@ -232,8 +254,9 @@ class ProtoPatchRunner:
         if self.model:
             args += ["--model", self.model]
         env = os.environ.copy()
-        if self.gateway_base_url:
-            env["OPENAI_BASE_URL"] = self.gateway_base_url
+        env["GATEWAY_API_KEY"] = gateway_key
+        if gateway_base:
+            env["OPENAI_BASE_URL"] = gateway_base
         # The CLI's own provider timeout must sit inside our wall-clock budget.
         env.setdefault("CLAWPATCH_GATEWAY_TIMEOUT_MS", str(max((self.budget_s - 30) * 1000, 30_000)))
 
@@ -246,7 +269,7 @@ class ProtoPatchRunner:
             return unavailable(f"`{self.bin}` is not installed (npm: @protolabsai/protopatch)")
         if rc != 0:
             reason = _EXIT_REASONS.get(rc, "runtime failure")
-            detail = redact((stderr or stdout).strip()[-400:], token)
+            detail = redact(redact((stderr or stdout).strip()[-400:], token), gateway_key)
             return unavailable(f"clawpatch exit {rc} ({reason}): {detail}")
 
         findings = read_findings(state_dir, changed)

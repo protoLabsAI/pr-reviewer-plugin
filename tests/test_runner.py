@@ -75,6 +75,40 @@ async def test_missing_gateway_credentials_degrade(tmp_path, monkeypatch):
     assert "gateway credentials" in out and out.startswith("PROTOPATCH UNAVAILABLE")
 
 
+async def test_gateway_creds_fall_back_to_host_model_config(tmp_path, pr_refs, monkeypatch):
+    # Wizard-configured deployments keep the key in model.api_key (config), not env —
+    # the runner must feed the subprocess from the host config when env is empty.
+    import sys
+    import types
+
+    monkeypatch.delenv("GATEWAY_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("GITHUB_TOKEN", "ghtok")
+    sdk = types.ModuleType("graph.sdk")
+    sdk.config = lambda: types.SimpleNamespace(api_key="cfg-key", api_base="http://localhost:4000/v1")
+    monkeypatch.setitem(sys.modules, "graph.sdk", sdk)
+
+    seen = {}
+    r = runner(tmp_path, run_clawpatch=make_clawpatch(on_run=lambda a, c, env, b: seen.update(env=env)))
+    out = await r.review(1, "octo/repo")
+    assert "reportable finding(s)" in out
+    assert seen["env"]["GATEWAY_API_KEY"] == "cfg-key"
+    assert seen["env"]["OPENAI_BASE_URL"] == "http://localhost:4000/v1"
+
+
+async def test_explicit_gateway_base_url_beats_host_config(tmp_path, pr_refs, monkeypatch):
+    monkeypatch.setenv("GATEWAY_API_KEY", "gk")
+    monkeypatch.setenv("GITHUB_TOKEN", "ghtok")
+    seen = {}
+    r = runner(
+        tmp_path,
+        cfg={"gateway_base_url": "http://elsewhere:9000/v1"},
+        run_clawpatch=make_clawpatch(on_run=lambda a, c, env, b: seen.update(env=env)),
+    )
+    await r.review(1, "octo/repo")
+    assert seen["env"]["OPENAI_BASE_URL"] == "http://elsewhere:9000/v1"
+
+
 async def test_unresolvable_pr_degrades(tmp_path, gateway_env, monkeypatch):
     async def fake_run_gh(args, timeout=30):
         return 1, "", "HTTP 404: Not Found"
