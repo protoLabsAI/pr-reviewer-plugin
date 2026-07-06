@@ -44,3 +44,5 @@ ruff check . && pytest -q
 ```
 
 Host-free: the suite stubs `graph.subagents.config` and never shells out.
+
+_Reviewed by its own machinery — see ADR 0078._
