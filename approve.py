@@ -29,7 +29,7 @@ HOLD_CHECKS_FAILED = "hold:checks-failed"
 HOLD_CHECKS_UNKNOWN = "hold:checks-unknown"
 HOLD_THREADS_UNRESOLVED = "hold:threads-unresolved"
 HOLD_THREADS_UNKNOWN = "hold:threads-unknown"
-HOLD_NO_PASS_VERDICT = "hold:no-pass-verdict"
+HOLD_NO_CLEAR_VERDICT = "hold:no-clear-verdict"
 HOLD_STALE_HEAD = "hold:stale-head"
 HOLD_ALREADY_PROMOTED = "hold:already-promoted"
 HOLD_NOT_OWNER = "hold:not-promotion-owner"
@@ -42,7 +42,12 @@ class Observations:
     head_sha: str  # the PR's current head
     checks_state: str | None  # "green" | "pending" | "failed" | None (unreadable)
     unresolved_threads: int | None  # count | None (unreadable)
-    verdict_head: str | None  # head SHA our posted PASS verdict names; None = no PASS verdict
+    # Head SHA our latest CLEAR (non-blocking: PASS or WARN) verdict names; None = no
+    # clear verdict. Quinn's semantics, kept: WARN explicitly "does NOT block merge" —
+    # her #888 auto-approves a COMMENTED verdict on green; the unresolved-threads gate
+    # is what answers "were the flagged concerns seen/addressed". A promotion that
+    # honored only PASS would quietly turn WARN into a forever-block.
+    verdict_head: str | None
     verdict_promoted: bool  # the posted marker's promoted flag
     promotion_owner: bool  # this agent owns COMMENTED→APPROVE promotion for the repo
 
@@ -53,7 +58,7 @@ def promotion_decision(obs: Observations) -> str:
     if not obs.promotion_owner:
         return HOLD_NOT_OWNER
     if obs.verdict_head is None:
-        return HOLD_NO_PASS_VERDICT
+        return HOLD_NO_CLEAR_VERDICT
     if obs.verdict_head != obs.head_sha:
         return HOLD_STALE_HEAD
     if obs.verdict_promoted:

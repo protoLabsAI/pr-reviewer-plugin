@@ -291,3 +291,21 @@ async def test_promotion_arms_auto_merge_on_main_only(tmp_path):
     d2 = make(tmp_path, cfg={"shadow_mode": False, "promotion_owner": True}, gh=gh2)
     assert (await d2.evaluate_promotion("o/r", 1)) == "promote"
     assert not [c for c in gh2.calls if c[0] == "pr" and "merge" in c]  # stacked PR: never armed
+
+
+async def test_warn_verdict_is_non_blocking_and_promotes_on_green(tmp_path):
+    # Quinn's semantics: WARN "does NOT block merge" — COMMENTED + green auto-approves;
+    # the unresolved-threads gate is what answers "were the concerns seen".
+    green = [{"status": "completed", "conclusion": "success"}]
+    gh = RoutedGH(pr_facts=facts(), reviews=[review_row(HEAD, "WARN")], checks=green)
+    d = make(tmp_path, cfg={"shadow_mode": False, "promotion_owner": True}, gh=gh)
+    assert (await d.evaluate_promotion("o/r", 1)) == "promote"
+    assert "WARN verdict" in gh.posted[0]["body"]
+
+
+async def test_latest_fail_holds_even_after_an_earlier_pass(tmp_path):
+    green = [{"status": "completed", "conclusion": "success"}]
+    reviews = [review_row(OLD_HEAD, "PASS"), review_row(HEAD, "FAIL")]
+    gh = RoutedGH(pr_facts=facts(), reviews=reviews, checks=green)
+    d = make(tmp_path, cfg={"shadow_mode": False, "promotion_owner": True}, gh=gh)
+    assert (await d.evaluate_promotion("o/r", 1)) == "hold:no-clear-verdict"

@@ -7,7 +7,7 @@ from pr_reviewer.approve import (
     HOLD_CHECKS_FAILED,
     HOLD_CHECKS_PENDING,
     HOLD_CHECKS_UNKNOWN,
-    HOLD_NO_PASS_VERDICT,
+    HOLD_NO_CLEAR_VERDICT,
     HOLD_NOT_OWNER,
     HOLD_STALE_HEAD,
     HOLD_THREADS_UNKNOWN,
@@ -40,7 +40,7 @@ def test_the_one_green_path_promotes():
 def test_every_unknown_falls_through_fail_closed():
     assert promotion_decision(obs(checks_state=None)) == HOLD_CHECKS_UNKNOWN
     assert promotion_decision(obs(unresolved_threads=None)) == HOLD_THREADS_UNKNOWN
-    assert promotion_decision(obs(verdict_head=None)) == HOLD_NO_PASS_VERDICT
+    assert promotion_decision(obs(verdict_head=None)) == HOLD_NO_CLEAR_VERDICT
 
 
 def test_non_green_facts_hold():

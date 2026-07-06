@@ -32,7 +32,7 @@ from .chokepoint import DISPATCH_ACTIONS, Chokepoint
 from .gh_cli import bad_repo, run_gh
 from .telemetry import Telemetry
 from .trigger import structural_trigger
-from .verdicts import FAIL, PASS, parse_verdict_marker, render_verdict_body, verdict_for
+from .verdicts import FAIL, PASS, WARN, parse_verdict_marker, render_verdict_body, verdict_for
 
 log = logging.getLogger("protoagent.plugins.pr_reviewer")
 
@@ -332,13 +332,16 @@ class Dispatcher:
             return "hold:pr-not-eligible"
         head = str(facts["head"])
         ours = await self._our_reviews(repo, pr)
-        latest_pass = next((r for r in reversed(ours) if r["verdict"] == PASS), None)
+        # The latest verdict decides: PASS/WARN are non-blocking (promotable — Quinn's
+        # WARN "does NOT block merge"); a latest FAIL holds until a re-review clears it.
+        latest = ours[-1] if ours else None
+        clear = latest if latest and latest["verdict"] in (PASS, WARN) else None
         promoted = any(r["state"] == "APPROVED" and r["head"] == head for r in ours)
         obs = Observations(
             head_sha=head,
             checks_state=await self._map_checks_for_promotion(repo, head),
             unresolved_threads=await self._unresolved_threads(repo, pr),
-            verdict_head=latest_pass["head"] if latest_pass else None,
+            verdict_head=clear["head"] if clear else None,
             verdict_promoted=promoted,
             promotion_owner=self.promotion_owner and not self.shadow,
         )
@@ -346,9 +349,10 @@ class Dispatcher:
         self.telemetry.emit("promotion", repo=repo, pr=pr, sha=head, decision=decision)
         if decision != PROMOTE:
             return decision
+        verdict = clear["verdict"] if clear else PASS
         body = (
-            f"<!-- protoagent-qa-review head={head} verdict=PASS promoted=true -->\n"
-            f"Promoting the PASS verdict for head `{head[:12]}`: all checks terminal-green, "
+            f"<!-- protoagent-qa-review head={head} verdict={verdict} promoted=true -->\n"
+            f"Promoting the {verdict} verdict for head `{head[:12]}`: all checks terminal-green, "
             f"zero unresolved review threads. (approve-on-green)"
         )
         rc, _out, err = await self._run_gh(
