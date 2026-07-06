@@ -28,6 +28,12 @@ The deterministic half of protoAgent's PR-review QA tier
 Later phases (ADR 0078 C): webhook chokepoint, structural-trigger dispatch,
 approve-on-green + sweep, the review eval.
 
+## Clone depth control
+
+Checkouts default to a depth-bounded clone (`clone_depth: 50`) to keep large-repo
+checkouts fast; set `clone_depth: 0` to restore the full blobless clone. The cache
+also prunes eagerly on every resolve now, so the maintenance ceremony has less to do.
+
 ## Requirements
 
 - protoAgent ≥ the version carrying the findings `source` field (see the manifest pin).

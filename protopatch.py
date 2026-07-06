@@ -176,6 +176,7 @@ class ProtoPatchRunner:
         self.checkout_root = Path(self.cfg.get("checkout_root") or home / "checkouts")
         self.state_root = Path(self.cfg.get("state_root") or home / "clawpatch")
         self.budget_s = int(self.cfg.get("time_budget_s") or 300)
+        self.clone_depth = int(self.cfg.get("clone_depth") or 50)
         self.bin = str(self.cfg.get("clawpatch_bin") or "clawpatch")
         self.model = str(self.cfg.get("model") or "")
         self.gateway_base_url = str(self.cfg.get("gateway_base_url") or "")

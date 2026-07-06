@@ -84,18 +84,21 @@ class CheckoutCache:
     def dir_for(self, repo: str, sha: str) -> Path:
         return self.root / repo.replace("/", "-") / sha
 
-    async def resolve(self, repo: str, sha: str, token: str | None = None) -> Path:
-        """The checkout dir for `repo@sha` — a fresh cache hit or a new blobless clone."""
+    async def resolve(self, repo: str, sha: str, token: str | None, *, depth: int) -> Path:
+        """The checkout dir for `repo@sha` — a fresh cache hit or a new depth-bounded clone.
+
+        `depth` bounds how much history the clone fetches; pass 0 for the full
+        blobless clone (the pre-0.2 behavior)."""
         if not _REPO_RE.match(repo or ""):
             raise CheckoutError(f"invalid repo {repo!r} (want owner/name)")
         if not _SHA_RE.match(sha or ""):
             raise CheckoutError(f"invalid sha {sha!r} (want 7-40 hex chars)")
-        key = f"{repo}@{sha}"
-        lock = self._locks.setdefault(key, asyncio.Lock())
-        async with lock:
-            return await self._resolve_locked(repo, sha, token)
+        # Eager housekeeping: keep the cache trim on every resolve so the daily
+        # ceremony has less to do.
+        self.prune()
+        return await self._resolve_locked(repo, sha, token, depth)
 
-    async def _resolve_locked(self, repo: str, sha: str, token: str | None) -> Path:
+    async def _resolve_locked(self, repo: str, sha: str, token: str | None, depth: int) -> Path:
         target = self.dir_for(repo, sha)
         if target.is_dir():
             age = time.time() - target.stat().st_mtime
@@ -105,19 +108,20 @@ class CheckoutCache:
             shutil.rmtree(target, ignore_errors=True)
         target.parent.mkdir(parents=True, exist_ok=True)
         try:
-            await self._clone(repo, sha, target, token)
+            await self._clone(repo, sha, target, token, depth)
         except Exception:
             # A half-cloned tree must never look like a hit next time.
             shutil.rmtree(target, ignore_errors=True)
             raise
         return target
 
-    async def _clone(self, repo: str, sha: str, target: Path, token: str | None) -> None:
+    async def _clone(self, repo: str, sha: str, target: Path, token: str | None, depth: int = 0) -> None:
         auth = f"x-access-token:{token}@" if token else ""
         url = f"https://{auth}github.com/{repo}.git"
-        rc, _out, err = await self._run_git(
-            ["clone", "--filter=blob:none", "--no-checkout", "--no-tags", "--quiet", url, str(target)]
-        )
+        clone_args = ["clone", "--filter=blob:none", "--no-checkout", "--no-tags", "--quiet"]
+        if depth:
+            clone_args += ["--depth", str(depth)]
+        rc, _out, err = await self._run_git([*clone_args, url, str(target)])
         if rc != 0:
             raise CheckoutError(f"clone of {repo} failed (rc {rc}): {redact(err.strip(), token)}")
         # Best-effort: the head of an un-merged PR may not be reachable from clone refs.
