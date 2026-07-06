@@ -1,0 +1,47 @@
+# protoagent.plugin.yaml — DATA ONLY (the host reads this without importing code).
+# Keep `version` in lockstep with pyproject.toml (tests/test_version.py asserts it).
+id: pr-reviewer
+name: PR reviewer (structural review machinery)
+version: 0.1.0
+description: >-
+  The deterministic half of the PR-review QA tier (protoAgent ADR 0078). Ships the
+  `protopatch_review` tool — a budgeted, checkout-cached run of the protoPatch
+  (`clawpatch`) structural analysis engine over a PR, its findings mapped into the
+  ADR 0077 findings contract with `source: protopatch` — and the `structural-finder`
+  subagent + `code-review-structural` workflow that seat it as a fifth, non-LLM
+  member of the adversarial review panel (same dedup + independent verify as the
+  LLM finders). Head/base SHAs are resolved server-side from the PR, never taken
+  from the model. A timeout or missing engine degrades to a Gap, never an error —
+  a partial structural pass must not void the panel review (ADR 0078 D3).
+enabled: false                 # SHIP DISABLED — enabling is the operator's trust decision
+repository: https://github.com/protoLabsAI/pr-reviewer-plugin
+min_protoagent_version: "0.95.0"   # needs the findings `source` field (ADR 0078 B2 core half)
+
+# Config (ADR 0019): defaults are the source of truth; langgraph-config.yaml overlays.
+config_section: pr_reviewer
+config:
+  default_repo: ""             # repo the tool falls back to when `repo` is omitted (owner/name)
+  clawpatch_bin: "clawpatch"   # the protoPatch CLI (npm: @protolabsai/protopatch)
+  time_budget_s: 300           # hard wall-clock budget for one clawpatch run (SIGKILL past it)
+  model: ""                    # clawpatch --model override; "" = its default (protolabs/smart)
+  gateway_base_url: ""         # exported as OPENAI_BASE_URL to clawpatch; "" = its default
+  checkout_root: ""            # "" = ~/.protoagent/pr-reviewer/checkouts
+  state_root: ""               # "" = ~/.protoagent/pr-reviewer/clawpatch (per-repo state dirs)
+  checkout_ttl_s: 3600         # cache entry freshness window (Quinn's model: ~token lifetime)
+  checkout_max_entries: 50     # LRU prune caps (enforced on prune())
+  checkout_max_bytes: 5000000000
+
+# Settings (ADR 0019) — surfaced as editable fields in the console.
+settings:
+  - {key: default_repo, label: "Default repo (owner/name)", type: string}
+  - {key: time_budget_s, label: "protoPatch time budget (seconds)", type: int}
+  - {key: model, label: "protoPatch model override", type: string}
+
+# Auth: git clones + PR lookups use `gh`'s ambient auth or GITHUB_TOKEN/GH_TOKEN from
+# the env; clawpatch's gateway provider reads GATEWAY_API_KEY or OPENAI_API_KEY (+
+# OPENAI_BASE_URL). No plugin secret of its own.
+
+# Declarative transparency (shown in the console; not yet enforced).
+capabilities:
+  network: ["api.github.com", "github.com"]  # gh + git clone; clawpatch talks to the LLM gateway
+  filesystem: "checkout + state caches under ~/.protoagent/pr-reviewer (configurable)"

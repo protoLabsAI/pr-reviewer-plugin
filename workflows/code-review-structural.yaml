@@ -1,0 +1,151 @@
+# Adversarial code review, structural variant (ADR 0077 + ADR 0078 B2). The four
+# LLM review-finders plus protoPatch as a fifth, NON-LLM finder (the
+# structural-finder relay seat) — its findings enter the SAME dedup + independent
+# verify + noise filtering as everything else, which is the edge over wiring the
+# engine straight into a verdict. Dispatch picks THIS recipe when the structural
+# trigger fires (>3 files / >120 lines / sensitive paths — ADR 0078 D2, Phase C);
+# small diffs run the core four-finder `code-review` recipe instead — the engine
+# has no conditional steps, recipe SELECTION is the trigger mechanism.
+#
+#   run_workflow("code-review-structural", {"pr": "1846"})
+#   run_workflow("code-review-structural", {"pr": "69", "repo": "owner/name"})
+#
+# Needs the github plugin (finder/verifier reads) and this pr-reviewer plugin
+# (protopatch_review + the structural-finder subagent). All steps speak the
+# findings contract in graph/review/findings.py; protoPatch items carry
+# `source: "protopatch"`. A protoPatch timeout degrades to the four-finder
+# review with a Gap noted — the structural seat never fails the panel.
+name: code-review-structural
+description: >-
+  Adversarial PR review with the structural engine seated — four parallel LLM
+  finders (correctness, removed behavior, cross-file, conventions) plus a
+  protoPatch structural pass (source: protopatch), dedup/rank, an
+  evidence-checking verify pass, and a final findings block. Output ends with
+  the canonical fenced findings JSON.
+version: 1
+inputs:
+  - name: pr
+    description: The pull-request number to review.
+    required: true
+  - name: repo
+    description: Repository as owner/name (omit to use the configured default repo).
+    default: ""
+  - name: prior_findings
+    description: >-
+      Findings JSON from a previous review of this PR (optional). When present,
+      finders run a DELTA re-review: drop what's fixed, carry forward what's
+      still open, then look for new defects. GitHub-native review memory
+      (ADR 0078 D5) — the caller recalls, the panel re-evaluates.
+    default: "(none — first review of this PR)"
+steps:
+  - id: find_correctness
+    subagent: review-finder
+    prompt: |
+      Review PR #{{inputs.pr}} (repo: "{{inputs.repo}}" — empty means the
+      default repo). Your assigned angle: **correctness**. Logic errors,
+      off-by-ones, broken edge cases, error-handling gaps, races, wrong
+      conditionals, unhandled None/empty/failure paths — does this code do what
+      it claims under all inputs it will actually see?
+
+      ## Prior findings
+      {{inputs.prior_findings}}
+
+  - id: find_removed_behavior
+    subagent: review-finder
+    prompt: |
+      Review PR #{{inputs.pr}} (repo: "{{inputs.repo}}" — empty means the
+      default repo). Your assigned angle: **removed or changed behavior**. Read
+      the DELETED and rewritten lines: what did the old code do that the new
+      code silently doesn't? Dropped guards, lost fallbacks, narrowed
+      conditions, deleted call sites, semantics changed without the callers
+      changing. Regressions hide on the minus side of the diff.
+
+      ## Prior findings
+      {{inputs.prior_findings}}
+
+  - id: find_crossfile
+    subagent: review-finder
+    prompt: |
+      Review PR #{{inputs.pr}} (repo: "{{inputs.repo}}" — empty means the
+      default repo). Your assigned angle: **cross-file consistency**. Signatures
+      changed but callers not updated, contracts/schemas drifting from their
+      consumers, config keys renamed on one side only, docs/tests contradicting
+      the new behavior. Use github_read_file on the files the diff touches
+      indirectly — this angle is exactly the one a hunk-by-hunk read misses.
+
+      ## Prior findings
+      {{inputs.prior_findings}}
+
+  - id: find_conventions
+    subagent: review-finder
+    prompt: |
+      Review PR #{{inputs.pr}} (repo: "{{inputs.repo}}" — empty means the
+      default repo). Your assigned angle: **conventions and hygiene**. The
+      repo's own documented rules first (read its CLAUDE.md / PROTO.md /
+      contributor docs with github_read_file if present), then: naming that
+      lies, duplicated logic, dead/debug code left in, missing or weakened
+      tests for changed behavior, secrets or scratch files in the diff.
+      Severity honestly — most convention findings are minor/nit.
+
+      ## Prior findings
+      {{inputs.prior_findings}}
+
+  - id: find_structural
+    subagent: structural-finder
+    prompt: |
+      Run the structural pass on PR #{{inputs.pr}} (repo: "{{inputs.repo}}" —
+      empty means the default repo): call protopatch_review once and relay its
+      findings verbatim. If the engine is unavailable, report the Gap it
+      prescribes and an empty findings array — the panel proceeds without you.
+
+  - id: synthesize
+    subagent: review-synthesizer
+    depends_on: [find_correctness, find_removed_behavior, find_crossfile, find_conventions, find_structural]
+    prompt: |
+      Merge these five review-finder reports on PR #{{inputs.pr}} into one
+      deduped, ranked findings block (your standard procedure). The structural
+      finder is the protoPatch engine — its findings carry `source:
+      "protopatch"`; same rules as everyone else, preserve the attribution.
+
+      ## Correctness finder
+      {{steps.find_correctness.output}}
+
+      ## Removed-behavior finder
+      {{steps.find_removed_behavior.output}}
+
+      ## Cross-file finder
+      {{steps.find_crossfile.output}}
+
+      ## Conventions finder
+      {{steps.find_conventions.output}}
+
+      ## Structural finder (protoPatch)
+      {{steps.find_structural.output}}
+
+  - id: verify
+    subagent: verifier
+    depends_on: [synthesize]
+    prompt: |
+      Verify these code-review findings against PR #{{inputs.pr}} (repo:
+      "{{inputs.repo}}" — empty means the default repo). Re-read the actual
+      diff with github_pr_diff (and github_read_file where a claim depends on
+      surrounding code); annotate every finding with verdict
+      confirmed/refuted/uncertain + a one-line note. Return the same fenced
+      findings array, annotated — preserve every field, including `source`.
+
+      {{steps.synthesize.output}}
+
+  - id: report
+    subagent: review-synthesizer
+    depends_on: [verify]
+    prompt: |
+      Final pass for the review of PR #{{inputs.pr}}: the verifier has
+      annotated the findings below. Drop the "refuted" ones, keep "uncertain"
+      ones marked as such, re-rank, and produce the deliverable: the prose
+      brief first (overall risk, fix-first item, what the panel disagreed on,
+      what verification changed, any Gaps — including a skipped structural
+      pass), then the canonical fenced findings JSON as the FINAL block of
+      your reply.
+
+      {{steps.verify.output}}
+output: "{{steps.report.output}}"

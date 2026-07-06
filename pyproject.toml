@@ -1,0 +1,16 @@
+[project]
+name = "pr-reviewer-plugin"
+version = "0.1.0"
+description = "protoAgent PR-review machinery: budgeted protoPatch structural reviews as a fifth panel member (ADR 0078 B2)."
+requires-python = ">=3.11"
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+ignore = ["E501"]   # long comment/docstring lines are idiomatic here
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
