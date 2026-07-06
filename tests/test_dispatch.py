@@ -309,3 +309,66 @@ async def test_latest_fail_holds_even_after_an_earlier_pass(tmp_path):
     gh = RoutedGH(pr_facts=facts(), reviews=reviews, checks=green)
     d = make(tmp_path, cfg={"shadow_mode": False, "promotion_owner": True}, gh=gh)
     assert (await d.evaluate_promotion("o/r", 1)) == "hold:no-clear-verdict"
+
+
+class FailingApproveGH(RoutedGH):
+    """APPROVE POSTs always fail (GitHub 422-style); everything else routed normally."""
+
+    async def __call__(self, args, timeout=30):
+        if "-X" in args and "POST" in args and "event=APPROVE" in " ".join(args):
+            self.calls.append(args)
+            return 1, "", "gh: Unprocessable Entity (HTTP 422)"
+        return await super().__call__(args, timeout)
+
+
+async def test_promotion_backs_off_after_repeated_approve_failures(tmp_path):
+    green = [{"status": "completed", "conclusion": "success"}]
+    gh = FailingApproveGH(pr_facts=facts(), reviews=[review_row(HEAD, "PASS")], checks=green)
+    escalations = []
+    d = make(
+        tmp_path,
+        cfg={"shadow_mode": False, "promotion_owner": True},
+        gh=gh,
+        inbox=lambda text, **kw: escalations.append(text),
+    )
+    for _ in range(3):
+        assert (await d.evaluate_promotion("o/r", 1)) == "error:approve-failed"
+    # Fourth tick: typed backoff hold, no further APPROVE attempts.
+    approve_attempts_before = sum(1 for c in gh.calls if "event=APPROVE" in " ".join(c))
+    assert (await d.evaluate_promotion("o/r", 1)) == "hold:promote-backoff"
+    assert sum(1 for c in gh.calls if "event=APPROVE" in " ".join(c)) == approve_attempts_before == 3
+    assert escalations and "backing off" in escalations[0]
+
+
+async def test_backoff_clears_on_a_new_head(tmp_path):
+    green = [{"status": "completed", "conclusion": "success"}]
+    gh = FailingApproveGH(pr_facts=facts(), reviews=[review_row(HEAD, "PASS")], checks=green)
+    d = make(tmp_path, cfg={"shadow_mode": False, "promotion_owner": True}, gh=gh)
+    for _ in range(3):
+        await d.evaluate_promotion("o/r", 1)
+    assert (await d.evaluate_promotion("o/r", 1)) == "hold:promote-backoff"
+    # A new push: different head, different backoff key — promotion re-enters
+    # (and holds stale-head here because the verdict names the OLD head).
+    gh.pr_facts = facts(head=OLD_HEAD)
+    assert (await d.evaluate_promotion("o/r", 1)) == "hold:stale-head"
+
+
+async def test_successful_approve_resets_the_failure_count(tmp_path):
+    green = [{"status": "completed", "conclusion": "success"}]
+
+    class FlakyGH(RoutedGH):
+        fail_next = 2
+
+        async def __call__(self, args, timeout=30):
+            if "-X" in args and "POST" in args and "event=APPROVE" in " ".join(args) and self.fail_next > 0:
+                self.fail_next -= 1
+                self.calls.append(args)
+                return 1, "", "HTTP 502"
+            return await super().__call__(args, timeout)
+
+    gh = FlakyGH(pr_facts=facts(), reviews=[review_row(HEAD, "PASS")], checks=green)
+    d = make(tmp_path, cfg={"shadow_mode": False, "promotion_owner": True}, gh=gh)
+    assert (await d.evaluate_promotion("o/r", 1)) == "error:approve-failed"
+    assert (await d.evaluate_promotion("o/r", 1)) == "error:approve-failed"
+    assert (await d.evaluate_promotion("o/r", 1)) == "promote"  # 3rd attempt succeeds, count resets
+    assert d._promote_failures == {}

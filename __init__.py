@@ -79,6 +79,14 @@ def register(registry) -> None:
         registry.register_router(public, prefix="/plugins/pr-reviewer")
         registry.register_router(api, prefix="/api/plugins/pr-reviewer")
 
+        # The agent-facing eval command (issue-tracked as the three-way report seam).
+        from .eval import get_eval_tools
+        from .gh_cli import run_gh
+
+        for t in get_eval_tools(telemetry, run_gh):
+            registry.register_tool(t)
+            n_tools += 1
+
         if hasattr(registry, "register_surface"):
             stop_event = asyncio.Event()
             interval = int(cfg.get("sweep_interval_s") or 180)

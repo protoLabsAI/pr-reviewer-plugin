@@ -83,3 +83,29 @@ def test_manual_dispatch_and_eval_endpoints(tmp_path):
     assert r.json()["outcome"] == "reviewed:PASS"
     ev = client.get("/api/plugins/pr-reviewer/eval").json()
     assert ev["completion_rate"] == 1.0 and ev["verdict_mix"] == {"PASS": 1}
+
+
+def test_three_way_endpoint_renders_the_report(tmp_path):
+    async def fake_gh(args, timeout=30):
+        return (
+            0,
+            json.dumps(
+                [
+                    {"login": "protoquinn[bot]", "state": "APPROVED"},
+                    {"login": "coderabbitai[bot]", "state": "COMMENTED"},
+                ]
+            ),
+            "",
+        )
+
+    dispatcher = SpyDispatcher()
+    telemetry = Telemetry(tmp_path)
+    telemetry.emit("dispatch", repo="o/r", pr=7)
+    telemetry.emit("reviewed", repo="o/r", pr=7, verdict="PASS", posted=True, latency_s=60.0, recipe="code-review")
+    public, api = build_routers(dispatcher, telemetry, lambda: "s", run_gh_fn=fake_gh)
+    app = FastAPI()
+    app.include_router(api, prefix="/api/plugins/pr-reviewer")
+    r = TestClient(app).get("/api/plugins/pr-reviewer/eval/three-way").json()
+    assert r["rows"] == [{"repo": "o/r", "pr": 7, "ours": "PASS", "quinn": "APPROVED", "coderabbit_reviews": 1}]
+    assert "| o/r#7 | PASS | APPROVED | 1 |" in r["markdown"]
+    assert "1/1 PRs also carry a Quinn verdict" in r["markdown"]

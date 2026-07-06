@@ -46,9 +46,20 @@ class FakeRegistry:
         self.config = config or {}
         self.tools: list = []
         self.subagents: list = []
+        self.routers: list = []
+        self.surfaces: list = []
 
     def register_tool(self, tool) -> None:
         self.tools.append(tool)
 
     def register_subagent(self, config) -> None:
         self.subagents.append(config)
+
+    def register_router(self, router, prefix=None) -> None:
+        self.routers.append((router, prefix))
+
+    def register_surface(self, start, stop=None, name=None, reload=None) -> None:
+        self.surfaces.append({"start": start, "stop": stop, "name": name})
+
+    def live_config(self):
+        return self.config

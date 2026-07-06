@@ -7,11 +7,13 @@ import pr_reviewer
 from tests.conftest import FakeRegistry
 
 
-def test_registers_tool_and_subagent():
+def test_registers_tools_subagent_routers_and_surface():
     reg = FakeRegistry({"default_repo": "octo/repo"})
     pr_reviewer.register(reg)
-    assert [t.name for t in reg.tools] == ["protopatch_review"]
+    assert [t.name for t in reg.tools] == ["protopatch_review", "pr_review_eval"]
     assert [s.name for s in reg.subagents] == ["structural-finder"]
+    assert [p for _r, p in reg.routers] == ["/plugins/pr-reviewer", "/api/plugins/pr-reviewer"]
+    assert [s["name"] for s in reg.surfaces] == ["pr-reviewer-sweep"]
 
 
 def test_tool_has_a_description():
@@ -43,3 +45,12 @@ def test_registers_on_a_minimal_host_without_subagent_seam():
     reg = MinimalRegistry()
     pr_reviewer.register(reg)  # must not raise
     assert len(reg.tools) == 1
+
+
+def test_machinery_registers_the_eval_tool():
+    reg = FakeRegistry({})
+    pr_reviewer.register(reg)
+    names = [t.name for t in reg.tools]
+    assert "pr_review_eval" in names
+    tool = next(t for t in reg.tools if t.name == "pr_review_eval")
+    assert "three-way" in (tool.description or "").lower() or "quinn" in (tool.description or "").lower()
