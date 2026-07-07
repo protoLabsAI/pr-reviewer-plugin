@@ -2,7 +2,7 @@
 # Keep `version` in lockstep with pyproject.toml (tests/test_version.py asserts it).
 id: pr-reviewer
 name: PR reviewer (review machinery + structural engine)
-version: 0.2.2
+version: 0.2.3
 description: >-
   The deterministic half of the PR-review QA tier (protoAgent ADR 0078). Ships the
   `protopatch_review` tool — a budgeted, checkout-cached run of the protoPatch
@@ -29,7 +29,7 @@ config:
   cooldown_s: 30               # chokepoint window per repo#pr@sha (webhook burst collapse)
   allow_self_review: false     # TESTING ONLY: lift the never-review-your-own-PR rail
   sweep_interval_s: 180        # approve-on-green level sweep cadence
-  webhook_secret: ""           # HMAC secret for /plugins/pr-reviewer/webhook (empty = 403 all)
+  webhook_secret: ""           # HMAC secret (or PR_REVIEWER_WEBHOOK_SECRET env; empty = 403 all)
   clawpatch_bin: "clawpatch"   # the protoPatch CLI (npm: @protolabsai/protopatch)
   time_budget_s: 300           # hard wall-clock budget for one clawpatch run (SIGKILL past it)
   model: ""                    # clawpatch --model override; "" = its default (protolabs/smart)

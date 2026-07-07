@@ -70,10 +70,15 @@ def register(registry) -> None:
         live = registry.live_config if hasattr(registry, "live_config") else (lambda: cfg)
 
         def _secret() -> str:
+            # Config first (Settings → secrets overlay); env fallback for headless
+            # config-as-code deployments, where the secrets overlay can't be baked
+            # (secret keys are stripped from the main YAML) — the linear-plugin
+            # pattern. Empty ⇒ the webhook 403s everything (fail closed).
             try:
-                return str((live() or {}).get("webhook_secret") or "")
+                value = str((live() or {}).get("webhook_secret") or "")
             except Exception:  # noqa: BLE001
-                return str(cfg.get("webhook_secret") or "")
+                value = str(cfg.get("webhook_secret") or "")
+            return value or os.environ.get("PR_REVIEWER_WEBHOOK_SECRET", "")
 
         public, api = build_routers(dispatcher, telemetry, _secret)
         registry.register_router(public, prefix="/plugins/pr-reviewer")

@@ -109,3 +109,38 @@ def test_three_way_endpoint_renders_the_report(tmp_path):
     assert r["rows"] == [{"repo": "o/r", "pr": 7, "ours": "PASS", "quinn": "APPROVED", "coderabbit_reviews": 1}]
     assert "| o/r#7 | PASS | APPROVED | 1 |" in r["markdown"]
     assert "1/1 PRs also carry a Quinn verdict" in r["markdown"]
+
+
+def test_webhook_secret_env_fallback_for_headless_deploys(tmp_path, monkeypatch):
+    """Headless config-as-code can't bake the secrets overlay — the plugin falls
+    back to PR_REVIEWER_WEBHOOK_SECRET (config wins when both are set)."""
+    import pr_reviewer
+
+    from tests.conftest import FakeRegistry
+
+    monkeypatch.setenv("PR_REVIEWER_WEBHOOK_SECRET", "env-secret")
+    reg = FakeRegistry({})  # no webhook_secret in config
+    pr_reviewer.register(reg)
+    public, _prefix = reg.routers[0]
+    app = FastAPI()
+    app.include_router(public, prefix="/plugins/pr-reviewer")
+    r = TestClient(app).post("/plugins/pr-reviewer/webhook", content=PAYLOAD, headers=signed(PAYLOAD, "env-secret"))
+    assert r.status_code == 200  # env secret verified the HMAC
+
+    reg2 = FakeRegistry({"webhook_secret": "config-secret"})
+    pr_reviewer.register(reg2)
+    public2, _p = reg2.routers[0]
+    app2 = FastAPI()
+    app2.include_router(public2, prefix="/plugins/pr-reviewer")
+    assert (
+        TestClient(app2)
+        .post("/plugins/pr-reviewer/webhook", content=PAYLOAD, headers=signed(PAYLOAD, "env-secret"))
+        .status_code
+        == 403
+    )
+    assert (
+        TestClient(app2)
+        .post("/plugins/pr-reviewer/webhook", content=PAYLOAD, headers=signed(PAYLOAD, "config-secret"))
+        .status_code
+        == 200
+    )
