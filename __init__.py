@@ -104,6 +104,24 @@ def register(registry) -> None:
                 stop_event.set()
 
             registry.register_surface(_start, _stop, name="pr-reviewer-sweep")
+
+            # GitHub App identity (optional): when App credentials are configured,
+            # a refresher keeps a fresh installation token in GH_TOKEN/GITHUB_TOKEN
+            # (App tokens expire hourly; gh has no App mode). Reviews then post as
+            # the App's bot identity — no machine-user PAT.
+            from .app_auth import AppAuthConfig, token_refresh_loop
+
+            app_cfg = AppAuthConfig(cfg)
+            if app_cfg.configured:
+                auth_stop = asyncio.Event()
+
+                def _auth_start():
+                    return asyncio.get_running_loop().create_task(token_refresh_loop(app_cfg, auth_stop))
+
+                def _auth_stop():
+                    auth_stop.set()
+
+                registry.register_surface(_auth_start, _auth_stop, name="pr-reviewer-app-auth")
         machinery = True
     except Exception:  # noqa: BLE001
         log.exception("[pr-reviewer] registering the reviewer machinery failed")

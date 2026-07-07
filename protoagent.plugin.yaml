@@ -2,7 +2,7 @@
 # Keep `version` in lockstep with pyproject.toml (tests/test_version.py asserts it).
 id: pr-reviewer
 name: PR reviewer (review machinery + structural engine)
-version: 0.2.3
+version: 0.3.0
 description: >-
   The deterministic half of the PR-review QA tier (protoAgent ADR 0078). Ships the
   `protopatch_review` tool — a budgeted, checkout-cached run of the protoPatch
@@ -30,6 +30,10 @@ config:
   allow_self_review: false     # TESTING ONLY: lift the never-review-your-own-PR rail
   sweep_interval_s: 180        # approve-on-green level sweep cadence
   webhook_secret: ""           # HMAC secret (or PR_REVIEWER_WEBHOOK_SECRET env; empty = 403 all)
+  app_id: ""                   # GitHub App identity (or PROTOREVIEW_APP_ID env) — with the
+                               # private key, a refresher keeps GH_TOKEN a fresh installation
+                               # token (hourly expiry); empty = BYO GH_TOKEN (PAT/machine user)
+  installation_id: ""          # optional (or PROTOREVIEW_APP_INSTALLATION_ID); auto-discovered
   clawpatch_bin: "clawpatch"   # the protoPatch CLI (npm: @protolabsai/protopatch)
   time_budget_s: 300           # hard wall-clock budget for one clawpatch run (SIGKILL past it)
   model: ""                    # clawpatch --model override; "" = its default (protolabs/smart)
@@ -41,7 +45,8 @@ config:
   checkout_max_bytes: 5000000000
 
 # Secrets — routed to the untracked secrets.yaml overlay, never the main config.
-secrets: [webhook_secret]
+# app_private_key: the App's PEM (or PROTOREVIEW_APP_PRIVATE_KEY env for headless).
+secrets: [webhook_secret, app_private_key]
 
 # Settings (ADR 0019) — surfaced as editable fields in the console.
 settings:
@@ -49,6 +54,8 @@ settings:
   - {key: shadow_mode, label: "Shadow mode (verdicts as comments only)", type: bool}
   - {key: promotion_owner, label: "Own approve-on-green promotion (formal mode only)", type: bool}
   - {key: webhook_secret, label: "GitHub webhook secret", type: secret}
+  - {key: app_id, label: "GitHub App ID (App identity)", type: string}
+  - {key: app_private_key, label: "GitHub App private key (PEM)", type: secret}
   - {key: default_repo, label: "Default repo (owner/name)", type: string}
   - {key: time_budget_s, label: "protoPatch time budget (seconds)", type: int}
   - {key: model, label: "protoPatch model override", type: string}
