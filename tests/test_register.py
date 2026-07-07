@@ -54,3 +54,15 @@ def test_machinery_registers_the_eval_tool():
     assert "pr_review_eval" in names
     tool = next(t for t in reg.tools if t.name == "pr_review_eval")
     assert "three-way" in (tool.description or "").lower() or "quinn" in (tool.description or "").lower()
+
+
+def test_app_auth_surface_registers_only_when_configured(monkeypatch):
+    reg = FakeRegistry({})
+    pr_reviewer.register(reg)
+    assert [s["name"] for s in reg.surfaces] == ["pr-reviewer-sweep"]  # BYO GH_TOKEN mode
+
+    monkeypatch.setenv("PROTOREVIEW_APP_ID", "1")
+    monkeypatch.setenv("PROTOREVIEW_APP_PRIVATE_KEY", "PEM")
+    reg2 = FakeRegistry({})
+    pr_reviewer.register(reg2)
+    assert [s["name"] for s in reg2.surfaces] == ["pr-reviewer-sweep", "pr-reviewer-app-auth"]
