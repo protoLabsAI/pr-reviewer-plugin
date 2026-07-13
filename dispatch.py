@@ -128,9 +128,15 @@ class Dispatcher:
         return [line.strip() for line in out.splitlines() if line.strip()] if rc == 0 else []
 
     async def _our_reviews(self, repo: str, pr: int) -> list[dict]:
-        """Our posted reviews (marker-bearing), oldest→newest: [{head, verdict, promoted, state, body}]."""
+        """Our posted reviews (marker-bearing), oldest→newest: [{head, verdict, promoted, state, body, id}]."""
         rc, out, _err = await self._run_gh(
-            ["api", f"repos/{repo}/pulls/{pr}/reviews", "--paginate", "--jq", "[.[] | {state: .state, body: .body}]"],
+            [
+                "api",
+                f"repos/{repo}/pulls/{pr}/reviews",
+                "--paginate",
+                "--jq",
+                "[.[] | {id: .id, state: .state, body: .body}]",
+            ],
         )
         if rc != 0:
             return []
@@ -142,7 +148,9 @@ class Dispatcher:
         for row in rows if isinstance(rows, list) else []:
             marker = parse_verdict_marker(row.get("body") or "")
             if marker:
-                ours.append({**marker, "state": row.get("state", ""), "body": row.get("body") or ""})
+                ours.append(
+                    {**marker, "state": row.get("state", ""), "body": row.get("body") or "", "id": row.get("id")}
+                )
         return ours
 
     async def _checks_state(self, repo: str, sha: str) -> str | None:
@@ -329,7 +337,39 @@ class Dispatcher:
         )
         if rc != 0:
             log.warning("[pr-reviewer] posting %s on %s#%s failed: %s", event, repo, pr, err[-300:])
-        return rc == 0
+            return False
+        if not self.shadow and verdict != FAIL:
+            # A cleared verdict must also LIFT our earlier block: PASS/WARN post as
+            # COMMENT, and a comment never supersedes the same reviewer's REQUEST_CHANGES.
+            await self._dismiss_stale_blocks(repo, pr)
+        return True
+
+    async def _dismiss_stale_blocks(self, repo: str, pr: int) -> None:
+        """Dismiss our own now-stale REQUEST_CHANGES reviews after a later head clears.
+        With a `pull_request` branch rule active, changes-requested blocks the merge at
+        ANY approval count, and only an APPROVE or a dismissal lifts it — never a
+        comment. APPROVE stays reserved for the promotion owner, so the gate lifts
+        itself by dismissal. Every non-dismissed blocker goes (GitHub rolls the
+        reviewer's effective state back to the previous one otherwise)."""
+        for review in await self._our_reviews(repo, pr):
+            if review.get("state") != "CHANGES_REQUESTED" or not review.get("id"):
+                continue
+            rc, _out, err = await self._run_gh(
+                [
+                    "api",
+                    f"repos/{repo}/pulls/{pr}/reviews/{review['id']}/dismissals",
+                    "-X",
+                    "PUT",
+                    "-f",
+                    "message=Superseded — a later head cleared the QA panel (see the newest verdict).",
+                    "-f",
+                    "event=DISMISS",
+                ],
+                timeout=60,
+            )
+            if rc != 0:
+                log.warning("[pr-reviewer] dismissing stale block on %s#%s failed: %s", repo, pr, err[-300:])
+            self.telemetry.emit("dismissal", repo=repo, pr=pr, review_id=review["id"], ok=rc == 0)
 
     # ── promotion (edge + sweep share this) ───────────────────────────────────
 

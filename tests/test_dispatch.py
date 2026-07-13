@@ -108,7 +108,7 @@ async def test_self_authored_pr_drops(tmp_path):
 # ── recall: reaffirm + delta ──────────────────────────────────────────────────
 
 
-def review_row(head, verdict, state="COMMENTED", findings_json=""):
+def review_row(head, verdict, state="COMMENTED", findings_json="", id=None):
     body = render_verdict_body(
         repo="o/r",
         pr=1,
@@ -118,17 +118,21 @@ def review_row(head, verdict, state="COMMENTED", findings_json=""):
         shadow=True,
         recipe="code-review",
     )
-    return {"state": state, "body": body}
+    return {"state": state, "body": body, "id": id}
 
 
 class RoutedGH(FakeGH):
     def __init__(self, *, pr_facts, reviews=None, checks=None, files="x.py\n"):
         super().__init__()
         self.pr_facts, self.reviews, self.checks, self.files = pr_facts, reviews or [], checks, files
+        self.dismissed: list[str] = []
 
     async def __call__(self, args, timeout=30):
         self.calls.append(args)
         joined = " ".join(args)
+        if "-X" in args and "PUT" in args and "/dismissals" in joined:
+            self.dismissed.append(args[1])
+            return 0, "{}", ""
         if "-X" in args and "POST" in args:
             fields = {a.split("=", 1)[0]: a.split("=", 1)[1] for a in args if "=" in a and not a.startswith("query=")}
             self.posted.append(fields)
@@ -226,6 +230,52 @@ async def test_formal_fail_blocks_only_on_terminal_ci(tmp_path):
     d2 = make(tmp_path, cfg={"shadow_mode": False}, gh=gh2)
     await d2.handle_pr_event("o/r", 1, HEAD, "opened")
     assert gh2.posted[0]["event"] == "REQUEST_CHANGES"
+
+
+CLEAN_REPORT = "all good\n```json\n[]\n```"
+
+
+async def clean_runner(name, inputs):
+    return {"output": CLEAN_REPORT, "failed": []}
+
+
+async def test_formal_clear_dismisses_our_stale_block(tmp_path):
+    # A FAILed head left our REQUEST_CHANGES standing; the fixed head clears as a
+    # COMMENT — which GitHub does NOT treat as superseding the same reviewer's
+    # block — so the dispatcher must dismiss its own stale blocker (the gate
+    # lifts itself; APPROVE stays reserved for the promotion owner).
+    green = [{"status": "completed", "conclusion": "success"}]
+    stale = review_row(OLD_HEAD, "FAIL", state="CHANGES_REQUESTED", id=77)
+    gh = RoutedGH(pr_facts=facts(), reviews=[stale], checks=green)
+    d = make(tmp_path, cfg={"shadow_mode": False}, gh=gh, runner=clean_runner)
+    out = await d.handle_pr_event("o/r", 1, HEAD, "synchronize")
+    assert out == "reviewed:PASS"
+    assert gh.posted[0]["event"] == "COMMENT"
+    assert gh.dismissed == ["repos/o/r/pulls/1/reviews/77/dismissals"]
+
+
+async def test_formal_fail_keeps_the_block(tmp_path):
+    # Still failing on the new head: the fresh REQUEST_CHANGES supersedes — the
+    # old blocker must NOT be dismissed (dismissing would flap the gate open
+    # between the dismissal and the new review landing).
+    green = [{"status": "completed", "conclusion": "success"}]
+    stale = review_row(OLD_HEAD, "FAIL", state="CHANGES_REQUESTED", id=77)
+    gh = RoutedGH(pr_facts=facts(), reviews=[stale], checks=green)
+    d = make(tmp_path, cfg={"shadow_mode": False}, gh=gh)  # default runner → FAIL report
+    out = await d.handle_pr_event("o/r", 1, HEAD, "synchronize")
+    assert out == "reviewed:FAIL"
+    assert gh.dismissed == []
+
+
+async def test_shadow_mode_never_dismisses(tmp_path):
+    # Shadow never posted a blocking review, so it must never dismiss either
+    # (a shadow instance touching review state would be a silent write).
+    stale = review_row(OLD_HEAD, "FAIL", state="CHANGES_REQUESTED", id=77)
+    gh = RoutedGH(pr_facts=facts(), reviews=[stale])
+    d = make(tmp_path, gh=gh, runner=clean_runner)  # shadow default
+    out = await d.handle_pr_event("o/r", 1, HEAD, "synchronize")
+    assert out == "reviewed:PASS"
+    assert gh.dismissed == []
 
 
 # ── promotion ─────────────────────────────────────────────────────────────────
