@@ -5,6 +5,13 @@ The verdict mapping is a PURE function of the final findings list — the model 
 machine-readable marker line so prior-review recall and per-head-SHA promotion dedup
 read GitHub itself as the store (ADR 0078 D5 — no local review DB to drift).
 
+In-diff confinement (open-swe's `add_finding` lesson, applied at our seam): the panel
+prompts ask finders to stay inside the diff, but nothing enforced it — a finding on an
+untouched file could gate a merge. `confine_findings` makes it a property: findings
+whose `file` isn't one of the PR's changed paths never reach `verdict_for`. It fails
+OPEN on an empty/unreadable changed-path list — an unreadable file list must never
+launder a FAIL into a PASS.
+
 Severity → verdict: any confirmed-or-unverdicted blocker/major ⇒ FAIL (real defects
 gate); only minors, or majors the verify pass left "uncertain" ⇒ WARN (worth a human
 glance, not a block); empty or nits-only ⇒ PASS. A finding the verifier REFUTED never
@@ -41,16 +48,59 @@ def verdict_for(findings: list[dict]) -> str:
     return worst
 
 
+def _norm_path(path: str) -> str:
+    path = path.strip()
+    while path.startswith("./"):
+        path = path[2:]
+    return path.removeprefix("/")
+
+
+def confine_findings(findings: list[dict], changed_paths: list[str]) -> tuple[list[dict], list[dict]]:
+    """(kept, dropped). A finding must anchor to a file this PR actually changed —
+    file-less findings are contract violations (gaps belong in prose, not the array)
+    and drop too. Empty `changed_paths` means the file list was unreadable: skip
+    confinement entirely (fail open) rather than dropping everything to PASS."""
+    changed = {_norm_path(p) for p in changed_paths if p and p.strip()}
+    if not changed:
+        return list(findings), []
+    kept: list[dict] = []
+    dropped: list[dict] = []
+    for finding in findings:
+        file = _norm_path(str(finding.get("file") or ""))
+        (kept if file and file in changed else dropped).append(finding)
+    return kept, dropped
+
+
 def render_verdict_body(
-    *, repo: str, pr: int, head_sha: str, verdict: str, report: str, shadow: bool, recipe: str
+    *,
+    repo: str,
+    pr: int,
+    head_sha: str,
+    verdict: str,
+    report: str,
+    shadow: bool,
+    recipe: str,
+    confined: list[dict] | None = None,
 ) -> str:
-    """The comment body: marker line (machine) + header (human) + the panel's report."""
+    """The comment body: marker line (machine) + header (human) + the panel's report,
+    plus a confinement footnote when findings were excluded — the report's own JSON
+    still shows them, so the reader needs to see why the verdict ignored them."""
     mode = "shadow — comment-only" if shadow else "formal"
+    footnote = ""
+    if confined:
+        lines = "\n".join(
+            f"- `{f.get('file') or '(no file)'}` ({f.get('severity') or '?'}) — {str(f.get('claim') or '')[:160]}"
+            for f in confined
+        )
+        footnote = (
+            f"\n\n---\n_{len(confined)} finding(s) excluded from the verdict by in-diff "
+            f"confinement (file not among this PR's changed paths):_\n{lines}"
+        )
     return (
         f"<!-- protoagent-qa-review head={head_sha} verdict={verdict} promoted=false -->\n"
         f"## QA panel review — **{verdict}**\n"
         f"_{recipe} · head `{head_sha[:12]}` · {mode}_\n\n"
-        f"{report}"
+        f"{report}{footnote}"
     )
 
 

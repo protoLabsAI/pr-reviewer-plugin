@@ -16,8 +16,20 @@ STEPS = {s["id"]: s for s in RECIPE["steps"]}
 
 def test_recipe_shape():
     assert RECIPE["name"] == "code-review-structural"
-    assert {i["name"] for i in RECIPE["inputs"]} == {"pr", "repo", "prior_findings"}
+    assert {i["name"] for i in RECIPE["inputs"]} == {"pr", "repo", "prior_findings", "head_sha", "base_ref"}
     assert RECIPE["output"] == "{{steps.report.output}}"
+
+
+def test_llm_finders_get_server_resolved_refs_and_wrapped_prior_findings():
+    # The dispatcher resolves head/base server-side; finders pin code reads to the
+    # head SHA and policy-doc reads to the base ref. Prior findings ride inside an
+    # explicit data wrapper — recalled review text is re-evidenced, never obeyed.
+    for sid in ("find_correctness", "find_removed_behavior", "find_crossfile", "find_conventions"):
+        prompt = STEPS[sid]["prompt"]
+        assert "{{inputs.head_sha}}" in prompt and "{{inputs.base_ref}}" in prompt, sid
+        assert "<prior_findings>" in prompt and "</prior_findings>" in prompt, sid
+    assert "BASE ref" in STEPS["find_conventions"]["prompt"]
+    assert "{{inputs.head_sha}}" in STEPS["verify"]["prompt"]
 
 
 def test_five_finders_feed_the_synthesizer():
