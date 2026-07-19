@@ -33,6 +33,12 @@ structural-trigger dispatch, approve-on-green + sweep, and the review eval.
   footnoted in the posted body). The panel prompts promise in-diff discipline; the
   dispatcher now enforces it. Fails open when the changed-path list is unreadable —
   a failed GitHub read must never launder a FAIL into a PASS.
+- **Existing-thread awareness (v0.5.0)** — the dispatcher fetches the PR's inline
+  review threads (Quinn's, CodeRabbit's, humans'), renders them as one escaped
+  `<pr_review_threads>` data block (closing-tag neutralization, login-grammar
+  validation, body truncation), and passes it as the `existing_threads` recipe
+  input; finders suppress candidates that overlap a live thread. Unreadable
+  threads degrade to "(none)" — awareness never blocks a review.
 
 ## Requirements
 

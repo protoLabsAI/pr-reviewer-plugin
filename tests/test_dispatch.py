@@ -122,9 +122,10 @@ def review_row(head, verdict, state="COMMENTED", findings_json="", id=None):
 
 
 class RoutedGH(FakeGH):
-    def __init__(self, *, pr_facts, reviews=None, checks=None, files="x.py\n"):
+    def __init__(self, *, pr_facts, reviews=None, checks=None, files="x.py\n", threads=None):
         super().__init__()
         self.pr_facts, self.reviews, self.checks, self.files = pr_facts, reviews or [], checks, files
+        self.threads = threads  # None → the generic graphql "0" (fetch degrades to no block)
         self.dismissed: list[str] = []
 
     async def __call__(self, args, timeout=30):
@@ -145,6 +146,8 @@ class RoutedGH(FakeGH):
             return 0, json.dumps(self.reviews), ""
         if "/check-runs" in joined:
             return (0, json.dumps(self.checks), "") if self.checks is not None else (1, "", "403")
+        if "comments(first" in joined:  # the threads fetch (before the count query below)
+            return (0, json.dumps(self.threads), "") if self.threads is not None else (0, "null", "")
         if "graphql" in joined:
             return 0, "0", ""
         if "/pulls/1" in joined:
@@ -180,6 +183,46 @@ async def test_advanced_head_runs_a_delta_review_with_prior_findings(tmp_path):
     out = await d.handle_pr_event("o/r", 1, HEAD, "synchronize")
     assert out == "reviewed:FAIL"
     assert "old" in seen["inputs"]["prior_findings"]
+
+
+# ── existing-threads context ──────────────────────────────────────────────────
+
+
+async def test_existing_threads_block_reaches_the_panel_as_wrapped_data(tmp_path):
+    nodes = [
+        {
+            "isResolved": False,
+            "isOutdated": False,
+            "path": "x.py",
+            "line": 3,
+            "originalLine": 3,
+            "comments": {"nodes": [{"author": {"login": "coderabbitai[bot]"}, "body": "possible dup"}]},
+        }
+    ]
+    gh = RoutedGH(pr_facts=facts(), threads=nodes)
+    seen = {}
+
+    async def runner(name, inputs):
+        seen.update(inputs=inputs)
+        return {"output": REPORT, "failed": []}
+
+    d = make(tmp_path, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "reviewed:FAIL"
+    block = seen["inputs"]["existing_threads"]
+    assert block.startswith("<pr_review_threads>") and "coderabbitai[bot]" in block
+
+
+async def test_unreadable_threads_never_block_the_review(tmp_path):
+    gh = RoutedGH(pr_facts=facts())  # threads fetch degrades (null nodes)
+    seen = {}
+
+    async def runner(name, inputs):
+        seen.update(inputs=inputs)
+        return {"output": REPORT, "failed": []}
+
+    d = make(tmp_path, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "reviewed:FAIL"
+    assert "existing_threads" not in seen["inputs"]  # recipe default "(none)" applies
 
 
 # ── in-diff confinement ───────────────────────────────────────────────────────
