@@ -16,8 +16,21 @@ STEPS = {s["id"]: s for s in RECIPE["steps"]}
 
 def test_recipe_shape():
     assert RECIPE["name"] == "code-review-structural"
-    assert {i["name"] for i in RECIPE["inputs"]} == {"pr", "repo", "prior_findings", "head_sha", "base_ref"}
+    assert {i["name"] for i in RECIPE["inputs"]} == {
+        "pr",
+        "repo",
+        "prior_findings",
+        "head_sha",
+        "base_ref",
+        "existing_threads",
+    }
     assert RECIPE["output"] == "{{steps.report.output}}"
+
+
+def test_llm_finders_see_existing_threads_and_ci_enforcement():
+    for sid in ("find_correctness", "find_removed_behavior", "find_crossfile", "find_conventions"):
+        assert "{{inputs.existing_threads}}" in STEPS[sid]["prompt"], sid
+    assert "check test enforcement specifically" in STEPS["find_conventions"]["prompt"]
 
 
 def test_llm_finders_get_server_resolved_refs_and_wrapped_prior_findings():

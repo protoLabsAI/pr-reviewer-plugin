@@ -208,6 +208,18 @@ class Dispatcher:
         except ValueError:
             return None
 
+    async def _existing_threads_block(self, repo: str, pr: int) -> str:
+        """The rendered <pr_review_threads> block, or "" (unreadable/none — the
+        recipe default "(none)" applies; thread awareness never blocks a review)."""
+        from .threads import fetch_threads, render_threads_block
+
+        try:
+            nodes = await fetch_threads(self._run_gh, repo, pr)
+        except Exception:  # noqa: BLE001
+            log.exception("[pr-reviewer] existing-threads fetch failed on %s#%s", repo, pr)
+            return ""
+        return render_threads_block(nodes) if nodes else ""
+
     # ── the review path ───────────────────────────────────────────────────────
 
     async def handle_pr_event(self, repo: str, pr: int, head_sha: str, action: str) -> str:
@@ -284,6 +296,9 @@ class Dispatcher:
         }
         if prior_findings:
             inputs["prior_findings"] = prior_findings
+        threads_block = await self._existing_threads_block(repo, pr)
+        if threads_block:
+            inputs["existing_threads"] = threads_block
         try:
             result = await runner(recipe, inputs)
         except Exception as exc:  # noqa: BLE001
