@@ -182,6 +182,30 @@ async def test_advanced_head_runs_a_delta_review_with_prior_findings(tmp_path):
     assert "old" in seen["inputs"]["prior_findings"]
 
 
+# ── in-diff confinement ───────────────────────────────────────────────────────
+
+
+async def test_out_of_diff_finding_is_confined_and_cannot_gate(tmp_path):
+    # REPORT's confirmed major sits on x.py; the PR only touched y.py — the finding
+    # is dropped before the verdict, footnoted in the body, and telemetered.
+    gh = RoutedGH(pr_facts=facts(), files="y.py\n")
+    d = make(tmp_path, gh=gh)
+    out = await d.handle_pr_event("o/r", 1, HEAD, "opened")
+    assert out == "reviewed:PASS"
+    assert "in-diff confinement" in gh.posted[0]["body"] and "x.py" in gh.posted[0]["body"]
+    events = {e["event"]: e for e in d.telemetry.read_all()}
+    assert events["confined"]["dropped"] == [{"file": "x.py", "severity": "major"}]
+    assert events["reviewed"]["confined"] == 1 and events["reviewed"]["findings"] == 0
+
+
+async def test_confinement_stands_down_when_the_file_list_is_unreadable(tmp_path):
+    # No changed-path list (the /files read returned nothing) — the FAIL must survive.
+    gh = RoutedGH(pr_facts=facts(), files="")
+    d = make(tmp_path, gh=gh)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "reviewed:FAIL"
+    assert "in-diff confinement" not in gh.posted[0]["body"]
+
+
 # ── exhaustion (D3) ───────────────────────────────────────────────────────────
 
 
@@ -203,7 +227,7 @@ async def test_failed_panel_step_escalates_and_posts_nothing(tmp_path):
 
 
 async def test_shadow_mode_posts_comment_and_structural_trigger_picks_recipe(tmp_path):
-    gh = RoutedGH(pr_facts=facts(changed_files=6, additions=300, deletions=50), files="a\nb\nc\nd\ne\nf\n")
+    gh = RoutedGH(pr_facts=facts(changed_files=6, additions=300, deletions=50), files="x.py\nb\nc\nd\ne\nf\n")
     seen = {}
 
     async def runner(name, inputs):

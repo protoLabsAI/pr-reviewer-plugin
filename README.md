@@ -25,8 +25,14 @@ The deterministic half of protoAgent's PR-review QA tier
   protoPatch findings get the same adversarial verify as everything else — the edge
   over wiring the engine straight into a verdict.
 
-Later phases (ADR 0078 C): webhook chokepoint, structural-trigger dispatch,
-approve-on-green + sweep, the review eval.
+Phase C shipped the deterministic loop around the panel: webhook chokepoint,
+structural-trigger dispatch, approve-on-green + sweep, and the review eval.
+
+- **In-diff confinement (v0.4.0)** — parsed findings whose `file` isn't one of the
+  PR's changed paths are dropped server-side before the verdict mapping (telemetered,
+  footnoted in the posted body). The panel prompts promise in-diff discipline; the
+  dispatcher now enforces it. Fails open when the changed-path list is unreadable —
+  a failed GitHub read must never launder a FAIL into a PASS.
 
 ## Requirements
 

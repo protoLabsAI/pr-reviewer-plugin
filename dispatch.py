@@ -32,7 +32,15 @@ from .chokepoint import DISPATCH_ACTIONS, Chokepoint
 from .gh_cli import bad_repo, run_gh
 from .telemetry import Telemetry
 from .trigger import structural_trigger
-from .verdicts import FAIL, PASS, WARN, parse_verdict_marker, render_verdict_body, verdict_for
+from .verdicts import (
+    FAIL,
+    PASS,
+    WARN,
+    confine_findings,
+    parse_verdict_marker,
+    render_verdict_body,
+    verdict_for,
+)
 
 log = logging.getLogger("protoagent.plugins.pr_reviewer")
 
@@ -265,7 +273,15 @@ class Dispatcher:
         self.telemetry.emit(
             "dispatch", repo=repo, pr=pr, sha=head, recipe=recipe, trigger_reasons=reasons, delta=bool(prior_findings)
         )
-        inputs = {"pr": str(pr), "repo": repo}
+        # Server-resolved refs ride along: finders pin code reads to the head SHA
+        # and policy-doc reads to the base ref (a PR must not rewrite the rules it
+        # is judged by). A host recipe without these declared just ignores them.
+        inputs = {
+            "pr": str(pr),
+            "repo": repo,
+            "head_sha": head,
+            "base_ref": str(facts.get("base_ref") or ""),
+        }
         if prior_findings:
             inputs["prior_findings"] = prior_findings
         try:
@@ -288,10 +304,23 @@ class Dispatcher:
             return "error:panel-exhausted"
 
         output = str(result.get("output") or "")
-        findings = self._parse_findings(output)
+        findings, confined = confine_findings(self._parse_findings(output), paths)
+        if confined:
+            # Server-side in-diff enforcement — prompt discipline made a promise,
+            # this keeps it. The drops are telemetered (eval evidence) and footnoted
+            # in the posted body so the verdict never silently disagrees with the report.
+            self.telemetry.emit(
+                "confined",
+                repo=repo,
+                pr=pr,
+                sha=head,
+                dropped=[
+                    {"file": str(f.get("file") or ""), "severity": str(f.get("severity") or "")} for f in confined
+                ],
+            )
         verdict = verdict_for(findings)
         elapsed = time.monotonic() - started
-        posted = await self._post_verdict(repo, pr, head, verdict, output, recipe)
+        posted = await self._post_verdict(repo, pr, head, verdict, output, recipe, confined=confined)
         self.telemetry.emit(
             "reviewed",
             repo=repo,
@@ -300,6 +329,7 @@ class Dispatcher:
             recipe=recipe,
             verdict=verdict,
             findings=len(findings),
+            confined=len(confined),
             latency_s=round(elapsed, 1),
             posted=posted,
             shadow=self.shadow,
@@ -321,9 +351,25 @@ class Dispatcher:
             except json.JSONDecodeError:
                 return []
 
-    async def _post_verdict(self, repo: str, pr: int, head: str, verdict: str, report: str, recipe: str) -> bool:
+    async def _post_verdict(
+        self,
+        repo: str,
+        pr: int,
+        head: str,
+        verdict: str,
+        report: str,
+        recipe: str,
+        confined: list[dict] | None = None,
+    ) -> bool:
         body = render_verdict_body(
-            repo=repo, pr=pr, head_sha=head, verdict=verdict, report=report, shadow=self.shadow, recipe=recipe
+            repo=repo,
+            pr=pr,
+            head_sha=head,
+            verdict=verdict,
+            report=report,
+            shadow=self.shadow,
+            recipe=recipe,
+            confined=confined,
         )
         event = "COMMENT"
         if not self.shadow and verdict == FAIL:
