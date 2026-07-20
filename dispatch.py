@@ -25,6 +25,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import re
 import time
 
 from .approve import PROMOTE, Observations, promotion_decision
@@ -60,13 +62,39 @@ _NON_TERMINAL = {"queued", "in_progress", "waiting", "requested", "pending"}
 _GREEN = {"success", "neutral", "skipped"}
 
 
+def _env_repos() -> list[str]:
+    """Managed allowlist from PR_REVIEWER_REPOS — comma/space/newline separated."""
+    return [r for r in re.split(r"[,\s]+", os.environ.get("PR_REVIEWER_REPOS", "").strip()) if r]
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    """A tri-state env flag: unset → default; else truthy iff 1/true/yes/on."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
 class Dispatcher:
     def __init__(self, cfg: dict, telemetry: Telemetry, *, run_gh_fn=None, workflow_run=None, inbox_add=None):
         self.cfg = cfg or {}
         self.telemetry = telemetry
-        self.repos = [str(r) for r in (self.cfg.get("repos") or []) if r]
-        self.shadow = bool(self.cfg.get("shadow_mode", True))
-        self.promotion_owner = bool(self.cfg.get("promotion_owner", False))
+        # Config-first, ENV fallback for the operator-tunable state — the same
+        # posture as webhook_secret. HEADLESS config-as-code seeds the config
+        # volume ONCE, so state baked only there can't be updated on an image
+        # roll; PR_REVIEWER_REPOS / _SHADOW_MODE / _PROMOTION_OWNER let the compose
+        # env (re-applied every roll) carry it, keeping the config volume
+        # disposable. A config key present wins over the env; for the bools that
+        # means an explicit `shadow_mode: false` is honoured (not treated as unset).
+        self.repos = [str(r) for r in (self.cfg.get("repos") or []) if r] or _env_repos()
+        self.shadow = (
+            bool(self.cfg["shadow_mode"]) if "shadow_mode" in self.cfg
+            else _env_bool("PR_REVIEWER_SHADOW_MODE", True)
+        )
+        self.promotion_owner = (
+            bool(self.cfg["promotion_owner"]) if "promotion_owner" in self.cfg
+            else _env_bool("PR_REVIEWER_PROMOTION_OWNER", False)
+        )
         self.chokepoint = Chokepoint(cooldown_s=int(self.cfg.get("cooldown_s") or 30))
         self._run_gh = run_gh_fn or run_gh
         self._workflow_run = workflow_run  # None → resolve STATE.workflow_run lazily

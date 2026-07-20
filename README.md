@@ -48,6 +48,20 @@ structural-trigger dispatch, approve-on-green + sweep, and the review eval.
 - Gateway credentials in the host env: `GATEWAY_API_KEY` or `OPENAI_API_KEY`
   (+ `OPENAI_BASE_URL` / `pr_reviewer.gateway_base_url` for a non-default gateway).
 
+## Config (env fallbacks)
+
+The operator-tunable state reads **config first, env as a fallback** — the same
+posture as `webhook_secret`, for headless config-as-code deployments where the
+config volume is seed-once and can't be re-edited on an image roll. A config key
+present always wins; the env only fills an unset/empty key. Put these in the
+compose env (re-applied every roll) to keep the config volume disposable:
+
+| Env | Config key | Default | Notes |
+|---|---|---|---|
+| `PR_REVIEWER_REPOS` | `pr_reviewer.repos` | `[]` | Managed allowlist; comma/space/newline separated. Config wins only when non-empty (seed ships `repos: []` → env applies). |
+| `PR_REVIEWER_SHADOW_MODE` | `pr_reviewer.shadow_mode` | `true` | `1/true/yes/on` ⇒ shadow. A present config bool (incl. `false`) wins over the env. |
+| `PR_REVIEWER_PROMOTION_OWNER` | `pr_reviewer.promotion_owner` | `false` | Same tri-state semantics. |
+
 ## Dev
 
 ```

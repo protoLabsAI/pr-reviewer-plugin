@@ -489,3 +489,52 @@ async def test_successful_approve_resets_the_failure_count(tmp_path):
     assert (await d.evaluate_promotion("o/r", 1)) == "error:approve-failed"
     assert (await d.evaluate_promotion("o/r", 1)) == "promote"  # 3rd attempt succeeds, count resets
     assert d._promote_failures == {}
+
+
+# ── managed state: config-first with an env fallback (headless config-as-code) ──
+
+
+def test_repos_fall_back_to_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("PR_REVIEWER_REPOS", "o/one, o/two\no/three")
+    d = Dispatcher({}, Telemetry(tmp_path))
+    assert d.repos == ["o/one", "o/two", "o/three"]
+
+
+def test_config_repos_win_over_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("PR_REVIEWER_REPOS", "o/env")
+    d = Dispatcher({"repos": ["o/cfg"]}, Telemetry(tmp_path))
+    assert d.repos == ["o/cfg"]  # a present, non-empty config list wins
+
+
+def test_empty_config_repos_fall_through_to_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("PR_REVIEWER_REPOS", "o/env")
+    d = Dispatcher({"repos": []}, Telemetry(tmp_path))
+    assert d.repos == ["o/env"]  # seed ships repos: [] — the disposable-volume case
+
+
+def test_no_repos_anywhere_is_empty(monkeypatch, tmp_path):
+    monkeypatch.delenv("PR_REVIEWER_REPOS", raising=False)
+    d = Dispatcher({}, Telemetry(tmp_path))
+    assert d.repos == []
+
+
+def test_shadow_and_promotion_env_fallback(monkeypatch, tmp_path):
+    monkeypatch.setenv("PR_REVIEWER_SHADOW_MODE", "false")
+    monkeypatch.setenv("PR_REVIEWER_PROMOTION_OWNER", "true")
+    d = Dispatcher({}, Telemetry(tmp_path))
+    assert d.shadow is False and d.promotion_owner is True
+
+
+def test_bool_defaults_when_unset(monkeypatch, tmp_path):
+    monkeypatch.delenv("PR_REVIEWER_SHADOW_MODE", raising=False)
+    monkeypatch.delenv("PR_REVIEWER_PROMOTION_OWNER", raising=False)
+    d = Dispatcher({}, Telemetry(tmp_path))
+    assert d.shadow is True and d.promotion_owner is False  # safe defaults
+
+
+def test_explicit_config_bool_wins_over_env(monkeypatch, tmp_path):
+    # A present key wins even when it's the "falsy" value — an operator who set
+    # shadow_mode: false in config must not be flipped back to shadow by a stale env.
+    monkeypatch.setenv("PR_REVIEWER_SHADOW_MODE", "true")
+    d = Dispatcher({"shadow_mode": False}, Telemetry(tmp_path))
+    assert d.shadow is False
