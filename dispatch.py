@@ -64,6 +64,7 @@ PROMOTE_MAX_FAILURES = 3
 # the typed outcomes of the sweep's second look. Same backoff posture as promotion.
 REGATE = "regate"
 HOLD_REGATE_SHADOW = "hold:regate-shadow"
+HOLD_REGATE_DISABLED = "hold:regate-disabled"
 HOLD_REGATE_NO_FAIL = "hold:regate-no-current-fail"
 HOLD_REGATE_ALREADY = "hold:regate-already-blocking"
 HOLD_REGATE_CHECKS_UNKNOWN = "hold:regate-checks-unknown"
@@ -135,6 +136,15 @@ class Dispatcher:
             int(self.cfg["backfill_per_pass"])
             if "backfill_per_pass" in self.cfg
             else _env_int("PR_REVIEWER_BACKFILL_PER_PASS", 2)
+        )
+        # Independent kill switch for the re-gate. Arming a block is the one thing
+        # this machinery does that can WEDGE someone else's merge, so it needs an off
+        # switch that doesn't also cost you promotion and backfill — an operator who
+        # discovers the panel is emitting false FAILs (e.g. #20's wrong-ref reads)
+        # must be able to stop arming blocks in one config edit, without demoting the
+        # whole seat back to shadow.
+        self.regate_enabled = (
+            bool(self.cfg["regate"]) if "regate" in self.cfg else _env_bool("PR_REVIEWER_REGATE", True)
         )
         self.chokepoint = Chokepoint(cooldown_s=int(self.cfg.get("cooldown_s") or 30))
         self._run_gh = run_gh_fn or run_gh
@@ -540,6 +550,8 @@ class Dispatcher:
         """
         if self.shadow:
             return HOLD_REGATE_SHADOW
+        if not self.regate_enabled:
+            return HOLD_REGATE_DISABLED
         facts = await self._pr_facts(repo, pr)
         if not facts or facts.get("state") != "open" or facts.get("draft"):
             return "hold:pr-not-eligible"

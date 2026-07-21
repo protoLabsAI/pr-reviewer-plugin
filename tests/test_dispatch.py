@@ -785,3 +785,32 @@ def test_int_knobs_fall_back_to_env(monkeypatch, tmp_path):
 
     monkeypatch.setenv("PR_REVIEWER_PANEL_RETRIES", "not-a-number")
     assert Dispatcher({}, Telemetry(tmp_path)).panel_retries == 1  # unreadable → default
+
+
+async def test_regate_can_be_disabled_without_leaving_formal_mode(tmp_path):
+    """The blast-radius switch: stop arming blocks (e.g. the panel is emitting false
+    FAILs) while KEEPING the formal seat, promotion and backfill."""
+    green = [{"status": "completed", "conclusion": "success"}]
+    gh = RoutedGH(pr_facts=facts(), reviews=[review_row(HEAD, "FAIL", state="COMMENTED")], checks=green)
+    d = make(tmp_path, cfg={"shadow_mode": False, "promotion_owner": True, "regate": False}, gh=gh)
+    assert (await d.evaluate_regate("o/r", 1)) == "hold:regate-disabled"
+    assert gh.posted == []
+    assert d.shadow is False and d.promotion_owner is True  # still a formal, promoting seat
+
+
+async def test_disabling_regate_leaves_promotion_working(tmp_path):
+    green = [{"status": "completed", "conclusion": "success"}]
+    gh = RoutedGH(pr_facts=facts(), reviews=[review_row(HEAD, "PASS")], checks=green)
+    d = make(tmp_path, cfg={"shadow_mode": False, "promotion_owner": True, "regate": False}, gh=gh)
+    outcome, _ = await d.reconcile_pr("o/r", 1, backfill_budget=0)
+    assert outcome == "promote"
+    assert gh.posted[0]["event"] == "APPROVE"
+
+
+def test_regate_env_fallback_and_default(monkeypatch, tmp_path):
+    monkeypatch.delenv("PR_REVIEWER_REGATE", raising=False)
+    assert Dispatcher({}, Telemetry(tmp_path)).regate_enabled is True  # on by default
+    monkeypatch.setenv("PR_REVIEWER_REGATE", "false")
+    assert Dispatcher({}, Telemetry(tmp_path)).regate_enabled is False
+    # a present config key wins over the env, in both directions
+    assert Dispatcher({"regate": True}, Telemetry(tmp_path)).regate_enabled is True
