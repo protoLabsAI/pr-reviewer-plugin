@@ -48,6 +48,41 @@ structural-trigger dispatch, approve-on-green + sweep, and the review eval.
 - Gateway credentials in the host env: `GATEWAY_API_KEY` or `OPENAI_API_KEY`
   (+ `OPENAI_BASE_URL` / `pr_reviewer.gateway_base_url` for a non-default gateway).
 
+## Config (env fallbacks)
+
+The operator-tunable state reads **config first, env as a fallback** — the same
+posture as `webhook_secret`, for headless config-as-code deployments where the
+config volume is seed-once and can't be re-edited on an image roll. A config key
+present always wins; the env only fills an unset/empty key. Put these in the
+compose env (re-applied every roll) to keep the config volume disposable:
+
+| Env | Config key | Default | Notes |
+|---|---|---|---|
+| `PR_REVIEWER_REPOS` | `pr_reviewer.repos` | `[]` | Managed allowlist; comma/space/newline separated. Config wins only when non-empty (seed ships `repos: []` → env applies). |
+| `PR_REVIEWER_SHADOW_MODE` | `pr_reviewer.shadow_mode` | `true` | `1/true/yes/on` ⇒ shadow. A present config bool (incl. `false`) wins over the env. |
+| `PR_REVIEWER_PROMOTION_OWNER` | `pr_reviewer.promotion_owner` | `false` | Same tri-state semantics. |
+| `PR_REVIEWER_PANEL_RETRIES` | `pr_reviewer.panel_retries` | `1` | Re-runs of a recipe whose panel reported a failed step, before D3 escalation. `0` restores the old give-up-on-first-failure behaviour. |
+| `PR_REVIEWER_BACKFILL_PER_PASS` | `pr_reviewer.backfill_per_pass` | `2` | Reviews the sweep may backfill per pass, across all repos. `0` disables backfill. |
+
+### What the sweep does (every `sweep_interval_s`, default 180s)
+
+Each open PR in each managed repo is reconciled in this order — cheapest and most
+decisive first:
+
+1. **Backfill** — no verdict for the current head ⇒ review it. Dispatch actions only
+   fire for live webhook events, so a PR opened before the reviewer existed (or while
+   it was down, or whose panel exhausted) would otherwise hold `no-clear-verdict`
+   forever and never become promotable. Budgeted by `backfill_per_pass`.
+2. **Re-gate** — a FAIL standing against the current head that isn't blocking yet, now
+   that checks are terminal ⇒ post the stored verdict as `REQUEST_CHANGES`. A verdict
+   must decide its review event when the panel lands, and #863 forbids blocking against
+   pending CI, so a fast reviewer's FAIL posts as a comment and the gate never arms.
+   This is the mirror of the stale-block dismissal: that lifts a block, this arms one.
+3. **Promote** — the existing approve-on-green path.
+
+A PR that was just backfilled skips 2 and 3 for that pass; the fresh review posts its
+own verdict through the normal path and the next tick sees settled state.
+
 ## Dev
 
 ```
