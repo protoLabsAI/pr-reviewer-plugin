@@ -538,3 +538,250 @@ def test_explicit_config_bool_wins_over_env(monkeypatch, tmp_path):
     monkeypatch.setenv("PR_REVIEWER_SHADOW_MODE", "true")
     d = Dispatcher({"shadow_mode": False}, Telemetry(tmp_path))
     assert d.shadow is False
+
+
+# ── panel retry before exhaustion (D3's "retry or escalate", issue #18) ───────
+
+
+async def test_a_transient_panel_failure_is_retried_and_the_review_lands(tmp_path):
+    gh = RoutedGH(pr_facts=facts())
+    attempts = []
+
+    async def runner(name, inputs):
+        attempts.append(name)
+        if len(attempts) == 1:
+            return {"output": "partial", "failed": ["find_crossfile"]}
+        return {"output": REPORT, "failed": []}
+
+    escalations = []
+    d = make(tmp_path, gh=gh, runner=runner, inbox=lambda text, **kw: escalations.append(text))
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "reviewed:FAIL"
+    assert len(attempts) == 2  # one retry, then a real verdict
+    assert escalations == []  # a recovered run is not an operator problem
+    assert gh.posted  # and the PR is no longer left UNREVIEWED
+
+
+async def test_retries_are_bounded_and_still_never_synthesize_a_partial_verdict(tmp_path):
+    gh = RoutedGH(pr_facts=facts())
+    attempts = []
+
+    async def runner(name, inputs):
+        attempts.append(name)
+        return {"output": "partial", "failed": ["find_crossfile"]}
+
+    escalations = []
+    d = make(tmp_path, cfg={"panel_retries": 2}, gh=gh, runner=runner, inbox=lambda t, **kw: escalations.append(t))
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "error:panel-exhausted"
+    assert len(attempts) == 3  # the original + 2 retries
+    assert gh.posted == []  # D3 holds: no verdict from a partial panel
+    assert escalations and "UNREVIEWED" in escalations[0]
+
+
+async def test_panel_retries_can_be_disabled(tmp_path):
+    attempts = []
+
+    async def runner(name, inputs):
+        attempts.append(name)
+        return {"output": "partial", "failed": ["report"]}
+
+    d = make(tmp_path, cfg={"panel_retries": 0}, gh=RoutedGH(pr_facts=facts()), runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "error:panel-exhausted"
+    assert len(attempts) == 1
+
+
+async def test_a_crashing_runner_is_retried_too(tmp_path):
+    attempts = []
+
+    async def runner(name, inputs):
+        attempts.append(name)
+        if len(attempts) == 1:
+            raise RuntimeError("transient")
+        return {"output": REPORT, "failed": []}
+
+    d = make(tmp_path, gh=RoutedGH(pr_facts=facts()), runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "reviewed:FAIL"
+    assert len(attempts) == 2
+
+
+# ── re-gate: arm a block CI timing beat us to (issue #16) ─────────────────────
+
+
+def formal(tmp_path, gh):
+    return make(tmp_path, cfg={"shadow_mode": False, "promotion_owner": True}, gh=gh)
+
+
+async def test_regate_arms_a_pending_ci_fail_once_checks_go_terminal(tmp_path):
+    # The exact shape of the miss: a FAIL that posted as a COMMENT because CI was
+    # still queued when the panel landed.
+    green = [{"status": "completed", "conclusion": "success"}]
+    gh = RoutedGH(pr_facts=facts(), reviews=[review_row(HEAD, "FAIL", state="COMMENTED")], checks=green)
+    d = formal(tmp_path, gh)
+    assert (await d.evaluate_regate("o/r", 1)) == "regate"
+    assert gh.posted[0]["event"] == "REQUEST_CHANGES"
+    # the original judgement is re-used verbatim — no second panel spend
+    assert "verdict=FAIL" in gh.posted[0]["body"]
+
+
+async def test_regate_holds_while_checks_are_pending(tmp_path):
+    pending = [{"status": "in_progress", "conclusion": None}]
+    gh = RoutedGH(pr_facts=facts(), reviews=[review_row(HEAD, "FAIL", state="COMMENTED")], checks=pending)
+    d = formal(tmp_path, gh)
+    assert (await d.evaluate_regate("o/r", 1)) == "hold:regate-checks-pending"
+    assert gh.posted == []  # #863: never block against non-terminal CI
+
+
+async def test_regate_holds_when_checks_are_unreadable(tmp_path):
+    gh = RoutedGH(pr_facts=facts(), reviews=[review_row(HEAD, "FAIL", state="COMMENTED")], checks=None)
+    d = formal(tmp_path, gh)
+    assert (await d.evaluate_regate("o/r", 1)) == "hold:regate-checks-unknown"
+    assert gh.posted == []
+
+
+async def test_regate_is_idempotent_once_the_block_is_up(tmp_path):
+    green = [{"status": "completed", "conclusion": "success"}]
+    reviews = [review_row(HEAD, "FAIL", state="COMMENTED"), review_row(HEAD, "FAIL", state="CHANGES_REQUESTED")]
+    gh = RoutedGH(pr_facts=facts(), reviews=reviews, checks=green)
+    d = formal(tmp_path, gh)
+    assert (await d.evaluate_regate("o/r", 1)) == "hold:regate-already-blocking"
+    assert gh.posted == []
+
+
+async def test_regate_never_fires_in_shadow(tmp_path):
+    green = [{"status": "completed", "conclusion": "success"}]
+    gh = RoutedGH(pr_facts=facts(), reviews=[review_row(HEAD, "FAIL", state="COMMENTED")], checks=green)
+    d = make(tmp_path, gh=gh)  # shadow default
+    assert (await d.evaluate_regate("o/r", 1)) == "hold:regate-shadow"
+    assert gh.posted == []
+
+
+async def test_regate_ignores_a_fail_that_a_later_verdict_superseded(tmp_path):
+    green = [{"status": "completed", "conclusion": "success"}]
+    reviews = [review_row(HEAD, "FAIL", state="COMMENTED"), review_row(HEAD, "PASS")]
+    gh = RoutedGH(pr_facts=facts(), reviews=reviews, checks=green)
+    d = formal(tmp_path, gh)
+    assert (await d.evaluate_regate("o/r", 1)) == "hold:regate-no-current-fail"
+    assert gh.posted == []
+
+
+async def test_regate_ignores_a_fail_against_a_stale_head(tmp_path):
+    green = [{"status": "completed", "conclusion": "success"}]
+    gh = RoutedGH(pr_facts=facts(), reviews=[review_row(OLD_HEAD, "FAIL", state="COMMENTED")], checks=green)
+    d = formal(tmp_path, gh)
+    assert (await d.evaluate_regate("o/r", 1)) == "hold:regate-no-current-fail"
+    assert gh.posted == []
+
+
+async def test_regate_backs_off_after_repeated_post_failures(tmp_path):
+    green = [{"status": "completed", "conclusion": "success"}]
+
+    class RefusingGH(RoutedGH):
+        async def __call__(self, args, timeout=30):
+            if "-X" in args and "POST" in args and "/reviews" in " ".join(args):
+                self.calls.append(args)
+                return 1, "", "422 Unprocessable"
+            return await super().__call__(args, timeout)
+
+    gh = RefusingGH(pr_facts=facts(), reviews=[review_row(HEAD, "FAIL", state="COMMENTED")], checks=green)
+    escalations = []
+    d = make(
+        tmp_path,
+        cfg={"shadow_mode": False, "promotion_owner": True},
+        gh=gh,
+        inbox=lambda text, **kw: escalations.append(text),
+    )
+    for _ in range(3):
+        assert (await d.evaluate_regate("o/r", 1)) == "error:regate-failed"
+    assert (await d.evaluate_regate("o/r", 1)) == "hold:regate-backoff"
+    assert escalations and "NOT blocking" in escalations[0]
+
+
+# ── backfill: a first review the event stream never delivered (issue #17) ─────
+
+
+async def test_backfill_is_needed_only_when_the_current_head_has_no_verdict(tmp_path):
+    gh = RoutedGH(pr_facts=facts(), reviews=[])
+    assert (await make(tmp_path, gh=gh).needs_backfill("o/r", 1)) == HEAD
+
+    gh2 = RoutedGH(pr_facts=facts(), reviews=[review_row(HEAD, "PASS")])
+    assert (await make(tmp_path, gh=gh2).needs_backfill("o/r", 1)) is None
+
+    # a verdict against an OLD head does not count — that PR is unreviewed at HEAD
+    gh3 = RoutedGH(pr_facts=facts(), reviews=[review_row(OLD_HEAD, "PASS")])
+    assert (await make(tmp_path, gh=gh3).needs_backfill("o/r", 1)) == HEAD
+
+
+async def test_backfill_skips_drafts_and_closed_prs(tmp_path):
+    gh = RoutedGH(pr_facts=facts(draft=True), reviews=[])
+    assert (await make(tmp_path, gh=gh).needs_backfill("o/r", 1)) is None
+
+    gh2 = RoutedGH(pr_facts=facts(state="closed"), reviews=[])
+    assert (await make(tmp_path, gh=gh2).needs_backfill("o/r", 1)) is None
+
+
+async def test_sweep_backfills_a_never_reviewed_pr(tmp_path):
+    # The stuck shape observed in production: an open PR that predates the reviewer,
+    # holding hold:no-clear-verdict on every tick with nothing to break the loop.
+    gh = RoutedGH(pr_facts=facts(), reviews=[])
+    ran = []
+
+    async def runner(name, inputs):
+        ran.append(inputs["pr"])
+        return {"output": REPORT, "failed": []}
+
+    d = make(tmp_path, cfg={"shadow_mode": False, "promotion_owner": True}, gh=gh, runner=runner)
+    assert (await d.sweep_once()) == 1
+    assert ran == ["1"]  # the sweep created the first review itself
+    assert gh.posted and "verdict=FAIL" in gh.posted[0]["body"]
+
+
+async def test_backfill_still_honours_the_self_authored_rail(tmp_path):
+    gh = RoutedGH(pr_facts=facts(author="qa-bot[bot]"), reviews=[])
+    d = make(tmp_path, cfg={"shadow_mode": False, "promotion_owner": True}, gh=gh)
+    assert (await d.backfill_review("o/r", 1, HEAD)) == "drop:self-authored"
+    assert gh.posted == []
+
+
+async def test_backfill_budget_bounds_one_sweep_pass(tmp_path):
+    """A deployment adopting a repo with a backlog must not fire N panels at once."""
+
+    class ManyPRsGH(RoutedGH):
+        async def __call__(self, args, timeout=30):
+            joined = " ".join(args)
+            if "/pulls?" in joined:
+                self.calls.append(args)
+                return 0, "[1, 2, 3, 4, 5]", ""
+            if "/pulls/" in joined and "/files" not in joined and "/reviews" not in joined:
+                self.calls.append(args)
+                return 0, json.dumps(self.pr_facts), ""
+            return await super().__call__(args, timeout)
+
+    gh = ManyPRsGH(pr_facts=facts(), reviews=[])
+    ran = []
+
+    async def runner(name, inputs):
+        ran.append(inputs["pr"])
+        return {"output": REPORT, "failed": []}
+
+    d = make(tmp_path, cfg={"backfill_per_pass": 2, "shadow_mode": False}, gh=gh, runner=runner)
+    assert (await d.sweep_once()) == 5  # every PR still reconciled
+    assert len(ran) == 2  # but only the budgeted number of panels spent
+
+
+async def test_reconcile_prefers_regate_over_promotion_on_the_same_pass(tmp_path):
+    green = [{"status": "completed", "conclusion": "success"}]
+    gh = RoutedGH(pr_facts=facts(), reviews=[review_row(HEAD, "FAIL", state="COMMENTED")], checks=green)
+    d = formal(tmp_path, gh)
+    outcome, _budget = await d.reconcile_pr("o/r", 1, backfill_budget=0)
+    assert outcome == "regate"
+    # exactly one write: the block. Nothing approves a PR we just blocked.
+    assert [p["event"] for p in gh.posted] == ["REQUEST_CHANGES"]
+
+
+def test_int_knobs_fall_back_to_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("PR_REVIEWER_PANEL_RETRIES", "3")
+    monkeypatch.setenv("PR_REVIEWER_BACKFILL_PER_PASS", "7")
+    d = Dispatcher({}, Telemetry(tmp_path))
+    assert d.panel_retries == 3 and d.backfill_per_pass == 7
+
+    monkeypatch.setenv("PR_REVIEWER_PANEL_RETRIES", "not-a-number")
+    assert Dispatcher({}, Telemetry(tmp_path)).panel_retries == 1  # unreadable → default

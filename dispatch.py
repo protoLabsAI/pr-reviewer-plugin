@@ -58,6 +58,25 @@ HOLD_PROMOTE_BACKOFF = "hold:promote-backoff"
 # same posture as the chokepoint.
 PROMOTE_MAX_FAILURES = 3
 
+# Re-gate (issue #16): _post_verdict decides COMMENT-vs-REQUEST_CHANGES once, at
+# review time, and a FAIL that landed while CI was still pending stays non-blocking
+# for that head forever — the sweep only ever promoted, it never re-gated. These are
+# the typed outcomes of the sweep's second look. Same backoff posture as promotion.
+REGATE = "regate"
+HOLD_REGATE_SHADOW = "hold:regate-shadow"
+HOLD_REGATE_NO_FAIL = "hold:regate-no-current-fail"
+HOLD_REGATE_ALREADY = "hold:regate-already-blocking"
+HOLD_REGATE_CHECKS_UNKNOWN = "hold:regate-checks-unknown"
+HOLD_REGATE_CHECKS_PENDING = "hold:regate-checks-pending"
+HOLD_REGATE_BACKOFF = "hold:regate-backoff"
+REGATE_MAX_FAILURES = 3
+
+# Backfill (issue #17): a PR with no verdict for its current head is unreviewable by
+# the promotion path forever — it holds `no-clear-verdict` on every tick. Dispatch
+# actions only fire for LIVE events, so anything opened before the reviewer existed
+# (or while it was down, or that exhausted its panel) never gets a first review.
+BACKFILL_ACTION = "sweep-backfill"
+
 _NON_TERMINAL = {"queued", "in_progress", "waiting", "requested", "pending"}
 _GREEN = {"success", "neutral", "skipped"}
 
@@ -75,6 +94,15 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
+def _env_int(name: str, default: int) -> int:
+    """An int env knob; unreadable/negative → default (never raises at boot)."""
+    try:
+        value = int(str(os.environ.get(name, "")).strip())
+    except ValueError:
+        return default
+    return value if value >= 0 else default
+
+
 class Dispatcher:
     def __init__(self, cfg: dict, telemetry: Telemetry, *, run_gh_fn=None, workflow_run=None, inbox_add=None):
         self.cfg = cfg or {}
@@ -88,12 +116,25 @@ class Dispatcher:
         # means an explicit `shadow_mode: false` is honoured (not treated as unset).
         self.repos = [str(r) for r in (self.cfg.get("repos") or []) if r] or _env_repos()
         self.shadow = (
-            bool(self.cfg["shadow_mode"]) if "shadow_mode" in self.cfg
-            else _env_bool("PR_REVIEWER_SHADOW_MODE", True)
+            bool(self.cfg["shadow_mode"]) if "shadow_mode" in self.cfg else _env_bool("PR_REVIEWER_SHADOW_MODE", True)
         )
         self.promotion_owner = (
-            bool(self.cfg["promotion_owner"]) if "promotion_owner" in self.cfg
+            bool(self.cfg["promotion_owner"])
+            if "promotion_owner" in self.cfg
             else _env_bool("PR_REVIEWER_PROMOTION_OWNER", False)
+        )
+        # D3 says an exhausted run is "retry or escalate" — we do both, in that order.
+        # A failed panel step is usually transient (a starved finder, a flaky tool
+        # call), and the alternative to retrying is a PR that merges UNREVIEWED.
+        self.panel_retries = (
+            int(self.cfg["panel_retries"]) if "panel_retries" in self.cfg else _env_int("PR_REVIEWER_PANEL_RETRIES", 1)
+        )
+        # Reviews the sweep may backfill per pass, across all repos. Bounds the
+        # first-pass stampede on a deployment that adopts a repo with a PR backlog.
+        self.backfill_per_pass = (
+            int(self.cfg["backfill_per_pass"])
+            if "backfill_per_pass" in self.cfg
+            else _env_int("PR_REVIEWER_BACKFILL_PER_PASS", 2)
         )
         self.chokepoint = Chokepoint(cooldown_s=int(self.cfg.get("cooldown_s") or 30))
         self._run_gh = run_gh_fn or run_gh
@@ -101,6 +142,7 @@ class Dispatcher:
         self._inbox_add = inbox_add  # None → resolve STATE.inbox_store lazily
         self._viewer: str | None = None
         self._promote_failures: dict[str, int] = {}  # repo#pr@head -> consecutive APPROVE failures
+        self._regate_failures: dict[str, int] = {}  # repo#pr@head -> consecutive REQUEST_CHANGES failures
 
     # ── plumbing ──────────────────────────────────────────────────────────────
 
@@ -327,23 +369,45 @@ class Dispatcher:
         threads_block = await self._existing_threads_block(repo, pr)
         if threads_block:
             inputs["existing_threads"] = threads_block
-        try:
-            result = await runner(recipe, inputs)
-        except Exception as exc:  # noqa: BLE001
-            self._escalate(
-                f"pr-reviewer: review run crashed on {repo}#{pr} ({type(exc).__name__}: {exc}) — PR is UNREVIEWED.",
-                dedup_key=f"pr-reviewer-crash:{repo}#{pr}@{head[:7]}",
-            )
-            return "error:run-crashed"
-
-        failed = list(result.get("failed") or [])
+        # D3 spells the caller's options as "retry or escalate to the operator" — a
+        # partial panel still never synthesizes a verdict, we just don't give up on
+        # the FIRST failure. Retries re-run the whole recipe (the runner's unit of
+        # work); the panel is deterministic in its inputs, so a rerun is a fresh
+        # draw against whatever starved the failed step.
+        result: dict = {}
+        failed: list = []
+        for attempt in range(1, self.panel_retries + 2):
+            last = attempt == self.panel_retries + 1
+            try:
+                result = await runner(recipe, inputs)
+            except Exception as exc:  # noqa: BLE001
+                if not last:
+                    self.telemetry.emit(
+                        "panel_retry", repo=repo, pr=pr, sha=head, attempt=attempt, crashed=type(exc).__name__
+                    )
+                    continue
+                self._escalate(
+                    f"pr-reviewer: review run crashed on {repo}#{pr} ({type(exc).__name__}: {exc}) — PR is UNREVIEWED.",
+                    dedup_key=f"pr-reviewer-crash:{repo}#{pr}@{head[:7]}",
+                )
+                return "error:run-crashed"
+            failed = list(result.get("failed") or [])
+            if not failed:
+                break
+            if not last:
+                self.telemetry.emit("panel_retry", repo=repo, pr=pr, sha=head, attempt=attempt, failed=failed)
         if failed:
-            # D3: a partial panel is not a review. No verdict, operator escalation.
+            # Retries spent: D3's other branch. No verdict, operator escalation — and
+            # the sweep's backfill will try again on a later pass (issue #17), so an
+            # exhausted PR is no longer abandoned for good.
             self._escalate(
-                f"pr-reviewer: panel step(s) {failed} failed on {repo}#{pr} — no verdict posted; PR is UNREVIEWED.",
+                f"pr-reviewer: panel step(s) {failed} failed on {repo}#{pr} "
+                f"after {self.panel_retries + 1} attempt(s) — no verdict posted; PR is UNREVIEWED.",
                 dedup_key=f"pr-reviewer-exhaustion:{repo}#{pr}@{head[:7]}",
             )
-            self.telemetry.emit("exhaustion", repo=repo, pr=pr, sha=head, failed=failed)
+            self.telemetry.emit(
+                "exhaustion", repo=repo, pr=pr, sha=head, failed=failed, attempts=self.panel_retries + 1
+            )
             return "error:panel-exhausted"
 
         output = str(result.get("output") or "")
@@ -460,6 +524,90 @@ class Dispatcher:
                 log.warning("[pr-reviewer] dismissing stale block on %s#%s failed: %s", repo, pr, err[-300:])
             self.telemetry.emit("dismissal", repo=repo, pr=pr, review_id=review["id"], ok=rc == 0)
 
+    # ── re-gate: arm a block the CI clock beat us to (issue #16) ──────────────
+
+    async def evaluate_regate(self, repo: str, pr: int) -> str:
+        """Post the blocking review a pending-CI FAIL couldn't post at review time.
+
+        `_post_verdict` must decide COMMENT vs REQUEST_CHANGES the moment the panel
+        lands, and #863 forbids blocking against non-terminal CI — so a fast reviewer
+        (verdict in ~10s, CI still queued) posts a comment and the gate never arms.
+        This is the mirror of `_dismiss_stale_blocks`: that one LIFTS our block when a
+        later head clears, this one ARMS it when the checks we were waiting on finish.
+
+        The stored verdict body is re-posted verbatim (plus a one-line note): the
+        judgement was already made and paid for — only the GitHub review event changes.
+        """
+        if self.shadow:
+            return HOLD_REGATE_SHADOW
+        facts = await self._pr_facts(repo, pr)
+        if not facts or facts.get("state") != "open" or facts.get("draft"):
+            return "hold:pr-not-eligible"
+        head = str(facts["head"])
+        ours = await self._our_reviews(repo, pr)
+        latest = ours[-1] if ours else None
+        if not latest or latest["head"] != head or latest["verdict"] != FAIL:
+            # No FAIL standing against the current head — a later PASS/WARN supersedes
+            # (and `_dismiss_stale_blocks` already handled any block it left behind).
+            return HOLD_REGATE_NO_FAIL
+        if any(r.get("state") == "CHANGES_REQUESTED" and r["head"] == head for r in ours):
+            return HOLD_REGATE_ALREADY
+        backoff_key = f"{repo}#{pr}@{head}"
+        if self._regate_failures.get(backoff_key, 0) >= REGATE_MAX_FAILURES:
+            self.telemetry.emit("regate", repo=repo, pr=pr, sha=head, decision=HOLD_REGATE_BACKOFF)
+            return HOLD_REGATE_BACKOFF
+        checks = await self._checks_state(repo, head)
+        if checks is None:
+            decision = HOLD_REGATE_CHECKS_UNKNOWN
+        elif checks == "pending":
+            decision = HOLD_REGATE_CHECKS_PENDING
+        else:
+            decision = REGATE
+        if decision != REGATE:
+            self.telemetry.emit("regate", repo=repo, pr=pr, sha=head, decision=decision)
+            return decision
+        body = (
+            f"_Checks are terminal ({checks}) — arming the FAIL verdict below as a blocking review "
+            f"(it posted as a comment while CI was still pending)._\n\n" + latest["body"]
+        )
+        rc, _out, err = await self._run_gh(
+            [
+                "api",
+                f"repos/{repo}/pulls/{pr}/reviews",
+                "-X",
+                "POST",
+                "-f",
+                "event=REQUEST_CHANGES",
+                "-f",
+                f"body={body}",
+            ],
+            timeout=60,
+        )
+        if rc != 0:
+            failures = self._regate_failures.get(backoff_key, 0) + 1
+            self._regate_failures[backoff_key] = failures
+            if len(self._regate_failures) > 1024:  # bounded, like the promote counter
+                self._regate_failures = dict(list(self._regate_failures.items())[-512:])
+            log.warning(
+                "[pr-reviewer] re-gate REQUEST_CHANGES on %s#%s failed (%d/%d): %s",
+                repo,
+                pr,
+                failures,
+                REGATE_MAX_FAILURES,
+                err[-300:],
+            )
+            if failures >= REGATE_MAX_FAILURES:
+                self._escalate(
+                    f"pr-reviewer: re-gate keeps failing on {repo}#{pr} @{head[:7]} ({failures}× — backing off "
+                    f"until a new head). A FAIL verdict is standing but NOT blocking. Last error: {err[-200:]}",
+                    dedup_key=f"pr-reviewer-regate-backoff:{backoff_key[:64]}",
+                )
+            self.telemetry.emit("regate", repo=repo, pr=pr, sha=head, decision="error:regate-failed")
+            return "error:regate-failed"
+        self._regate_failures.pop(backoff_key, None)
+        self.telemetry.emit("regate", repo=repo, pr=pr, sha=head, decision=REGATE, checks=checks)
+        return REGATE
+
     # ── promotion (edge + sweep share this) ───────────────────────────────────
 
     async def evaluate_promotion(self, repo: str, pr: int) -> str:
@@ -537,10 +685,63 @@ class Dispatcher:
         # 'no-checks' is terminal but NEVER green for promotion (fails closed).
         return "failed" if state == "no-checks" else state
 
+    # ── backfill: a first review for a PR no live event ever reached (issue #17) ──
+
+    async def needs_backfill(self, repo: str, pr: int) -> str | None:
+        """The head SHA to review, or None when this PR already has a current verdict.
+
+        `hold:no-clear-verdict` is otherwise terminal: dispatch actions only fire for
+        live webhook events, so a PR opened before the reviewer existed — or while it
+        was down, or whose panel exhausted — holds on every tick, forever, and can
+        never be promoted. Cheap checks first; this runs per-PR per-pass.
+        """
+        facts = await self._pr_facts(repo, pr)
+        if not facts or facts.get("state") != "open" or facts.get("draft"):
+            return None
+        head = str(facts["head"])
+        ours = await self._our_reviews(repo, pr)
+        if any(r["head"] == head for r in ours):
+            return None  # a verdict for the CURRENT head exists — nothing to backfill
+        return head
+
+    async def backfill_review(self, repo: str, pr: int, head: str) -> str:
+        """Review a PR the sweep found without a verdict — same path as the edge, so
+        every guard (self-authored, eligibility, cooldown, in-flight) still applies."""
+        decision = self.chokepoint.admit(repo, pr, head)
+        if decision != "accept":
+            self.telemetry.emit("drop", repo=repo, pr=pr, sha=head, reason=decision, action=BACKFILL_ACTION)
+            return f"drop:{decision}"
+        self.telemetry.emit("backfill", repo=repo, pr=pr, sha=head)
+        try:
+            return await self._review(repo, pr)
+        finally:
+            self.chokepoint.done(repo, pr)
+
+    async def reconcile_pr(self, repo: str, pr: int, *, backfill_budget: int = 0) -> tuple[str, int]:
+        """One PR reconciled to the state its verdict implies. Returns (outcome, budget left).
+
+        Order matters, and it is the cheap-and-decisive-first order:
+          1. backfill — no verdict at all, so nothing downstream can decide anything
+          2. re-gate  — a FAIL that isn't blocking yet (the merge-race is live NOW)
+          3. promote  — a clear verdict on terminal-green (the existing behaviour)
+        A backfilled PR skips 2 and 3 this pass: the fresh review just posted its own
+        verdict through the normal path, and the next tick sees the settled state.
+        """
+        if backfill_budget > 0:
+            head = await self.needs_backfill(repo, pr)
+            if head:
+                return await self.backfill_review(repo, pr, head), backfill_budget - 1
+        regated = await self.evaluate_regate(repo, pr)
+        if regated == REGATE:
+            # A block just went up; promotion on the same pass would be incoherent.
+            return regated, backfill_budget
+        return await self.evaluate_promotion(repo, pr), backfill_budget
+
     async def sweep_once(self) -> int:
-        """The 3-minute level pass: every open PR in every managed repo through the
-        promotion decision. Returns PRs evaluated. Never raises."""
+        """The 3-minute level pass: every open PR in every managed repo reconciled
+        (backfill → re-gate → promote). Returns PRs evaluated. Never raises."""
         count = 0
+        budget = self.backfill_per_pass
         for repo in self.repos:
             try:
                 rc, out, _err = await self._run_gh(
@@ -551,10 +752,10 @@ class Dispatcher:
                 numbers = []
             for pr in numbers if isinstance(numbers, list) else []:
                 try:
-                    await self.evaluate_promotion(repo, int(pr))
+                    _outcome, budget = await self.reconcile_pr(repo, int(pr), backfill_budget=budget)
                     count += 1
                 except Exception:  # noqa: BLE001
-                    log.exception("[pr-reviewer] sweep promotion failed on %s#%s", repo, pr)
+                    log.exception("[pr-reviewer] sweep reconcile failed on %s#%s", repo, pr)
         return count
 
 
