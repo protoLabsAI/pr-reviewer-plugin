@@ -15,6 +15,14 @@ Rules that recur:
   degrade the panel to four finders instead.
 - **Server-side refs.** PR head/base SHAs come from `gh` inside the tool; never accept
   a model-provided ref.
+- **Verdicts stay pure.** `verdict_for` maps findings → verdict and nothing else
+  (ADR 0078 C). Anything that needs review *history* — the convergence rule, round
+  counting — layers on top in `rounds.py` and takes its facts as arguments; the
+  dispatcher does the GitHub reads. Relief always fails CLOSED: unreadable delta,
+  uncertain major, or a finding outside the delta ⇒ the WARN stands.
+- **A promotion is not a round.** Approve-on-green posts a marker-bearing review with
+  no findings. Anything reading "the previous review" must go through
+  `rounds.panel_rounds`, or it silently recalls nothing (issue #23).
 - Keep `protoagent.plugin.yaml` and `pyproject.toml` versions in lockstep
   (tests/test_version.py asserts it).
 

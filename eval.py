@@ -43,6 +43,10 @@ def build_report(events: list[dict]) -> dict:
     exhaustions = [e for e in events if e.get("event") == "exhaustion"]
     promotions = Counter(str(e.get("decision")) for e in events if e.get("event") == "promotion")
     latencies = [float(e["latency_s"]) for e in reviewed if e.get("latency_s") is not None]
+    rounds: dict[tuple[str, int], int] = {}
+    for e in reviewed:
+        key = (str(e.get("repo")), int(e.get("pr") or 0))
+        rounds[key] = max(rounds.get(key, 0), int(e.get("round") or 1))
     return {
         "dispatches": len(dispatches),
         "reviews_posted": sum(1 for e in reviewed if e.get("posted")),
@@ -57,6 +61,14 @@ def build_report(events: list[dict]) -> dict:
             round(sum(int(e.get("findings") or 0) for e in reviewed) / len(reviewed), 2) if reviewed else None
         ),
         "delta_reviews": sum(1 for e in dispatches if e.get("delta")),
+        # Convergence (issue #23). `rounds_per_pr` is the metric the loop was invisible
+        # in: an average creeping past ~3, or a max in the high single digits, is a
+        # panel re-reviewing its own churn — #88 hit 8 before anyone counted.
+        "rounds_per_pr": round(sum(rounds.values()) / len(rounds), 2) if rounds else None,
+        "max_rounds": max(rounds.values()) if rounds else None,
+        "converged": sum(
+            1 for e in events if e.get("event") == "converged" and str(e.get("reason", "")).startswith("converged")
+        ),
         "drops": dict(drops),
         "exhaustions": len(exhaustions),
         "promotion_decisions": dict(promotions),
@@ -125,6 +137,9 @@ def render_report_markdown(summary: dict, rows: list[dict] | None = None) -> str
         f"(Quinn's floor: 44.7s median — the lite recipe is the lever)",
         f"- **Reaffirmed (unchanged head):** {summary.get('reaffirmed', 0)} · **delta re-reviews:** "
         f"{summary.get('delta_reviews', 0)} · **findings/review:** {summary.get('findings_per_review')}",
+        f"- **Rounds/PR:** {summary.get('rounds_per_pr')} (max {summary.get('max_rounds')}) · "
+        f"**converged to PASS-with-notes:** {summary.get('converged', 0)} — a climbing max is the "
+        f"panel re-reviewing its own churn (issue #23)",
         f"- **Exhaustions (fail-closed, no verdict):** {summary.get('exhaustions', 0)}",
         f"- **Typed drops:** {summary.get('drops') or {}}",
         f"- **Promotion decisions:** {summary.get('promotion_decisions') or {}}",

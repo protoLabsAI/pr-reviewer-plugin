@@ -32,6 +32,14 @@ import time
 from .approve import PROMOTE, Observations, promotion_decision
 from .chokepoint import DISPATCH_ACTIONS, Chokepoint
 from .gh_cli import bad_repo, run_gh
+from .rounds import (
+    DEFAULT_CONVERGENCE_ROUNDS,
+    converge,
+    delta_ranges,
+    panel_rounds,
+    render_notes_section,
+    render_prior_requests,
+)
 from .telemetry import Telemetry
 from .trigger import structural_trigger
 from .verdicts import (
@@ -146,6 +154,14 @@ class Dispatcher:
         self.regate_enabled = (
             bool(self.cfg["regate"]) if "regate" in self.cfg else _env_bool("PR_REVIEWER_REGATE", True)
         )
+        # Convergence (issue #23): the round from which an all-minor, all-in-delta WARN
+        # retires to PASS-with-notes. 0 disables the rule — the operator knob for a
+        # repo that would rather keep re-reviewing than ever floor a minor.
+        self.convergence_rounds = (
+            int(self.cfg["convergence_rounds"])
+            if "convergence_rounds" in self.cfg
+            else _env_int("PR_REVIEWER_CONVERGENCE_ROUNDS", DEFAULT_CONVERGENCE_ROUNDS)
+        )
         self.chokepoint = Chokepoint(cooldown_s=int(self.cfg.get("cooldown_s") or 30))
         self._run_gh = run_gh_fn or run_gh
         self._workflow_run = workflow_run  # None → resolve STATE.workflow_run lazily
@@ -240,6 +256,30 @@ class Dispatcher:
                     {**marker, "state": row.get("state", ""), "body": row.get("body") or "", "id": row.get("id")}
                 )
         return ours
+
+    async def _delta_ranges(self, repo: str, base: str, head: str) -> dict | None:
+        """Line ranges that moved between two reviewed heads, or None (unreadable).
+
+        None is load-bearing: `converge` grants no relief without a readable delta, so
+        a failed compare costs a round of churn, never a laundered verdict.
+        """
+        if not base or not head or base == head:
+            return None
+        rc, out, _err = await self._run_gh(
+            [
+                "api",
+                f"repos/{repo}/compare/{base}...{head}",
+                "--jq",
+                "[.files[]? | {filename: .filename, patch: .patch}]",
+            ],
+        )
+        if rc != 0:
+            return None
+        try:
+            files = json.loads(out)
+        except json.JSONDecodeError:
+            return None
+        return delta_ranges(files) if isinstance(files, list) else None
 
     async def _checks_state(self, repo: str, sha: str) -> str | None:
         """'green' | 'pending' | 'failed' | None(unreadable). NO check runs at all →
@@ -347,23 +387,35 @@ class Dispatcher:
         recipe = "code-review-structural" if fires else "code-review"
 
         ours = await self._our_reviews(repo, pr)
-        prior = ours[-1] if ours else None
-        if prior and prior["head"] == head:
+        # ROUNDS, not reviews (issue #23): promotion bodies carry our marker and no
+        # findings, so `ours[-1]` after an approve-on-green was an empty recall — the
+        # delta re-review silently degraded to a cold one, which is what kept #88
+        # rediscovering the same surface. `panel_rounds` also folds a re-gate's
+        # verbatim re-post back into the head it belongs to.
+        history = panel_rounds(ours)
+        current = next((r for r in reversed(history) if r["head"] == head), None)
+        if current:
             # Unchanged head with a posted verdict — reaffirm, don't re-spend the panel.
-            self.telemetry.emit("reaffirm", repo=repo, pr=pr, sha=head, verdict=prior["verdict"])
-            return f"reaffirmed:{prior['verdict']}"
-        prior_findings = ""
-        if prior:
-            from .verdicts import extract_findings_json
-
-            prior_findings = extract_findings_json(prior["body"])
+            self.telemetry.emit("reaffirm", repo=repo, pr=pr, sha=head, verdict=current["verdict"])
+            return f"reaffirmed:{current['verdict']}"
+        prior = history[-1] if history else None
+        round_number = len(history) + 1
+        prior_findings = json.dumps(prior["findings"]) if prior and prior["findings"] else ""
+        prior_requests = render_prior_requests(history)
 
         runner = self._runner()
         if runner is None:
             self.telemetry.emit("drop", repo=repo, pr=pr, reason=DROP_NO_RUNNER)
             return f"drop:{DROP_NO_RUNNER}"
         self.telemetry.emit(
-            "dispatch", repo=repo, pr=pr, sha=head, recipe=recipe, trigger_reasons=reasons, delta=bool(prior_findings)
+            "dispatch",
+            repo=repo,
+            pr=pr,
+            sha=head,
+            recipe=recipe,
+            trigger_reasons=reasons,
+            delta=bool(prior_findings),
+            round=round_number,
         )
         # Server-resolved refs ride along: finders pin code reads to the head SHA
         # and policy-doc reads to the base ref (a PR must not rewrite the rules it
@@ -376,6 +428,11 @@ class Dispatcher:
         }
         if prior_findings:
             inputs["prior_findings"] = prior_findings
+        if prior_requests:
+            # The panel's own request history — a change it demanded is verified as
+            # implemented, not re-litigated as a novel unrequested delta (issue #23).
+            inputs["prior_requests"] = prior_requests
+            inputs["review_round"] = str(round_number)
         threads_block = await self._existing_threads_block(repo, pr)
         if threads_block:
             inputs["existing_threads"] = threads_block
@@ -436,8 +493,23 @@ class Dispatcher:
                 ],
             )
         verdict = verdict_for(findings)
+        # Convergence (issue #23) sits AFTER the pure mapping, never inside it: ADR
+        # 0078 C's rule is that findings decide the verdict, and that still holds —
+        # this only asks whether a non-blocking verdict is still worth another round.
+        ranges = None
+        if prior and self.convergence_rounds and verdict == WARN and round_number >= self.convergence_rounds:
+            ranges = await self._delta_ranges(repo, prior["head"], head)
+        verdict, notes, reason = converge(
+            verdict, findings, round_number=round_number, ranges=ranges, threshold=self.convergence_rounds
+        )
+        if notes or reason.startswith("converged"):
+            self.telemetry.emit(
+                "converged", repo=repo, pr=pr, sha=head, round=round_number, reason=reason, notes=len(notes)
+            )
         elapsed = time.monotonic() - started
-        posted = await self._post_verdict(repo, pr, head, verdict, output, recipe, confined=confined)
+        posted = await self._post_verdict(
+            repo, pr, head, verdict, output, recipe, confined=confined, notes=render_notes_section(notes)
+        )
         self.telemetry.emit(
             "reviewed",
             repo=repo,
@@ -445,7 +517,9 @@ class Dispatcher:
             sha=head,
             recipe=recipe,
             verdict=verdict,
+            round=round_number,
             findings=len(findings),
+            notes=len(notes),
             confined=len(confined),
             latency_s=round(elapsed, 1),
             posted=posted,
@@ -477,6 +551,7 @@ class Dispatcher:
         report: str,
         recipe: str,
         confined: list[dict] | None = None,
+        notes: str = "",
     ) -> bool:
         body = render_verdict_body(
             repo=repo,
@@ -487,6 +562,7 @@ class Dispatcher:
             shadow=self.shadow,
             recipe=recipe,
             confined=confined,
+            notes=notes,
         )
         event = "COMMENT"
         if not self.shadow and verdict == FAIL:

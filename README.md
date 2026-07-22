@@ -39,6 +39,26 @@ structural-trigger dispatch, approve-on-green + sweep, and the review eval.
   validation, body truncation), and passes it as the `existing_threads` recipe
   input; finders suppress candidates that overlap a live thread. Unreadable
   threads degrade to "(none)" — awareness never blocks a review.
+- **Re-review convergence (v0.8.0)** — a review loop now has an exit. Three parts,
+  all in `rounds.py` (issue #23; the case was projectBoard-plugin#88, eight rounds
+  on a small store fix where the panel kept reviewing changes it had itself demanded):
+  - **Rounds, not reviews.** Recall reads the PR's *panel rounds*. A promotion body
+    carries our marker and no findings, so taking the newest marker-bearing review as
+    "the prior review" meant that after any approve-on-green the next round recalled
+    an empty `prior_findings` and silently re-reviewed **cold**. A re-gate's verbatim
+    re-post no longer double-counts a head either.
+  - **Prior-request memory** — every round's findings ride along as one escaped
+    `<prior_requests>` block plus `review_round`. A finder can see that the line it is
+    about to flag exists *because the panel asked for it*: it verifies the change was
+    implemented correctly instead of re-litigating it as unexplained new scope. A
+    wrong, partial or defect-introducing fix is still a finding.
+  - **The exit rule** — from round 3 (`PR_REVIEWER_CONVERGENCE_ROUNDS`), a **WARN**
+    whose findings are *all* minor/nit **and** *all* anchored to lines that moved since
+    the previous reviewed head becomes **PASS with notes**: the findings still post, as
+    a follow-up checklist, they just stop holding the verdict. Fails closed in every
+    direction — a FAIL never converges, an uncertain major never converges, a finding
+    on code the review never touched never converges, and an unreadable compare grants
+    no relief at all.
 
 ## Requirements
 
@@ -63,6 +83,7 @@ compose env (re-applied every roll) to keep the config volume disposable:
 | `PR_REVIEWER_PROMOTION_OWNER` | `pr_reviewer.promotion_owner` | `false` | Same tri-state semantics. |
 | `PR_REVIEWER_PANEL_RETRIES` | `pr_reviewer.panel_retries` | `1` | Re-runs of a recipe whose panel reported a failed step, before D3 escalation. `0` restores the old give-up-on-first-failure behaviour. |
 | `PR_REVIEWER_BACKFILL_PER_PASS` | `pr_reviewer.backfill_per_pass` | `2` | Reviews the sweep may backfill per pass, across all repos. `0` disables backfill. |
+| `PR_REVIEWER_CONVERGENCE_ROUNDS` | `pr_reviewer.convergence_rounds` | `3` | The round from which an all-minor, all-in-delta WARN retires to PASS-with-notes. `0` disables the rule — the panel keeps re-reviewing rather than ever floor a minor. |
 | `PR_REVIEWER_REGATE` | `pr_reviewer.regate` | `true` | Master switch for step 2 below. `false` stops arming blocks while KEEPING the formal seat, promotion and backfill — the lever to pull when the panel is emitting false FAILs. |
 
 ### What the sweep does (every `sweep_interval_s`, default 180s)

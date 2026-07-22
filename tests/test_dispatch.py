@@ -122,10 +122,11 @@ def review_row(head, verdict, state="COMMENTED", findings_json="", id=None):
 
 
 class RoutedGH(FakeGH):
-    def __init__(self, *, pr_facts, reviews=None, checks=None, files="x.py\n", threads=None):
+    def __init__(self, *, pr_facts, reviews=None, checks=None, files="x.py\n", threads=None, compare=None):
         super().__init__()
         self.pr_facts, self.reviews, self.checks, self.files = pr_facts, reviews or [], checks, files
         self.threads = threads  # None → the generic graphql "0" (fetch degrades to no block)
+        self.compare = compare  # None → the compare read fails (no convergence relief)
         self.dismissed: list[str] = []
 
     async def __call__(self, args, timeout=30):
@@ -140,6 +141,8 @@ class RoutedGH(FakeGH):
             return 0, "{}", ""
         if args[1] == "user":
             return 0, "qa-bot", ""
+        if "/compare/" in joined:
+            return (0, json.dumps(self.compare), "") if self.compare is not None else (1, "", "404")
         if "/files" in joined:
             return 0, self.files, ""
         if "/reviews" in joined:
@@ -814,3 +817,140 @@ def test_regate_env_fallback_and_default(monkeypatch, tmp_path):
     assert Dispatcher({}, Telemetry(tmp_path)).regate_enabled is False
     # a present config key wins over the env, in both directions
     assert Dispatcher({"regate": True}, Telemetry(tmp_path)).regate_enabled is True
+
+
+# ── convergence: rounds, request memory, the exit rule (issue #23) ────────────
+
+MID_HEAD = "c" * 40
+MINOR = [{"file": "x.py", "line": 12, "severity": "minor", "claim": "dup", "evidence": "e", "verdict": "confirmed"}]
+MINOR_REPORT = "Brief prose.\n\n```json\n" + json.dumps(MINOR) + "\n```"
+PATCH = "@@ -10,3 +10,6 @@ def f():\n ctx\n+a\n+b\n+c\n"
+
+
+def promotion_row(head, verdict="WARN"):
+    """What approve-on-green posts: our marker, and no findings JSON at all."""
+    return {
+        "state": "APPROVED",
+        "id": 9,
+        "body": (
+            f"<!-- protoagent-qa-review head={head} verdict={verdict} promoted=true -->\n"
+            f"Promoting the {verdict} verdict for head `{head[:12]}`."
+        ),
+    }
+
+
+def capturing_runner(report=REPORT):
+    seen = {}
+
+    async def runner(name, inputs):
+        seen.update(name=name, inputs=inputs)
+        return {"output": report, "failed": []}
+
+    return runner, seen
+
+
+async def test_a_promotion_no_longer_shadows_the_prior_findings_recall(tmp_path):
+    # #23's root cause: with the promotion review newest, recall used to read a body
+    # with no findings JSON — `prior_findings` came through empty and the delta
+    # re-review silently degraded to a cold first review.
+    prior = json.dumps([{"file": "x.py", "line": 1, "severity": "minor", "claim": "old", "evidence": "e"}])
+    gh = RoutedGH(
+        pr_facts=facts(),
+        reviews=[review_row(OLD_HEAD, "WARN", findings_json=prior), promotion_row(OLD_HEAD)],
+    )
+    runner, seen = capturing_runner()
+    d = make(tmp_path, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "synchronize")) == "reviewed:FAIL"
+    assert "old" in seen["inputs"]["prior_findings"]
+
+
+async def test_the_panels_own_request_history_reaches_the_recipe(tmp_path):
+    first = json.dumps([{"file": "x.py", "line": 1, "severity": "major", "claim": "edges dropped", "evidence": "e"}])
+    second = json.dumps([{"file": "x.py", "line": 5, "severity": "minor", "claim": "normalize it", "evidence": "e"}])
+    gh = RoutedGH(
+        pr_facts=facts(),
+        reviews=[review_row(OLD_HEAD, "FAIL", findings_json=first), review_row(MID_HEAD, "WARN", findings_json=second)],
+    )
+    runner, seen = capturing_runner()
+    d = make(tmp_path, gh=gh, runner=runner)
+    await d.handle_pr_event("o/r", 1, HEAD, "synchronize")
+    block = seen["inputs"]["prior_requests"]
+    assert "edges dropped" in block and "normalize it" in block
+    assert '<round number="1"' in block and '<round number="2"' in block
+    assert seen["inputs"]["review_round"] == "3"
+
+
+async def test_first_review_carries_no_request_history(tmp_path):
+    gh = RoutedGH(pr_facts=facts(), reviews=[])
+    runner, seen = capturing_runner()
+    d = make(tmp_path, gh=gh, runner=runner)
+    await d.handle_pr_event("o/r", 1, HEAD, "opened")
+    assert "prior_requests" not in seen["inputs"] and "review_round" not in seen["inputs"]
+
+
+def two_prior_rounds():
+    return [review_row(OLD_HEAD, "FAIL"), review_row(MID_HEAD, "WARN")]
+
+
+async def test_round_three_minor_in_delta_posts_pass_with_notes(tmp_path):
+    gh = RoutedGH(
+        pr_facts=facts(),
+        reviews=two_prior_rounds(),
+        compare=[{"filename": "x.py", "patch": PATCH}],
+    )
+    runner, _seen = capturing_runner(MINOR_REPORT)
+    d = make(tmp_path, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "synchronize")) == "reviewed:PASS"
+    body = gh.posted[0]["body"]
+    assert f"head={HEAD} verdict=PASS" in body
+    assert "notes, not gates" in body and "- [ ] `x.py:12`" in body  # nothing hidden
+    assert '"claim": "dup"' in body  # the findings JSON still ships
+
+
+async def test_an_unreadable_delta_keeps_the_warn(tmp_path):
+    gh = RoutedGH(pr_facts=facts(), reviews=two_prior_rounds(), compare=None)
+    runner, _seen = capturing_runner(MINOR_REPORT)
+    d = make(tmp_path, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "synchronize")) == "reviewed:WARN"
+    assert "notes, not gates" not in gh.posted[0]["body"]
+
+
+async def test_a_finding_on_code_the_review_never_touched_keeps_the_warn(tmp_path):
+    gh = RoutedGH(
+        pr_facts=facts(),
+        reviews=two_prior_rounds(),
+        compare=[{"filename": "other.py", "patch": PATCH}],  # x.py:12 is untouched since MID_HEAD
+    )
+    runner, _seen = capturing_runner(MINOR_REPORT)
+    d = make(tmp_path, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "synchronize")) == "reviewed:WARN"
+
+
+async def test_a_major_still_fails_at_any_round(tmp_path):
+    gh = RoutedGH(pr_facts=facts(), reviews=two_prior_rounds(), compare=[{"filename": "x.py", "patch": PATCH}])
+    runner, _seen = capturing_runner()  # REPORT is a confirmed major on x.py
+    d = make(tmp_path, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "synchronize")) == "reviewed:FAIL"
+
+
+async def test_early_rounds_skip_the_compare_read_entirely(tmp_path):
+    gh = RoutedGH(pr_facts=facts(), reviews=[review_row(OLD_HEAD, "WARN")], compare=[])
+    runner, _seen = capturing_runner(MINOR_REPORT)
+    d = make(tmp_path, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "synchronize")) == "reviewed:WARN"
+    assert not any("/compare/" in " ".join(c) for c in gh.calls)
+
+
+async def test_convergence_can_be_disabled(tmp_path):
+    gh = RoutedGH(pr_facts=facts(), reviews=two_prior_rounds(), compare=[{"filename": "x.py", "patch": PATCH}])
+    runner, _seen = capturing_runner(MINOR_REPORT)
+    d = make(tmp_path, cfg={"convergence_rounds": 0}, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "synchronize")) == "reviewed:WARN"
+
+
+def test_convergence_env_fallback_and_default(monkeypatch, tmp_path):
+    monkeypatch.delenv("PR_REVIEWER_CONVERGENCE_ROUNDS", raising=False)
+    assert Dispatcher({}, Telemetry(tmp_path)).convergence_rounds == 3
+    monkeypatch.setenv("PR_REVIEWER_CONVERGENCE_ROUNDS", "5")
+    assert Dispatcher({}, Telemetry(tmp_path)).convergence_rounds == 5
+    assert Dispatcher({"convergence_rounds": 0}, Telemetry(tmp_path)).convergence_rounds == 0
