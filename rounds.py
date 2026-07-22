@@ -221,6 +221,67 @@ def converge(
     return PASS, list(findings), f"converged-round-{round_number}"
 
 
+def unexplained_clearance(
+    history: list[dict],
+    verdict: str,
+    findings: list[dict],
+    *,
+    corroborate: int = 2,
+) -> dict | None:
+    """The prior blocker/major this clean PASS silently dropped, or None (issue #26).
+
+    A zero-finding PASS is the highest-consequence transition this machinery has: it
+    dismisses our standing REQUEST_CHANGES and clears the promotion path. On
+    protoAgent#2141 the panel confirmed a major on one head and returned PASS with zero
+    findings on the next — the code unchanged — which lifted the block and the defect
+    merged 44 seconds later.
+
+    A miss cannot be caught the way a hallucination can: there is no claim to re-ground,
+    and `findings=0` reads identically whether the code is clean or nobody looked. So
+    the rule is structural rather than evidential — an unexplained *disappearance* of a
+    blocker/major is treated as unproven, not as a clearance.
+
+    `corroborate` is the escape hatch that stops this wedging a PR forever: the FIRST
+    clean PASS after a blocker/major holds the block, a SECOND consecutive one lifts it.
+    Two independent draws finding nothing is evidence; one is a coin flip.
+    """
+    if verdict != PASS or findings:
+        return None  # only a *clean* PASS can silently drop a finding
+    clean_runs = 1  # this round
+    for round_ in reversed(history or []):
+        prior = [f for f in (round_.get("findings") or []) if isinstance(f, dict)]
+        if str(round_.get("verdict") or "") == PASS and not prior:
+            clean_runs += 1
+            continue
+        for finding in prior:
+            severity = str(finding.get("severity") or "").lower()
+            if severity in ("blocker", "major") and str(finding.get("verdict") or "").lower() != "refuted":
+                if clean_runs >= corroborate:
+                    return None  # corroborated by repeat draws — let the block lift
+                return dict(finding)
+        return None  # the last substantive round carried nothing gating
+    return None
+
+
+def render_held_note(finding: dict) -> str:
+    """Why the standing block did NOT lift, in the body of the very verdict that would
+    otherwise have lifted it — so the next reader sees the disagreement, not a clean PASS."""
+    location = str(finding.get("file") or "(no file)")
+    if isinstance(finding.get("line"), int):
+        location = f"{location}:{finding['line']}"
+    return (
+        "\n\n---\n**This PASS does not lift the standing block.** An earlier round of this "
+        f"same panel confirmed a {finding.get('severity') or '?'} finding that this round "
+        "neither reports nor explains:\n\n"
+        f"> `{location}` — {str(finding.get('claim') or '')[:400]}\n\n"
+        "A finding that disappears without being fixed, carried, or refuted is unproven, not "
+        "resolved — and a clean PASS is exactly the verdict that would clear the merge path "
+        "(issue #26). Either the fix landed (say so, and the next review will corroborate and "
+        "lift), or the panel missed it on this draw. A second consecutive clean PASS lifts the "
+        "block automatically; an operator can also dismiss this review directly."
+    )
+
+
 def render_notes_section(notes: list[dict]) -> str:
     """The follow-up checklist appended to a converged body — findings the verdict
     stopped carrying, in the form someone can actually act on later."""

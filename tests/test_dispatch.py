@@ -954,3 +954,72 @@ def test_convergence_env_fallback_and_default(monkeypatch, tmp_path):
     monkeypatch.setenv("PR_REVIEWER_CONVERGENCE_ROUNDS", "5")
     assert Dispatcher({}, Telemetry(tmp_path)).convergence_rounds == 5
     assert Dispatcher({"convergence_rounds": 0}, Telemetry(tmp_path)).convergence_rounds == 0
+
+
+# ── the block-hold end to end (issue #26) ────────────────────────────────────
+
+
+CLEAN_PASS_REPORT = "Nothing found.\n\n```json\n[]\n```"
+
+
+async def test_a_clean_pass_that_drops_a_prior_major_does_not_dismiss_the_block(tmp_path):
+    major = json.dumps([{"file": "x.py", "line": 3, "severity": "major", "claim": "real bug", "evidence": "e"}])
+    gh = RoutedGH(
+        pr_facts=facts(),
+        reviews=[
+            review_row(OLD_HEAD, "FAIL", state="CHANGES_REQUESTED", findings_json=major, id=77),
+        ],
+    )
+    runner, _seen = capturing_runner(CLEAN_PASS_REPORT)
+    d = make(tmp_path, cfg={"shadow_mode": False}, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "synchronize")) == "reviewed:PASS"
+    assert gh.dismissed == []  # the standing REQUEST_CHANGES stays up
+    body = gh.posted[0]["body"]
+    assert "does not lift the standing block" in body
+    assert "real bug" in body  # the dropped finding is named, not merely counted
+
+
+async def test_a_second_consecutive_clean_pass_lifts_the_block(tmp_path):
+    major = json.dumps([{"file": "x.py", "line": 3, "severity": "major", "claim": "real bug", "evidence": "e"}])
+    gh = RoutedGH(
+        pr_facts=facts(),
+        reviews=[
+            review_row(OLD_HEAD, "FAIL", state="CHANGES_REQUESTED", findings_json=major, id=77),
+            review_row(MID_HEAD, "PASS"),  # the first clean draw — held
+        ],
+    )
+    runner, _seen = capturing_runner(CLEAN_PASS_REPORT)
+    d = make(tmp_path, cfg={"shadow_mode": False}, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "synchronize")) == "reviewed:PASS"
+    assert gh.dismissed  # corroborated by a second draw — the gate lifts
+    assert "does not lift the standing block" not in gh.posted[0]["body"]
+
+
+async def test_an_ordinary_clean_pass_still_lifts_the_block(tmp_path):
+    gh = RoutedGH(
+        pr_facts=facts(),
+        reviews=[review_row(OLD_HEAD, "WARN", state="CHANGES_REQUESTED", id=77)],
+    )
+    runner, _seen = capturing_runner(CLEAN_PASS_REPORT)
+    d = make(tmp_path, cfg={"shadow_mode": False}, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "synchronize")) == "reviewed:PASS"
+    assert gh.dismissed  # no prior major — nothing to hold for
+
+
+async def test_the_hold_can_be_disabled(tmp_path):
+    major = json.dumps([{"file": "x.py", "line": 3, "severity": "major", "claim": "real bug", "evidence": "e"}])
+    gh = RoutedGH(
+        pr_facts=facts(),
+        reviews=[review_row(OLD_HEAD, "FAIL", state="CHANGES_REQUESTED", findings_json=major, id=77)],
+    )
+    runner, _seen = capturing_runner(CLEAN_PASS_REPORT)
+    d = make(tmp_path, cfg={"shadow_mode": False, "hold_unexplained_clearance": False}, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "synchronize")) == "reviewed:PASS"
+    assert gh.dismissed
+
+
+def test_hold_env_fallback_and_default(monkeypatch, tmp_path):
+    monkeypatch.delenv("PR_REVIEWER_HOLD_UNEXPLAINED_CLEARANCE", raising=False)
+    assert Dispatcher({}, Telemetry(tmp_path)).hold_unexplained is True
+    monkeypatch.setenv("PR_REVIEWER_HOLD_UNEXPLAINED_CLEARANCE", "false")
+    assert Dispatcher({}, Telemetry(tmp_path)).hold_unexplained is False

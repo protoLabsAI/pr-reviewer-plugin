@@ -37,8 +37,10 @@ from .rounds import (
     converge,
     delta_ranges,
     panel_rounds,
+    render_held_note,
     render_notes_section,
     render_prior_requests,
+    unexplained_clearance,
 )
 from .telemetry import Telemetry
 from .trigger import structural_trigger
@@ -161,6 +163,14 @@ class Dispatcher:
             int(self.cfg["convergence_rounds"])
             if "convergence_rounds" in self.cfg
             else _env_int("PR_REVIEWER_CONVERGENCE_ROUNDS", DEFAULT_CONVERGENCE_ROUNDS)
+        )
+        # Hold our own block when a clean PASS silently drops a prior blocker/major
+        # (issue #26). On by default: the failure it guards SHIPPED a defect to main
+        # (protoAgent#2143), and the cost of a false hold is one extra review round.
+        self.hold_unexplained = (
+            bool(self.cfg["hold_unexplained_clearance"])
+            if "hold_unexplained_clearance" in self.cfg
+            else _env_bool("PR_REVIEWER_HOLD_UNEXPLAINED_CLEARANCE", True)
         )
         self.chokepoint = Chokepoint(cooldown_s=int(self.cfg.get("cooldown_s") or 30))
         self._run_gh = run_gh_fn or run_gh
@@ -506,9 +516,34 @@ class Dispatcher:
             self.telemetry.emit(
                 "converged", repo=repo, pr=pr, sha=head, round=round_number, reason=reason, notes=len(notes)
             )
+        # An unexplained clearance (issue #26): this clean PASS would dismiss our own
+        # standing block, but a prior round of this same panel confirmed a blocker/major
+        # that this round neither reports nor explains. Hold the block; the verdict still
+        # posts, and a second consecutive clean PASS lifts it.
+        dropped_finding = unexplained_clearance(history, verdict, findings) if self.hold_unexplained else None
+        trailer = render_notes_section(notes)
+        if dropped_finding:
+            trailer += render_held_note(dropped_finding)
+            self.telemetry.emit(
+                "clearance_held",
+                repo=repo,
+                pr=pr,
+                sha=head,
+                round=round_number,
+                severity=str(dropped_finding.get("severity") or ""),
+                file=str(dropped_finding.get("file") or ""),
+            )
         elapsed = time.monotonic() - started
         posted = await self._post_verdict(
-            repo, pr, head, verdict, output, recipe, confined=confined, notes=render_notes_section(notes)
+            repo,
+            pr,
+            head,
+            verdict,
+            output,
+            recipe,
+            confined=confined,
+            notes=trailer,
+            hold_blocks=bool(dropped_finding),
         )
         self.telemetry.emit(
             "reviewed",
@@ -520,6 +555,7 @@ class Dispatcher:
             round=round_number,
             findings=len(findings),
             notes=len(notes),
+            held=bool(dropped_finding),
             confined=len(confined),
             latency_s=round(elapsed, 1),
             posted=posted,
@@ -552,6 +588,7 @@ class Dispatcher:
         recipe: str,
         confined: list[dict] | None = None,
         notes: str = "",
+        hold_blocks: bool = False,
     ) -> bool:
         body = render_verdict_body(
             repo=repo,
@@ -577,9 +614,11 @@ class Dispatcher:
         if rc != 0:
             log.warning("[pr-reviewer] posting %s on %s#%s failed: %s", event, repo, pr, err[-300:])
             return False
-        if not self.shadow and verdict != FAIL:
+        if not self.shadow and verdict != FAIL and not hold_blocks:
             # A cleared verdict must also LIFT our earlier block: PASS/WARN post as
             # COMMENT, and a comment never supersedes the same reviewer's REQUEST_CHANGES.
+            # `hold_blocks` is the one exception — a clean PASS that silently dropped a
+            # prior blocker/major has not earned the dismissal yet (issue #26).
             await self._dismiss_stale_blocks(repo, pr)
         return True
 

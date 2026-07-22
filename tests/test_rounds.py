@@ -12,8 +12,10 @@ from pr_reviewer.rounds import (
     delta_ranges,
     in_delta,
     panel_rounds,
+    render_held_note,
     render_notes_section,
     render_prior_requests,
+    unexplained_clearance,
 )
 from pr_reviewer.verdicts import PASS, WARN, render_verdict_body
 
@@ -218,3 +220,70 @@ def test_notes_section_renders_an_actionable_checklist():
     assert "notes, not gates" in section
     assert "docstring omits foundation" in section
     assert render_notes_section([]) == ""
+
+
+# ── unexplained clearance: the block-hold (issue #26) ─────────────────────────
+
+
+def test_a_clean_pass_after_a_confirmed_major_does_not_lift_the_block():
+    # protoAgent#2141: major confirmed on cb079fc, PASS with zero findings on d139f4d
+    # with the code unchanged. The PASS lifted the block and the defect merged in 44s.
+    history = [
+        {"head": HEAD_1, "verdict": "FAIL", "findings": [finding(severity="major", claim="null slips the guard")]}
+    ]
+    dropped = unexplained_clearance(history, PASS, [])
+    assert dropped is not None
+    assert dropped["claim"] == "null slips the guard"
+
+
+def test_a_second_consecutive_clean_pass_lifts_it():
+    # Two independent draws finding nothing is evidence; one is a coin flip. This is
+    # the escape hatch that stops the rule wedging a PR forever.
+    history = [
+        {"head": HEAD_1, "verdict": "FAIL", "findings": [finding(severity="major")]},
+        {"head": HEAD_2, "verdict": PASS, "findings": []},
+    ]
+    assert unexplained_clearance(history, PASS, []) is None
+
+
+def test_a_pass_that_still_reports_findings_is_not_a_silent_drop():
+    history = [{"head": HEAD_1, "verdict": "FAIL", "findings": [finding(severity="major")]}]
+    assert unexplained_clearance(history, PASS, [finding(severity="nit")]) is None
+
+
+def test_only_a_pass_can_be_an_unexplained_clearance():
+    history = [{"head": HEAD_1, "verdict": "FAIL", "findings": [finding(severity="major")]}]
+    assert unexplained_clearance(history, WARN, []) is None
+    assert unexplained_clearance(history, "FAIL", []) is None
+
+
+def test_a_prior_round_of_only_minors_does_not_hold_the_block():
+    # Minors never gated in the first place — there is no block to hold.
+    history = [{"head": HEAD_1, "verdict": WARN, "findings": [finding(severity="minor"), finding(severity="nit")]}]
+    assert unexplained_clearance(history, PASS, []) is None
+
+
+def test_a_refuted_major_does_not_hold_the_block():
+    f = finding(severity="major")
+    f["verdict"] = "refuted"
+    assert unexplained_clearance([{"head": HEAD_1, "verdict": PASS, "findings": [f]}], PASS, []) is None
+
+
+def test_first_review_ever_has_nothing_to_drop():
+    assert unexplained_clearance([], PASS, []) is None
+
+
+def test_only_the_most_recent_substantive_round_is_consulted():
+    # An old major that a later substantive round already cleared is settled history.
+    history = [
+        {"head": HEAD_1, "verdict": "FAIL", "findings": [finding(severity="major")]},
+        {"head": HEAD_2, "verdict": WARN, "findings": [finding(severity="minor")]},
+    ]
+    assert unexplained_clearance(history, PASS, []) is None
+
+
+def test_held_note_names_the_finding_and_the_way_out():
+    note = render_held_note(finding(severity="major", claim="null slips the guard"))
+    assert "does not lift the standing block" in note
+    assert "store.py:100" in note and "null slips the guard" in note
+    assert "second consecutive clean PASS" in note  # the escape hatch is documented
