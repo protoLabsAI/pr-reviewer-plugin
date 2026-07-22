@@ -81,10 +81,14 @@ def render_verdict_body(
     shadow: bool,
     recipe: str,
     confined: list[dict] | None = None,
+    notes: str = "",
 ) -> str:
     """The comment body: marker line (machine) + header (human) + the panel's report,
     plus a confinement footnote when findings were excluded — the report's own JSON
-    still shows them, so the reader needs to see why the verdict ignored them."""
+    still shows them, so the reader needs to see why the verdict ignored them.
+
+    `notes` is a pre-rendered trailing section (the convergence checklist, issue #23);
+    it arrives as text so this module stays free of the round machinery that builds it."""
     mode = "shadow — comment-only" if shadow else "formal"
     footnote = ""
     if confined:
@@ -100,7 +104,7 @@ def render_verdict_body(
         f"<!-- protoagent-qa-review head={head_sha} verdict={verdict} promoted=false -->\n"
         f"## QA panel review — **{verdict}**\n"
         f"_{recipe} · head `{head_sha[:12]}` · {mode}_\n\n"
-        f"{report}{footnote}"
+        f"{report}{footnote}{notes}"
     )
 
 

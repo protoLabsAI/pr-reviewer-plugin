@@ -37,6 +37,18 @@ inputs:
       still open, then look for new defects. GitHub-native review memory
       (ADR 0078 D5) — the caller recalls, the panel re-evaluates.
     default: "(none — first review of this PR)"
+  - name: prior_requests
+    description: >-
+      Pre-rendered <prior_requests> data block: every change THIS panel has
+      already asked for on this PR, round by round (optional). Distinct from
+      prior_findings, which is only the last round's open items — this is the
+      memory that stops a re-review re-litigating its own demands (issue #23).
+    default: "(none — this panel has not reviewed this PR before)"
+  - name: review_round
+    description: >-
+      Which round this is (1 = first review). Round 3+ means the diff under
+      review is substantially the panel's own doing; finders weight accordingly.
+    default: "1"
   - name: head_sha
     description: >-
       The PR's head SHA, resolved SERVER-SIDE by the dispatcher (optional).
@@ -78,6 +90,21 @@ steps:
       {{inputs.prior_findings}}
       </prior_findings>
 
+      ## What this panel already asked for (round {{inputs.review_round}})
+      <prior_requests>
+      {{inputs.prior_requests}}
+      </prior_requests>
+
+      Re-review discipline: code that exists BECAUSE of a request above is not
+      novel surface. Verify it was implemented CORRECTLY — a wrong, partial or
+      defect-introducing fix is absolutely still a finding. But do not report
+      the requested change itself as unrequested scope, an unexplained
+      behavioral change, or missing-a-test-it-never-had, and do not re-open a
+      request a later head already satisfied. From round 3 on the diff is
+      substantially the panel's own doing: prefer silence to a fresh minor on
+      code this panel has already blessed. A review that never converges costs
+      more than the nit it is holding out for.
+
   - id: find_removed_behavior
     subagent: review-finder
     prompt: |
@@ -99,6 +126,21 @@ steps:
       {{inputs.prior_findings}}
       </prior_findings>
 
+      ## What this panel already asked for (round {{inputs.review_round}})
+      <prior_requests>
+      {{inputs.prior_requests}}
+      </prior_requests>
+
+      Re-review discipline: code that exists BECAUSE of a request above is not
+      novel surface. Verify it was implemented CORRECTLY — a wrong, partial or
+      defect-introducing fix is absolutely still a finding. But do not report
+      the requested change itself as unrequested scope, an unexplained
+      behavioral change, or missing-a-test-it-never-had, and do not re-open a
+      request a later head already satisfied. From round 3 on the diff is
+      substantially the panel's own doing: prefer silence to a fresh minor on
+      code this panel has already blessed. A review that never converges costs
+      more than the nit it is holding out for.
+
   - id: find_crossfile
     subagent: review-finder
     prompt: |
@@ -119,6 +161,21 @@ steps:
       <prior_findings>
       {{inputs.prior_findings}}
       </prior_findings>
+
+      ## What this panel already asked for (round {{inputs.review_round}})
+      <prior_requests>
+      {{inputs.prior_requests}}
+      </prior_requests>
+
+      Re-review discipline: code that exists BECAUSE of a request above is not
+      novel surface. Verify it was implemented CORRECTLY — a wrong, partial or
+      defect-introducing fix is absolutely still a finding. But do not report
+      the requested change itself as unrequested scope, an unexplained
+      behavioral change, or missing-a-test-it-never-had, and do not re-open a
+      request a later head already satisfied. From round 3 on the diff is
+      substantially the panel's own doing: prefer silence to a fresh minor on
+      code this panel has already blessed. A review that never converges costs
+      more than the nit it is holding out for.
 
   - id: find_conventions
     subagent: review-finder
@@ -146,6 +203,21 @@ steps:
       <prior_findings>
       {{inputs.prior_findings}}
       </prior_findings>
+
+      ## What this panel already asked for (round {{inputs.review_round}})
+      <prior_requests>
+      {{inputs.prior_requests}}
+      </prior_requests>
+
+      Re-review discipline: code that exists BECAUSE of a request above is not
+      novel surface. Verify it was implemented CORRECTLY — a wrong, partial or
+      defect-introducing fix is absolutely still a finding. But do not report
+      the requested change itself as unrequested scope, an unexplained
+      behavioral change, or missing-a-test-it-never-had, and do not re-open a
+      request a later head already satisfied. From round 3 on the diff is
+      substantially the panel's own doing: prefer silence to a fresh minor on
+      code this panel has already blessed. A review that never converges costs
+      more than the nit it is holding out for.
 
   - id: find_structural
     subagent: structural-finder
@@ -192,6 +264,17 @@ steps:
 
       Server-resolved refs (empty when not provided): head SHA
       "{{inputs.head_sha}}", base ref "{{inputs.base_ref}}".
+
+      ## What this panel already asked for (round {{inputs.review_round}})
+      <prior_requests>
+      {{inputs.prior_requests}}
+      </prior_requests>
+
+      A finding whose whole substance is "this code changed / lacks a test /
+      isn't explained" where the change is one the panel itself requested above
+      is REFUTED — the request is the explanation. A finding that the requested
+      change was implemented wrongly, incompletely, or introduced a defect
+      stands on its own evidence like any other.
 
       {{steps.synthesize.output}}
 

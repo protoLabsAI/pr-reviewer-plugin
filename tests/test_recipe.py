@@ -20,6 +20,8 @@ def test_recipe_shape():
         "pr",
         "repo",
         "prior_findings",
+        "prior_requests",
+        "review_round",
         "head_sha",
         "base_ref",
         "existing_threads",
@@ -43,6 +45,19 @@ def test_llm_finders_get_server_resolved_refs_and_wrapped_prior_findings():
         assert "<prior_findings>" in prompt and "</prior_findings>" in prompt, sid
     assert "BASE ref" in STEPS["find_conventions"]["prompt"]
     assert "{{inputs.head_sha}}" in STEPS["verify"]["prompt"]
+
+
+def test_finders_and_verifier_carry_the_panels_own_request_history():
+    # Issue #23: a re-review must be able to tell "the panel asked for this" from
+    # "this appeared unexplained" — otherwise round N re-litigates round N-3's demand.
+    for sid in ("find_correctness", "find_removed_behavior", "find_crossfile", "find_conventions", "verify"):
+        prompt = STEPS[sid]["prompt"]
+        assert "<prior_requests>" in prompt and "</prior_requests>" in prompt, sid
+        assert "{{inputs.prior_requests}}" in prompt, sid
+        assert "{{inputs.review_round}}" in prompt, sid
+    # The relief is one-directional: a badly-implemented request is still a finding.
+    assert "implemented CORRECTLY" in STEPS["find_correctness"]["prompt"]
+    assert "REFUTED" in STEPS["verify"]["prompt"]
 
 
 def test_five_finders_feed_the_synthesizer():
