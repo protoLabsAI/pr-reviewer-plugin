@@ -1246,3 +1246,20 @@ def test_a_failing_provider_falls_back_to_boot_config(tmp_path):
 def test_without_a_provider_the_boot_config_still_applies(tmp_path):
     d = Dispatcher({"shadow_mode": False, "repos": ["o/r"]}, Telemetry(tmp_path))
     assert d.shadow is False and d.repos == ["o/r"]
+
+
+async def test_a_promotion_carrying_findings_is_not_re_promoted(tmp_path):
+    # The regression end to end: v0.13.0's `findings=N` broke marker parsing, so the
+    # APPROVE was not recognised as ours and the sweep re-approved every tick.
+    green = [{"status": "completed", "conclusion": "success"}]
+    warn_finding = json.dumps([{"file": "x.py", "line": 4, "severity": "minor", "claim": "c", "evidence": "e"}])
+    gh = RoutedGH(pr_facts=facts(), reviews=[review_row(HEAD, "WARN", findings_json=warn_finding)], checks=green)
+    d = make(tmp_path, cfg={"shadow_mode": False, "promotion_owner": True}, gh=gh)
+    assert (await d.evaluate_promotion("o/r", 1)) == "promote"
+    body = gh.posted[0]["body"]
+    assert "findings=1" in body
+
+    # Feed our own promotion back in, exactly as _our_reviews would see it next tick.
+    gh.reviews.append({"state": "APPROVED", "body": body, "id": 99})
+    assert (await d.evaluate_promotion("o/r", 1)) == "hold:already-promoted"
+    assert len(gh.posted) == 1  # not a second APPROVE
