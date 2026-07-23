@@ -60,6 +60,17 @@ structural-trigger dispatch, approve-on-green + sweep, and the review eval.
     on code the review never touched never converges, and an unreadable compare grants
     no relief at all.
 
+- **Unexplained-clearance hold (v0.9.0)** — a zero-finding PASS is the highest-consequence
+  verdict this machinery posts: it dismisses our own `REQUEST_CHANGES` and clears the
+  promotion path. On protoAgent#2141 the panel confirmed a major on one head, returned
+  PASS with zero findings on the next with the code unchanged, and the defect merged 44
+  seconds later. A miss cannot be caught the way a hallucination can — there is no claim
+  to re-ground, and `findings=0` reads identically whether the code is clean or nobody
+  looked — so the rule is structural: a blocker/major that *disappears* without being
+  fixed, carried, or refuted is treated as unproven, and the block stays up. The verdict
+  still posts, names the dropped finding, and a **second consecutive** clean PASS lifts
+  the block automatically (two independent draws are evidence; one is a coin flip).
+
 ## Requirements
 
 - protoAgent ≥ the version carrying the findings `source` field (see the manifest pin).
@@ -83,6 +94,7 @@ compose env (re-applied every roll) to keep the config volume disposable:
 | `PR_REVIEWER_PROMOTION_OWNER` | `pr_reviewer.promotion_owner` | `false` | Same tri-state semantics. |
 | `PR_REVIEWER_PANEL_RETRIES` | `pr_reviewer.panel_retries` | `1` | Re-runs of a recipe whose panel reported a failed step, before D3 escalation. `0` restores the old give-up-on-first-failure behaviour. |
 | `PR_REVIEWER_BACKFILL_PER_PASS` | `pr_reviewer.backfill_per_pass` | `2` | Reviews the sweep may backfill per pass, across all repos. `0` disables backfill. |
+| `PR_REVIEWER_HOLD_UNEXPLAINED_CLEARANCE` | `pr_reviewer.hold_unexplained_clearance` | `true` | A zero-finding PASS does not dismiss our standing block when a prior round confirmed a blocker/major it neither reports nor explains. A second consecutive clean PASS lifts it. `false` restores the old always-dismiss behaviour. |
 | `PR_REVIEWER_CONVERGENCE_ROUNDS` | `pr_reviewer.convergence_rounds` | `3` | The round from which an all-minor, all-in-delta WARN retires to PASS-with-notes. `0` disables the rule — the panel keeps re-reviewing rather than ever floor a minor. |
 | `PR_REVIEWER_REGATE` | `pr_reviewer.regate` | `true` | Master switch for step 2 below. `false` stops arming blocks while KEEPING the formal seat, promotion and backfill — the lever to pull when the panel is emitting false FAILs. |
 
