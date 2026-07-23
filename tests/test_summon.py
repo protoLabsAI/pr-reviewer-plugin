@@ -93,3 +93,47 @@ def test_help_names_the_commands_and_the_cost():
 def test_refusal_names_the_person_the_verb_and_the_reason():
     text = refusal_text("someone", "review")
     assert "@someone" in text and "`review`" in text and "admin" in text
+
+
+# ── pause / resume (slice 2) ─────────────────────────────────────────────────
+
+
+def test_pause_and_resume_are_verbs():
+    assert parse_command("@vera pause", HANDLES) == "pause"
+    assert parse_command("@vera resume", HANDLES) == "resume"
+
+
+def test_the_last_marker_wins_not_a_tally():
+    # pause → resume → pause must end PAUSED. Counting markers would get this wrong.
+    from pr_reviewer.summon import is_paused, pause_text, resume_text
+
+    assert is_paused([pause_text("a")]) is True
+    assert is_paused([pause_text("a"), resume_text("a")]) is False
+    assert is_paused([pause_text("a"), resume_text("a"), pause_text("a")]) is True
+    assert is_paused(["an ordinary comment", "another"]) is False
+    assert is_paused([]) is False
+
+
+def test_pause_state_survives_in_github_not_memory():
+    # The marker rides in a posted comment body — GitHub is the store (ADR 0078 D5),
+    # so a container restart cannot forget that someone asked for quiet.
+    from pr_reviewer.summon import PAUSE_MARKER, pause_text
+
+    assert PAUSE_MARKER in pause_text("someone")
+
+
+def test_pause_says_that_an_explicit_review_still_works():
+    from pr_reviewer.summon import pause_text
+
+    assert "`@vera resume`" in pause_text("a") and "review" in pause_text("a")
+
+
+def test_help_lists_the_new_verbs():
+    text = help_text(HANDLES)
+    assert "@vera pause" in text and "@vera resume" in text
+
+
+def test_required_app_events_names_both_summon_surfaces():
+    from pr_reviewer.summon import required_app_events
+
+    assert required_app_events() == ["issue_comment", "pull_request_review_comment"]

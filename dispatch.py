@@ -64,6 +64,7 @@ log = logging.getLogger("protoagent.plugins.pr_reviewer")
 DROP_SELF_AUTHORED = "self-authored"
 DROP_PR_NOT_ELIGIBLE = "pr-not-eligible"  # closed, draft, or facts unreadable
 DROP_NO_RUNNER = "no-workflow-runner"
+DROP_PAUSED = "paused-by-operator"  # `@vera pause` (issue #28)
 
 HOLD_PROMOTE_BACKOFF = "hold:promote-backoff"
 # Consecutive APPROVE failures on one repo#pr@head before the sweep stops retrying
@@ -141,6 +142,12 @@ class Dispatcher:
         self.telemetry = telemetry
         # Boot-time by necessity: the chokepoint owns in-flight/cooldown state, so it
         # cannot be rebuilt per read without dropping the bookkeeping it exists for.
+        # On-demand summon surface (issue #28). Off disables the comment commands
+        # entirely, including the pause check — a repo that never wants comment-driven
+        # behaviour pays nothing for it.
+        self.summon_enabled = (
+            bool(self.cfg["summon"]) if "summon" in self.cfg else _env_bool("PR_REVIEWER_SUMMON", True)
+        )
         self.chokepoint = Chokepoint(cooldown_s=int(self._cfg.get("cooldown_s") or 30))
         self._run_gh = run_gh_fn or run_gh
         self._workflow_run = workflow_run  # None → resolve STATE.workflow_run lazily
@@ -332,6 +339,19 @@ class Dispatcher:
                 )
         return ours
 
+    async def _pr_comments(self, repo: str, pr: int) -> list[str]:
+        """This PR's issue-comment bodies, oldest→newest — where pause markers live."""
+        rc, out, _err = await self._run_gh(
+            ["api", f"repos/{repo}/issues/{pr}/comments", "--paginate", "--jq", "[.[].body]"]
+        )
+        if rc != 0:
+            return []
+        try:
+            rows = json.loads(out)
+        except json.JSONDecodeError:
+            return []
+        return [str(b or "") for b in rows] if isinstance(rows, list) else []
+
     async def _finding_sources(self, repo: str, pr: int, head: str, findings: list[dict]) -> dict[str, str | None]:
         """{file: text-to-ground-against} for the files the findings cite.
 
@@ -513,6 +533,15 @@ class Dispatcher:
             return f"drop:{DROP_SELF_AUTHORED}"
 
         head = str(facts["head"])
+        if not force and self.summon_enabled:
+            # An operator asked for quiet (issue #28). Push-triggered review stops; an
+            # explicit `@vera review` still runs, because "stop reviewing every push" and
+            # "never look at this again" are different requests.
+            from .summon import is_paused
+
+            if is_paused(await self._pr_comments(repo, pr)):
+                self.telemetry.emit("drop", repo=repo, pr=pr, sha=head, reason=DROP_PAUSED)
+                return f"drop:{DROP_PAUSED}"
         paths = await self._changed_paths(repo, pr)
         fires, reasons = structural_trigger(
             changed_files=int(facts.get("changed_files") or len(paths)),

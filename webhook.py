@@ -66,7 +66,15 @@ def build_routers(dispatcher, telemetry, get_secret, run_gh_fn=None):
     async def _handle_comment(body: bytes) -> dict:
         """`@vera <verb>` on a PR (issue #28). The HMAC already authenticated GITHUB;
         this authenticates the AUTHOR, server-side, before spending a panel."""
-        from .summon import NOT_A_SUMMON, help_text, is_admin, parse_command, refusal_text
+        from .summon import (
+            NOT_A_SUMMON,
+            help_text,
+            is_admin,
+            parse_command,
+            pause_text,
+            refusal_text,
+            resume_text,
+        )
 
         try:
             payload = json.loads(body)
@@ -96,6 +104,14 @@ def build_routers(dispatcher, telemetry, get_secret, run_gh_fn=None):
             await _reply(repo, pr, help_text(handles))
             telemetry.emit("summon", repo=repo, pr=pr, actor=login, verb="help")
             return {"ok": True, "dispatched": False, "reason": "summon:help"}
+        if verb in ("pause", "resume"):
+            if not await is_admin(run_gh_fn, repo, login):
+                await _reply(repo, pr, refusal_text(login, verb))
+                telemetry.emit("summon", repo=repo, pr=pr, actor=login, verb=verb, outcome="refused-not-admin")
+                return {"ok": True, "dispatched": False, "reason": "summon:refused-not-admin"}
+            await _reply(repo, pr, pause_text(login) if verb == "pause" else resume_text(login))
+            telemetry.emit("summon", repo=repo, pr=pr, actor=login, verb=verb, outcome="ok")
+            return {"ok": True, "dispatched": False, "reason": f"summon:{verb}"}
         if verb not in ("review",):
             await _reply(repo, pr, help_text(handles))
             telemetry.emit("summon", repo=repo, pr=pr, actor=login, verb=verb, outcome="unknown-verb")
@@ -158,6 +174,39 @@ def build_routers(dispatcher, telemetry, get_secret, run_gh_fn=None):
         if not repo or not pr:
             raise HTTPException(status_code=400, detail="need repo (owner/name) and pr (number)")
         return {"repo": repo, "pr": pr, "decision": await dispatcher.evaluate_promotion(repo, pr)}
+
+    @api.get("/summon/health")
+    async def _summon_health():
+        """Can a summon actually reach us? (issue #28)
+
+        `@vera review` is delivered as an `issue_comment` webhook. If the GitHub App
+        subscribes only to `pull_request` — which it did when the feature shipped — the
+        comment never arrives and the feature looks broken with no error anywhere: the
+        code is correct, the event simply does not exist. This endpoint answers that
+        question directly instead of requiring a JWT and an App settings page.
+        """
+        from .summon import required_app_events
+
+        rc, out, _err = await run_gh_fn(["api", "/app", "--jq", ".events"], timeout=20)
+        subscribed = []
+        if rc == 0:
+            try:
+                subscribed = json.loads(out) or []
+            except json.JSONDecodeError:
+                subscribed = []
+        missing = [e for e in required_app_events() if e not in subscribed]
+        return {
+            "subscribed": subscribed,
+            "required": required_app_events(),
+            "missing": missing,
+            "summon_reachable": rc == 0 and not missing,
+            "note": (
+                "Add the missing event(s) to the GitHub App's subscriptions — the webhook "
+                "URL and secret are unchanged. Without `issue_comment` a summon never arrives."
+                if missing
+                else "Summon events are subscribed."
+            ),
+        }
 
     @api.get("/eval")
     async def _eval():
