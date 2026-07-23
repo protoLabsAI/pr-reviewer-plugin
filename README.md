@@ -71,6 +71,20 @@ structural-trigger dispatch, approve-on-green + sweep, and the review eval.
   still posts, names the dropped finding, and a **second consecutive** clean PASS lifts
   the block automatically (two independent draws are evidence; one is a coin flip).
 
+- **Evidence grounding (v0.10.0)** — the verify pass exists to kill plausible-but-wrong
+  findings, and twice on 2026-07-22 it did the opposite: it *confirmed* claims about code
+  that isn't in the file, escalating one to a blocker on a head where the operator had
+  already posted the refuting blob **and** a passing test asserting the behaviour. The
+  panel wasn't missing the evidence, it was discounting evidence in view — which is why
+  this is code and not only prompt discipline (the `confine_findings` lesson, applied to
+  the evidence itself). A finding whose quoted code appears nowhere in the cited file at
+  the reviewed head, nor in this PR's patch for it, is annotated `uncertain`; nothing is
+  ever dropped, and `verdict_for` already refuses to turn `uncertain` into a FAIL.
+  Fail-open throughout — unreadable blob, no quotable evidence, or any one quote that
+  matches, and the finding stands. It catches the fabricated-quote class; a finding that
+  quotes real code and reasons wrongly about it (a prefix that doesn't actually match) is
+  the verify prompt's half.
+
 ## Requirements
 
 - protoAgent ≥ the version carrying the findings `source` field (see the manifest pin).
@@ -94,6 +108,7 @@ compose env (re-applied every roll) to keep the config volume disposable:
 | `PR_REVIEWER_PROMOTION_OWNER` | `pr_reviewer.promotion_owner` | `false` | Same tri-state semantics. |
 | `PR_REVIEWER_PANEL_RETRIES` | `pr_reviewer.panel_retries` | `1` | Re-runs of a recipe whose panel reported a failed step, before D3 escalation. `0` restores the old give-up-on-first-failure behaviour. |
 | `PR_REVIEWER_BACKFILL_PER_PASS` | `pr_reviewer.backfill_per_pass` | `2` | Reviews the sweep may backfill per pass, across all repos. `0` disables backfill. |
+| `PR_REVIEWER_EVIDENCE_GROUNDING` | `pr_reviewer.evidence_grounding` | `true` | A finding whose quoted code appears nowhere in the cited file at the reviewed head (nor in this PR's patch for it) is annotated `uncertain` — it still posts, it just can't carry a FAIL. Fails open on an unreadable blob or unquotable evidence. |
 | `PR_REVIEWER_HOLD_UNEXPLAINED_CLEARANCE` | `pr_reviewer.hold_unexplained_clearance` | `true` | A zero-finding PASS does not dismiss our standing block when a prior round confirmed a blocker/major it neither reports nor explains. A second consecutive clean PASS lifts it. `false` restores the old always-dismiss behaviour. |
 | `PR_REVIEWER_CONVERGENCE_ROUNDS` | `pr_reviewer.convergence_rounds` | `3` | The round from which an all-minor, all-in-delta WARN retires to PASS-with-notes. `0` disables the rule — the panel keeps re-reviewing rather than ever floor a minor. |
 | `PR_REVIEWER_REGATE` | `pr_reviewer.regate` | `true` | Master switch for step 2 below. `false` stops arming blocks while KEEPING the formal seat, promotion and backfill — the lever to pull when the panel is emitting false FAILs. |

@@ -276,6 +276,40 @@ steps:
       change was implemented wrongly, incompletely, or introduced a defect
       stands on its own evidence like any other.
 
+      ## Grounding — the verdict follows the read, not the story
+
+      Your verdict on each finding must be DERIVED from what you actually read,
+      never from how convincing the finding sounds. Two failures to avoid, both
+      observed in production:
+
+      1. **Quoted code that isn't there.** Before confirming, read the cited
+         file at head SHA "{{inputs.head_sha}}" with github_read_file and locate
+         the finding's quoted code IN THAT FILE. If it isn't there (and isn't on
+         the minus side of the diff for a removed-behavior claim), the finding
+         is REFUTED — say which quote you could not find. A finding claiming
+         "X was dropped" requires you to demonstrate X's ABSENCE in the actual
+         file, not to find the claim plausible.
+
+      2. **Decidable predicates you reasoned about instead of evaluating.** If a
+         claim turns on what a string, prefix, regex, or comparison actually
+         does — `"developer".startswith("dev.")`, `str(None)` being truthy, a
+         glob matching a path — work the exact characters through, one by one,
+         and write the result in your note. Do not reason "these look similar,
+         so they match". A real panel confirmed that `"dev."` prefix-matches
+         `"developer.env.TOKEN"`; it does not, because the fourth character is
+         `e`, not `.`. That finding blocked a correct PR.
+
+      If evidence you cannot ground is the ONLY support for a finding, mark it
+      `uncertain`, not `confirmed` — uncertain never blocks a merge on its own,
+      and a finding you could not verify has not earned a block.
+
+      **Evidence already on the PR counts.** If an existing review thread above
+      contains a refutation with a blob citation, or a test that asserts the
+      behavior the finding disputes, that is evidence — weigh it. Confirming a
+      finding whose refutation is already sitting on the PR is the single most
+      expensive mistake this panel makes: it burns the author's trust and costs
+      a full round.
+
       {{steps.synthesize.output}}
 
   - id: report
