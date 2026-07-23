@@ -45,8 +45,11 @@ def build_routers(dispatcher, telemetry, get_secret, run_gh_fn=None):
         if not verify_signature(get_secret(), body, request.headers.get("X-Hub-Signature-256")):
             telemetry.emit("drop", reason="bad-signature", path="/webhook")
             raise HTTPException(status_code=403, detail="bad signature")
-        if request.headers.get("X-GitHub-Event") != "pull_request":
-            telemetry.emit("drop", reason="not-a-pr-event", gh_event=request.headers.get("X-GitHub-Event", ""))
+        gh_event = request.headers.get("X-GitHub-Event", "")
+        if gh_event == "issue_comment":
+            return await _handle_comment(body)
+        if gh_event != "pull_request":
+            telemetry.emit("drop", reason="not-a-pr-event", gh_event=gh_event)
             return {"ok": True, "dispatched": False, "reason": "not-a-pr-event"}
         try:
             payload = json.loads(body)
@@ -59,6 +62,78 @@ def build_routers(dispatcher, telemetry, get_secret, run_gh_fn=None):
             return {"ok": True, "dispatched": False, "reason": "malformed-payload"}
         asyncio.get_running_loop().create_task(_safe_handle(repo, pr, head, action))
         return {"ok": True, "dispatched": True}
+
+    async def _handle_comment(body: bytes) -> dict:
+        """`@vera <verb>` on a PR (issue #28). The HMAC already authenticated GITHUB;
+        this authenticates the AUTHOR, server-side, before spending a panel."""
+        from .summon import NOT_A_SUMMON, help_text, is_admin, parse_command, refusal_text
+
+        try:
+            payload = json.loads(body)
+            if str(payload.get("action") or "") not in ("created", "edited"):
+                return {"ok": True, "dispatched": False, "reason": "not-a-comment-action"}
+            issue = payload["issue"]
+            if not issue.get("pull_request"):  # a plain issue is not reviewable
+                return {"ok": True, "dispatched": False, "reason": "not-a-pull-request"}
+            repo = str(payload["repository"]["full_name"])
+            pr = int(issue["number"])
+            comment = payload["comment"]
+            text = str(comment.get("body") or "")
+            login = str((comment.get("user") or {}).get("login") or "")
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            telemetry.emit("drop", reason="malformed-payload", gh_event="issue_comment")
+            return {"ok": True, "dispatched": False, "reason": "malformed-payload"}
+
+        handles = await _handles()
+        verb = parse_command(text, handles)
+        if verb is None:
+            return {"ok": True, "dispatched": False, "reason": NOT_A_SUMMON}
+        # Never answer ourselves: our own review bodies mention the handle, and a bot
+        # replying to its own comment is an infinite loop with a five-subagent price tag.
+        if login.lower().removesuffix("[bot]") in {h.lower().removesuffix("[bot]") for h in handles}:
+            return {"ok": True, "dispatched": False, "reason": "summon:self"}
+        if verb == "help":
+            await _reply(repo, pr, help_text(handles))
+            telemetry.emit("summon", repo=repo, pr=pr, actor=login, verb="help")
+            return {"ok": True, "dispatched": False, "reason": "summon:help"}
+        if verb not in ("review",):
+            await _reply(repo, pr, help_text(handles))
+            telemetry.emit("summon", repo=repo, pr=pr, actor=login, verb=verb, outcome="unknown-verb")
+            return {"ok": True, "dispatched": False, "reason": "summon:unknown-verb"}
+        if not await is_admin(run_gh_fn, repo, login):
+            await _reply(repo, pr, refusal_text(login, verb))
+            telemetry.emit("summon", repo=repo, pr=pr, actor=login, verb=verb, outcome="refused-not-admin")
+            return {"ok": True, "dispatched": False, "reason": "summon:refused-not-admin"}
+        asyncio.get_running_loop().create_task(_safe_summon(repo, pr, login))
+        return {"ok": True, "dispatched": True, "reason": "summon:review"}
+
+    async def _handles() -> list[str]:
+        """Names this reviewer answers to: the configured handle plus its own login, so
+        `@the-bot review` works without configuring anything."""
+        cfg_handle = str((dispatcher.cfg or {}).get("summon_handle") or "vera")
+        try:
+            viewer = await dispatcher._viewer_login()
+        except Exception:  # noqa: BLE001 — an unreadable login must not disable summons
+            viewer = ""
+        return [h for h in (cfg_handle, viewer, (viewer or "").removesuffix("[bot]")) if h]
+
+    async def _reply(repo: str, pr: int, message: str) -> None:
+        rc, _out, err = await run_gh_fn(
+            ["api", f"repos/{repo}/issues/{pr}/comments", "-X", "POST", "-f", f"body={message}"], timeout=30
+        )
+        if rc != 0:
+            log.warning("[pr-reviewer] summon reply failed on %s#%s: %s", repo, pr, err[-200:])
+
+    async def _safe_summon(repo: str, pr: int, actor: str) -> None:
+        try:
+            outcome = await dispatcher.handle_summon(repo, pr, actor)
+            log.info("[pr-reviewer] summon %s#%s by @%s -> %s", repo, pr, actor, outcome)
+            if outcome.startswith("drop:"):
+                await _reply(
+                    repo, pr, f"@{actor} — {outcome[5:]}: nothing ran. Try again once the current review finishes."
+                )
+        except Exception:  # noqa: BLE001
+            log.exception("[pr-reviewer] summon crashed for %s#%s", repo, pr)
 
     async def _safe_handle(repo: str, pr: int, head: str, action: str) -> None:
         try:

@@ -1263,3 +1263,39 @@ async def test_a_promotion_carrying_findings_is_not_re_promoted(tmp_path):
     gh.reviews.append({"state": "APPROVED", "body": body, "id": 99})
     assert (await d.evaluate_promotion("o/r", 1)) == "hold:already-promoted"
     assert len(gh.posted) == 1  # not a second APPROVE
+
+
+# ── a summon forces a review the reaffirm path would have skipped (#28) ──────
+
+
+async def test_a_summon_re_reviews_an_unchanged_head(tmp_path):
+    # Normally an unchanged head with a posted verdict reaffirms without spending the
+    # panel. `@vera review` on that head is the "I think you got this wrong" case —
+    # reaffirming would answer the question with the answer under dispute.
+    gh = RoutedGH(pr_facts=facts(), reviews=[review_row(HEAD, "FAIL")])
+    ran = []
+
+    async def runner(name, inputs):
+        ran.append(name)
+        return {"output": REPORT, "failed": []}
+
+    d = make(tmp_path, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "synchronize")) == "reaffirmed:FAIL"
+    assert ran == []
+    assert (await d.handle_summon("o/r", 1, "an-admin")) == "reviewed:FAIL"
+    assert len(ran) == 1  # the panel actually ran (recipe choice is the trigger's job)
+
+
+async def test_a_summon_bypasses_the_cooldown(tmp_path):
+    gh = RoutedGH(pr_facts=facts(), reviews=[])
+    d = make(tmp_path, gh=gh)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "reviewed:FAIL"
+    # An immediate second webhook is eaten by the cooldown...
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "synchronize")) == "drop:cooldown"
+    # ...but a human who typed a command is not a webhook burst.
+    assert (await d.handle_summon("o/r", 1, "an-admin")) == "reviewed:FAIL"
+
+
+async def test_a_summon_still_respects_the_allowlist(tmp_path):
+    d = make(tmp_path, gh=RoutedGH(pr_facts=facts()))
+    assert (await d.handle_summon("evil/repo", 1, "an-admin")) == "drop:unlisted-repo"
