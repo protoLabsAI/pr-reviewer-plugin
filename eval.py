@@ -34,6 +34,23 @@ def _percentile(values: list[float], q: float) -> float | None:
     return xs[idx]
 
 
+def _step_percentiles(reviewed: list[dict]) -> dict:
+    """p50 wall-clock per recipe step, over reviews whose host reported timings.
+
+    The panel's cost is a DAG, not a number: the four/five finders run as one parallel
+    stage (so the stage costs the slowest of them), then synthesize -> verify -> report
+    run strictly in sequence. Attacking the wrong one buys nothing.
+    """
+    per: dict[str, list[float]] = {}
+    for e in reviewed:
+        for sid, secs in (e.get("step_s") or {}).items():
+            try:
+                per.setdefault(str(sid), []).append(float(secs))
+            except (TypeError, ValueError):
+                continue
+    return {sid: _percentile(v, 0.5) for sid, v in sorted(per.items())}
+
+
 def build_report(events: list[dict]) -> dict:
     """The numeric summary over raw telemetry events."""
     dispatches = [e for e in events if e.get("event") == "dispatch"]
@@ -64,6 +81,10 @@ def build_report(events: list[dict]) -> dict:
         # Convergence (issue #23). `rounds_per_pr` is the metric the loop was invisible
         # in: an average creeping past ~3, or a max in the high single digits, is a
         # panel re-reviewing its own churn — #88 hit 8 before anyone counted.
+        # Where the 7.5-minute p50 actually goes. The panel is nine LLM steps; a single
+        # latency number cannot say which one to attack (issue: latency work, 2026-07-23).
+        "slowest_step_mix": dict(Counter(str(e.get("slowest_step")) for e in reviewed if e.get("slowest_step"))),
+        "step_p50_s": _step_percentiles(reviewed),
         "rounds_per_pr": round(sum(rounds.values()) / len(rounds), 2) if rounds else None,
         "max_rounds": max(rounds.values()) if rounds else None,
         "converged": sum(
@@ -137,6 +158,8 @@ def render_report_markdown(summary: dict, rows: list[dict] | None = None) -> str
         f"(Quinn's floor: 44.7s median — the lite recipe is the lever)",
         f"- **Reaffirmed (unchanged head):** {summary.get('reaffirmed', 0)} · **delta re-reviews:** "
         f"{summary.get('delta_reviews', 0)} · **findings/review:** {summary.get('findings_per_review')}",
+        f"- **Step p50s:** {summary.get('step_p50_s') or 'n/a (host reports no timings)'} · "
+        f"**slowest step:** {summary.get('slowest_step_mix') or {}}",
         f"- **Rounds/PR:** {summary.get('rounds_per_pr')} (max {summary.get('max_rounds')}) · "
         f"**converged to PASS-with-notes:** {summary.get('converged', 0)} — a climbing max is the "
         f"panel re-reviewing its own churn (issue #23)",

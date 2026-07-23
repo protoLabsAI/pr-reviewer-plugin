@@ -82,3 +82,31 @@ def test_verify_then_report_chain_preserves_source():
     assert STEPS["verify"]["depends_on"] == ["synthesize"]
     assert STEPS["report"]["depends_on"] == ["verify"]
     assert "`source`" in STEPS["verify"]["prompt"]
+
+
+def test_verifier_must_derive_its_verdict_from_a_read_not_a_story():
+    # Issue #25: the verify pass twice CONFIRMED code that wasn't in the file — once
+    # with the refuting blob and a passing test already on the PR. The prompt half of
+    # the fix; grounding.py is the deterministic half.
+    p = STEPS["verify"]["prompt"]
+    assert "github_read_file" in p and "{{inputs.head_sha}}" in p
+    assert "REFUTED" in p and "uncertain" in p
+    assert "startswith" in p  # the decidable-predicate rule carries its real example
+    assert "Evidence already on the PR counts" in p
+
+
+def test_report_pass_must_disposition_every_prior_blocker_or_major():
+    # Issue #26: a confirmed major must not simply stop being mentioned.
+    p = STEPS["report"]["prompt"]
+    assert "prior_dispositions" in p or "dispositions" in p
+    assert '"fixed"' in p or "`fixed`" in p
+    assert "not a disposition" in p  # "I didn't see it this time" is explicitly excluded
+    assert "{{inputs.prior_requests}}" in p
+
+
+def test_the_panel_declares_its_own_fan_out_width():
+    # Five finders under the caller's default cap of 4 ran as 4+1 — two waves, paying
+    # the slowest finder twice (~136s of the measured p50). Needs protoAgent's
+    # recipe-declared width; an older host ignores the key.
+    finders = [sid for sid in STEPS if sid.startswith("find_")]
+    assert RECIPE["max_concurrency"] == len(finders) == 5

@@ -12,9 +12,12 @@ from pr_reviewer.rounds import (
     delta_ranges,
     in_delta,
     panel_rounds,
+    parse_dispositions,
     render_held_note,
     render_notes_section,
     render_prior_requests,
+    render_unaccounted_note,
+    unaccounted_priors,
     unexplained_clearance,
 )
 from pr_reviewer.verdicts import PASS, WARN, render_verdict_body
@@ -287,3 +290,71 @@ def test_held_note_names_the_finding_and_the_way_out():
     assert "does not lift the standing block" in note
     assert "store.py:100" in note and "null slips the guard" in note
     assert "second consecutive clean PASS" in note  # the escape hatch is documented
+
+
+# ── prior-finding dispositions: #26 in its general form ──────────────────────
+
+
+def dispo(prior, disposition, why="because"):
+    return {"prior": prior, "disposition": disposition, "why": why}
+
+
+def report_with(dispositions, findings="[]"):
+    return "prose\n\n```json\n" + json.dumps(dispositions) + "\n```\n\nmore prose\n\n```json\n" + findings + "\n```"
+
+
+def test_dispositions_parse_and_findings_arrays_never_match():
+    out = report_with([dispo("store.py:100", "fixed")], findings=json.dumps([finding(severity="minor")]))
+    rows = parse_dispositions(out)
+    assert len(rows) == 1 and rows[0]["disposition"] == "fixed"
+
+
+def test_no_dispositions_block_parses_empty_so_the_caller_falls_back():
+    assert parse_dispositions("prose\n```json\n" + json.dumps([finding()]) + "\n```") == []
+    assert parse_dispositions("") == []
+
+
+def test_an_undispositioned_major_is_unaccounted_at_ANY_verdict():
+    # protoAgent#2150 r3: a confirmed major vanished into a WARN about unrelated nits.
+    # #27's clean-PASS rule said nothing — correctly, since the verdict wasn't a PASS.
+    history = [{"head": HEAD_1, "verdict": "FAIL", "findings": [finding(severity="major", claim="real")]}]
+    missing = unaccounted_priors(history, [dispo("other.py:9", "fixed")])
+    assert len(missing) == 1 and missing[0]["claim"] == "real"
+
+
+def test_a_dispositioned_major_is_accounted():
+    history = [{"head": HEAD_1, "verdict": "FAIL", "findings": [finding(severity="major")]}]
+    for state in ("fixed", "open", "refuted"):
+        assert unaccounted_priors(history, [dispo("store.py:100", state)]) == []
+
+
+def test_minors_need_no_disposition():
+    history = [{"head": HEAD_1, "verdict": WARN, "findings": [finding(severity="minor"), finding(severity="nit")]}]
+    assert unaccounted_priors(history, [dispo("unrelated.py:1", "fixed")]) == []
+
+
+def test_an_absent_dispositions_block_never_reports_debts():
+    # Otherwise every round of a recipe that doesn't emit the block would hold blocks.
+    history = [{"head": HEAD_1, "verdict": "FAIL", "findings": [finding(severity="major")]}]
+    assert unaccounted_priors(history, []) == []
+
+
+def test_a_refuted_prior_major_needs_no_disposition():
+    f = finding(severity="major")
+    f["verdict"] = "refuted"
+    assert unaccounted_priors([{"head": HEAD_1, "verdict": PASS, "findings": [f]}], [dispo("x:1", "fixed")]) == []
+
+
+def test_only_the_last_substantive_round_carries_debt():
+    history = [
+        {"head": HEAD_1, "verdict": "FAIL", "findings": [finding(severity="major", claim="old")]},
+        {"head": HEAD_2, "verdict": WARN, "findings": [finding(severity="minor")]},
+    ]
+    assert unaccounted_priors(history, [dispo("nothing:0", "fixed")]) == []
+
+
+def test_unaccounted_note_names_the_dropped_finding():
+    note = render_unaccounted_note([finding(severity="major", claim="the real one")])
+    assert "Unaccounted prior finding" in note
+    assert "store.py:100" in note and "the real one" in note
+    assert render_unaccounted_note([]) == ""

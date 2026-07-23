@@ -32,14 +32,18 @@ import time
 from .approve import PROMOTE, Observations, promotion_decision
 from .chokepoint import DISPATCH_ACTIONS, Chokepoint
 from .gh_cli import bad_repo, run_gh
+from .grounding import apply_grounding, render_grounding_footnote
 from .rounds import (
     DEFAULT_CONVERGENCE_ROUNDS,
     converge,
     delta_ranges,
     panel_rounds,
+    parse_dispositions,
     render_held_note,
     render_notes_section,
     render_prior_requests,
+    render_unaccounted_note,
+    unaccounted_priors,
     unexplained_clearance,
 )
 from .telemetry import Telemetry
@@ -172,6 +176,15 @@ class Dispatcher:
             if "hold_unexplained_clearance" in self.cfg
             else _env_bool("PR_REVIEWER_HOLD_UNEXPLAINED_CLEARANCE", True)
         )
+        # Evidence grounding (issue #25). On by default: it only ever REMOVES gating
+        # power from a finding whose quoted code isn't in the file, and twice in one day
+        # that exact shape blocked a correct PR — once escalated to blocker, on a head
+        # where the operator had already posted the refuting blob and a passing test.
+        self.grounding_enabled = (
+            bool(self.cfg["evidence_grounding"])
+            if "evidence_grounding" in self.cfg
+            else _env_bool("PR_REVIEWER_EVIDENCE_GROUNDING", True)
+        )
         self.chokepoint = Chokepoint(cooldown_s=int(self.cfg.get("cooldown_s") or 30))
         self._run_gh = run_gh_fn or run_gh
         self._workflow_run = workflow_run  # None → resolve STATE.workflow_run lazily
@@ -266,6 +279,41 @@ class Dispatcher:
                     {**marker, "state": row.get("state", ""), "body": row.get("body") or "", "id": row.get("id")}
                 )
         return ours
+
+    async def _finding_sources(self, repo: str, pr: int, head: str, findings: list[dict]) -> dict[str, str | None]:
+        """{file: text-to-ground-against} for the files the findings cite.
+
+        The haystack is the file AT THE REVIEWED HEAD plus this PR's patch for it. The
+        patch matters: a removed-behaviour finding legitimately quotes code the head no
+        longer contains, and grounding it against the head alone would downgrade the
+        panel's sharpest angle. An unreadable file maps to None — fail open, never
+        downgrade on a failed read (the `confine_findings` posture).
+        """
+        patches: dict[str, str] = {}
+        rc, out, _err = await self._run_gh(
+            ["api", f"repos/{repo}/pulls/{pr}/files", "--paginate", "--jq", "[.[] | {f: .filename, p: .patch}]"]
+        )
+        if rc == 0:
+            try:
+                for row in json.loads(out) or []:
+                    if isinstance(row, dict) and row.get("f"):
+                        patches[str(row["f"])] = str(row.get("p") or "")
+            except json.JSONDecodeError:
+                pass
+        sources: dict[str, str | None] = {}
+        for file in {str(f.get("file") or "") for f in findings if f.get("file")}:
+            rc, out, _err = await self._run_gh(["api", f"repos/{repo}/contents/{file}?ref={head}", "--jq", ".content"])
+            blob = ""
+            if rc == 0 and out.strip():
+                try:
+                    import base64
+
+                    blob = base64.b64decode(out.strip()).decode("utf-8", errors="replace")
+                except Exception:  # noqa: BLE001 — an undecodable blob is a failed read
+                    blob = ""
+            patch = patches.get(file, "")
+            sources[file] = f"{blob}\n{patch}" if (blob or patch) else None
+        return sources
 
     async def _delta_ranges(self, repo: str, base: str, head: str) -> dict | None:
         """Line ranges that moved between two reviewed heads, or None (unreadable).
@@ -487,6 +535,10 @@ class Dispatcher:
             )
             return "error:panel-exhausted"
 
+        # Per-step timings (protoAgent's engine, additive — {} on an older host). The
+        # panel's cost is nine LLM steps and a single `latency_s` cannot say which one to
+        # attack; this is what turns "the panel is slow" into a step name.
+        timings = result.get("timings") if isinstance(result.get("timings"), dict) else {}
         output = str(result.get("output") or "")
         findings, confined = confine_findings(self._parse_findings(output), paths)
         if confined:
@@ -502,6 +554,17 @@ class Dispatcher:
                     {"file": str(f.get("file") or ""), "severity": str(f.get("severity") or "")} for f in confined
                 ],
             )
+        # Evidence grounding (issue #25) runs BEFORE the mapping, unlike convergence:
+        # it doesn't reconsider a verdict, it corrects the findings the verdict is
+        # computed from. A finding quoting code that isn't at the reviewed head is
+        # annotated `uncertain`, which verdict_for already refuses to turn into a FAIL.
+        grounded_findings, ungrounded = [], []
+        if self.grounding_enabled and findings:
+            sources = await self._finding_sources(repo, pr, head, findings)
+            grounded_findings, ungrounded = apply_grounding(findings, sources)
+            findings = grounded_findings
+        if ungrounded:
+            self.telemetry.emit("ungrounded", repo=repo, pr=pr, sha=head, round=round_number, downgraded=ungrounded)
         verdict = verdict_for(findings)
         # Convergence (issue #23) sits AFTER the pure mapping, never inside it: ADR
         # 0078 C's rule is that findings decide the verdict, and that still holds —
@@ -520,8 +583,33 @@ class Dispatcher:
         # standing block, but a prior round of this same panel confirmed a blocker/major
         # that this round neither reports nor explains. Hold the block; the verdict still
         # posts, and a second consecutive clean PASS lifts it.
-        dropped_finding = unexplained_clearance(history, verdict, findings) if self.hold_unexplained else None
-        trailer = render_notes_section(notes)
+        # #26 in its general form: a prior blocker/major must be DISPOSITIONED
+        # (fixed / open / refuted), whatever this round's verdict is. `unexplained_clearance`
+        # could only guard a clean PASS, because silence there is unambiguous; with an
+        # explicit dispositions block the same debt is visible at any verdict. A recipe
+        # that emits no block falls back to the narrower rule rather than losing the guard.
+        dispositions = parse_dispositions(output) if self.hold_unexplained else []
+        unaccounted = unaccounted_priors(history, dispositions)
+        # The two guards are a fallback chain, not a belt-and-braces pair. When the panel
+        # HAS dispositioned its priors, that statement is the authority — re-applying the
+        # clean-PASS heuristic on top would hold a block the panel just explained, making
+        # the explicit contract worthless exactly where it matters most.
+        dropped_finding = (
+            unexplained_clearance(history, verdict, findings) if (self.hold_unexplained and not dispositions) else None
+        )
+        trailer = render_notes_section(notes) + render_grounding_footnote(ungrounded)
+        if unaccounted:
+            trailer += render_unaccounted_note(unaccounted)
+            self.telemetry.emit(
+                "unaccounted_priors",
+                repo=repo,
+                pr=pr,
+                sha=head,
+                round=round_number,
+                findings=[
+                    {"file": str(m.get("file") or ""), "severity": str(m.get("severity") or "")} for m in unaccounted
+                ],
+            )
         if dropped_finding:
             trailer += render_held_note(dropped_finding)
             self.telemetry.emit(
@@ -543,7 +631,7 @@ class Dispatcher:
             recipe,
             confined=confined,
             notes=trailer,
-            hold_blocks=bool(dropped_finding),
+            hold_blocks=bool(dropped_finding) or bool(unaccounted),
         )
         self.telemetry.emit(
             "reviewed",
@@ -555,9 +643,11 @@ class Dispatcher:
             round=round_number,
             findings=len(findings),
             notes=len(notes),
-            held=bool(dropped_finding),
+            held=bool(dropped_finding) or bool(unaccounted),
             confined=len(confined),
             latency_s=round(elapsed, 1),
+            step_s=timings or None,
+            slowest_step=(max(timings, key=timings.get) if timings else None),
             posted=posted,
             shadow=self.shadow,
         )
