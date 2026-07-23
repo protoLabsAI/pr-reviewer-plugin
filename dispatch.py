@@ -42,6 +42,7 @@ from .rounds import (
     render_held_note,
     render_notes_section,
     render_prior_requests,
+    render_promotion_findings,
     render_unaccounted_note,
     unaccounted_priors,
     unexplained_clearance,
@@ -119,79 +120,130 @@ def _env_int(name: str, default: int) -> int:
 
 
 class Dispatcher:
-    def __init__(self, cfg: dict, telemetry: Telemetry, *, run_gh_fn=None, workflow_run=None, inbox_add=None):
-        self.cfg = cfg or {}
+    def __init__(
+        self,
+        cfg: dict,
+        telemetry: Telemetry,
+        *,
+        run_gh_fn=None,
+        workflow_run=None,
+        inbox_add=None,
+        cfg_provider=None,
+    ):
+        # Config is resolved LIVE, never snapshotted (issue #11). Every knob below used
+        # to be read once in __init__, so an operator editing `repos` or flipping
+        # `shadow_mode` through Settings saw "config saved / reloaded" and got a silent
+        # no-op until the container restarted. These read as ordinary settings — the
+        # core schema cannot know a plugin cached them — so the operator believes a gate
+        # flip took effect when it did not. That is the dangerous direction.
+        self._cfg = cfg or {}
+        self._cfg_provider = cfg_provider
         self.telemetry = telemetry
-        # Config-first, ENV fallback for the operator-tunable state — the same
-        # posture as webhook_secret. HEADLESS config-as-code seeds the config
-        # volume ONCE, so state baked only there can't be updated on an image
-        # roll; PR_REVIEWER_REPOS / _SHADOW_MODE / _PROMOTION_OWNER let the compose
-        # env (re-applied every roll) carry it, keeping the config volume
-        # disposable. A config key present wins over the env; for the bools that
-        # means an explicit `shadow_mode: false` is honoured (not treated as unset).
-        self.repos = [str(r) for r in (self.cfg.get("repos") or []) if r] or _env_repos()
-        self.shadow = (
-            bool(self.cfg["shadow_mode"]) if "shadow_mode" in self.cfg else _env_bool("PR_REVIEWER_SHADOW_MODE", True)
-        )
-        self.promotion_owner = (
-            bool(self.cfg["promotion_owner"])
-            if "promotion_owner" in self.cfg
-            else _env_bool("PR_REVIEWER_PROMOTION_OWNER", False)
-        )
-        # D3 says an exhausted run is "retry or escalate" — we do both, in that order.
-        # A failed panel step is usually transient (a starved finder, a flaky tool
-        # call), and the alternative to retrying is a PR that merges UNREVIEWED.
-        self.panel_retries = (
-            int(self.cfg["panel_retries"]) if "panel_retries" in self.cfg else _env_int("PR_REVIEWER_PANEL_RETRIES", 1)
-        )
-        # Reviews the sweep may backfill per pass, across all repos. Bounds the
-        # first-pass stampede on a deployment that adopts a repo with a PR backlog.
-        self.backfill_per_pass = (
-            int(self.cfg["backfill_per_pass"])
-            if "backfill_per_pass" in self.cfg
-            else _env_int("PR_REVIEWER_BACKFILL_PER_PASS", 2)
-        )
-        # Independent kill switch for the re-gate. Arming a block is the one thing
-        # this machinery does that can WEDGE someone else's merge, so it needs an off
-        # switch that doesn't also cost you promotion and backfill — an operator who
-        # discovers the panel is emitting false FAILs (e.g. #20's wrong-ref reads)
-        # must be able to stop arming blocks in one config edit, without demoting the
-        # whole seat back to shadow.
-        self.regate_enabled = (
-            bool(self.cfg["regate"]) if "regate" in self.cfg else _env_bool("PR_REVIEWER_REGATE", True)
-        )
-        # Convergence (issue #23): the round from which an all-minor, all-in-delta WARN
-        # retires to PASS-with-notes. 0 disables the rule — the operator knob for a
-        # repo that would rather keep re-reviewing than ever floor a minor.
-        self.convergence_rounds = (
-            int(self.cfg["convergence_rounds"])
-            if "convergence_rounds" in self.cfg
-            else _env_int("PR_REVIEWER_CONVERGENCE_ROUNDS", DEFAULT_CONVERGENCE_ROUNDS)
-        )
-        # Hold our own block when a clean PASS silently drops a prior blocker/major
-        # (issue #26). On by default: the failure it guards SHIPPED a defect to main
-        # (protoAgent#2143), and the cost of a false hold is one extra review round.
-        self.hold_unexplained = (
-            bool(self.cfg["hold_unexplained_clearance"])
-            if "hold_unexplained_clearance" in self.cfg
-            else _env_bool("PR_REVIEWER_HOLD_UNEXPLAINED_CLEARANCE", True)
-        )
-        # Evidence grounding (issue #25). On by default: it only ever REMOVES gating
-        # power from a finding whose quoted code isn't in the file, and twice in one day
-        # that exact shape blocked a correct PR — once escalated to blocker, on a head
-        # where the operator had already posted the refuting blob and a passing test.
-        self.grounding_enabled = (
-            bool(self.cfg["evidence_grounding"])
-            if "evidence_grounding" in self.cfg
-            else _env_bool("PR_REVIEWER_EVIDENCE_GROUNDING", True)
-        )
-        self.chokepoint = Chokepoint(cooldown_s=int(self.cfg.get("cooldown_s") or 30))
+        # Boot-time by necessity: the chokepoint owns in-flight/cooldown state, so it
+        # cannot be rebuilt per read without dropping the bookkeeping it exists for.
+        self.chokepoint = Chokepoint(cooldown_s=int(self._cfg.get("cooldown_s") or 30))
         self._run_gh = run_gh_fn or run_gh
         self._workflow_run = workflow_run  # None → resolve STATE.workflow_run lazily
         self._inbox_add = inbox_add  # None → resolve STATE.inbox_store lazily
         self._viewer: str | None = None
         self._promote_failures: dict[str, int] = {}  # repo#pr@head -> consecutive APPROVE failures
         self._regate_failures: dict[str, int] = {}  # repo#pr@head -> consecutive REQUEST_CHANGES failures
+
+    # ── config, resolved live ────────────────────────────────────────────────
+    #
+    # Config-first, ENV fallback — the same posture as webhook_secret. HEADLESS
+    # config-as-code seeds the config volume ONCE, so state baked only there can't be
+    # updated on an image roll; the compose env (re-applied every roll) carries it,
+    # keeping the config volume disposable. A config key present wins over the env; for
+    # the bools that means an explicit `shadow_mode: false` is honoured, not treated as
+    # unset.
+
+    @property
+    def cfg(self) -> dict:
+        """The CURRENT plugin config. `cfg_provider` is the host's live view (the same
+        `registry.live_config` the webhook secret already uses); without one this falls
+        back to the dict handed in at construction."""
+        if self._cfg_provider is not None:
+            try:
+                return self._cfg_provider() or {}
+            except Exception:  # noqa: BLE001 — a failing provider must never break a review
+                log.exception("[pr-reviewer] live config read failed; using boot config")
+        return self._cfg
+
+    @property
+    def repos(self) -> list[str]:
+        """Managed allowlist. Config wins only when NON-empty — a seed shipping
+        `repos: []` must fall through to the env."""
+        return [str(r) for r in (self.cfg.get("repos") or []) if r] or _env_repos()
+
+    @property
+    def shadow(self) -> bool:
+        cfg = self.cfg
+        return bool(cfg["shadow_mode"]) if "shadow_mode" in cfg else _env_bool("PR_REVIEWER_SHADOW_MODE", True)
+
+    @property
+    def promotion_owner(self) -> bool:
+        cfg = self.cfg
+        return (
+            bool(cfg["promotion_owner"])
+            if "promotion_owner" in cfg
+            else _env_bool("PR_REVIEWER_PROMOTION_OWNER", False)
+        )
+
+    @property
+    def panel_retries(self) -> int:
+        """D3 says an exhausted run is "retry or escalate" — we do both, in that order.
+        A failed panel step is usually transient, and the alternative to retrying is a
+        PR that merges UNREVIEWED."""
+        cfg = self.cfg
+        return int(cfg["panel_retries"]) if "panel_retries" in cfg else _env_int("PR_REVIEWER_PANEL_RETRIES", 1)
+
+    @property
+    def backfill_per_pass(self) -> int:
+        """Reviews the sweep may backfill per pass, across all repos — bounds the
+        first-pass stampede on a deployment adopting a repo with a PR backlog."""
+        cfg = self.cfg
+        return (
+            int(cfg["backfill_per_pass"])
+            if "backfill_per_pass" in cfg
+            else _env_int("PR_REVIEWER_BACKFILL_PER_PASS", 2)
+        )
+
+    @property
+    def regate_enabled(self) -> bool:
+        """Independent kill switch for the re-gate. Arming a block is the one thing this
+        machinery does that can WEDGE someone else's merge, so it needs an off switch
+        that doesn't also cost you promotion and backfill — and one that takes effect
+        WITHOUT a restart, which is the whole point of #11."""
+        cfg = self.cfg
+        return bool(cfg["regate"]) if "regate" in cfg else _env_bool("PR_REVIEWER_REGATE", True)
+
+    @property
+    def convergence_rounds(self) -> int:
+        cfg = self.cfg
+        return (
+            int(cfg["convergence_rounds"])
+            if "convergence_rounds" in cfg
+            else _env_int("PR_REVIEWER_CONVERGENCE_ROUNDS", DEFAULT_CONVERGENCE_ROUNDS)
+        )
+
+    @property
+    def hold_unexplained(self) -> bool:
+        cfg = self.cfg
+        return (
+            bool(cfg["hold_unexplained_clearance"])
+            if "hold_unexplained_clearance" in cfg
+            else _env_bool("PR_REVIEWER_HOLD_UNEXPLAINED_CLEARANCE", True)
+        )
+
+    @property
+    def grounding_enabled(self) -> bool:
+        cfg = self.cfg
+        return (
+            bool(cfg["evidence_grounding"])
+            if "evidence_grounding" in cfg
+            else _env_bool("PR_REVIEWER_EVIDENCE_GROUNDING", True)
+        )
 
     # ── plumbing ──────────────────────────────────────────────────────────────
 
@@ -835,9 +887,14 @@ class Dispatcher:
             return "hold:pr-not-eligible"
         head = str(facts["head"])
         ours = await self._our_reviews(repo, pr)
-        # The latest verdict decides: PASS/WARN are non-blocking (promotable — Quinn's
-        # WARN "does NOT block merge"); a latest FAIL holds until a re-review clears it.
-        latest = ours[-1] if ours else None
+        # The latest PANEL ROUND decides — not `ours[-1]`, which can be our own promotion
+        # body (marker-bearing, no findings). Same shadowing that made delta re-reviews
+        # recall nothing before #24; here it would silently promote with an empty
+        # findings list and defeat the carry-forward below.
+        history = panel_rounds(ours)
+        # PASS/WARN are non-blocking (promotable — Quinn's WARN "does NOT block merge");
+        # a latest FAIL holds until a re-review clears it.
+        latest = history[-1] if history else None
         clear = latest if latest and latest["verdict"] in (PASS, WARN) else None
         promoted = any(r["state"] == "APPROVED" and r["head"] == head for r in ours)
         obs = Observations(
@@ -857,10 +914,22 @@ class Dispatcher:
         if decision != PROMOTE:
             return decision
         verdict = clear["verdict"] if clear else PASS
+        # A promoted WARN carries its findings forward (issue #22). Otherwise the PR
+        # reads APPROVED seconds after a confirmed finding lands and the finding has no
+        # consumer at all — which is how projectBoard-plugin#80 shipped a defect. The
+        # marker gains `findings=N` so merge tooling can gate on "approved WITH findings"
+        # without parsing prose. Deliberately NOT a block: this session showed a
+        # hallucinated blocker surviving two rounds, so gate rigidity must not outrun
+        # verdict reliability.
+        open_findings = [f for f in (clear.get("findings") or []) if isinstance(f, dict)] if clear else []
+        marker = f"<!-- protoagent-qa-review head={head} verdict={verdict} promoted=true"
+        if open_findings:
+            marker += f" findings={len(open_findings)}"
         body = (
-            f"<!-- protoagent-qa-review head={head} verdict={verdict} promoted=true -->\n"
+            f"{marker} -->\n"
             f"Promoting the {verdict} verdict for head `{head[:12]}`: all checks terminal-green, "
             f"zero unresolved review threads. (approve-on-green)"
+            f"{render_promotion_findings(open_findings)}"
         )
         rc, _out, err = await self._run_gh(
             ["api", f"repos/{repo}/pulls/{pr}/reviews", "-X", "POST", "-f", "event=APPROVE", "-f", f"body={body}"],

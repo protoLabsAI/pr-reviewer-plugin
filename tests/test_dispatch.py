@@ -1159,3 +1159,90 @@ async def test_a_false_disposition_still_holds_via_the_narrow_rule_when_the_bloc
     assert (await d.handle_pr_event("o/r", 1, HEAD, "synchronize")) == "reviewed:PASS"
     assert gh.dismissed == []
     assert "does not lift the standing block" in gh.posted[0]["body"]
+
+
+# ── a promoted WARN carries its findings (issue #22) ─────────────────────────
+
+
+WARN_FINDING = json.dumps(
+    [{"file": "x.py", "line": 4, "severity": "minor", "claim": "malformed diff: label", "evidence": "e"}]
+)
+
+
+async def test_promoting_a_warn_carries_its_findings_into_the_approval(tmp_path):
+    # projectBoard-plugin#80: a confirmed minor, promoted 32s later, and the finding had
+    # no consumer — the PR just read APPROVED. The defect shipped.
+    green = [{"status": "completed", "conclusion": "success"}]
+    gh = RoutedGH(pr_facts=facts(), reviews=[review_row(HEAD, "WARN", findings_json=WARN_FINDING)], checks=green)
+    d = make(tmp_path, cfg={"shadow_mode": False, "promotion_owner": True}, gh=gh)
+    assert (await d.evaluate_promotion("o/r", 1)) == "promote"
+    body = gh.posted[0]["body"]
+    assert gh.posted[0]["event"] == "APPROVE"  # still non-blocking — NOT a gate
+    assert "findings=1" in body  # machine-readable, no prose parsing needed
+    assert "Open findings carried by this approval" in body
+    assert "malformed diff: label" in body
+
+
+async def test_a_clean_pass_promotion_is_unchanged(tmp_path):
+    green = [{"status": "completed", "conclusion": "success"}]
+    gh = RoutedGH(pr_facts=facts(), reviews=[review_row(HEAD, "PASS")], checks=green)
+    d = make(tmp_path, cfg={"shadow_mode": False, "promotion_owner": True}, gh=gh)
+    assert (await d.evaluate_promotion("o/r", 1)) == "promote"
+    body = gh.posted[0]["body"]
+    assert "findings=" not in body and "Open findings carried" not in body
+
+
+async def test_our_own_promotion_body_does_not_shadow_the_verdict_it_promoted(tmp_path):
+    # `ours[-1]` after an approve-on-green is the promotion body — marker-bearing, no
+    # findings. The same shadowing #24 fixed for delta recall; here it would promote
+    # with an empty findings list and silently defeat the carry-forward.
+    green = [{"status": "completed", "conclusion": "success"}]
+    gh = RoutedGH(
+        pr_facts=facts(),
+        reviews=[review_row(OLD_HEAD, "WARN", findings_json=WARN_FINDING), promotion_row(OLD_HEAD)],
+        checks=green,
+    )
+    d = make(tmp_path, cfg={"shadow_mode": False, "promotion_owner": True}, gh=gh)
+    # head has advanced past the promoted one → stale-head hold, but the point is that
+    # panel_rounds (not ours[-1]) is what the decision reads.
+    assert (await d.evaluate_promotion("o/r", 1)) == "hold:stale-head"
+
+
+# ── config is live, not snapshotted (issue #11) ──────────────────────────────
+
+
+def test_config_edits_take_effect_without_a_restart(tmp_path):
+    # The footgun: an operator flips the gate through Settings, sees "config saved /
+    # reloaded", and the running dispatcher keeps its boot values. Believing you are
+    # formal-blocking a repo you are not is the dangerous direction.
+    cfg = {"repos": ["o/r"], "shadow_mode": True, "regate": True}
+    d = Dispatcher(cfg, Telemetry(tmp_path), cfg_provider=lambda: cfg)
+    assert d.shadow is True and d.repos == ["o/r"] and d.regate_enabled is True
+
+    cfg.clear()
+    cfg.update({"repos": ["o/r", "o/newly-managed"], "shadow_mode": False, "regate": False})
+    assert d.shadow is False  # the gate flip took effect
+    assert "o/newly-managed" in d.repos  # a newly-added repo dispatches
+    assert d.regate_enabled is False  # the kill switch works without a restart
+
+
+def test_a_replaced_config_object_is_still_seen(tmp_path):
+    # The host may hand back a NEW dict on reload rather than mutating in place.
+    box = {"cfg": {"shadow_mode": True}}
+    d = Dispatcher(box["cfg"], Telemetry(tmp_path), cfg_provider=lambda: box["cfg"])
+    assert d.shadow is True
+    box["cfg"] = {"shadow_mode": False}
+    assert d.shadow is False
+
+
+def test_a_failing_provider_falls_back_to_boot_config(tmp_path):
+    def _boom():
+        raise RuntimeError("config store is down")
+
+    d = Dispatcher({"shadow_mode": False}, Telemetry(tmp_path), cfg_provider=_boom)
+    assert d.shadow is False  # degrades to boot values; a review never dies on this
+
+
+def test_without_a_provider_the_boot_config_still_applies(tmp_path):
+    d = Dispatcher({"shadow_mode": False, "repos": ["o/r"]}, Telemetry(tmp_path))
+    assert d.shadow is False and d.repos == ["o/r"]

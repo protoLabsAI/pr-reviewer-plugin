@@ -65,9 +65,12 @@ def register(registry) -> None:
         from .webhook import build_routers
 
         telemetry = Telemetry(_state_home(cfg))
-        dispatcher = Dispatcher(cfg, telemetry)
-
         live = registry.live_config if hasattr(registry, "live_config") else (lambda: cfg)
+        # The dispatcher resolves its knobs through the SAME live view the webhook
+        # secret already used (issue #11) — `repos`, `shadow_mode`, the kill switches.
+        # Snapshotting them meant an operator flipping the gate through Settings got a
+        # silent no-op until the container restarted.
+        dispatcher = Dispatcher(cfg, telemetry, cfg_provider=live)
 
         def _secret() -> str:
             # Config first (Settings → secrets overlay); env fallback for headless
