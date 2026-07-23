@@ -42,6 +42,7 @@ from .rounds import (
     render_held_note,
     render_notes_section,
     render_prior_requests,
+    render_promotion_findings,
     render_unaccounted_note,
     unaccounted_priors,
     unexplained_clearance,
@@ -835,9 +836,14 @@ class Dispatcher:
             return "hold:pr-not-eligible"
         head = str(facts["head"])
         ours = await self._our_reviews(repo, pr)
-        # The latest verdict decides: PASS/WARN are non-blocking (promotable — Quinn's
-        # WARN "does NOT block merge"); a latest FAIL holds until a re-review clears it.
-        latest = ours[-1] if ours else None
+        # The latest PANEL ROUND decides — not `ours[-1]`, which can be our own promotion
+        # body (marker-bearing, no findings). Same shadowing that made delta re-reviews
+        # recall nothing before #24; here it would silently promote with an empty
+        # findings list and defeat the carry-forward below.
+        history = panel_rounds(ours)
+        # PASS/WARN are non-blocking (promotable — Quinn's WARN "does NOT block merge");
+        # a latest FAIL holds until a re-review clears it.
+        latest = history[-1] if history else None
         clear = latest if latest and latest["verdict"] in (PASS, WARN) else None
         promoted = any(r["state"] == "APPROVED" and r["head"] == head for r in ours)
         obs = Observations(
@@ -857,10 +863,22 @@ class Dispatcher:
         if decision != PROMOTE:
             return decision
         verdict = clear["verdict"] if clear else PASS
+        # A promoted WARN carries its findings forward (issue #22). Otherwise the PR
+        # reads APPROVED seconds after a confirmed finding lands and the finding has no
+        # consumer at all — which is how projectBoard-plugin#80 shipped a defect. The
+        # marker gains `findings=N` so merge tooling can gate on "approved WITH findings"
+        # without parsing prose. Deliberately NOT a block: this session showed a
+        # hallucinated blocker surviving two rounds, so gate rigidity must not outrun
+        # verdict reliability.
+        open_findings = [f for f in (clear.get("findings") or []) if isinstance(f, dict)] if clear else []
+        marker = f"<!-- protoagent-qa-review head={head} verdict={verdict} promoted=true"
+        if open_findings:
+            marker += f" findings={len(open_findings)}"
         body = (
-            f"<!-- protoagent-qa-review head={head} verdict={verdict} promoted=true -->\n"
+            f"{marker} -->\n"
             f"Promoting the {verdict} verdict for head `{head[:12]}`: all checks terminal-green, "
             f"zero unresolved review threads. (approve-on-green)"
+            f"{render_promotion_findings(open_findings)}"
         )
         rc, _out, err = await self._run_gh(
             ["api", f"repos/{repo}/pulls/{pr}/reviews", "-X", "POST", "-f", "event=APPROVE", "-f", f"body={body}"],

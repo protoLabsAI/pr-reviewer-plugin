@@ -359,6 +359,31 @@ def render_unaccounted_note(missing: list[dict]) -> str:
     )
 
 
+def render_promotion_findings(findings: list[dict]) -> str:
+    """Open findings restated in the APPROVE body (issue #22).
+
+    A WARN is non-blocking by design, and approve-on-green promotes it — so thirty
+    seconds after a confirmed minor lands, the PR reads APPROVED and the finding has no
+    consumer. On projectBoard-plugin#80 a malformed-label defect shipped that way.
+
+    The fix is NOT to make WARN block. This session produced the counterexample: the
+    panel issued a twice-confirmed, escalated, hallucinated blocker, and the correct
+    outcome was an adjudicated merge past it — gate rigidity must not outrun verdict
+    reliability. So the findings ride ALONG with the approval instead: visible to a human
+    scanning the PR, and machine-readable for anything gating on the marker.
+    """
+    if not findings:
+        return ""
+    lines = "\n".join(
+        f"- **{f.get('severity') or '?'}** `{_anchor(f.get('file'), f.get('line'))}` — {str(f.get('claim') or '')[:200]}"
+        for f in findings
+    )
+    return (
+        "\n\n**Open findings carried by this approval** — non-blocking, but they did not "
+        f"go away:\n{lines}\n\n_Approving a WARN does not resolve its findings (issue #22)._"
+    )
+
+
 def render_held_note(finding: dict) -> str:
     """Why the standing block did NOT lift, in the body of the very verdict that would
     otherwise have lifted it — so the next reader sees the disagreement, not a clean PASS."""

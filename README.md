@@ -105,6 +105,18 @@ structural-trigger dispatch, approve-on-green + sweep, and the review eval.
   p50 per step plus a slowest-step histogram — "the panel is slow" was never an
   actionable number across nine steps.
 
+- **A promoted WARN carries its findings (v0.13.0)** — approve-on-green promotes WARN by
+  design (a WARN "does NOT block merge"), so a confirmed finding could land and the PR
+  read **APPROVED** thirty seconds later with the finding having no consumer at all; that
+  is how projectBoard-plugin#80 shipped a malformed-label defect. The approval body now
+  restates the open findings and the marker gains `findings=N`, so merge tooling can gate
+  on "approved WITH findings" without parsing prose. Deliberately **not** a block:
+  making WARN gate would have hard-blocked a correct PR on the hallucinated blocker this
+  panel produced twice in one night — gate rigidity must not outrun verdict reliability.
+  The promotion path also now reads panel *rounds* rather than `ours[-1]`, which could be
+  our own promotion body (marker-bearing, findings-free) — the same shadowing #24 fixed
+  for delta recall.
+
 ## Requirements
 
 - protoAgent ≥ the version carrying the findings `source` field (see the manifest pin).
