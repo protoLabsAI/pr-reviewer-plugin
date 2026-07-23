@@ -1263,6 +1263,8 @@ async def test_a_promotion_carrying_findings_is_not_re_promoted(tmp_path):
     gh.reviews.append({"state": "APPROVED", "body": body, "id": 99})
     assert (await d.evaluate_promotion("o/r", 1)) == "hold:already-promoted"
     assert len(gh.posted) == 1  # not a second APPROVE
+
+
 # ── a summon forces a review the reaffirm path would have skipped (#28) ──────
 
 
