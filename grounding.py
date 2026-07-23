@@ -49,6 +49,19 @@ MIN_QUOTE_CHARS = 14
 # reference, not a claim about text present in the file.
 _CODE_HINT_RE = re.compile(r"[=(){}\[\];]|\.\w|->|=>|::|\w_\w")
 
+# ...and must not be PROSE. Backticks get used for emphasis as often as for code, and
+# an explanatory sentence full of code-ish punctuation passes every other filter here.
+# From production, 2026-07-23 — this was accepted as a "code quote" and downgraded a
+# TRUE finding, because it is long, has whitespace, and contains `(`, `)`, `.`, `_`:
+#
+#   "— for dep='--5', lstrip('-') → '5' (isdigit() → True), then int('--5') raises
+#    ValueError. The exception propagates out of create_from_plan uncaught, ..."
+#
+# A quoted LINE OF CODE is short, has few tokens, and carries no narrative punctuation.
+MAX_QUOTE_CHARS = 120
+MAX_QUOTE_TOKENS = 14
+_PROSE_RE = re.compile(r"[—→…]|\.\s+[A-Z]|\b(?:then|because|which|so that|i\.e\.|e\.g\.)\b", re.IGNORECASE)
+
 # ...and must be STATEMENT-like: containing whitespace between tokens. A bare
 # `_writable_dir()` is a reference to a thing, not an assertion about the file's text —
 # and it is nearly always present, so counting it would ground a fabrication by
@@ -77,7 +90,11 @@ def quoted_snippets(finding: dict) -> list[str]:
     for fenced, inline in _TICKS_RE.findall(blob):
         raw = fenced or inline
         text = _normalize(raw)
-        if len(text) >= MIN_QUOTE_CHARS and _CODE_HINT_RE.search(text) and _STATEMENT_RE.search(text):
+        if not (MIN_QUOTE_CHARS <= len(text) <= MAX_QUOTE_CHARS):
+            continue
+        if len(text.split()) > MAX_QUOTE_TOKENS or _PROSE_RE.search(text):
+            continue  # a sentence about the code, not a claim about the file's text
+        if _CODE_HINT_RE.search(text) and _STATEMENT_RE.search(text):
             out.append(text)
     return out
 
