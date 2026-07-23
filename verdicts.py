@@ -25,9 +25,18 @@ import re
 
 PASS, WARN, FAIL = "PASS", "WARN", "FAIL"
 
+# The marker must tolerate attributes it does not know about. It anchors on head +
+# verdict, accepts `promoted`, and then allows ANY further `key=value` pairs before the
+# close. v0.13.0 appended `findings=N` after `promoted=true` and this regex — which
+# required `-->` right after `promoted` — stopped matching entirely. A marker that fails
+# to parse is not read as ours, so `already-promoted` never fired and approve-on-green
+# re-approved the same head every sweep tick, forever. An unparsed marker is silent and
+# its consequences are not: extensibility here is a correctness property, not neatness.
 _MARKER_RE = re.compile(
     r"<!--\s*protoagent-qa-review\s+head=(?P<head>[a-f0-9]{7,40})\s+verdict=(?P<verdict>PASS|WARN|FAIL)"
-    r"(?:\s+promoted=(?P<promoted>true|false))?\s*-->"
+    r"(?:\s+promoted=(?P<promoted>true|false))?"
+    r"(?:\s+[A-Za-z_][A-Za-z0-9_]*=[^\s>]*)*"
+    r"\s*-->"
 )
 
 

@@ -1,6 +1,6 @@
 [project]
 name = "pr-reviewer-plugin"
-version = "0.14.0"
+version = "0.14.1"
 description = "protoAgent PR-review machinery: budgeted protoPatch structural reviews as a fifth panel member (ADR 0078 B2)."
 requires-python = ">=3.11"
 

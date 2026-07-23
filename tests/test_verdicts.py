@@ -95,3 +95,29 @@ def test_extract_findings_json_takes_the_final_array_block():
     )
     assert "newest" in extract_findings_json(body)
     assert extract_findings_json("no blocks here") == ""
+
+
+# ── the marker must survive attributes added later ───────────────────────────
+
+
+def test_a_marker_with_trailing_attributes_still_parses():
+    # PRODUCTION REGRESSION (2026-07-23): v0.13.0 appended `findings=N` after
+    # `promoted=true`. The regex required `-->` immediately after `promoted`, so the
+    # marker stopped parsing — the promotion was no longer recognised as ours,
+    # `already-promoted` never fired, and approve-on-green re-approved the same head
+    # every sweep tick. 20+ duplicate APPROVE reviews before it was caught.
+    body = "<!-- protoagent-qa-review head=abc1234 verdict=WARN promoted=true findings=1 -->\nPromoting..."
+    m = parse_verdict_marker(body)
+    assert m == {"head": "abc1234", "verdict": "WARN", "promoted": True}
+
+
+def test_unknown_future_attributes_do_not_break_the_marker():
+    body = "<!-- protoagent-qa-review head=abc1234 verdict=PASS promoted=false findings=0 mode=shadow x=1 -->"
+    m = parse_verdict_marker(body)
+    assert m and m["head"] == "abc1234" and m["verdict"] == "PASS" and m["promoted"] is False
+
+
+def test_the_plain_marker_forms_still_parse():
+    assert parse_verdict_marker("<!-- protoagent-qa-review head=abc1234 verdict=FAIL -->")["verdict"] == "FAIL"
+    assert parse_verdict_marker("<!-- protoagent-qa-review head=abc1234 verdict=PASS promoted=true -->")["promoted"]
+    assert parse_verdict_marker("not ours") is None
