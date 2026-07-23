@@ -177,7 +177,11 @@ def in_delta(finding: dict, ranges: dict[str, list[tuple[int, int]]]) -> bool:
     if not spans:  # changed file, unreadable patch — whole-file
         return True
     line = finding.get("line")
-    if not isinstance(line, int):  # file-level finding on a changed file
+    # `line: 0` is the findings contract's "no particular line", not line zero — panels
+    # emit it for file-level findings (seen on protoAgent#2139's CHANGELOG finding).
+    # Treating it as a real line tested it against hunk ranges that start at 1, so it
+    # could never be in-delta and silently blocked convergence forever.
+    if not isinstance(line, int) or line <= 0:  # file-level finding on a changed file
         return True
     return any(start <= line <= end for start, end in spans)
 

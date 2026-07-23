@@ -358,3 +358,13 @@ def test_unaccounted_note_names_the_dropped_finding():
     assert "Unaccounted prior finding" in note
     assert "store.py:100" in note and "the real one" in note
     assert render_unaccounted_note([]) == ""
+
+
+def test_line_zero_means_no_line_not_line_zero():
+    # protoAgent#2139 posted a CHANGELOG finding with `line: 0`. Hunk ranges start at 1,
+    # so treating 0 as a real line made it permanently un-in-delta and silently blocked
+    # convergence — the finding could never be retired however many rounds passed.
+    ranges = delta_ranges([{"filename": "CHANGELOG.md", "patch": PATCH}])
+    assert in_delta({"file": "CHANGELOG.md", "line": 0, "severity": "minor"}, ranges) is True
+    assert in_delta({"file": "CHANGELOG.md", "line": -1, "severity": "minor"}, ranges) is True
+    assert in_delta({"file": "CHANGELOG.md", "line": 300, "severity": "minor"}, ranges) is False  # real line, untouched

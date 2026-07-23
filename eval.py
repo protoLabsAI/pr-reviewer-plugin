@@ -83,6 +83,18 @@ def build_report(events: list[dict]) -> dict:
         # panel re-reviewing its own churn — #88 hit 8 before anyone counted.
         # Where the 7.5-minute p50 actually goes. The panel is nine LLM steps; a single
         # latency number cannot say which one to attack (issue: latency work, 2026-07-23).
+        # Guard decisions, firing AND declining. A guard you can only see when it acts
+        # is a guard you are trusting on faith — and two of these silently protect a
+        # merge gate.
+        "convergence_decisions": dict(
+            Counter(str(e.get("converge_reason")) for e in reviewed if e.get("converge_reason"))
+        ),
+        "grounding": {
+            "findings_checked": sum(int(e.get("grounding_checked") or 0) for e in reviewed),
+            "downgraded": sum(int(e.get("grounding_downgraded") or 0) for e in reviewed),
+        },
+        "blocks_held": sum(1 for e in reviewed if e.get("held")),
+        "unaccounted_priors": sum(int(e.get("unaccounted") or 0) for e in reviewed),
         "slowest_step_mix": dict(Counter(str(e.get("slowest_step")) for e in reviewed if e.get("slowest_step"))),
         "step_p50_s": _step_percentiles(reviewed),
         "rounds_per_pr": round(sum(rounds.values()) / len(rounds), 2) if rounds else None,
@@ -158,6 +170,11 @@ def render_report_markdown(summary: dict, rows: list[dict] | None = None) -> str
         f"(Quinn's floor: 44.7s median — the lite recipe is the lever)",
         f"- **Reaffirmed (unchanged head):** {summary.get('reaffirmed', 0)} · **delta re-reviews:** "
         f"{summary.get('delta_reviews', 0)} · **findings/review:** {summary.get('findings_per_review')}",
+        f"- **Guards:** grounding checked {(summary.get('grounding') or {}).get('findings_checked', 0)} finding(s), "
+        f"downgraded {(summary.get('grounding') or {}).get('downgraded', 0)} · blocks held: {summary.get('blocks_held', 0)} · "
+        f"unaccounted priors: {summary.get('unaccounted_priors', 0)}",
+        f"- **Convergence decisions:** {summary.get('convergence_decisions') or {}} — a rule that only "
+        f"reports when it fires cannot be told apart from one that never runs",
         f"- **Step p50s:** {summary.get('step_p50_s') or 'n/a (host reports no timings)'} · "
         f"**slowest step:** {summary.get('slowest_step_mix') or {}}",
         f"- **Rounds/PR:** {summary.get('rounds_per_pr')} (max {summary.get('max_rounds')}) · "
