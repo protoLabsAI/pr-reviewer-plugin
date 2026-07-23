@@ -127,6 +127,13 @@ structural-trigger dispatch, approve-on-green + sweep, and the review eval.
 
 ## Config (env fallbacks)
 
+Every key below is resolved **live on each use** (v0.14.0, issue #11) through the host's
+`live_config` view — editing `repos` or flipping `shadow_mode` in Settings takes effect
+without a restart. They previously snapshotted at boot, so an operator saw *"config
+saved / reloaded"* and got a silent no-op; believing you are formal-blocking a repo you
+are not is the dangerous direction. (`cooldown_s` is the exception — the chokepoint owns
+in-flight state and can't be rebuilt per read.)
+
 The operator-tunable state reads **config first, env as a fallback** — the same
 posture as `webhook_secret`, for headless config-as-code deployments where the
 config volume is seed-once and can't be re-edited on an image roll. A config key
