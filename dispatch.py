@@ -636,9 +636,11 @@ class Dispatcher:
         # computed from. A finding quoting code that isn't at the reviewed head is
         # annotated `uncertain`, which verdict_for already refuses to turn into a FAIL.
         grounded_findings, ungrounded = [], []
+        grounding_checked = 0
         if self.grounding_enabled and findings:
             sources = await self._finding_sources(repo, pr, head, findings)
             grounded_findings, ungrounded = apply_grounding(findings, sources)
+            grounding_checked = len(findings)
             findings = grounded_findings
         if ungrounded:
             self.telemetry.emit("ungrounded", repo=repo, pr=pr, sha=head, round=round_number, downgraded=ungrounded)
@@ -722,6 +724,15 @@ class Dispatcher:
             notes=len(notes),
             held=bool(dropped_finding) or bool(unaccounted),
             confined=len(confined),
+            # Every guard reports what it DECIDED, not only when it acted. A rule that
+            # is silent unless it fires cannot be distinguished from a rule that never
+            # ran — twice tonight "grounding checked N and downgraded 0" had to be
+            # reconstructed by hand-fetching blobs. Absence of an event is not evidence.
+            converge_reason=reason,
+            grounding_checked=grounding_checked,
+            grounding_downgraded=len(ungrounded),
+            dispositions=len(dispositions),
+            unaccounted=len(unaccounted),
             latency_s=round(elapsed, 1),
             step_s=timings or None,
             slowest_step=(max(timings, key=timings.get) if timings else None),

@@ -1299,3 +1299,20 @@ async def test_a_summon_bypasses_the_cooldown(tmp_path):
 async def test_a_summon_still_respects_the_allowlist(tmp_path):
     d = make(tmp_path, gh=RoutedGH(pr_facts=facts()))
     assert (await d.handle_summon("evil/repo", 1, "an-admin")) == "drop:unlisted-repo"
+
+
+async def test_every_guard_records_its_decision_even_when_it_declines(tmp_path):
+    # The gap this closes: "grounding checked 6 findings and downgraded 0" and
+    # "grounding never ran" were indistinguishable in telemetry, so verifying a guard
+    # meant hand-fetching blobs. Absence of an event is not evidence.
+    gh = GroundingGH(source="writable = Path(str(configured))\n", pr_facts=facts(), reviews=[])
+    runner, _seen = capturing_runner(FABRICATED_REPORT)
+    d = make(tmp_path, cfg={"shadow_mode": False}, gh=gh, runner=runner)
+    await d.handle_pr_event("o/r", 1, HEAD, "opened")
+    reviewed = [e for e in Telemetry(tmp_path).read_all() if e.get("event") == "reviewed"]
+    assert reviewed
+    e = reviewed[-1]
+    assert e["grounding_checked"] == 1  # it RAN
+    assert e["grounding_downgraded"] == 0  # and declined to downgrade
+    assert e["converge_reason"]  # a reason on every review, firing or not
+    assert e["unaccounted"] == 0 and e["held"] is False
