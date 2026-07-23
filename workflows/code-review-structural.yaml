@@ -322,7 +322,33 @@ steps:
       brief first (overall risk, fix-first item, what the panel disagreed on,
       what verification changed, any Gaps — including a skipped structural
       pass), then the canonical fenced findings JSON as the FINAL block of
-      your reply. Carry every surviving finding's `verdict` and `note` fields
+      your reply.
+
+      ## Account for what this panel said before
+
+      If the prior-requests block below is non-empty, then BEFORE the findings
+      JSON emit a fenced ```json block of dispositions — one row per prior
+      **blocker or major**, no exceptions:
+
+      ```json
+      [{"prior": "path/to/file.py:42", "disposition": "fixed", "why": "the new
+      head adds the isinstance guard ahead of the state flip"}]
+      ```
+
+      `disposition` is exactly one of `fixed` (say WHICH change fixed it),
+      `open` (it survives — carry it into your findings array too), or
+      `refuted` (it was wrong; say what evidence shows that).
+
+      A prior blocker/major that simply stops being mentioned is the failure
+      this exists to prevent: a confirmed major once vanished from a round into
+      a clean PASS, the standing block lifted, and the defect merged 44 seconds
+      later. "I didn't see it this time" is not a disposition — if you cannot
+      tell whether it was fixed, say `open` and let the next round settle it.
+
+      ## Prior requests
+      <prior_requests>
+      {{inputs.prior_requests}}
+      </prior_requests> Carry every surviving finding's `verdict` and `note` fields
       into that final JSON verbatim — a reprint that drops them erases the
       verify pass for downstream parsers.
 

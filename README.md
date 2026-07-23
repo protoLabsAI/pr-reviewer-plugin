@@ -85,6 +85,16 @@ structural-trigger dispatch, approve-on-green + sweep, and the review eval.
   quotes real code and reasons wrongly about it (a prefix that doesn't actually match) is
   the verify prompt's half.
 
+- **Prior-finding dispositions (v0.11.0)** — the general form of the clearance hold. The
+  report pass must state, per prior **blocker/major**, whether it was `fixed` (naming the
+  change), is still `open`, or was `refuted` (on evidence). A confirmed major that simply
+  stops being mentioned holds any standing block, **whatever the new verdict is** — the
+  v0.9.0 rule could only guard a zero-finding PASS, because silence there is unambiguous,
+  and protoAgent#2150 showed a major vanishing into a WARN about unrelated nits instead.
+  The two guards are a **fallback chain**: when dispositions are present they are the
+  authority (re-applying the clean-PASS heuristic on top would hold a block the panel just
+  explained); a recipe that emits no block keeps the narrower v0.9.0 rule.
+
 ## Requirements
 
 - protoAgent ≥ the version carrying the findings `source` field (see the manifest pin).

@@ -93,3 +93,12 @@ def test_verifier_must_derive_its_verdict_from_a_read_not_a_story():
     assert "REFUTED" in p and "uncertain" in p
     assert "startswith" in p  # the decidable-predicate rule carries its real example
     assert "Evidence already on the PR counts" in p
+
+
+def test_report_pass_must_disposition_every_prior_blocker_or_major():
+    # Issue #26: a confirmed major must not simply stop being mentioned.
+    p = STEPS["report"]["prompt"]
+    assert "prior_dispositions" in p or "dispositions" in p
+    assert '"fixed"' in p or "`fixed`" in p
+    assert "not a disposition" in p  # "I didn't see it this time" is explicitly excluded
+    assert "{{inputs.prior_requests}}" in p

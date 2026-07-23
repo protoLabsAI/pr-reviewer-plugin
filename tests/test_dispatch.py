@@ -1106,3 +1106,56 @@ def test_grounding_env_fallback_and_default(monkeypatch, tmp_path):
     assert Dispatcher({}, Telemetry(tmp_path)).grounding_enabled is True
     monkeypatch.setenv("PR_REVIEWER_EVIDENCE_GROUNDING", "false")
     assert Dispatcher({}, Telemetry(tmp_path)).grounding_enabled is False
+
+
+# ── unaccounted priors hold the block at any verdict (issue #26) ─────────────
+
+
+def report_with_dispositions(dispositions, findings="[]"):
+    return "prose\n\n```json\n" + json.dumps(dispositions) + "\n```\n\nbrief\n\n```json\n" + findings + "\n```"
+
+
+async def test_a_warn_that_drops_a_prior_major_holds_the_block(tmp_path):
+    # protoAgent#2150 r3 in miniature: the major vanishes into a WARN about other things.
+    # #27's clean-PASS rule cannot see this; the dispositions contract can.
+    major = json.dumps([{"file": "x.py", "line": 3, "severity": "major", "claim": "real bug", "evidence": "e"}])
+    nit = json.dumps([{"file": "x.py", "line": 9, "severity": "minor", "claim": "unrelated nit", "evidence": "e"}])
+    gh = RoutedGH(
+        pr_facts=facts(),
+        reviews=[review_row(OLD_HEAD, "FAIL", state="CHANGES_REQUESTED", findings_json=major, id=77)],
+    )
+    runner, _seen = capturing_runner(report_with_dispositions([{"prior": "other.py:1", "disposition": "fixed"}], nit))
+    d = make(tmp_path, cfg={"shadow_mode": False, "evidence_grounding": False}, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "synchronize")) == "reviewed:WARN"
+    assert gh.dismissed == []  # the block stays up
+    assert "Unaccounted prior finding" in gh.posted[0]["body"]
+    assert "real bug" in gh.posted[0]["body"]
+
+
+async def test_a_dispositioned_major_lets_the_verdict_clear(tmp_path):
+    major = json.dumps([{"file": "x.py", "line": 3, "severity": "major", "claim": "real bug", "evidence": "e"}])
+    gh = RoutedGH(
+        pr_facts=facts(),
+        reviews=[review_row(OLD_HEAD, "FAIL", state="CHANGES_REQUESTED", findings_json=major, id=77)],
+    )
+    runner, _seen = capturing_runner(
+        report_with_dispositions([{"prior": "x.py:3", "disposition": "fixed", "why": "guard added"}])
+    )
+    d = make(tmp_path, cfg={"shadow_mode": False, "evidence_grounding": False}, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "synchronize")) == "reviewed:PASS"
+    assert gh.dismissed  # accounted for → the gate lifts
+    assert "Unaccounted prior finding" not in gh.posted[0]["body"]
+
+
+async def test_a_false_disposition_still_holds_via_the_narrow_rule_when_the_block_is_absent(tmp_path):
+    # The fallback chain: no dispositions block at all → #27's clean-PASS rule applies.
+    major = json.dumps([{"file": "x.py", "line": 3, "severity": "major", "claim": "real bug", "evidence": "e"}])
+    gh = RoutedGH(
+        pr_facts=facts(),
+        reviews=[review_row(OLD_HEAD, "FAIL", state="CHANGES_REQUESTED", findings_json=major, id=77)],
+    )
+    runner, _seen = capturing_runner(CLEAN_PASS_REPORT)  # no dispositions emitted
+    d = make(tmp_path, cfg={"shadow_mode": False, "evidence_grounding": False}, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "synchronize")) == "reviewed:PASS"
+    assert gh.dismissed == []
+    assert "does not lift the standing block" in gh.posted[0]["body"]

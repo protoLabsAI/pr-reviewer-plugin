@@ -263,6 +263,102 @@ def unexplained_clearance(
     return None
 
 
+_DISPOSITIONS_RE = re.compile(r"```json\s*\n(\[.*?\])\s*```", re.DOTALL)
+_VALID_DISPOSITIONS = ("fixed", "open", "refuted")
+
+
+def parse_dispositions(output: str) -> list[dict]:
+    """The report pass's `prior_dispositions` block: what happened to each prior finding.
+
+    #27 could only ask "did a blocker/major vanish into a CLEAN pass?" — it had nothing
+    to distinguish *fixed* from *forgotten*, so it could only guard the one verdict where
+    silence is unambiguous. This block is the panel stating, per prior finding, which it
+    was. That turns the guard from a heuristic about zero findings into a contract:
+    a blocker/major must be dispositioned, whatever the new verdict is.
+
+    Absent block ⇒ empty list ⇒ the caller falls back to #27's narrower rule. A recipe
+    that doesn't emit dispositions must not become *less* guarded than before.
+    """
+    for block in _DISPOSITIONS_RE.findall(output or ""):
+        try:
+            parsed = json.loads(block)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(parsed, list):
+            continue
+        rows = [
+            r
+            for r in parsed
+            if isinstance(r, dict)
+            and str(r.get("disposition") or "").lower() in _VALID_DISPOSITIONS
+            and (r.get("prior") or r.get("file"))
+        ]
+        if rows:  # the FIRST block shaped like dispositions; findings arrays have no
+            return rows  # `disposition` key, so they can never match
+    return []
+
+
+def _anchor(file: object, line: object) -> str:
+    path = _norm(str(file or ""))
+    return f"{path}:{line}" if isinstance(line, int) else path
+
+
+def unaccounted_priors(history: list[dict], dispositions: list[dict]) -> list[dict]:
+    """Prior blocker/major findings this round neither reported nor dispositioned.
+
+    The generalization of `unexplained_clearance`: it applies at ANY verdict, because a
+    confirmed major can vanish into a WARN about unrelated nits just as easily as into a
+    clean PASS — protoAgent#2150 round 3 did exactly that, and #27's rule (rightly)
+    said nothing, because the verdict wasn't a clean PASS.
+
+    Only the LAST substantive round is consulted, same as `unexplained_clearance`: an
+    older finding a later round already handled is settled history, not an open debt.
+    """
+    if not dispositions:
+        return []
+    accounted = set()
+    for row in dispositions:
+        anchor = _anchor(row.get("file") or str(row.get("prior") or "").rsplit(":", 1)[0], row.get("line"))
+        accounted.add(anchor)
+        accounted.add(_norm(str(row.get("prior") or "")))
+    for round_ in reversed(history or []):
+        prior = [f for f in (round_.get("findings") or []) if isinstance(f, dict)]
+        if not prior:
+            continue
+        missing = []
+        for finding in prior:
+            severity = str(finding.get("severity") or "").lower()
+            if severity not in ("blocker", "major"):
+                continue
+            if str(finding.get("verdict") or "").lower() == "refuted":
+                continue
+            anchor = _anchor(finding.get("file"), finding.get("line"))
+            if anchor not in accounted and _norm(str(finding.get("file") or "")) not in accounted:
+                missing.append(dict(finding))
+        return missing
+    return []
+
+
+def render_unaccounted_note(missing: list[dict]) -> str:
+    """Names the prior findings this round left unaccounted, in the body of the round
+    that dropped them — silence about a blocker is the thing being made loud."""
+    if not missing:
+        return ""
+    lines = "\n".join(
+        f"- `{_anchor(m.get('file'), m.get('line'))}` ({m.get('severity') or '?'}) — {str(m.get('claim') or '')[:220]}"
+        for m in missing
+    )
+    return (
+        "\n\n---\n**Unaccounted prior finding(s).** An earlier round of this panel confirmed "
+        "the following, and this round neither reports them, nor says they were fixed, nor "
+        "refutes them:\n"
+        f"{lines}\n\n"
+        "_A finding that disappears without a disposition is unproven, not resolved (issue #26). "
+        "Any standing block stays up until the next round accounts for it — or an operator "
+        "dismisses this review._"
+    )
+
+
 def render_held_note(finding: dict) -> str:
     """Why the standing block did NOT lift, in the body of the very verdict that would
     otherwise have lifted it — so the next reader sees the disagreement, not a clean PASS."""

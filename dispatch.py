@@ -38,9 +38,12 @@ from .rounds import (
     converge,
     delta_ranges,
     panel_rounds,
+    parse_dispositions,
     render_held_note,
     render_notes_section,
     render_prior_requests,
+    render_unaccounted_note,
+    unaccounted_priors,
     unexplained_clearance,
 )
 from .telemetry import Telemetry
@@ -576,8 +579,33 @@ class Dispatcher:
         # standing block, but a prior round of this same panel confirmed a blocker/major
         # that this round neither reports nor explains. Hold the block; the verdict still
         # posts, and a second consecutive clean PASS lifts it.
-        dropped_finding = unexplained_clearance(history, verdict, findings) if self.hold_unexplained else None
+        # #26 in its general form: a prior blocker/major must be DISPOSITIONED
+        # (fixed / open / refuted), whatever this round's verdict is. `unexplained_clearance`
+        # could only guard a clean PASS, because silence there is unambiguous; with an
+        # explicit dispositions block the same debt is visible at any verdict. A recipe
+        # that emits no block falls back to the narrower rule rather than losing the guard.
+        dispositions = parse_dispositions(output) if self.hold_unexplained else []
+        unaccounted = unaccounted_priors(history, dispositions)
+        # The two guards are a fallback chain, not a belt-and-braces pair. When the panel
+        # HAS dispositioned its priors, that statement is the authority — re-applying the
+        # clean-PASS heuristic on top would hold a block the panel just explained, making
+        # the explicit contract worthless exactly where it matters most.
+        dropped_finding = (
+            unexplained_clearance(history, verdict, findings) if (self.hold_unexplained and not dispositions) else None
+        )
         trailer = render_notes_section(notes) + render_grounding_footnote(ungrounded)
+        if unaccounted:
+            trailer += render_unaccounted_note(unaccounted)
+            self.telemetry.emit(
+                "unaccounted_priors",
+                repo=repo,
+                pr=pr,
+                sha=head,
+                round=round_number,
+                findings=[
+                    {"file": str(m.get("file") or ""), "severity": str(m.get("severity") or "")} for m in unaccounted
+                ],
+            )
         if dropped_finding:
             trailer += render_held_note(dropped_finding)
             self.telemetry.emit(
@@ -599,7 +627,7 @@ class Dispatcher:
             recipe,
             confined=confined,
             notes=trailer,
-            hold_blocks=bool(dropped_finding),
+            hold_blocks=bool(dropped_finding) or bool(unaccounted),
         )
         self.telemetry.emit(
             "reviewed",
@@ -611,7 +639,7 @@ class Dispatcher:
             round=round_number,
             findings=len(findings),
             notes=len(notes),
-            held=bool(dropped_finding),
+            held=bool(dropped_finding) or bool(unaccounted),
             confined=len(confined),
             latency_s=round(elapsed, 1),
             posted=posted,
