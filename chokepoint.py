@@ -52,16 +52,22 @@ class Chokepoint:
     def _key(repo: str, pr: int, sha: str) -> str:
         return f"{repo}#{pr}@{sha}"
 
-    def admit(self, repo: str, pr: int, sha: str) -> str:
+    def admit(self, repo: str, pr: int, sha: str, *, bypass_cooldown: bool = False) -> str:
         """'accept' or a typed drop reason. An accept marks the PR in-flight —
-        the caller MUST call `done()` when the review run finishes (however it ends)."""
+        the caller MUST call `done()` when the review run finishes (however it ends).
+
+        `bypass_cooldown` is for an operator summon (issue #28). The cooldown exists to
+        eat webhook bursts — a synchronize storm, a redelivery — and a human who typed a
+        command is neither. The IN-FLIGHT guard still applies: it protects against two
+        panels running on one PR, which a summon must not do either.
+        """
         flight_key = f"{repo}#{pr}"
         if flight_key in self._in_flight:
             return DROP_IN_FLIGHT
         key = self._key(repo, pr, sha)
         now = self._now()
         last = self._last.get(key)
-        if last is not None and now - last < self.cooldown_s:
+        if last is not None and not bypass_cooldown and now - last < self.cooldown_s:
             return DROP_COOLDOWN
         self._last[key] = now
         self._in_flight.add(flight_key)

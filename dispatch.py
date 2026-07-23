@@ -471,7 +471,32 @@ class Dispatcher:
         finally:
             self.chokepoint.done(repo, pr)
 
-    async def _review(self, repo: str, pr: int) -> str:
+    async def handle_summon(self, repo: str, pr: int, actor: str) -> str:
+        """An operator asked for a review (issue #28). Same panel, two differences.
+
+        A summon bypasses the COOLDOWN (that exists to eat webhook bursts; a human who
+        typed a command is not a burst) and the REAFFIRM short-circuit (an unchanged head
+        with a posted verdict normally reaffirms without re-spending the panel — but
+        `@vera review` on an unchanged head is precisely the "I think you got this wrong"
+        case, and reaffirming it would answer the question with the answer under dispute).
+
+        Everything else is unchanged: allowlist, eligibility, self-authored, in-flight,
+        confinement, grounding, fail-closed exhaustion.
+        """
+        if bad_repo(repo) or (self.repos and repo not in self.repos):
+            self.telemetry.emit("drop", repo=repo, pr=pr, reason="unlisted-repo", summon=actor)
+            return "drop:unlisted-repo"
+        decision = self.chokepoint.admit(repo, pr, f"summon-{pr}", bypass_cooldown=True)
+        if decision != "accept":
+            self.telemetry.emit("drop", repo=repo, pr=pr, reason=decision, summon=actor)
+            return f"drop:{decision}"
+        self.telemetry.emit("summon", repo=repo, pr=pr, actor=actor)
+        try:
+            return await self._review(repo, pr, force=True)
+        finally:
+            self.chokepoint.done(repo, pr)
+
+    async def _review(self, repo: str, pr: int, *, force: bool = False) -> str:
         started = time.monotonic()
         facts = await self._pr_facts(repo, pr)
         if not facts or facts.get("state") != "open" or facts.get("draft"):
@@ -504,7 +529,7 @@ class Dispatcher:
         # verbatim re-post back into the head it belongs to.
         history = panel_rounds(ours)
         current = next((r for r in reversed(history) if r["head"] == head), None)
-        if current:
+        if current and not force:  # `force` = an operator summon disputing this verdict
             # Unchanged head with a posted verdict — reaffirm, don't re-spend the panel.
             self.telemetry.emit("reaffirm", repo=repo, pr=pr, sha=head, verdict=current["verdict"])
             return f"reaffirmed:{current['verdict']}"

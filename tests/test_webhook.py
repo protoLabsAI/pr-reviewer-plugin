@@ -163,3 +163,136 @@ def test_webhook_secret_env_fallback_for_headless_deploys(tmp_path, monkeypatch)
         .status_code
         == 200
     )
+
+
+# ── on-demand summon (issue #28, slice 1) ────────────────────────────────────
+
+
+class SummonSpy(SpyDispatcher):
+    def __init__(self, cfg=None):
+        super().__init__()
+        self.cfg = cfg or {"summon_handle": "vera"}
+        self.summons: list[tuple] = []
+        self.summon_outcome = "reviewed:FAIL"
+
+    async def _viewer_login(self):
+        return "qa-bot"
+
+    async def handle_summon(self, repo, pr, actor):
+        self.summons.append((repo, pr, actor))
+        return self.summon_outcome
+
+
+def comment_payload(text: str, login: str = "someone", *, is_pr: bool = True, action: str = "created") -> bytes:
+    issue: dict = {"number": 7}
+    if is_pr:
+        issue["pull_request"] = {"url": "..."}
+    return json.dumps(
+        {
+            "action": action,
+            "repository": {"full_name": "o/r"},
+            "issue": issue,
+            "comment": {"body": text, "user": {"login": login}},
+        }
+    ).encode()
+
+
+def summon_app(tmp_path, *, permission="admin"):
+    dispatcher = SummonSpy()
+    telemetry = Telemetry(tmp_path)
+    posted: list[dict] = []
+
+    async def fake_gh(args, timeout=30):
+        joined = " ".join(args)
+        if "/collaborators/" in joined:
+            return 0, permission, ""
+        if "-X" in args and "POST" in args and "/comments" in joined:
+            posted.append({a.split("=", 1)[0]: a.split("=", 1)[1] for a in args if "=" in a})
+            return 0, "{}", ""
+        return 0, "", ""
+
+    public, _api = build_routers(dispatcher, telemetry, lambda: SECRET, run_gh_fn=fake_gh)
+    app = FastAPI()
+    app.include_router(public, prefix="/plugins/pr-reviewer")
+    return app, dispatcher, posted
+
+
+def post_comment(app, body: bytes):
+    return TestClient(app).post(
+        "/plugins/pr-reviewer/webhook",
+        content=body,
+        headers={**signed(body), "X-GitHub-Event": "issue_comment"},
+    )
+
+
+def test_an_admin_summon_dispatches_a_review(tmp_path):
+    app, dispatcher, _posted = summon_app(tmp_path)
+    r = post_comment(app, comment_payload("@vera review"))
+    assert r.json() == {"ok": True, "dispatched": True, "reason": "summon:review"}
+    assert dispatcher.summons == [("o/r", 7, "someone")]
+
+
+def test_a_non_admin_is_refused_with_a_reply_not_silence(tmp_path):
+    app, dispatcher, posted = summon_app(tmp_path, permission="write")
+    r = post_comment(app, comment_payload("@vera review"))
+    assert r.json()["reason"] == "summon:refused-not-admin"
+    assert dispatcher.summons == []  # no panel spent
+    assert posted and "admin" in posted[0]["body"]  # the caller is told why
+
+
+def test_an_unreadable_permission_refuses(tmp_path):
+    # is_admin fails closed; the webhook must not spend a panel on it.
+    app, dispatcher, posted = summon_app(tmp_path, permission="")
+    assert post_comment(app, comment_payload("@vera review")).json()["reason"] == "summon:refused-not-admin"
+    assert dispatcher.summons == []
+
+
+def test_help_answers_without_spending_a_panel(tmp_path):
+    app, dispatcher, posted = summon_app(tmp_path)
+    assert post_comment(app, comment_payload("@vera help")).json()["reason"] == "summon:help"
+    assert dispatcher.summons == []
+    assert "@vera review" in posted[0]["body"]
+
+
+def test_an_unknown_verb_gets_help_not_silence(tmp_path):
+    app, _d, posted = summon_app(tmp_path)
+    assert post_comment(app, comment_payload("@vera frobnicate")).json()["reason"] == "summon:unknown-verb"
+    assert posted and "review" in posted[0]["body"]
+
+
+def test_an_ordinary_comment_is_not_a_summon(tmp_path):
+    app, dispatcher, posted = summon_app(tmp_path)
+    r = post_comment(app, comment_payload("this looks good to me"))
+    assert r.json()["reason"] == "summon:not-addressed"
+    assert dispatcher.summons == [] and posted == []
+
+
+def test_the_reviewer_never_answers_itself(tmp_path):
+    # Our own verdict bodies mention the handle; replying to them is an infinite loop
+    # with a five-subagent price tag.
+    app, dispatcher, posted = summon_app(tmp_path)
+    r = post_comment(app, comment_payload("@vera review", login="qa-bot[bot]"))
+    assert r.json()["reason"] == "summon:self"
+    assert dispatcher.summons == [] and posted == []
+
+
+def test_a_plain_issue_is_not_reviewable(tmp_path):
+    app, dispatcher, _posted = summon_app(tmp_path)
+    r = post_comment(app, comment_payload("@vera review", is_pr=False))
+    assert r.json()["reason"] == "not-a-pull-request"
+    assert dispatcher.summons == []
+
+
+def test_a_deleted_comment_action_does_nothing(tmp_path):
+    app, dispatcher, _posted = summon_app(tmp_path)
+    r = post_comment(app, comment_payload("@vera review", action="deleted"))
+    assert r.json()["reason"] == "not-a-comment-action"
+    assert dispatcher.summons == []
+
+
+def test_an_unsigned_summon_is_rejected_like_any_other_delivery(tmp_path):
+    app, dispatcher, _posted = summon_app(tmp_path)
+    body = comment_payload("@vera review")
+    r = TestClient(app).post("/plugins/pr-reviewer/webhook", content=body, headers={"X-GitHub-Event": "issue_comment"})
+    assert r.status_code == 403
+    assert dispatcher.summons == []

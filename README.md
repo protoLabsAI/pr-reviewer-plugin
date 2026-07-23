@@ -117,6 +117,24 @@ structural-trigger dispatch, approve-on-green + sweep, and the review eval.
   our own promotion body (marker-bearing, findings-free) — the same shadowing #24 fixed
   for delta recall.
 
+- **On-demand review (v0.15.0, slice 1 of #28)** — `@vera review` in a PR comment runs the
+  panel now. Every review before this was triggered by a push or the sweep, so the cheapest
+  way to ask a question about a PR was to alter the artifact you were asking about — and a
+  refutation of a wrong finding had nowhere to go (protoAgent#2138: the operator posted a
+  blob citation *and* a passing test, and nothing consumed either).
+  - **Admin only, resolved server-side** via the collaborator-permission API — never from
+    the payload's `author_association`, which is caller-supplied. Fails closed. The gate is
+    about cost: a summon spends five subagents for 5–9 minutes.
+  - **A summon overrides the reaffirm short-circuit.** An unchanged head normally reaffirms
+    without re-spending the panel; `@vera review` on that head is precisely the "I think you
+    got this wrong" case, and reaffirming would answer with the answer under dispute.
+  - **Bypasses the cooldown, not the in-flight guard** — the cooldown eats webhook bursts,
+    and a human who typed a command is not a burst; two panels on one PR is still wrong.
+  - **Never silent.** Refusals, unknown verbs and drops all reply. `@vera help` lists the
+    verbs. `@vera` alone is treated as asking what this thing does.
+  - Handle is `summon_handle` (default `vera`) *plus* the reviewer's own login, and it never
+    answers itself — its own verdict bodies mention the handle.
+
 ## Requirements
 
 - protoAgent ≥ the version carrying the findings `source` field (see the manifest pin).
