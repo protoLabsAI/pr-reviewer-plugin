@@ -134,6 +134,16 @@ structural-trigger dispatch, approve-on-green + sweep, and the review eval.
     verbs. `@vera` alone is treated as asking what this thing does.
   - Handle is `summon_handle` (default `vera`) *plus* the reviewer's own login, and it never
     answers itself — its own verdict bodies mention the handle.
+  - **`pause` / `resume` (v0.17.0)** — stop reviewing a PR on push while it is being
+    reworked; an explicit `@vera review` still runs, because "stop reviewing every push"
+    and "never look at this again" are different requests. State rides in a marker on a
+    posted comment, so GitHub is the store (ADR 0078 D5) and a restart cannot forget it.
+    The **last** marker wins, not a tally — pause → resume → pause ends paused.
+  - ⚠️ **Requires GitHub App events.** A summon arrives as `issue_comment` (and, for
+    inline replies, `pull_request_review_comment`). An App subscribed only to
+    `pull_request` — as ours was when this shipped — makes every summon vanish with no
+    error at all: correct code, no event. `GET /api/plugins/pr-reviewer/summon/health`
+    reports exactly which events are missing.
 
 ## Requirements
 
@@ -165,6 +175,7 @@ compose env (re-applied every roll) to keep the config volume disposable:
 | `PR_REVIEWER_PROMOTION_OWNER` | `pr_reviewer.promotion_owner` | `false` | Same tri-state semantics. |
 | `PR_REVIEWER_PANEL_RETRIES` | `pr_reviewer.panel_retries` | `1` | Re-runs of a recipe whose panel reported a failed step, before D3 escalation. `0` restores the old give-up-on-first-failure behaviour. |
 | `PR_REVIEWER_BACKFILL_PER_PASS` | `pr_reviewer.backfill_per_pass` | `2` | Reviews the sweep may backfill per pass, across all repos. `0` disables backfill. |
+| `PR_REVIEWER_SUMMON` | `pr_reviewer.summon` | `true` | The comment-command surface (`@vera review` / `pause` / `resume` / `help`) **and** the pause check on the automated path. `false` costs nothing for a repo that never wants comment-driven behaviour. |
 | `PR_REVIEWER_EVIDENCE_GROUNDING` | `pr_reviewer.evidence_grounding` | `true` | A finding whose quoted code appears nowhere in the cited file at the reviewed head (nor in this PR's patch for it) is annotated `uncertain` — it still posts, it just can't carry a FAIL. Fails open on an unreadable blob or unquotable evidence. |
 | `PR_REVIEWER_HOLD_UNEXPLAINED_CLEARANCE` | `pr_reviewer.hold_unexplained_clearance` | `true` | A zero-finding PASS does not dismiss our standing block when a prior round confirmed a blocker/major it neither reports nor explains. A second consecutive clean PASS lifts it. `false` restores the old always-dismiss behaviour. |
 | `PR_REVIEWER_CONVERGENCE_ROUNDS` | `pr_reviewer.convergence_rounds` | `3` | The round from which an all-minor, all-in-delta WARN retires to PASS-with-notes. `0` disables the rule — the panel keeps re-reviewing rather than ever floor a minor. |

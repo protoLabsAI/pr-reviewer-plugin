@@ -33,7 +33,25 @@ import re
 
 # Slice 1. `pause`/`resume` need somewhere durable to live (the marker line is the
 # natural home — GitHub is already the store, ADR 0078 D5) and land next.
-VERBS = ("review", "help")
+VERBS = ("review", "pause", "resume", "help")
+
+# Webhook events a summon needs. `issue_comment` carries top-level `@vera <verb>`;
+# `pull_request_review_comment` carries inline thread replies (the refutation channel).
+# A GitHub App subscribed only to `pull_request` — as it was when this shipped — makes
+# every summon vanish with no error: correct code, no event. `/api/plugins/pr-reviewer/
+# summon/health` reports the gap rather than leaving it to be discovered as "broken".
+_APP_EVENTS = ("issue_comment", "pull_request_review_comment")
+
+
+def required_app_events() -> list[str]:
+    return list(_APP_EVENTS)
+
+
+# `pause` state lives in a marker on a posted comment — GitHub is already the store
+# (ADR 0078 D5), so there is no local DB to drift and a container restart cannot forget
+# that someone asked for quiet. Read the same way verdict markers are.
+PAUSE_MARKER = "<!-- protoagent-qa-paused -->"
+RESUME_MARKER = "<!-- protoagent-qa-resumed -->"
 
 REFUSED_NOT_ADMIN = "summon:refused-not-admin"
 REFUSED_UNKNOWN_VERB = "summon:unknown-verb"
@@ -84,6 +102,40 @@ async def is_admin(run_gh, repo: str, login: str) -> bool:
     return rc == 0 and out.strip().lower() == "admin"
 
 
+def is_paused(comment_bodies: list[str]) -> bool:
+    """Is automated review paused for this PR? The LAST pause/resume marker wins.
+
+    Ordering matters more than counting: `pause` then `resume` then `pause` must end
+    paused, so this reads the newest marker rather than tallying. Bodies arrive
+    oldest-first, as the GitHub comments API returns them.
+    """
+    state = False
+    for body in comment_bodies or []:
+        text = str(body or "")
+        if PAUSE_MARKER in text:
+            state = True
+        elif RESUME_MARKER in text:
+            state = False
+    return state
+
+
+def pause_text(login: str) -> str:
+    return (
+        f"{PAUSE_MARKER}\n**Automated review paused** for this PR at @{login}'s request.\n\n"
+        f"Pushes will not trigger the panel. `@vera resume` restores it; `@vera review` still "
+        f"runs a one-off review without resuming.\n\n"
+        f"_A PR mid-rework does not need six rounds (issue #23) — this is the human-controlled "
+        f"version of that._"
+    )
+
+
+def resume_text(login: str) -> str:
+    return (
+        f"{RESUME_MARKER}\n**Automated review resumed** for this PR at @{login}'s request. "
+        f"The next push will be reviewed as normal."
+    )
+
+
 def help_text(handles: list[str]) -> str:
     handle = next((h for h in handles if h), "vera")
     return (
@@ -91,10 +143,11 @@ def help_text(handles: list[str]) -> str:
         f"| command | effect |\n|---|---|\n"
         f"| `@{handle} review` | Re-review the current head now — including a head already "
         f"reviewed, which is the point when you think a verdict was wrong |\n"
+        f"| `@{handle} pause` | Stop reviewing this PR on push (a one-off `review` still works) |\n"
+        f"| `@{handle} resume` | Resume automated review |\n"
         f"| `@{handle} help` | This message |\n\n"
         f"A summon spends a full panel (five finders, ~5–9 min), which is why it is "
-        f"admin-gated. `pause` / `resume` and inline thread replies are not built yet "
-        f"(pr-reviewer-plugin#28)."
+        f"admin-gated. Inline thread replies are not built yet (pr-reviewer-plugin#28)."
     )
 
 

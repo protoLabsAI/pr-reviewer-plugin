@@ -1316,3 +1316,61 @@ async def test_every_guard_records_its_decision_even_when_it_declines(tmp_path):
     assert e["grounding_downgraded"] == 0  # and declined to downgrade
     assert e["converge_reason"]  # a reason on every review, firing or not
     assert e["unaccounted"] == 0 and e["held"] is False
+
+
+# ── pause suppresses automated review only (issue #28 slice 2) ───────────────
+
+
+class PausedGH(RoutedGH):
+    def __init__(self, *, comments, **kw):
+        super().__init__(**kw)
+        self.comments = comments
+
+    async def __call__(self, args, timeout=30):
+        joined = " ".join(args)
+        if "/issues/" in joined and "/comments" in joined and "-X" not in args:
+            return 0, json.dumps(self.comments), ""
+        return await super().__call__(args, timeout=timeout)
+
+
+async def test_a_paused_pr_is_not_reviewed_on_push(tmp_path):
+    from pr_reviewer.summon import pause_text
+
+    gh = PausedGH(comments=[pause_text("an-admin")], pr_facts=facts(), reviews=[])
+    ran = []
+
+    async def runner(name, inputs):
+        ran.append(name)
+        return {"output": REPORT, "failed": []}
+
+    d = make(tmp_path, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "synchronize")) == "drop:paused-by-operator"
+    assert ran == []
+
+
+async def test_an_explicit_summon_still_runs_on_a_paused_pr(tmp_path):
+    # "stop reviewing every push" and "never look at this again" are different requests.
+    from pr_reviewer.summon import pause_text
+
+    gh = PausedGH(comments=[pause_text("an-admin")], pr_facts=facts(), reviews=[])
+    runner, _seen = capturing_runner()
+    d = make(tmp_path, gh=gh, runner=runner)
+    assert (await d.handle_summon("o/r", 1, "an-admin")) == "reviewed:FAIL"
+
+
+async def test_resume_restores_automated_review(tmp_path):
+    from pr_reviewer.summon import pause_text, resume_text
+
+    gh = PausedGH(comments=[pause_text("a"), resume_text("a")], pr_facts=facts(), reviews=[])
+    runner, _seen = capturing_runner()
+    d = make(tmp_path, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "reviewed:FAIL"
+
+
+async def test_summon_disabled_skips_the_pause_check_entirely(tmp_path):
+    from pr_reviewer.summon import pause_text
+
+    gh = PausedGH(comments=[pause_text("a")], pr_facts=facts(), reviews=[])
+    runner, _seen = capturing_runner()
+    d = make(tmp_path, cfg={"summon": False}, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "reviewed:FAIL"
