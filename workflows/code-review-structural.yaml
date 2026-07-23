@@ -23,6 +23,12 @@ description: >-
   evidence-checking verify pass, and a final findings block. Output ends with
   the canonical fenced findings JSON.
 version: 1
+# The five finders below are independent and run as ONE parallel stage. Declared
+# explicitly because the caller's `subagent_max_concurrency` default is 4 — one short —
+# which silently serialized the stage into 4+1 and paid the slowest finder's cost twice
+# (~136s of the p50 on 60 measured reviews). Needs protoAgent's recipe-declared fan-out
+# width; an older host ignores the key and behaves exactly as before.
+max_concurrency: 5
 inputs:
   - name: pr
     description: The pull-request number to review.

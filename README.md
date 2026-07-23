@@ -95,6 +95,16 @@ structural-trigger dispatch, approve-on-green + sweep, and the review eval.
   authority (re-applying the clean-PASS heuristic on top would hold a block the panel just
   explained); a recipe that emits no block keeps the narrower v0.9.0 rule.
 
+- **Panel latency work (v0.12.0)** — the five finders are one parallel stage, but the
+  host's `subagent_max_concurrency` defaults to **4**, so the stage silently ran as
+  **4+1** and paid the slowest finder twice. Measured over 60 reviews: the five-finder
+  recipe's p50 was **458s** against **322s** for the otherwise-identical four-finder one,
+  which solves to ~136s per finder and ~186s for the sequential tail. The recipe now
+  declares `max_concurrency: 5` (needs protoAgent#2168; an older host ignores it). The
+  dispatcher also records the engine's per-step `timings`, and the eval report shows a
+  p50 per step plus a slowest-step histogram — "the panel is slow" was never an
+  actionable number across nine steps.
+
 ## Requirements
 
 - protoAgent ≥ the version carrying the findings `source` field (see the manifest pin).

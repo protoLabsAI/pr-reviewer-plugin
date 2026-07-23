@@ -102,3 +102,11 @@ def test_report_pass_must_disposition_every_prior_blocker_or_major():
     assert '"fixed"' in p or "`fixed`" in p
     assert "not a disposition" in p  # "I didn't see it this time" is explicitly excluded
     assert "{{inputs.prior_requests}}" in p
+
+
+def test_the_panel_declares_its_own_fan_out_width():
+    # Five finders under the caller's default cap of 4 ran as 4+1 — two waves, paying
+    # the slowest finder twice (~136s of the measured p50). Needs protoAgent's
+    # recipe-declared width; an older host ignores the key.
+    finders = [sid for sid in STEPS if sid.startswith("find_")]
+    assert RECIPE["max_concurrency"] == len(finders) == 5

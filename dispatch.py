@@ -535,6 +535,10 @@ class Dispatcher:
             )
             return "error:panel-exhausted"
 
+        # Per-step timings (protoAgent's engine, additive — {} on an older host). The
+        # panel's cost is nine LLM steps and a single `latency_s` cannot say which one to
+        # attack; this is what turns "the panel is slow" into a step name.
+        timings = result.get("timings") if isinstance(result.get("timings"), dict) else {}
         output = str(result.get("output") or "")
         findings, confined = confine_findings(self._parse_findings(output), paths)
         if confined:
@@ -642,6 +646,8 @@ class Dispatcher:
             held=bool(dropped_finding) or bool(unaccounted),
             confined=len(confined),
             latency_s=round(elapsed, 1),
+            step_s=timings or None,
+            slowest_step=(max(timings, key=timings.get) if timings else None),
             posted=posted,
             shadow=self.shadow,
         )
