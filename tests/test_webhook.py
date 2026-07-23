@@ -113,13 +113,32 @@ def test_three_way_endpoint_renders_the_report(tmp_path):
 
 def test_webhook_secret_env_fallback_for_headless_deploys(tmp_path, monkeypatch):
     """Headless config-as-code can't bake the secrets overlay — the plugin falls
-    back to PR_REVIEWER_WEBHOOK_SECRET (config wins when both are set)."""
+    back to PR_REVIEWER_WEBHOOK_SECRET (config wins when both are set).
+
+    This test drives the REAL router, so a verified signature schedules the REAL
+    dispatcher on a background task. Left alone that reaches `gh` over the network
+    (issue #13: it hung indefinitely on a workstation with an authenticated `gh`,
+    while passing in CI where `gh` fails fast) — a unit test's outcome must not
+    depend on whoever runs it being logged out.
+
+    The ALLOWLIST is the real guard: an allowlist excluding the payload's repo drops
+    the dispatch at the gate, which by construction runs before any GitHub call. The
+    `run_gh` stub below is belt-and-braces only — a background task's exception is
+    swallowed, so it cannot fail this test (verified: admitting `o/r` still passes).
+    It stops real network I/O; it does not detect it.
+    """
     import pr_reviewer
 
     from tests.conftest import FakeRegistry
 
+    def _no_network(*_a, **_kw):  # belt-and-braces; see the docstring
+        raise AssertionError("the webhook suite must never shell out to gh")
+
+    monkeypatch.setattr("pr_reviewer.dispatch.run_gh", _no_network)
     monkeypatch.setenv("PR_REVIEWER_WEBHOOK_SECRET", "env-secret")
-    reg = FakeRegistry({})  # no webhook_secret in config
+    # An allowlist that excludes the payload's repo: the gate runs BEFORE any GitHub
+    # call, so the background task drops at `unlisted-repo` and never dials out.
+    reg = FakeRegistry({"repos": ["allowed/elsewhere"]})  # no webhook_secret in config
     pr_reviewer.register(reg)
     public, _prefix = reg.routers[0]
     app = FastAPI()
@@ -127,7 +146,7 @@ def test_webhook_secret_env_fallback_for_headless_deploys(tmp_path, monkeypatch)
     r = TestClient(app).post("/plugins/pr-reviewer/webhook", content=PAYLOAD, headers=signed(PAYLOAD, "env-secret"))
     assert r.status_code == 200  # env secret verified the HMAC
 
-    reg2 = FakeRegistry({"webhook_secret": "config-secret"})
+    reg2 = FakeRegistry({"webhook_secret": "config-secret", "repos": ["allowed/elsewhere"]})
     pr_reviewer.register(reg2)
     public2, _p = reg2.routers[0]
     app2 = FastAPI()
