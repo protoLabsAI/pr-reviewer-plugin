@@ -161,3 +161,41 @@ def test_footnote_names_the_missing_quote():
     assert "downgraded to **uncertain**" in note
     assert "Path(str(configured))" in note
     assert render_grounding_footnote([]) == ""
+
+
+# ── prose must never be mistaken for a code quote ────────────────────────────
+
+
+PROSE_FINDING = {
+    "file": "store.py",
+    "line": 567,
+    "severity": "minor",
+    "claim": "_resolve_plan_dep crashes with an uncaught ValueError on '--5'.",
+    "evidence": (
+        "— for dep='--5', lstrip('-') → '5' (isdigit() → True), then int('--5') raises ValueError. "
+        "The exception propagates out of create_from_plan uncaught, bypassing the tool's guard."
+    ),
+}
+
+
+def test_a_prose_explanation_is_not_a_checkable_quote():
+    # PRODUCTION REGRESSION (projectBoard-plugin#94 r2, 2026-07-23): this sentence was
+    # accepted as a code quote and downgraded a TRUE finding to uncertain. It is long,
+    # has whitespace, and contains `(`, `)`, `.`, `_` — it passed every other filter.
+    assert quoted_snippets(PROSE_FINDING) == []
+    assert ground_finding(PROSE_FINDING, "def _resolve_plan_dep(dep):\n    return int(dep.lstrip('-'))\n")[0] is True
+
+
+def test_narrative_punctuation_disqualifies_a_quote():
+    for prose in ("`a = 1 → then b = 2 happens`", "`x = compute() because the guard fails`", "`p = 1. Then q = 2`"):
+        assert quoted_snippets({"claim": prose, "evidence": ""}) == []
+
+
+def test_an_over_long_quote_is_not_checkable():
+    long_line = "`" + " = ".join(f"var{i}" for i in range(40)) + "`"
+    assert quoted_snippets({"claim": long_line, "evidence": ""}) == []
+
+
+def test_the_2138_fabrication_is_STILL_caught():
+    # The positive control: tightening the filter must not lose the real catch.
+    assert ground_finding(FABRICATED, WRITABLE_DIR_SRC)[0] is False
