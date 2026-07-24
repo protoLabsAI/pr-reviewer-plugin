@@ -155,6 +155,12 @@ structural-trigger dispatch, approve-on-green + sweep, and the review eval.
   a truncated run isn't scored as "found nothing". `python -m pr_reviewer.replay_cli
   --manifest replay_manifest.jsonl --model protolabs/fast`.
 
+- **Findings render as a table (v0.19.0)** — the posted review shows a scannable
+  severity-sorted markdown table (severity · location · finding · verified) instead of a
+  raw JSON dump. The machine-readable JSON is kept in a collapsed `<details>` — prior-round
+  recall reads it back out of the body, so it can't be removed. A clean pass (`[]`) or a
+  prose-only report is left untouched.
+
 ## Requirements
 
 - protoAgent ≥ the version carrying the findings `source` field (see the manifest pin).

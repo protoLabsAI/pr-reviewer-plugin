@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 from pr_reviewer.verdicts import (
     FAIL,
     PASS,
@@ -121,3 +123,59 @@ def test_the_plain_marker_forms_still_parse():
     assert parse_verdict_marker("<!-- protoagent-qa-review head=abc1234 verdict=FAIL -->")["verdict"] == "FAIL"
     assert parse_verdict_marker("<!-- protoagent-qa-review head=abc1234 verdict=PASS promoted=true -->")["promoted"]
     assert parse_verdict_marker("not ours") is None
+
+
+# ── findings render as a table, JSON preserved for recall ────────────────────
+
+
+_FINDINGS = [
+    {"file": "a.py", "line": 3, "severity": "major", "claim": "sync call blocks the loop", "verdict": "confirmed"},
+    {"file": "b.py", "line": 0, "severity": "minor", "claim": "nested ternary | hard to read", "verdict": "uncertain"},
+]
+_REPORT = "## Brief\n\nOverall risk: medium.\n\n```json\n" + json.dumps(_FINDINGS) + "\n```"
+
+
+def test_findings_render_as_a_table():
+    body = render_verdict_body(
+        repo="o/r", pr=1, head_sha="a" * 40, verdict="FAIL", report=_REPORT, shadow=False, recipe="code-review"
+    )
+    assert "### Findings" in body
+    assert "| Severity | Location | Finding | Verified |" in body
+    assert "`a.py:3`" in body and "`b.py`" in body  # line 0 → no :line
+    assert "🟠" in body and "🟡" in body
+    assert "⚠️ uncertain" in body
+
+
+def test_the_pipe_in_a_claim_does_not_break_the_table():
+    body = render_verdict_body(
+        repo="o/r", pr=1, head_sha="a" * 40, verdict="FAIL", report=_REPORT, shadow=False, recipe="code-review"
+    )
+    assert "nested ternary \\| hard to read" in body  # escaped, not a column break
+
+
+def test_the_raw_json_is_still_present_and_recallable():
+    # THE critical property: reflowing to a table must not break prior-round recall,
+    # which reads the findings JSON back out of the posted body.
+    body = render_verdict_body(
+        repo="o/r", pr=1, head_sha="a" * 40, verdict="FAIL", report=_REPORT, shadow=False, recipe="code-review"
+    )
+    assert "<details>" in body  # collapsed, not deleted
+    recalled = extract_findings_json(body)
+    assert json.loads(recalled) == _FINDINGS  # round-trips exactly
+
+
+def test_a_clean_pass_is_left_untouched():
+    clean = "Overall risk: low.\n\n```json\n[]\n```"
+    body = render_verdict_body(
+        repo="o/r", pr=1, head_sha="a" * 40, verdict="PASS", report=clean, shadow=False, recipe="code-review"
+    )
+    assert "### Findings" not in body and "<details>" not in body
+    assert "```json\n[]\n```" in body  # the empty array stays as-is for recall
+
+
+def test_prose_only_report_is_unchanged():
+    prose = "PROTOPATCH UNAVAILABLE\n\nGap: the structural engine timed out."
+    body = render_verdict_body(
+        repo="o/r", pr=1, head_sha="a" * 40, verdict="PASS", report=prose, shadow=False, recipe="code-review"
+    )
+    assert "Gap: the structural engine timed out." in body and "### Findings" not in body
