@@ -296,3 +296,61 @@ def test_an_unsigned_summon_is_rejected_like_any_other_delivery(tmp_path):
     r = TestClient(app).post("/plugins/pr-reviewer/webhook", content=body, headers={"X-GitHub-Event": "issue_comment"})
     assert r.status_code == 403
     assert dispatcher.summons == []
+
+
+# ── replay endpoint (in-process A/B runner, issue #20) ───────────────────────
+
+
+async def test_replay_endpoint_runs_the_panel_and_never_posts(tmp_path):
+
+    class ReplayDispatcher(SpyDispatcher):
+        def _runner(self):
+            async def run(recipe, inputs):
+                return {"output": "brief\n```json\n[]\n```", "failed": [], "timings": {}, "usage": {}}
+
+            return run
+
+        @staticmethod
+        def _parse_findings(output):
+            return []
+
+    dispatcher = ReplayDispatcher()
+    telemetry = Telemetry(tmp_path)
+
+    posted = []
+
+    async def fake_gh(args, timeout=30):
+        if "-X" in args:
+            posted.append(args)
+        if "/files" in " ".join(args):
+            return 0, "x.py\n", ""
+        return 0, "[]", ""
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    _pub, api = build_routers(dispatcher, telemetry, lambda: "s", run_gh_fn=fake_gh)
+    app = FastAPI()
+    app.include_router(api, prefix="/api/plugins/pr-reviewer")
+    r = TestClient(app).post(
+        "/api/plugins/pr-reviewer/replay",
+        json={"row": {"repo": "o/r", "pr": 1, "head": "a" * 40}, "model": "protolabs/fast"},
+    )
+    assert r.status_code == 200
+    runs = r.json()["runs"]
+    assert len(runs) == 1
+    assert runs[0]["run"]["model"] == "protolabs/fast" and runs[0]["verdict"] == "PASS"
+    assert posted == []  # side-effect-free
+
+
+async def test_replay_endpoint_503s_without_a_runner(tmp_path):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    dispatcher = SpyDispatcher()
+    dispatcher._runner = lambda: None
+    _pub, api = build_routers(dispatcher, Telemetry(tmp_path), lambda: "s")
+    app = FastAPI()
+    app.include_router(api, prefix="/api/plugins/pr-reviewer")
+    r = TestClient(app).post("/api/plugins/pr-reviewer/replay", json={"row": {"repo": "o/r", "pr": 1, "head": "a"}})
+    assert r.status_code == 503
