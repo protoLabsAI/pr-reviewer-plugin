@@ -208,6 +208,40 @@ def build_routers(dispatcher, telemetry, get_secret, run_gh_fn=None):
             ),
         }
 
+    @api.post("/replay")
+    async def _replay(body: dict = Body(...)):
+        """Run the panel on pinned rounds off the live-PR path, findings to JSON — the
+        model A/B (qaEngineer#20). MUST run in-process: replay needs the live runner
+        (`STATE.workflow_run`) and the minted GitHub App token, neither of which a fresh
+        CLI process has. Side-effect-free (no GitHub writes), so the gated API is safe.
+
+        Body: `{"manifest": [row, ...]}` or a single `row`, optional `model` / `trials` /
+        `stamp` overriding each row. Returns `{"runs": [run-output, ...]}`.
+        """
+        from .replay import replay_review
+
+        runner = dispatcher._runner()
+        if runner is None:
+            raise HTTPException(status_code=503, detail="no workflow runner — replay needs a live protoAgent host")
+        rows = body.get("manifest") or ([body["row"]] if body.get("row") else [body])
+        model, trials, stamp = body.get("model"), int(body.get("trials") or 1), str(body.get("stamp") or "")
+        runs = []
+        for row in rows:
+            if model:
+                row = {**row, "model": model}
+            for trial in range(trials):
+                runs.append(
+                    await replay_review(
+                        row,
+                        run_gh=run_gh_fn,
+                        runner=runner,
+                        parse_findings=dispatcher._parse_findings,
+                        trial=trial,
+                        stamp=stamp,
+                    )
+                )
+        return {"runs": runs}
+
     @api.get("/eval")
     async def _eval():
         from .eval import build_report
