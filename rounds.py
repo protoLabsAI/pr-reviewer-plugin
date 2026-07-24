@@ -307,24 +307,66 @@ def _anchor(file: object, line: object) -> str:
     return f"{path}:{line}" if isinstance(line, int) else path
 
 
-def unaccounted_priors(history: list[dict], dispositions: list[dict]) -> list[dict]:
-    """Prior blocker/major findings this round neither reported nor dispositioned.
+def _disposition_anchor(row: dict) -> tuple[str, int | None]:
+    """(file, line) a disposition points at — from `file`/`line`, or a `prior` "path:line"."""
+    file = row.get("file")
+    line = row.get("line")
+    if not file and row.get("prior"):
+        prior = str(row["prior"])
+        head, _, tail = prior.rpartition(":")
+        if head and tail.isdigit():
+            file, line = head, int(tail)
+        else:
+            file = prior
+    return _norm(str(file or "")), (line if isinstance(line, int) else None)
+
+
+def unaccounted_priors(
+    history: list[dict],
+    dispositions: list[dict],
+    *,
+    ranges: dict[str, list[tuple[int, int]]] | None = None,
+) -> list[dict]:
+    """Prior blocker/major findings this round neither reported nor honestly dispositioned.
 
     The generalization of `unexplained_clearance`: it applies at ANY verdict, because a
     confirmed major can vanish into a WARN about unrelated nits just as easily as into a
     clean PASS — protoAgent#2150 round 3 did exactly that, and #27's rule (rightly)
     said nothing, because the verdict wasn't a clean PASS.
 
-    Only the LAST substantive round is consulted, same as `unexplained_clearance`: an
-    older finding a later round already handled is settled history, not an open debt.
+    A `fixed` disposition is only honoured when `ranges` shows the flagged line ACTUALLY
+    MOVED. protoAgent#2208 shipped a real major to main because the model emitted
+    `{"prior": "config_routes.py:271", "disposition": "fixed", "why": "verifier confirmed
+    ... resolved in updated diff"}` on a line that is byte-identical across every head —
+    a hallucinated fix, trusted because dispositions were the authority and nothing
+    grounded the claim. This is the #25 lesson (a verdict follows the read, not the story)
+    applied to the disposition itself: a fix that left no trace in the delta is unproven,
+    and an unproven fix does not clear a blocker.
+
+    Fail-CLOSED on `fixed`: without a readable delta a `fixed` claim cannot be verified,
+    so it is not honoured — a real fix with an unreadable compare costs one extra round,
+    a false one shipping a defect costs a production incident. `open`/`refuted` are
+    unchanged: `open` keeps the finding (the block stands on the finding itself), and
+    `refuted` is a claim about the finding's validity, not about a diff that must exist.
+
+    Only the LAST substantive round is consulted, same as `unexplained_clearance`.
     """
     if not dispositions:
         return []
     accounted = set()
     for row in dispositions:
-        anchor = _anchor(row.get("file") or str(row.get("prior") or "").rsplit(":", 1)[0], row.get("line"))
+        disposition = str(row.get("disposition") or "").lower()
+        file, line = _disposition_anchor(row)
+        if disposition == "fixed":
+            # An unverifiable "fixed" accounts for nothing — the finding stays a debt.
+            if ranges is None:
+                continue
+            probe = {"file": file, "line": line}
+            if not in_delta(probe, ranges):
+                continue
+        anchor = f"{file}:{line}" if isinstance(line, int) else file
         accounted.add(anchor)
-        accounted.add(_norm(str(row.get("prior") or "")))
+        accounted.add(file)
     for round_ in reversed(history or []):
         prior = [f for f in (round_.get("findings") or []) if isinstance(f, dict)]
         if not prior:

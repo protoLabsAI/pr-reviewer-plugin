@@ -324,8 +324,13 @@ def test_an_undispositioned_major_is_unaccounted_at_ANY_verdict():
 
 def test_a_dispositioned_major_is_accounted():
     history = [{"head": HEAD_1, "verdict": "FAIL", "findings": [finding(severity="major")]}]
-    for state in ("fixed", "open", "refuted"):
+    # `open`/`refuted` account with no delta needed. `fixed` now REQUIRES the flagged
+    # line to have moved (protoAgent#2208) — verified here by a patch touching store.py:100.
+    for state in ("open", "refuted"):
         assert unaccounted_priors(history, [dispo("store.py:100", state)]) == []
+    fixed_patch = "@@ -97,3 +97,3 @@\n ctx\n-old\n+new line at 100\n"
+    ranges = delta_ranges([{"filename": "store.py", "patch": fixed_patch}])
+    assert unaccounted_priors(history, [dispo("store.py:100", "fixed")], ranges=ranges) == []
 
 
 def test_minors_need_no_disposition():
@@ -368,3 +373,68 @@ def test_line_zero_means_no_line_not_line_zero():
     assert in_delta({"file": "CHANGELOG.md", "line": 0, "severity": "minor"}, ranges) is True
     assert in_delta({"file": "CHANGELOG.md", "line": -1, "severity": "minor"}, ranges) is True
     assert in_delta({"file": "CHANGELOG.md", "line": 300, "severity": "minor"}, ranges) is False  # real line, untouched
+
+
+# ── a `fixed` disposition must be verified against the delta (protoAgent#2208) ─
+
+
+def _major(file="operator_api/config_routes.py", line=271, claim="sync call blocks the event loop"):
+    return {
+        "head": HEAD_1,
+        "verdict": "FAIL",
+        "findings": [finding(file=file, line=line, severity="major", claim=claim)],
+    }
+
+
+def test_a_hallucinated_fixed_on_an_unchanged_line_does_not_clear_the_block():
+    # The real incident: model emitted {"prior":"config_routes.py:271","disposition":
+    # "fixed","why":"verifier confirmed ... resolved in updated diff"} — but line 271 was
+    # byte-identical across every head. The delta touched OTHER files, not that line.
+    history = [_major()]
+    dispo = [{"prior": "operator_api/config_routes.py:271", "disposition": "fixed", "why": "resolved in updated diff"}]
+    ranges = delta_ranges([{"filename": "some/other_file.py", "patch": PATCH}])  # 271 not in here
+    missing = unaccounted_priors(history, dispo, ranges=ranges)
+    assert len(missing) == 1
+    assert missing[0]["line"] == 271  # the block is HELD
+
+
+def test_a_real_fixed_whose_line_moved_does_clear_the_block():
+    history = [_major()]
+    dispo = [{"prior": "operator_api/config_routes.py:271", "disposition": "fixed", "why": "now uses to_thread"}]
+    # the delta touches config_routes.py right where the finding was
+    patch = "@@ -268,3 +268,4 @@\n ctx\n-    _apply_settings_changes(config=updates)\n+    await asyncio.to_thread(_apply_settings_changes, config=updates)\n"
+    ranges = delta_ranges([{"filename": "operator_api/config_routes.py", "patch": patch}])
+    assert unaccounted_priors(history, dispo, ranges=ranges) == []
+
+
+def test_fixed_fails_closed_when_the_delta_is_unreadable():
+    # A `fixed` we cannot verify is not trusted — one extra round beats shipping a defect.
+    history = [_major()]
+    dispo = [{"prior": "operator_api/config_routes.py:271", "disposition": "fixed"}]
+    assert len(unaccounted_priors(history, dispo, ranges=None)) == 1
+
+
+def test_open_and_refuted_do_not_need_a_delta():
+    history = [_major()]
+    ranges = delta_ranges([{"filename": "unrelated.py", "patch": PATCH}])
+    # `open` keeps the finding (block stands on the finding); `refuted` is a validity claim
+    assert (
+        unaccounted_priors(
+            history, [{"prior": "operator_api/config_routes.py:271", "disposition": "open"}], ranges=ranges
+        )
+        == []
+    )
+    assert (
+        unaccounted_priors(
+            history, [{"prior": "operator_api/config_routes.py:271", "disposition": "refuted"}], ranges=ranges
+        )
+        == []
+    )
+
+
+def test_disposition_anchor_parses_prior_path_and_line():
+    from pr_reviewer.rounds import _disposition_anchor
+
+    assert _disposition_anchor({"prior": "a/b.py:42", "disposition": "fixed"}) == ("a/b.py", 42)
+    assert _disposition_anchor({"file": "a/b.py", "line": 42}) == ("a/b.py", 42)
+    assert _disposition_anchor({"prior": "a/b.py"}) == ("a/b.py", None)  # file-level
