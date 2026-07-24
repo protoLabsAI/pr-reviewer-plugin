@@ -145,6 +145,16 @@ structural-trigger dispatch, approve-on-green + sweep, and the review eval.
     error at all: correct code, no event. `GET /api/plugins/pr-reviewer/summon/health`
     reports exactly which events are missing.
 
+- **Replay mode (v0.18.0)** — run the panel against a **pinned checkout+diff**, findings
+  to JSON instead of GitHub, for the model A/B (qaEngineer#20, protoLab#26). Same finders,
+  verify pass, and guards as the live path (it reuses the exact functions, not a fork);
+  the model is a per-run gateway alias (`protolabs/fast` vs `protolabs/smart`) — that's the
+  entire A/B knob. **Side-effect-free**: reads blobs/diffs, never writes. Truncation is
+  first-class — a model that burns its budget on hidden reasoning and emits no answer
+  (`findings=[] & truncated=true`) is distinguished from a clean pass (an emitted `[]`), so
+  a truncated run isn't scored as "found nothing". `python -m pr_reviewer.replay_cli
+  --manifest replay_manifest.jsonl --model protolabs/fast`.
+
 ## Requirements
 
 - protoAgent ≥ the version carrying the findings `source` field (see the manifest pin).
