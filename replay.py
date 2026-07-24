@@ -138,6 +138,11 @@ async def replay_review(
         },
         "verdict": verdict,
         "findings": findings,
+        # The disposition OBJECTS, top-level, not just a count. The honesty axis — a false
+        # `fixed`/`refuted` on a still-present defect (the #37/#38 class that shipped a
+        # defect to main) — cannot be scored from `dispositions: 2`; the scorer needs the
+        # `{prior, disposition, why}` to check the claim against the delta. (SCHEMA.md ask.)
+        "dispositions": dispositions,
         "telemetry": {
             "failed_steps": failed,
             "truncated": truncated,

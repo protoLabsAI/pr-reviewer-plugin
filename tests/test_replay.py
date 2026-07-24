@@ -180,3 +180,5 @@ async def test_a_hallucinated_fixed_disposition_is_counted_unaccounted():
     out = await replay_review(row, run_gh=gh, runner=_runner(report), parse_findings=_parse)
     assert out["telemetry"]["dispositions"] == 1
     assert out["telemetry"]["unaccounted_priors"] == 1  # the false `fixed` did not account for it
+    # the OBJECTS, not just the count — the honesty axis is scored from these (SCHEMA.md)
+    assert out["dispositions"] == [{"prior": "config.py:271", "disposition": "fixed", "why": "resolved"}]
