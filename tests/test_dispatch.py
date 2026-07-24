@@ -1134,17 +1134,40 @@ async def test_a_warn_that_drops_a_prior_major_holds_the_block(tmp_path):
 
 async def test_a_dispositioned_major_lets_the_verdict_clear(tmp_path):
     major = json.dumps([{"file": "x.py", "line": 3, "severity": "major", "claim": "real bug", "evidence": "e"}])
+    # A `fixed` disposition now clears only if the delta shows x.py:3 actually moved.
+    compare = [{"filename": "x.py", "patch": "@@ -1,4 +1,4 @@\n a\n b\n-old line 3\n+fixed line 3\n"}]
     gh = RoutedGH(
         pr_facts=facts(),
         reviews=[review_row(OLD_HEAD, "FAIL", state="CHANGES_REQUESTED", findings_json=major, id=77)],
+        compare=compare,
     )
     runner, _seen = capturing_runner(
         report_with_dispositions([{"prior": "x.py:3", "disposition": "fixed", "why": "guard added"}])
     )
     d = make(tmp_path, cfg={"shadow_mode": False, "evidence_grounding": False}, gh=gh, runner=runner)
     assert (await d.handle_pr_event("o/r", 1, HEAD, "synchronize")) == "reviewed:PASS"
-    assert gh.dismissed  # accounted for → the gate lifts
+    assert gh.dismissed  # verified fix → the gate lifts
     assert "Unaccounted prior finding" not in gh.posted[0]["body"]
+
+
+async def test_a_hallucinated_fixed_disposition_holds_the_block_end_to_end(tmp_path):
+    # protoAgent#2208 exactly: FAIL on x.py:3, then a clean PASS whose report claims
+    # `fixed` — but the delta touches only OTHER files, so x.py:3 never moved.
+    major = json.dumps([{"file": "x.py", "line": 3, "severity": "major", "claim": "real bug", "evidence": "e"}])
+    compare = [{"filename": "unrelated.py", "patch": "@@ -1,2 +1,3 @@\n a\n+b\n c\n"}]
+    gh = RoutedGH(
+        pr_facts=facts(),
+        reviews=[review_row(OLD_HEAD, "FAIL", state="CHANGES_REQUESTED", findings_json=major, id=77)],
+        compare=compare,
+    )
+    runner, _seen = capturing_runner(
+        report_with_dispositions([{"prior": "x.py:3", "disposition": "fixed", "why": "resolved in updated diff"}])
+    )
+    d = make(tmp_path, cfg={"shadow_mode": False, "evidence_grounding": False}, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "synchronize")) == "reviewed:PASS"
+    assert gh.dismissed == []  # the block is HELD — an unverified fix does not clear it
+    assert "Unaccounted prior finding" in gh.posted[0]["body"]
+    assert "real bug" in gh.posted[0]["body"]
 
 
 async def test_a_false_disposition_still_holds_via_the_narrow_rule_when_the_block_is_absent(tmp_path):

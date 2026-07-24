@@ -697,7 +697,15 @@ class Dispatcher:
         # explicit dispositions block the same debt is visible at any verdict. A recipe
         # that emits no block falls back to the narrower rule rather than losing the guard.
         dispositions = parse_dispositions(output) if self.hold_unexplained else []
-        unaccounted = unaccounted_priors(history, dispositions)
+        # A `fixed` disposition is only honoured if the flagged line actually moved
+        # (issue: protoAgent#2208 shipped a major to main on a hallucinated "fixed" that
+        # left the line byte-identical). We need the delta prior-head→head to verify that;
+        # compute it here when there are dispositions and it wasn't already computed for
+        # convergence. Fail-closed: an unreadable delta means `fixed` can't be verified,
+        # so it isn't trusted.
+        if dispositions and ranges is None and prior:
+            ranges = await self._delta_ranges(repo, prior["head"], head)
+        unaccounted = unaccounted_priors(history, dispositions, ranges=ranges)
         # The two guards are a fallback chain, not a belt-and-braces pair. When the panel
         # HAS dispositioned its priors, that statement is the authority — re-applying the
         # clean-PASS heuristic on top would hold a block the panel just explained, making
