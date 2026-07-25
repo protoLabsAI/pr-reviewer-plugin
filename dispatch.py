@@ -54,6 +54,7 @@ from .verdicts import (
     PASS,
     WARN,
     confine_findings,
+    merge_carried_findings,
     parse_verdict_marker,
     render_verdict_body,
     verdict_for,
@@ -716,6 +717,11 @@ class Dispatcher:
         trailer = render_notes_section(notes) + render_grounding_footnote(ungrounded)
         if unaccounted:
             trailer += render_unaccounted_note(unaccounted)
+            # Write the recovered majors into the recorded findings JSON, not just the prose
+            # trailer — else `panel_rounds` rebuilds this round from the (de-escalated) array
+            # and the next round launders the debt away (protoAgent#2283 r3). The carry
+            # propagates until a verified `fixed`/`refuted` clears it from `unaccounted`.
+            output = merge_carried_findings(output, unaccounted)
             self.telemetry.emit(
                 "unaccounted_priors",
                 repo=repo,
