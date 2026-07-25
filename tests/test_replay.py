@@ -182,3 +182,12 @@ async def test_a_hallucinated_fixed_disposition_is_counted_unaccounted():
     assert out["telemetry"]["unaccounted_priors"] == 1  # the false `fixed` did not account for it
     # the OBJECTS, not just the count — the honesty axis is scored from these (SCHEMA.md)
     assert out["dispositions"] == [{"prior": "config.py:271", "disposition": "fixed", "why": "resolved"}]
+
+
+async def test_include_raw_adds_the_report_text_for_faithfulness_debugging():
+    gh = ReplayGH(blob="x")
+    row = {"repo": "o/r", "pr": 1, "head": "a" * 40}
+    off = await replay_review(row, run_gh=gh, runner=_runner(CLEAN_REPORT), parse_findings=_parse)
+    on = await replay_review(row, run_gh=gh, runner=_runner(CLEAN_REPORT), parse_findings=_parse, include_raw=True)
+    assert "raw_report" not in off  # large; off by default
+    assert on["raw_report"] == CLEAN_REPORT  # the exact panel text, to tell found-then-lost from never-found
