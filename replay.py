@@ -100,6 +100,7 @@ async def replay_review(
     result = await runner(recipe, inputs)
     output = str(result.get("output") or "")
     failed = list(result.get("failed") or [])
+    degraded = [str(s) for s in (result.get("degraded") or [])]
     timings = result.get("timings") if isinstance(result.get("timings"), dict) else {}
     usage = result.get("usage") if isinstance(result.get("usage"), dict) else {}
 
@@ -152,6 +153,7 @@ async def replay_review(
         "dispositions": dispositions,
         "telemetry": {
             "failed_steps": failed,
+            "degraded_steps": degraded,  # finders the engine cut off at their `timeout` (graceful)
             "truncated": truncated,
             "confined": len(confined),
             "grounding_checked": grounding_checked,

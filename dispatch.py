@@ -39,6 +39,7 @@ from .rounds import (
     delta_ranges,
     panel_rounds,
     parse_dispositions,
+    render_degraded_note,
     render_held_note,
     render_notes_section,
     render_prior_requests,
@@ -646,6 +647,12 @@ class Dispatcher:
         # panel's cost is nine LLM steps and a single `latency_s` cannot say which one to
         # attack; this is what turns "the panel is slow" into a step name.
         timings = result.get("timings") if isinstance(result.get("timings"), dict) else {}
+        # Steps the engine cut off at their opt-in `timeout` and degraded to an empty Gap
+        # (a slow finder, not a crash — see the recipe's finder `timeout`). Additive: an
+        # engine without the feature omits the key, so this is [] on an older host. A
+        # degraded finder means the panel reviewed with one fewer angle this round; that
+        # is surfaced (telemetry + body note) so it is never a silent gap in coverage.
+        degraded = [str(s) for s in (result.get("degraded") or [])]
         output = str(result.get("output") or "")
         findings, confined = confine_findings(self._parse_findings(output), paths)
         if confined:
@@ -715,6 +722,8 @@ class Dispatcher:
             unexplained_clearance(history, verdict, findings) if (self.hold_unexplained and not dispositions) else None
         )
         trailer = render_notes_section(notes) + render_grounding_footnote(ungrounded)
+        if degraded:
+            trailer += render_degraded_note(degraded)
         if unaccounted:
             trailer += render_unaccounted_note(unaccounted)
             # Write the recovered majors into the recorded findings JSON, not just the prose
@@ -779,6 +788,7 @@ class Dispatcher:
             latency_s=round(elapsed, 1),
             step_s=timings or None,
             slowest_step=(max(timings, key=timings.get) if timings else None),
+            degraded=degraded or None,
             posted=posted,
             shadow=self.shadow,
         )

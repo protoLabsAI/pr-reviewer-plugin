@@ -29,6 +29,15 @@ version: 1
 # (~136s of the p50 on 60 measured reviews). Needs protoAgent's recipe-declared fan-out
 # width; an older host ignores the key and behaves exactly as before.
 max_concurrency: 5
+# Each parallel finder carries a time budget. With no engine-level timeout a hung finder
+# stalls the whole panel forever, and the slowest finder (cross-file, p90 ~740s over 169
+# measured reviews, and the top exhaustion cause) sets the review latency floor unbounded.
+# On timeout the engine degrades that finder to an empty Gap (graceful — `degraded`, not
+# `failed`) so the panel reviews with one fewer angle instead of exhausting into no verdict.
+# 900s is deliberately conservative — just above both slow finders' p95 (crossfile 841s,
+# correctness 774s) — so it rescues the exhaustion/hang tail while rarely touching a
+# productive run; tune down as the eval harness's labeled set grows. Needs an engine that
+# honours the step `timeout` key; an older engine ignores it (the panel is unchanged).
 inputs:
   - name: pr
     description: The pull-request number to review.
@@ -78,6 +87,7 @@ inputs:
 steps:
   - id: find_correctness
     subagent: review-finder
+    timeout: 900
     prompt: |
       Review PR #{{inputs.pr}} (repo: "{{inputs.repo}}" — empty means the
       default repo). Your assigned angle: **correctness**. Logic errors,
@@ -113,6 +123,7 @@ steps:
 
   - id: find_removed_behavior
     subagent: review-finder
+    timeout: 900
     prompt: |
       Review PR #{{inputs.pr}} (repo: "{{inputs.repo}}" — empty means the
       default repo). Your assigned angle: **removed or changed behavior**. Read
@@ -149,6 +160,7 @@ steps:
 
   - id: find_crossfile
     subagent: review-finder
+    timeout: 900
     prompt: |
       Review PR #{{inputs.pr}} (repo: "{{inputs.repo}}" — empty means the
       default repo). Your assigned angle: **cross-file consistency**. Signatures
@@ -185,6 +197,7 @@ steps:
 
   - id: find_conventions
     subagent: review-finder
+    timeout: 900
     prompt: |
       Review PR #{{inputs.pr}} (repo: "{{inputs.repo}}" — empty means the
       default repo). Your assigned angle: **conventions and hygiene**. The
@@ -227,6 +240,7 @@ steps:
 
   - id: find_structural
     subagent: structural-finder
+    timeout: 900
     prompt: |
       Run the structural pass on PR #{{inputs.pr}} (repo: "{{inputs.repo}}" —
       empty means the default repo): call protopatch_review once and relay its
