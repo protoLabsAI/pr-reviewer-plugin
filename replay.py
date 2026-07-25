@@ -58,6 +58,7 @@ async def replay_review(
     parse_findings,
     trial: int = 0,
     stamp: str = "",
+    include_raw: bool = False,
 ) -> dict:
     """Run the panel against one pinned round and return the JSON run-output.
 
@@ -76,6 +77,11 @@ async def replay_review(
 
     Time and randomness are passed in (`stamp`, `trial`), never read here — a replay must
     be reproducible and stamping happens outside.
+
+    `include_raw` adds the panel's raw report text to the output. Off by default (it's
+    large), but when a run truncates or misses a known defect it's the only way to tell
+    found-then-lost (a finder flagged it, synthesize/report dropped it) from never-found
+    — the exact question the #2208 smoke-test raised.
     """
     repo = str(row["repo"])
     pr = int(row["pr"])
@@ -138,6 +144,7 @@ async def replay_review(
         },
         "verdict": verdict,
         "findings": findings,
+        **({"raw_report": output} if include_raw else {}),
         # The disposition OBJECTS, top-level, not just a count. The honesty axis — a false
         # `fixed`/`refuted` on a still-present defect (the #37/#38 class that shipped a
         # defect to main) — cannot be scored from `dispositions: 2`; the scorer needs the
