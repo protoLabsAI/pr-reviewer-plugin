@@ -13,6 +13,7 @@ from pr_reviewer.rounds import (
     in_delta,
     panel_rounds,
     parse_dispositions,
+    render_degraded_note,
     render_held_note,
     render_notes_section,
     render_prior_requests,
@@ -290,6 +291,14 @@ def test_held_note_names_the_finding_and_the_way_out():
     assert "does not lift the standing block" in note
     assert "store.py:100" in note and "null slips the guard" in note
     assert "second consecutive clean PASS" in note  # the escape hatch is documented
+
+
+def test_degraded_note_names_the_skipped_finders():
+    note = render_degraded_note(["find_crossfile", "find_correctness"])
+    assert "2 panel step(s) hit their time budget" in note
+    assert "`find_crossfile`" in note and "`find_correctness`" in note
+    assert "could be missed" in note  # honest about the coverage gap
+    assert render_degraded_note([]) == ""  # silent when nothing degraded
 
 
 # ── prior-finding dispositions: #26 in its general form ──────────────────────

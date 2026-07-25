@@ -217,6 +217,7 @@ def render_verdict_body(
     recipe: str,
     confined: list[dict] | None = None,
     notes: str = "",
+    complete: bool = True,
 ) -> str:
     """The comment body: marker line (machine) + header (human) + the panel's report,
     plus a confinement footnote when findings were excluded — the report's own JSON
@@ -235,8 +236,16 @@ def render_verdict_body(
             f"\n\n---\n_{len(confined)} finding(s) excluded from the verdict by in-diff "
             f"confinement (file not among this PR's changed paths):_\n{lines}"
         )
+    # `complete=false` records that a finder meant to run didn't (protoPatch down, a
+    # finder timeout) — the promotion gate reads it to refuse auto-approve on a clean
+    # verdict over incomplete coverage (#49). Emitted only when incomplete, so a normal
+    # marker is unchanged and an older marker parses as complete by default.
+    marker = f"<!-- protoagent-qa-review head={head_sha} verdict={verdict} promoted=false"
+    if not complete:
+        marker += " complete=false"
+    marker += " -->"
     return (
-        f"<!-- protoagent-qa-review head={head_sha} verdict={verdict} promoted=false -->\n"
+        f"{marker}\n"
         f"## QA panel review — **{verdict}**\n"
         f"_{recipe} · head `{head_sha[:12]}` · {mode}_\n\n"
         f"{reflow_report(report)}{footnote}{notes}"
@@ -248,10 +257,15 @@ def parse_verdict_marker(body: str) -> dict | None:
     m = _MARKER_RE.search(body or "")
     if not m:
         return None
+    # `complete` is a trailing attribute (absorbed by the marker's key=value tail); read
+    # it out of the matched marker text. Absent ⇒ True (markers predate the attribute and
+    # a plain review IS complete) — only an explicit `complete=false` withholds promotion.
+    complete = "complete=false" not in m.group(0)
     return {
         "head": m.group("head"),
         "verdict": m.group("verdict"),
         "promoted": m.group("promoted") == "true",
+        "complete": complete,
     }
 
 

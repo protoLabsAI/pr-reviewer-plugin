@@ -33,12 +33,14 @@ from .approve import HOLD_NOT_OWNER, PROMOTE, Observations, promotion_decision
 from .chokepoint import DISPATCH_ACTIONS, Chokepoint
 from .gh_cli import bad_repo, run_gh
 from .grounding import apply_grounding, render_grounding_footnote
+from .protopatch import UNAVAILABLE_PREFIX
 from .rounds import (
     DEFAULT_CONVERGENCE_ROUNDS,
     converge,
     delta_ranges,
     panel_rounds,
     parse_dispositions,
+    render_degraded_note,
     render_held_note,
     render_notes_section,
     render_prior_requests,
@@ -646,6 +648,22 @@ class Dispatcher:
         # panel's cost is nine LLM steps and a single `latency_s` cannot say which one to
         # attack; this is what turns "the panel is slow" into a step name.
         timings = result.get("timings") if isinstance(result.get("timings"), dict) else {}
+        # Steps the engine cut off at their opt-in `timeout` and degraded to an empty Gap
+        # (a slow finder, not a crash — see the recipe's finder `timeout`). Additive: an
+        # engine without the feature omits the key, so this is [] on an older host. A
+        # degraded finder means the panel reviewed with one fewer angle this round; that
+        # is surfaced (telemetry + body note) so it is never a silent gap in coverage.
+        degraded = [str(s) for s in (result.get("degraded") or [])]
+        # Panel completeness (#49): did every finder meant to run actually run? The
+        # structural finder degrades to a `PROTOPATCH UNAVAILABLE` Gap on a gateway/clone
+        # failure WITHOUT failing the step, so it's invisible to `failed`/`degraded` — read
+        # the raw step output for the token. A degraded (timed-out) finder also leaves a
+        # coverage hole. An incomplete panel still POSTS its verdict, but the marker records
+        # `complete=false` so the promotion gate refuses to auto-approve a clean-looking
+        # verdict that was produced over code a finder never examined.
+        steps_out = result.get("steps") if isinstance(result.get("steps"), dict) else {}
+        structural_unavailable = UNAVAILABLE_PREFIX in str(steps_out.get("find_structural") or "")
+        complete = not structural_unavailable and not degraded
         output = str(result.get("output") or "")
         findings, confined = confine_findings(self._parse_findings(output), paths)
         if confined:
@@ -715,6 +733,8 @@ class Dispatcher:
             unexplained_clearance(history, verdict, findings) if (self.hold_unexplained and not dispositions) else None
         )
         trailer = render_notes_section(notes) + render_grounding_footnote(ungrounded)
+        if degraded:
+            trailer += render_degraded_note(degraded)
         if unaccounted:
             trailer += render_unaccounted_note(unaccounted)
             # Write the recovered majors into the recorded findings JSON, not just the prose
@@ -754,6 +774,7 @@ class Dispatcher:
             confined=confined,
             notes=trailer,
             hold_blocks=bool(dropped_finding) or bool(unaccounted),
+            complete=complete,
         )
         self.telemetry.emit(
             "reviewed",
@@ -779,6 +800,9 @@ class Dispatcher:
             latency_s=round(elapsed, 1),
             step_s=timings or None,
             slowest_step=(max(timings, key=timings.get) if timings else None),
+            degraded=degraded or None,
+            complete=complete,
+            structural_unavailable=structural_unavailable or None,
             posted=posted,
             shadow=self.shadow,
         )
@@ -810,6 +834,7 @@ class Dispatcher:
         confined: list[dict] | None = None,
         notes: str = "",
         hold_blocks: bool = False,
+        complete: bool = True,
     ) -> bool:
         body = render_verdict_body(
             repo=repo,
@@ -821,6 +846,7 @@ class Dispatcher:
             recipe=recipe,
             confined=confined,
             notes=notes,
+            complete=complete,
         )
         event = "COMMENT"
         if not self.shadow and verdict == FAIL:
@@ -992,6 +1018,9 @@ class Dispatcher:
             verdict_head=clear["head"] if clear else None,
             verdict_promoted=promoted,
             promotion_owner=self.promotion_owner and not self.shadow,
+            # Only a clear verdict from a COMPLETE panel may auto-approve (#49): an
+            # incomplete pass (a finder was down) holds until a full pass clears the head.
+            complete=bool(clear.get("complete", True)) if clear else True,
         )
         backoff_key = f"{repo}#{pr}@{head}"
         if self._promote_failures.get(backoff_key, 0) >= PROMOTE_MAX_FAILURES:

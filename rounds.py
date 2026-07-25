@@ -94,7 +94,14 @@ def panel_rounds(reviews: list[dict]) -> list[dict]:
             except json.JSONDecodeError:
                 parsed = []
             findings = [f for f in parsed if isinstance(f, dict)] if isinstance(parsed, list) else []
-        by_head[head] = {"head": head, "verdict": str(review.get("verdict") or ""), "findings": findings}
+        by_head[head] = {
+            "head": head,
+            "verdict": str(review.get("verdict") or ""),
+            "findings": findings,
+            # Carried from the marker so the promotion gate can refuse a clean verdict
+            # that was produced over incomplete coverage (#49). Absent ⇒ complete.
+            "complete": bool(review.get("complete", True)),
+        }
     return list(by_head.values())
 
 
@@ -457,6 +464,21 @@ def render_held_note(finding: dict) -> str:
         "(issue #26). Either the fix landed (say so, and the next review will corroborate and "
         "lift), or the panel missed it on this draw. A second consecutive clean PASS lifts the "
         "block automatically; an operator can also dismiss this review directly."
+    )
+
+
+def render_degraded_note(degraded: list[str]) -> str:
+    """Names the finder(s) the engine cut off at their time budget this round. A review
+    that ran with fewer angles must say so — the same contract the grounding and
+    confinement footnotes keep. A degraded finder is not a failure (the panel still
+    produced a verdict), it is a coverage gap the reader should weigh."""
+    if not degraded:
+        return ""
+    steps = ", ".join(f"`{s}`" for s in degraded)
+    return (
+        f"\n\n---\n_{len(degraded)} panel step(s) hit their time budget and were skipped this "
+        f"round: {steps}. The verdict stands on the remaining angles; a finding only that step "
+        f"would have caught could be missed — the next push re-runs the full panel._"
     )
 
 

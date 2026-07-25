@@ -33,6 +33,7 @@ HOLD_NO_CLEAR_VERDICT = "hold:no-clear-verdict"
 HOLD_STALE_HEAD = "hold:stale-head"
 HOLD_ALREADY_PROMOTED = "hold:already-promoted"
 HOLD_NOT_OWNER = "hold:not-promotion-owner"
+HOLD_INCOMPLETE = "hold:incomplete-coverage"
 
 
 @dataclass(frozen=True)
@@ -50,6 +51,12 @@ class Observations:
     verdict_head: str | None
     verdict_promoted: bool  # the posted marker's promoted flag
     promotion_owner: bool  # this agent owns COMMENTED→APPROVE promotion for the repo
+    # Did the panel that produced the clear verdict actually COVER the code — i.e. did
+    # every finder that was meant to run actually run? A PASS emitted while a finder was
+    # down (protoPatch gateway failure, a finder timeout) is a clean verdict on
+    # incomplete analysis, and must not auto-approve (#49). Defaults True so a marker
+    # from before this field existed is not retroactively treated as incomplete.
+    complete: bool = True
 
 
 def promotion_decision(obs: Observations) -> str:
@@ -63,6 +70,12 @@ def promotion_decision(obs: Observations) -> str:
         return HOLD_STALE_HEAD
     if obs.verdict_promoted:
         return HOLD_ALREADY_PROMOTED
+    if not obs.complete:
+        # A clear verdict on incomplete coverage is not earned: a finder that was meant
+        # to run didn't (protoPatch down, a finder timed out), so "no findings" is
+        # "nobody looked", not "nothing there". Auto-approve is exactly the leg that can
+        # ship an unreviewed PR — hold until a COMPLETE pass clears the head (#49).
+        return HOLD_INCOMPLETE
     if obs.checks_state is None:
         return HOLD_CHECKS_UNKNOWN
     if obs.checks_state == "pending":

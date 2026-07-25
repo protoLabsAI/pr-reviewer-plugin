@@ -48,10 +48,16 @@ class ReplayGH:
         return 0, "", ""
 
 
-def _runner(output, *, failed=None, timings=None, usage=None):
+def _runner(output, *, failed=None, timings=None, usage=None, degraded=None):
     async def run(recipe, inputs):
         run.seen = {"recipe": recipe, "inputs": inputs}
-        return {"output": output, "failed": failed or [], "timings": timings or {}, "usage": usage or {}}
+        return {
+            "output": output,
+            "failed": failed or [],
+            "degraded": degraded or [],
+            "timings": timings or {},
+            "usage": usage or {},
+        }
 
     return run
 
@@ -139,6 +145,23 @@ async def test_a_failed_panel_step_is_not_labelled_truncation():
         parse_findings=_parse,
     )
     assert out["telemetry"]["truncated"] is False and out["telemetry"]["failed_steps"] == ["find_correctness"]
+
+
+async def test_a_degraded_finder_is_surfaced_and_is_not_a_failure():
+    # A finder cut off at its timeout degrades gracefully — the panel still produces a
+    # verdict from the other angles. The scorer must see it (measuring the latency/recall
+    # tradeoff), distinct from a failed step.
+    gh = ReplayGH(blob="def f():\n    return 1\n")
+    out = await replay_review(
+        {"repo": "o/r", "pr": 1, "head": "a" * 40},
+        run_gh=gh,
+        runner=_runner(CLEAN_REPORT, degraded=["find_crossfile"]),
+        parse_findings=_parse,
+    )
+    assert out["telemetry"]["degraded_steps"] == ["find_crossfile"]
+    assert out["telemetry"]["failed_steps"] == []  # degraded is not failed
+    assert out["telemetry"]["truncated"] is False  # the report still landed
+    assert out["verdict"] == "PASS"  # a verdict was still produced
 
 
 # ── the guards run authentically, on pinned input ─────────────────────────────
