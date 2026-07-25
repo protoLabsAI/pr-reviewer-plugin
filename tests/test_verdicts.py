@@ -194,7 +194,11 @@ _MAJOR = {"file": "chat_routes.py", "line": 262, "severity": "major", "claim": "
 
 def test_carried_major_lands_in_the_recorded_findings_json():
     # This round de-escalated to a nit; the recovered major must still be recallable.
-    report = "Round 2.\n\n```json\n" + json.dumps([{"file": "chat_routes.py", "severity": "nit", "claim": "style"}]) + "\n```"
+    report = (
+        "Round 2.\n\n```json\n"
+        + json.dumps([{"file": "chat_routes.py", "severity": "nit", "claim": "style"}])
+        + "\n```"
+    )
     merged = merge_carried_findings(report, [_MAJOR])
     recalled = json.loads(extract_findings_json(merged))
     majors = [f for f in recalled if f["severity"] == "major"]
