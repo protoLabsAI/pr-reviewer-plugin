@@ -365,6 +365,9 @@ async def test_promotion_holds_in_shadow_or_without_ownership(tmp_path):
     d = make(tmp_path, gh=gh)  # shadow default, not owner
     assert (await d.evaluate_promotion("o/r", 1)) == "hold:not-promotion-owner"
     assert gh.posted == []
+    # Short-circuit: a structurally-impossible promotion does ZERO GitHub reads — the
+    # decision is fixed before any facts/reviews/checks/threads fetch (sweep-cost win).
+    assert gh.calls == []
 
 
 async def test_promotion_dedups_per_head_via_review_state(tmp_path):

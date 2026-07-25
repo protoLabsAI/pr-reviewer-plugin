@@ -29,7 +29,7 @@ import os
 import re
 import time
 
-from .approve import PROMOTE, Observations, promotion_decision
+from .approve import HOLD_NOT_OWNER, PROMOTE, Observations, promotion_decision
 from .chokepoint import DISPATCH_ACTIONS, Chokepoint
 from .gh_cli import bad_repo, run_gh
 from .grounding import apply_grounding, render_grounding_footnote
@@ -961,6 +961,15 @@ class Dispatcher:
     async def evaluate_promotion(self, repo: str, pr: int) -> str:
         """One PR through the approve-on-green pure function; applies only when we own
         promotion AND not shadow. Every hold is telemetered (the dry-run evidence)."""
+        # Short-circuit BEFORE any GitHub read when promotion is structurally impossible:
+        # not the owner, or in shadow. `promotion_decision` returns HOLD_NOT_OWNER first
+        # thing in that case regardless of facts/reviews/checks/threads, so the four reads
+        # below are pure waste on every sweep pass for every PR. On a non-owner/shadow
+        # posture that was the bulk of the sweep's GitHub traffic (audit: 62% of promotion
+        # evals). Same decision, same telemetry — just without the I/O.
+        if not (self.promotion_owner and not self.shadow):
+            self.telemetry.emit("promotion", repo=repo, pr=pr, decision=HOLD_NOT_OWNER)
+            return HOLD_NOT_OWNER
         facts = await self._pr_facts(repo, pr)
         if not facts or facts.get("state") != "open" or facts.get("draft"):
             return "hold:pr-not-eligible"
