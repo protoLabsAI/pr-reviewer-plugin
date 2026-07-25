@@ -7,6 +7,7 @@ from pr_reviewer.approve import (
     HOLD_CHECKS_FAILED,
     HOLD_CHECKS_PENDING,
     HOLD_CHECKS_UNKNOWN,
+    HOLD_INCOMPLETE,
     HOLD_NO_CLEAR_VERDICT,
     HOLD_NOT_OWNER,
     HOLD_STALE_HEAD,
@@ -58,3 +59,14 @@ def test_promotion_ownership_gates_everything():
     # Two promoters racing is how double-merges happen — not-owner holds even on
     # a perfectly green PR (Quinn keeps promotion until per-repo handover).
     assert promotion_decision(obs(promotion_owner=False)) == HOLD_NOT_OWNER
+
+
+def test_incomplete_coverage_holds_even_on_a_perfectly_green_pass():
+    # #49: a clear verdict from a panel where a finder didn't run (protoPatch gateway
+    # failure, a finder timeout) is a clean-looking PASS over code nobody examined — it
+    # must not auto-approve, even with green checks and zero unresolved threads.
+    assert promotion_decision(obs(complete=False)) == HOLD_INCOMPLETE
+    # ... and a complete pass on the same otherwise-green facts still promotes.
+    assert promotion_decision(obs(complete=True)) == PROMOTE
+    # completeness defaults True, so a marker from before the field promotes as before.
+    assert promotion_decision(obs()) == PROMOTE

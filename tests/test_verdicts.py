@@ -43,7 +43,7 @@ def test_body_marker_roundtrip():
         recipe="code-review",
     )
     marker = parse_verdict_marker(body)
-    assert marker == {"head": "a" * 40, "verdict": WARN, "promoted": False}
+    assert marker == {"head": "a" * 40, "verdict": WARN, "promoted": False, "complete": True}
     assert "shadow" in body and "QA panel review" in body
 
 
@@ -111,13 +111,44 @@ def test_a_marker_with_trailing_attributes_still_parses():
     # every sweep tick. 20+ duplicate APPROVE reviews before it was caught.
     body = "<!-- protoagent-qa-review head=abc1234 verdict=WARN promoted=true findings=1 -->\nPromoting..."
     m = parse_verdict_marker(body)
-    assert m == {"head": "abc1234", "verdict": "WARN", "promoted": True}
+    assert m == {"head": "abc1234", "verdict": "WARN", "promoted": True, "complete": True}
 
 
 def test_unknown_future_attributes_do_not_break_the_marker():
     body = "<!-- protoagent-qa-review head=abc1234 verdict=PASS promoted=false findings=0 mode=shadow x=1 -->"
     m = parse_verdict_marker(body)
     assert m and m["head"] == "abc1234" and m["verdict"] == "PASS" and m["promoted"] is False
+
+
+def test_incomplete_marker_records_and_parses_complete_false():
+    # #49: a review produced while a finder was down stamps `complete=false`; the promotion
+    # gate reads it. A complete review omits the attribute (marker unchanged), and an older
+    # marker without it parses as complete.
+    incomplete = render_verdict_body(
+        repo="o/r",
+        pr=1,
+        head_sha="a" * 40,
+        verdict="PASS",
+        report="ok\n\n```json\n[]\n```",
+        shadow=False,
+        recipe="code-review-structural",
+        complete=False,
+    )
+    assert "complete=false" in incomplete
+    assert parse_verdict_marker(incomplete)["complete"] is False
+    complete = render_verdict_body(
+        repo="o/r",
+        pr=1,
+        head_sha="a" * 40,
+        verdict="PASS",
+        report="ok\n\n```json\n[]\n```",
+        shadow=False,
+        recipe="code-review-structural",
+        complete=True,
+    )
+    assert "complete=" not in complete  # omitted when complete — normal marker
+    assert parse_verdict_marker(complete)["complete"] is True
+    assert parse_verdict_marker("<!-- protoagent-qa-review head=abc1234 verdict=PASS -->")["complete"] is True
 
 
 def test_the_plain_marker_forms_still_parse():

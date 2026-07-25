@@ -108,7 +108,7 @@ async def test_self_authored_pr_drops(tmp_path):
 # ── recall: reaffirm + delta ──────────────────────────────────────────────────
 
 
-def review_row(head, verdict, state="COMMENTED", findings_json="", id=None):
+def review_row(head, verdict, state="COMMENTED", findings_json="", id=None, complete=True):
     body = render_verdict_body(
         repo="o/r",
         pr=1,
@@ -117,6 +117,7 @@ def review_row(head, verdict, state="COMMENTED", findings_json="", id=None):
         report=f"prose\n```json\n{findings_json or '[]'}\n```",
         shadow=True,
         recipe="code-review",
+        complete=complete,
     )
     return {"state": state, "body": body, "id": id}
 
@@ -368,6 +369,35 @@ async def test_promotion_holds_in_shadow_or_without_ownership(tmp_path):
     # Short-circuit: a structurally-impossible promotion does ZERO GitHub reads — the
     # decision is fixed before any facts/reviews/checks/threads fetch (sweep-cost win).
     assert gh.calls == []
+
+
+async def test_promotion_holds_on_an_incomplete_clear_verdict(tmp_path):
+    # #49: a clean PASS produced while a finder was down must not auto-approve, even on
+    # perfectly green CI. The clearing review's marker carries complete=false.
+    green = [{"status": "completed", "conclusion": "success"}]
+    gh = RoutedGH(pr_facts=facts(), reviews=[review_row(HEAD, "PASS", complete=False)], checks=green)
+    d = make(tmp_path, cfg={"shadow_mode": False, "promotion_owner": True}, gh=gh)
+    assert (await d.evaluate_promotion("o/r", 1)) == "hold:incomplete-coverage"
+    assert gh.posted == []  # held, not approved
+
+
+async def test_a_structural_gateway_failure_stamps_complete_false_on_the_verdict(tmp_path):
+    # End to end: protoPatch returns its PROTOPATCH UNAVAILABLE Gap (gateway auth/config),
+    # the LLM finders find nothing, so the verdict is a clean PASS — but the marker records
+    # complete=false so the promotion gate above will refuse to auto-approve it.
+    gh = RoutedGH(pr_facts=facts(changed_files=6, additions=300, deletions=50), files="x.py\nb\nc\nd\ne\nf\n")
+
+    async def runner(name, inputs):
+        return {
+            "output": CLEAN_REPORT,
+            "failed": [],
+            "steps": {"find_structural": "PROTOPATCH UNAVAILABLE — gateway auth/config failure\n\nGap: ..."},
+        }
+
+    d = make(tmp_path, cfg={"shadow_mode": False}, gh=gh, runner=runner)
+    out = await d.handle_pr_event("o/r", 1, HEAD, "opened")
+    assert out == "reviewed:PASS"
+    assert "complete=false" in gh.posted[0]["body"]
 
 
 async def test_promotion_dedups_per_head_via_review_state(tmp_path):

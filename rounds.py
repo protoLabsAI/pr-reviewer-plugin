@@ -94,7 +94,14 @@ def panel_rounds(reviews: list[dict]) -> list[dict]:
             except json.JSONDecodeError:
                 parsed = []
             findings = [f for f in parsed if isinstance(f, dict)] if isinstance(parsed, list) else []
-        by_head[head] = {"head": head, "verdict": str(review.get("verdict") or ""), "findings": findings}
+        by_head[head] = {
+            "head": head,
+            "verdict": str(review.get("verdict") or ""),
+            "findings": findings,
+            # Carried from the marker so the promotion gate can refuse a clean verdict
+            # that was produced over incomplete coverage (#49). Absent ⇒ complete.
+            "complete": bool(review.get("complete", True)),
+        }
     return list(by_head.values())
 
 
