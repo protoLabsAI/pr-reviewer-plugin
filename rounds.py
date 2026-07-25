@@ -345,9 +345,17 @@ def unaccounted_priors(
 
     Fail-CLOSED on `fixed`: without a readable delta a `fixed` claim cannot be verified,
     so it is not honoured — a real fix with an unreadable compare costs one extra round,
-    a false one shipping a defect costs a production incident. `open`/`refuted` are
-    unchanged: `open` keeps the finding (the block stands on the finding itself), and
-    `refuted` is a claim about the finding's validity, not about a diff that must exist.
+    a false one shipping a defect costs a production incident.
+
+    `open` does NOT clear a prior blocker/major (protoAgent#2283). The original design
+    assumed `open` meant "carried into the current findings at its severity", so the block
+    would stand on the finding itself. It doesn't hold: on #2283 the panel dispositioned
+    three still-present majors `open` ("PR does not address this — still exists") but
+    re-graded the FINDINGS major→minor/nit, dropping the verdict FAIL→WARN and lifting the
+    block on two real bugs (uncaught ValueError→500, session collision). An `open` blocker
+    is still blocking — the disposition IS the panel confirming the defect persists — so it
+    is treated as unaccounted, whatever severity the re-report used. Only a verified `fixed`
+    or a `refuted` clears a prior blocker/major.
 
     Only the LAST substantive round is consulted, same as `unexplained_clearance`.
     """
@@ -357,6 +365,9 @@ def unaccounted_priors(
     for row in dispositions:
         disposition = str(row.get("disposition") or "").lower()
         file, line = _disposition_anchor(row)
+        if disposition == "open":
+            # Still present by the panel's own admission — never clears a blocker/major.
+            continue
         if disposition == "fixed":
             # An unverifiable "fixed" accounts for nothing — the finding stays a debt.
             if ranges is None:

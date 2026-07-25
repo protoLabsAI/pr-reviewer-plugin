@@ -324,13 +324,14 @@ def test_an_undispositioned_major_is_unaccounted_at_ANY_verdict():
 
 def test_a_dispositioned_major_is_accounted():
     history = [{"head": HEAD_1, "verdict": "FAIL", "findings": [finding(severity="major")]}]
-    # `open`/`refuted` account with no delta needed. `fixed` now REQUIRES the flagged
-    # line to have moved (protoAgent#2208) — verified here by a patch touching store.py:100.
-    for state in ("open", "refuted"):
-        assert unaccounted_priors(history, [dispo("store.py:100", state)]) == []
+    # `refuted` accounts with no delta. `fixed` REQUIRES the flagged line to have moved
+    # (protoAgent#2208). `open` does NOT account — an open blocker is still blocking
+    # (protoAgent#2283) — so it is asserted separately, below.
+    assert unaccounted_priors(history, [dispo("store.py:100", "refuted")]) == []
     fixed_patch = "@@ -97,3 +97,3 @@\n ctx\n-old\n+new line at 100\n"
     ranges = delta_ranges([{"filename": "store.py", "patch": fixed_patch}])
     assert unaccounted_priors(history, [dispo("store.py:100", "fixed")], ranges=ranges) == []
+    assert unaccounted_priors(history, [dispo("store.py:100", "open")]) != []  # open holds
 
 
 def test_minors_need_no_disposition():
@@ -414,22 +415,13 @@ def test_fixed_fails_closed_when_the_delta_is_unreadable():
     assert len(unaccounted_priors(history, dispo, ranges=None)) == 1
 
 
-def test_open_and_refuted_do_not_need_a_delta():
+def test_refuted_does_not_need_a_delta_but_open_now_holds():
     history = [_major()]
     ranges = delta_ranges([{"filename": "unrelated.py", "patch": PATCH}])
-    # `open` keeps the finding (block stands on the finding); `refuted` is a validity claim
-    assert (
-        unaccounted_priors(
-            history, [{"prior": "operator_api/config_routes.py:271", "disposition": "open"}], ranges=ranges
-        )
-        == []
-    )
-    assert (
-        unaccounted_priors(
-            history, [{"prior": "operator_api/config_routes.py:271", "disposition": "refuted"}], ranges=ranges
-        )
-        == []
-    )
+    # `refuted` is a validity claim, no diff to check → clears.
+    assert unaccounted_priors(history, [dispo("operator_api/config_routes.py:271", "refuted")], ranges=ranges) == []
+    # `open` = still present → holds, whatever the current re-report graded it (#2283).
+    assert len(unaccounted_priors(history, [dispo("operator_api/config_routes.py:271", "open")], ranges=ranges)) == 1
 
 
 def test_disposition_anchor_parses_prior_path_and_line():
@@ -438,3 +430,48 @@ def test_disposition_anchor_parses_prior_path_and_line():
     assert _disposition_anchor({"prior": "a/b.py:42", "disposition": "fixed"}) == ("a/b.py", 42)
     assert _disposition_anchor({"file": "a/b.py", "line": 42}) == ("a/b.py", 42)
     assert _disposition_anchor({"prior": "a/b.py"}) == ("a/b.py", None)  # file-level
+
+
+# ── an `open` disposition on a prior major does NOT clear the block (#2283) ────
+
+
+def test_an_open_disposition_on_a_prior_major_holds_the_block():
+    # protoAgent#2283: r1 posted 3 majors (uncaught ValueError->500, session collision).
+    # r2 dispositioned all `open` ("PR does not address this - still exists") but re-graded
+    # the findings major->minor/nit, so the verdict dropped FAIL->WARN and the block lifted.
+    # The bugs were byte-for-byte still present. An open blocker is still blocking.
+    history = [
+        {
+            "head": HEAD_1,
+            "verdict": "FAIL",
+            "findings": [
+                finding(file="chat_routes.py", line=252, severity="major", claim="int() -> 500"),
+                finding(file="chat_routes.py", line=371, severity="major", claim="session collision"),
+            ],
+        }
+    ]
+    dispo = [
+        {"prior": "chat_routes.py:252", "disposition": "open", "why": "still exists"},
+        {"prior": "chat_routes.py:371", "disposition": "open", "why": "still exists"},
+    ]
+    # the delta moved the lines (unrelated edits shifted them) — but `open` says unfixed
+    ranges = delta_ranges([{"filename": "chat_routes.py", "patch": PATCH}])
+    missing = unaccounted_priors(history, dispo, ranges=ranges)
+    assert len(missing) == 2  # both majors held — `open` did not clear them
+
+
+def test_open_does_not_clear_even_when_the_line_moved():
+    # The specific trap: `open` + a moved line must not be mistaken for a verified fix.
+    history = [_major(line=100)]
+    moved = "@@ -97,3 +97,4 @@\n a\n-x\n+y\n+z\n"
+    ranges = delta_ranges([{"filename": "operator_api/config_routes.py", "patch": moved}])
+    assert len(unaccounted_priors(history, [dispo("operator_api/config_routes.py:100", "open")], ranges=ranges)) == 1
+
+
+def test_fixed_and_refuted_still_clear_after_the_open_change():
+    # The fix must not break the legitimate clearances.
+    history = [_major(line=100)]
+    fixed_patch = "@@ -97,3 +97,3 @@\n a\n-old\n+new at 100\n"
+    ranges = delta_ranges([{"filename": "operator_api/config_routes.py", "patch": fixed_patch}])
+    assert unaccounted_priors(history, [dispo("operator_api/config_routes.py:100", "fixed")], ranges=ranges) == []
+    assert unaccounted_priors(history, [dispo("operator_api/config_routes.py:100", "refuted")], ranges=None) == []
