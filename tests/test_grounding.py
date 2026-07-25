@@ -199,3 +199,67 @@ def test_an_over_long_quote_is_not_checkable():
 def test_the_2138_fabrication_is_STILL_caught():
     # The positive control: tightening the filter must not lose the real catch.
     assert ground_finding(FABRICATED, WRITABLE_DIR_SRC)[0] is False
+
+
+# ── tolerance: quote-STYLE and ellipsis ABBREVIATION are not fabrication ──────
+#
+# The confirmed false-downgrades from the review window. Each masked a REAL finding
+# (three of them `major`) because the model reformatted the quote, not because the code
+# was absent. Grounding must anchor them; the fabrication control above must still fail.
+
+# protoAgent#2284 r3, tools/fs_tools.py:243 — real code, double quotes.
+RGLOB_SRC = 'files = [base] if base.is_file() else [p for p in base.rglob("*") if p.is_file()]'
+
+# protoAgent#2189 r3, SchedulePanel.tsx:189 — real code, double quotes.
+OPTIONS_SRC = 'options={["00", "15", "30", "45"].map((mm) => ({ value: mm, label: mm }))}'
+
+# protoAgent#2283 r1, chat_routes.py:367 — the line the finding is about.
+MESSAGES_SRC = 'user_msgs = [m for m in messages if m.get("role") == "user"]'
+
+
+def test_quote_style_difference_does_not_downgrade():
+    # The model quoted single quotes; the file has double. Same code — must ground.
+    finding = {
+        "file": "fs_tools.py",
+        "severity": "major",
+        "claim": "unbounded walk: `files = [base] if base.is_file() else [p for p in base.rglob('*') if p.is_file()]`",
+    }
+    assert ground_finding(finding, RGLOB_SRC)[0] is True
+
+
+def test_ellipsis_abbreviation_grounds_on_its_fragments():
+    # `.map(...)` abbreviated — the fragment before it is real and present.
+    finding = {
+        "file": "SchedulePanel.tsx",
+        "severity": "major",
+        "claim": "hard-coded minutes: `options={['00', '15', '30', '45'].map(...)}`",
+    }
+    assert ground_finding(finding, OPTIONS_SRC)[0] is True
+
+
+def test_trailing_ellipsis_grounds_on_the_real_prefix():
+    # protoAgent#2283 r1: `[m for m in messages ...]` — abbreviated tail, real head.
+    finding = {
+        "file": "chat_routes.py",
+        "severity": "major",
+        "claim": "unvalidated: `[m for m in messages ...]` accepts a non-list",
+    }
+    assert ground_finding(finding, MESSAGES_SRC)[0] is True
+
+
+def test_an_ellipsis_over_fabricated_code_still_downgrades():
+    # The safety control: `...` is a wildcard, not an amnesty. A fabricated fragment that
+    # appears nowhere in the file is still ungrounded.
+    finding = {
+        "file": "x.py",
+        "severity": "major",
+        "claim": "invented: `writable = Path(str(configured)).expanduser(...)`",
+    }
+    assert ground_finding(finding, WRITABLE_DIR_SRC)[0] is False
+
+
+def test_an_ellipsis_leaving_only_tiny_fragments_does_not_ground():
+    # `res = ... + ...` is checkable (long enough, code-ish) but every fragment around the
+    # ellipses is too short to be evidence — so the wildcard grounds nothing.
+    finding = {"file": "x.py", "severity": "major", "claim": "quote: `res = ... + ...`"}
+    assert ground_finding(finding, "res = writable.mkdir() + instance_paths()")[0] is False

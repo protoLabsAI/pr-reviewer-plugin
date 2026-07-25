@@ -137,6 +137,75 @@ def reflow_report(report: str) -> str:
     return report[: m.start()] + f"### Findings\n\n{table}\n\n{collapsed}" + report[m.end() :]
 
 
+CARRIED_NOTE = (
+    "carried from a prior round — a confirmed blocker/major this round neither fixed nor "
+    "refuted (protoAgent#2283); it keeps gating until positively cleared"
+)
+
+
+def _carry_key(finding: dict) -> tuple[str, object]:
+    """The (file, line) a carried finding dedups on — so a round that DOES re-report the
+    bug doesn't record it twice."""
+    return (_norm_path(str(finding.get("file") or "")), finding.get("line"))
+
+
+def merge_carried_findings(report: str, carried: list[dict]) -> str:
+    """Write recovered prior blocker/major findings into the report's findings JSON, so the
+    debt survives into the recorded body — the store the next round recalls from (ADR 0078
+    D5). Returns the report unchanged when there's nothing to carry.
+
+    `unaccounted_priors` recovers a still-open prior blocker/major every round, but it only
+    rendered a PROSE note; the machine record (the findings array) kept whatever severity
+    THIS round used. A round that de-escalated a major to a minor therefore laundered it out
+    of history: `panel_rounds` rebuilds each round's findings from this array, and the
+    guards consult only the last substantive round — so the original major was never seen
+    again (protoAgent#2283 r3: a clean PASS emitted on two live bugs, two rounds after they
+    were confirmed). Injecting the carried findings makes the block durable — it re-appears
+    every round until a delta-verified `fixed` or a `refuted` disposition removes it from
+    `unaccounted_priors`, at which point it stops being carried and ages out.
+
+    Deduped against findings this round already reports at the same file:line. Marked
+    `carried: true` and re-annotated `verdict: confirmed`: an unproven downgrade does not
+    un-confirm a finding the panel previously confirmed, and `verdict_for` must FAIL on it
+    if the next round recalls it into its live findings."""
+    if not carried:
+        return report
+    target = None
+    existing: list[dict] = []
+    for m in reversed(list(re.finditer(r"```json\s*\n(.*?)```", report or "", re.DOTALL))):
+        text = m.group(1).strip()
+        if not text.startswith("["):
+            continue  # the findings array is the report's FINAL json array (dispositions precede it)
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, list):
+            target = m
+            existing = [f for f in parsed if isinstance(f, dict)]
+            break
+    seen = {_carry_key(f) for f in existing}
+    additions: list[dict] = []
+    for finding in carried:
+        key = _carry_key(finding)
+        if key in seen:
+            continue
+        seen.add(key)
+        item = {k: finding.get(k) for k in ("file", "line", "severity", "claim") if finding.get(k) is not None}
+        item.setdefault("severity", "major")
+        item["verdict"] = "confirmed"
+        item["carried"] = True
+        note = str(finding.get("note") or "").strip()
+        item["note"] = f"{note} — {CARRIED_NOTE}" if note else CARRIED_NOTE
+        additions.append(item)
+    if not additions:
+        return report
+    payload = json.dumps(existing + additions, indent=2)
+    if target is None:  # the panel emitted no findings array (e.g. a clean pass) — append one
+        return f"{report.rstrip()}\n\n```json\n{payload}\n```\n"
+    return report[: target.start()] + f"```json\n{payload}\n```" + report[target.end() :]
+
+
 def render_verdict_body(
     *,
     repo: str,

@@ -32,6 +32,13 @@ gating power, and even then it is downgraded (`verdict: uncertain`, which ADR 00
 already forbids from carrying a FAIL alone), never dropped: it still posts, still reads,
 still gets a human's judgement. A hallucination that merely stops blocking is handled; a
 real finding that gets deleted is not recoverable.
+
+Matching is tolerant of the two ways the model rewrites a quote without fabricating it —
+quote-STYLE (`'` vs `"`) and ellipsis ABBREVIATION (`foo(...)`) — because the fail-open
+posture cuts both ways: over the review window these two accounted for the bulk of a 19%
+downgrade rate and masked three real majors (protoAgent#2189, #2283, #2284). Normalizing
+quote chars and treating `...` as an ordered-fragment wildcard grounds the abbreviation
+while a genuine fabrication, sharing no fragment with the file, still downgrades.
 """
 
 from __future__ import annotations
@@ -73,10 +80,45 @@ _STATEMENT_RE = re.compile(r"\S\s+\S")
 # lifted from a patch hunk still matches the file's own text.
 _DIFF_PREFIX_RE = re.compile(r"^[+\-]\s?", re.MULTILINE)
 
+# Quote characters the model reformats freely — it quotes `rglob('*')` where the file has
+# `rglob("*")`, and either is the same code. Unify them (incl. smart quotes) on both sides
+# so a quote-STYLE difference never reads as fabrication. Confirmed false-downgrades:
+# protoAgent#2284 r3 (a real `major` masked purely on ' vs "), #2189 r3.
+_QUOTE_CHARS = str.maketrans({c: '"' for c in "'`‘’“”"})
+
+# The model abbreviates long quotes with an ellipsis — `options={[...].map(...)}`,
+# `[m for m in messages ...]`. A verbatim substring check can never match those, so a
+# real finding that quoted an abbreviated line got downgraded (protoAgent#2189 r2/r3 — a
+# `major` twice; #2283 r1). `...` (bare or `(...)`) is treated as a wildcard: every
+# substantial fragment around it must still appear, in order — so an abbreviation grounds
+# but a fabrication (no fragment present) still does not.
+_ELLIPSIS_RE = re.compile(r"\s*(?:\(\s*)?\.\.\.+(?:\s*\))?\s*")
+_MIN_FRAGMENT = 6  # a fragment shorter than this is too common to be evidence on its own
+
 
 def _normalize(text: str) -> str:
-    """Collapse whitespace so indentation and wrapping never decide groundedness."""
-    return re.sub(r"\s+", " ", _DIFF_PREFIX_RE.sub("", text)).strip()
+    """Collapse whitespace and unify quote characters, so neither indentation/wrapping nor
+    a `'`-vs-`"` choice ever decides groundedness."""
+    return re.sub(r"\s+", " ", _DIFF_PREFIX_RE.sub("", text)).translate(_QUOTE_CHARS).strip()
+
+
+def _present(quote: str, haystack: str) -> bool:
+    """Is `quote` anchored in `haystack`? Verbatim first; failing that, if the quote was
+    abbreviated with an ellipsis, require each substantial fragment to appear in order."""
+    if quote in haystack:
+        return True
+    if "..." not in quote:
+        return False
+    fragments = [f for f in _ELLIPSIS_RE.split(quote) if len(f) >= _MIN_FRAGMENT]
+    if not fragments:
+        return False  # only tiny fragments survive — no evidence value, don't ground
+    cursor = 0
+    for fragment in fragments:
+        found = haystack.find(fragment, cursor)
+        if found < 0:
+            return False
+        cursor = found + len(fragment)
+    return True
 
 
 def quoted_snippets(finding: dict) -> list[str]:
@@ -107,7 +149,7 @@ def ground_finding(finding: dict, source: str | None) -> tuple[bool, list[str]]:
     if source is None or not quotes:
         return True, []  # nothing to check against, or nothing checkable — fail open
     haystack = _normalize(source)
-    missing = [q for q in quotes if q not in haystack]
+    missing = [q for q in quotes if not _present(q, haystack)]
     if len(missing) < len(quotes):
         return True, []  # at least one quote landed — the finding is anchored in reality
     return False, missing

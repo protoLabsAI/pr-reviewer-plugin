@@ -10,6 +10,7 @@ from pr_reviewer.verdicts import (
     WARN,
     confine_findings,
     extract_findings_json,
+    merge_carried_findings,
     parse_verdict_marker,
     render_verdict_body,
     verdict_for,
@@ -179,3 +180,68 @@ def test_prose_only_report_is_unchanged():
         repo="o/r", pr=1, head_sha="a" * 40, verdict="PASS", report=prose, shadow=False, recipe="code-review"
     )
     assert "Gap: the structural engine timed out." in body and "### Findings" not in body
+
+
+# ── durable-debt carry: a recovered prior major is written INTO the record ────
+#
+# protoAgent#2283: r1 confirmed two majors, r2 de-escalated them to minor/nit. The
+# recorded findings array (which panel_rounds recalls from) kept the minors, so r3
+# never saw the majors and clean-PASSed on two live bugs. merge_carried_findings puts
+# the recovered majors back into that array so the debt survives the round.
+
+_MAJOR = {"file": "chat_routes.py", "line": 262, "severity": "major", "claim": "int(idx) → 500", "verdict": "confirmed"}
+
+
+def test_carried_major_lands_in_the_recorded_findings_json():
+    # This round de-escalated to a nit; the recovered major must still be recallable.
+    report = (
+        "Round 2.\n\n```json\n"
+        + json.dumps([{"file": "chat_routes.py", "severity": "nit", "claim": "style"}])
+        + "\n```"
+    )
+    merged = merge_carried_findings(report, [_MAJOR])
+    recalled = json.loads(extract_findings_json(merged))
+    majors = [f for f in recalled if f["severity"] == "major"]
+    assert len(majors) == 1
+    assert majors[0]["carried"] is True
+    assert majors[0]["verdict"] == "confirmed"  # an unproven downgrade doesn't un-confirm it
+
+
+def test_carried_major_forces_a_fail_when_the_next_round_recalls_it():
+    # The point of writing it back: verdict_for FAILs on it next round.
+    merged = merge_carried_findings("```json\n[]\n```", [_MAJOR])
+    recalled = json.loads(extract_findings_json(merged))
+    assert verdict_for(recalled) == FAIL
+
+
+def test_carry_dedups_against_a_finding_this_round_already_reports():
+    # A round that DOES re-report the bug at the same file:line must not record it twice.
+    report = "```json\n" + json.dumps([_MAJOR]) + "\n```"
+    merged = merge_carried_findings(report, [_MAJOR])
+    recalled = json.loads(extract_findings_json(merged))
+    assert len(recalled) == 1
+
+
+def test_carry_appends_an_array_when_the_report_had_none():
+    # A clean-pass report with no findings array still gets the debt recorded.
+    merged = merge_carried_findings("Overall: looks clean.", [_MAJOR])
+    recalled = json.loads(extract_findings_json(merged))
+    assert recalled[0]["carried"] is True and recalled[0]["severity"] == "major"
+
+
+def test_carry_is_a_noop_with_nothing_to_carry():
+    report = "```json\n[]\n```"
+    assert merge_carried_findings(report, []) == report
+
+
+def test_carried_debt_propagates_and_then_clears():
+    # Round N carries the major. Round N+1 recalls it (still unfixed) → carries again.
+    # When it's finally accounted (empty carry list, e.g. a verified fix), it stops.
+    r_n = merge_carried_findings("```json\n[]\n```", [_MAJOR])
+    recalled_n = json.loads(extract_findings_json(r_n))
+    assert any(f.get("carried") for f in recalled_n)
+    # next round still can't clear it → carries the same recalled major forward, no dup growth
+    r_n1 = merge_carried_findings("```json\n[]\n```", [f for f in recalled_n if f["severity"] == "major"])
+    assert len(json.loads(extract_findings_json(r_n1))) == 1
+    # once positively cleared, unaccounted is empty → nothing carried → clean record
+    assert merge_carried_findings("```json\n[]\n```", []) == "```json\n[]\n```"
