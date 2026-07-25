@@ -224,7 +224,8 @@ def build_routers(dispatcher, telemetry, get_secret, run_gh_fn=None):
         if runner is None:
             raise HTTPException(status_code=503, detail="no workflow runner — replay needs a live protoAgent host")
         rows = body.get("manifest") or ([body["row"]] if body.get("row") else [body])
-        model, trials, stamp = body.get("model"), int(body.get("trials") or 1), str(body.get("stamp") or "")
+        model, trials = body.get("model"), int(body.get("trials") or 1)
+        stamp, include_raw = str(body.get("stamp") or ""), bool(body.get("include_raw"))
         runs = []
         for row in rows:
             if model:
@@ -238,6 +239,7 @@ def build_routers(dispatcher, telemetry, get_secret, run_gh_fn=None):
                         parse_findings=dispatcher._parse_findings,
                         trial=trial,
                         stamp=stamp,
+                        include_raw=include_raw,
                     )
                 )
         return {"runs": runs}
