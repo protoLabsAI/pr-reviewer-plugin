@@ -323,6 +323,27 @@ steps:
       `uncertain`, not `confirmed` — uncertain never blocks a merge on its own,
       and a finding you could not verify has not earned a block.
 
+      **A failed READ is not evidence.** The rule above is about a file you read
+      that did not contain the quoted code. It does NOT apply when you could not
+      read the file at all — a `github_read_file` error, a 404, an empty result.
+      Those two look alike in your notes and mean opposite things: one is a weak
+      finding, the other is you learning nothing. Downgrading on a failed read
+      silently lifts the gate on a defect that is still there.
+
+      When a read fails at head SHA "{{inputs.head_sha}}":
+
+      1. **Retry without a ref** (the branch's current tip). A PR that is rebased
+         or force-pushed mid-review orphans the SHA this round pinned, and the
+         404 is about the ref, not the code.
+      2. If that also fails, **leave the finding exactly as it was** — same
+         severity, same disposition. Do NOT mark it `uncertain`, do not
+         de-escalate major→minor, and say plainly in your note that the file was
+         unreadable and the prior verdict stands unchanged.
+
+      Stale line anchors are the same trap wearing a different hat: when the head
+      has moved, a finding's line number may no longer point at its code. Locate
+      the finding by its quoted CODE, not by its line number, and re-anchor.
+
       **Evidence already on the PR counts.** If an existing review thread above
       contains a refutation with a blob citation, or a test that asserts the
       behavior the finding disputes, that is evidence — weigh it. Confirming a

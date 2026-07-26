@@ -110,3 +110,23 @@ def test_the_panel_declares_its_own_fan_out_width():
     # recipe-declared width; an older host ignores the key.
     finders = [sid for sid in STEPS if sid.startswith("find_")]
     assert RECIPE["max_concurrency"] == len(finders) == 5
+
+
+def test_a_failed_read_must_not_downgrade_a_finding():
+    """protoAgent#2296: on a PR rebased mid-review the verifier hit a file-fetch 404,
+    could not re-read the blob, and honestly marked still-present majors `uncertain` —
+    which de-escalated them (major→minor) and dropped the verdict, lifting the gate on
+    two real defects that were byte-for-byte still in the file.
+
+    The prior prompt conflated 'I read the file and the quote wasn't there' (a weak
+    finding) with 'I could not read the file' (learning nothing). Only the first earns
+    a downgrade."""
+    p = STEPS["verify"]["prompt"]
+    assert "A failed READ is not evidence" in p
+    # It must say what to do, not just what not to do: retry refless, then hold.
+    assert "Retry without a ref" in p
+    assert "leave the finding exactly as it was" in p
+    assert "de-escalate" in p
+    # Stale anchors are the same failure wearing a different hat (the issue's line
+    # 176/287-vs-257/259/376 observation).
+    assert "line number" in p and "re-anchor" in p
