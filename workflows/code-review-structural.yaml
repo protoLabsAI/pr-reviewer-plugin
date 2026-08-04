@@ -310,6 +310,21 @@ steps:
          "X was dropped" requires you to demonstrate X's ABSENCE in the actual
          file, not to find the claim plausible.
 
+         **But first, normalize the quote to VERBATIM — do not refute a real
+         finding over a loose quote.** The `evidence` you emit for a confirmed
+         finding must be the file's EXACT text: copy the bytes you read, never
+         paraphrase, simplify, or stitch a composite line from separate lines.
+         Finders (especially larger models) reconstruct quotes from memory —
+         e.g. they write `not origin_incognito` where the file has
+         `not getattr(j, "origin_incognito", False)`, or collapse a
+         multi-line expression into one. When the finding's SUBSTANCE is real
+         but its quote is a paraphrase of code that IS present, REPLACE the
+         evidence with the exact line(s) you read, then confirm. Refute only
+         when the claimed code exists in NO form — verbatim or paraphrased.
+         This matters because the grounding guard downgrades a non-verbatim
+         quote to `uncertain`: a real defect quoted loosely silently loses its
+         power to block, so fixing the quote here is what lets it gate.
+
       2. **Decidable predicates you reasoned about instead of evaluating.** If a
          claim turns on what a string, prefix, regex, or comparison actually
          does — `"developer".startswith("dev.")`, `str(None)` being truthy, a
@@ -389,9 +404,11 @@ steps:
       ## Prior requests
       <prior_requests>
       {{inputs.prior_requests}}
-      </prior_requests> Carry every surviving finding's `verdict` and `note` fields
-      into that final JSON verbatim — a reprint that drops them erases the
-      verify pass for downstream parsers.
+      </prior_requests> Carry every surviving finding's `verdict`, `note`, and
+      `evidence` fields into that final JSON verbatim — a reprint that drops them
+      erases the verify pass for downstream parsers, and re-paraphrasing the
+      `evidence` re-breaks its grounding (the verifier normalized it to the file's
+      exact text on purpose; keep it byte-for-byte).
 
       {{steps.verify.output}}
 output: "{{steps.report.output}}"
