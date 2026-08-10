@@ -231,9 +231,7 @@ def render_findings_block(findings: list[dict]) -> str:
     round records an explicit `[]` rather than an absence the next round has to guess at.
     """
     payload = json.dumps(findings, indent=2)
-    collapsed = (
-        f"<details>\n<summary>findings JSON (machine-readable)</summary>\n\n```json\n{payload}\n```\n</details>"
-    )
+    collapsed = f"<details>\n<summary>findings JSON (machine-readable)</summary>\n\n```json\n{payload}\n```\n</details>"
     if not findings:
         return f"_No findings — the review came back clean._\n\n{collapsed}"
     return f"### Findings\n\n{render_findings_table(findings)}\n\n{collapsed}"
@@ -343,9 +341,7 @@ def render_verdict_body(
         f"{marker}\n## QA panel review — **{verdict}**\n_{recipe} · head `{head_sha[:12]}` · {mode}_",
     ]
     if truncated:
-        sections.append(
-            "> ⚠️ The report pass was cut off at its turn limit — this round's findings may be incomplete."
-        )
+        sections.append("> ⚠️ The report pass was cut off at its turn limit — this round's findings may be incomplete.")
     if brief:
         sections.append(brief)
     elif not brief_found:
