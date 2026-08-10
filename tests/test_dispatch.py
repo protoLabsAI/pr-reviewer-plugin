@@ -8,13 +8,13 @@ import time
 
 from pr_reviewer.dispatch import POST_MAX_FAILURES, Dispatcher
 from pr_reviewer.telemetry import Telemetry
-from pr_reviewer.verdicts import render_verdict_body
+from pr_reviewer.verdicts import extract_findings_json, render_verdict_body
 
 HEAD = "a" * 40
 OLD_HEAD = "b" * 40
 
 REPORT = (
-    "Brief prose.\n\n```json\n"
+    "<!-- brief -->\nBrief prose.\n<!-- /brief -->\n\n```json\n"
     + json.dumps(
         [
             {
@@ -170,7 +170,8 @@ def review_row(head, verdict, state="COMMENTED", findings_json="", id=None, comp
         pr=1,
         head_sha=head,
         verdict=verdict,
-        report=f"prose\n```json\n{findings_json or '[]'}\n```",
+        brief="prose",
+        findings=json.loads(findings_json or "[]"),
         shadow=True,
         recipe="code-review",
         complete=complete,
@@ -636,6 +637,55 @@ async def test_shadow_mode_posts_comment_and_structural_trigger_picks_recipe(tmp
     assert seen["recipe"] == "code-review-structural"
     assert gh.posted[0]["event"] == "COMMENT"  # shadow: FAIL still comments
     assert f"head={HEAD}" in gh.posted[0]["body"]
+
+
+# protoAgent#2439 end to end: the serving lane put the report step's whole
+# chain-of-thought in `content`, and the publisher echoed it onto a public PR. The body
+# is now BUILT from the brief/dispositions/findings blocks, so no amount of surrounding
+# text has a path into it. This drives the real dispatcher, not the renderer alone.
+LEAKED_REPORT = (
+    "[review-synthesizer completed: workflow code-review-structural:report]\n\n"
+    "Let me process the prior requests. Actually, let me reconsider whether the fix is evident.\n\n"
+    '```json\n[{"prior": "x.py:3", "disposition": "fixed", "why": "draft — revised below"}]\n```\n\n'
+    "Let me write the final output.\n"
+    "<!-- brief -->\nOverall risk is moderate.\n<!-- /brief -->\n\n"
+    '```json\n[{"prior": "x.py:3", "disposition": "open", "why": "not addressed this pass"}]\n```\n\n'
+    + REPORT.split("\n\n", 1)[1]
+)
+
+
+async def test_a_leaked_chain_of_thought_never_reaches_the_posted_body(tmp_path):
+    gh = RoutedGH(pr_facts=facts(), files="x.py\n")
+
+    async def runner(name, inputs):
+        return {"output": LEAKED_REPORT, "failed": []}
+
+    d = make(tmp_path, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "reviewed:FAIL"
+    body = gh.posted[0]["body"]
+    assert "let me reconsider" not in body.lower()
+    assert "review-synthesizer completed" not in body
+    # Nor the deliberation's DRAFT disposition — the decided one is what the panel is
+    # recorded as saying, and it's what the convergence guard reads.
+    assert "draft — revised below" not in body
+    assert "not addressed this pass" in body
+    # …and the review itself is fully intact: brief, findings, machine record.
+    assert "Overall risk is moderate." in body
+    assert json.loads(extract_findings_json(body))[0]["file"] == "x.py"
+
+
+async def test_a_report_with_no_delimited_brief_still_posts_and_says_so(tmp_path):
+    gh = RoutedGH(pr_facts=facts(), files="x.py\n")
+
+    async def runner(name, inputs):
+        return {"output": "undelimited thinking\n\n" + REPORT.split("\n\n", 1)[1], "failed": []}
+
+    d = make(tmp_path, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "reviewed:FAIL"
+    body = gh.posted[0]["body"]
+    assert "undelimited thinking" not in body  # fails CLOSED — the old cut failed open here
+    assert "brief could not be read" in body
+    assert json.loads(extract_findings_json(body))[0]["file"] == "x.py"  # the review still lands
 
 
 async def test_formal_fail_blocks_only_on_terminal_ci(tmp_path):

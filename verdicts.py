@@ -40,6 +40,93 @@ _MARKER_RE = re.compile(
 )
 
 
+# ── reading the report step's output (protoAgent#2439) ───────────────────────
+# The raw output is NOT the review, and this module never treats it as such. It arrives
+# wrapped in the engine's delegation banner (`[review-synthesizer completed: …]`, meant
+# for an agent reading a delegation result, not for a PR) and — when the serving lane's
+# reasoning parser doesn't split deliberation onto the native `reasoning` channel
+# (homelab-iac#219) — with the model's entire chain-of-thought in `content` ahead of the
+# answer. #2439 is what that looked like published: a full "Actually, let me
+# reconsider…" monologue, including a DRAFT dispositions block, on a public PR.
+#
+# The fix is not to cut the preamble off. A cut has to decide where the answer starts,
+# so it fails OPEN the moment the model doesn't cooperate — and non-cooperation is the
+# whole failure mode here. The body is instead BUILT from three parsed blocks (brief,
+# dispositions, findings); text outside them is never published because no code path
+# publishes it. That holds whatever the lane does with `content`.
+_HARDSTOP_RE = re.compile(r"\A\[[^\]\n]*\bhard-stopped at max_turns:[^\]\n]*\]")
+
+_BRIEF_OPEN_FALLBACK, _BRIEF_CLOSE_FALLBACK = "<!-- brief -->", "<!-- /brief -->"
+
+# A brief is 3-6 lines. The cap is a backstop against a model that dumps its whole
+# deliberation INSIDE the delimiters — bounded, so the failure is a truncated brief
+# rather than an unbounded one.
+_BRIEF_LIMIT = 4000
+
+
+def _brief_delimiters() -> tuple[str, str]:
+    """The host's delimiters, so the two can't drift; the literals when there's no host
+    (this module is imported host-free by the test suite, like `_parse_findings`)."""
+    try:
+        from graph.review.findings import BRIEF_CLOSE, BRIEF_OPEN
+
+        return str(BRIEF_OPEN), str(BRIEF_CLOSE)
+    except Exception:  # noqa: BLE001 — host-free fallback
+        return _BRIEF_OPEN_FALLBACK, _BRIEF_CLOSE_FALLBACK
+
+
+def _clean_brief(text: str) -> str:
+    """Bound what the one free-text field can do.
+
+    The brief is the only model-authored prose the body carries, and finder reports
+    quote untrusted PR content into the panel, so it is reachable by anything a PR
+    author can write. Two things it must not be able to do:
+
+    - **Carry a fenced JSON array.** `extract_findings_json` reads this round's
+      findings back off the posted body for next-round recall; an array in the brief
+      is a second candidate for that read.
+    - **Carry an HTML comment.** The verdict marker IS an HTML comment, and promotion
+      dedup/round history parse it off the body. Neutering `<!--` outright is one rule
+      instead of a blocklist, and a real brief has no reason to contain one.
+    """
+    out = re.sub(r"```.*?```", "", text or "", flags=re.DOTALL).replace("```", "")
+    out = out.replace("<!--", "&lt;!--").strip()
+    return (out[: _BRIEF_LIMIT - 1] + "…") if len(out) > _BRIEF_LIMIT else out
+
+
+def extract_brief(output: str) -> tuple[str, bool]:
+    """`(brief, found)` — the prose brief from BETWEEN its delimiters.
+
+    Takes the LAST opener: a model that drafts its answer inside its deliberation emits
+    the block twice, and the final one is the real deliverable.
+
+    An opener with no closer is bounded at the next fence rather than run to EOF — an
+    unterminated brief must not swallow the findings JSON (or any thinking that follows
+    it). No opener at all ⇒ `("", False)`, and the caller says so in the body: an
+    unreadable brief is a visibly missing brief, never a silent fallback to raw text.
+    """
+    text = output or ""
+    open_d, close_d = _brief_delimiters()
+    start = text.rfind(open_d)
+    if start == -1:
+        return "", False
+    start += len(open_d)
+    end = text.find(close_d, start)
+    if end == -1:
+        fence = text.find("```", start)
+        end = fence if fence != -1 else len(text)
+    return _clean_brief(text[start:end]), True
+
+
+def report_hard_stopped(output: str) -> bool:
+    """Did the report step get cut off at max_turns? The engine says so in a banner it
+    prepends to the output. Nothing else surfaces it — `degraded`/`complete` cover finder
+    timeouts, not a truncated synthesis — and since the body no longer echoes any raw
+    text, this would otherwise be lost silently. Anchored, because the engine prepends
+    it: a model quoting the phrase mid-report cannot fake one."""
+    return bool(_HARDSTOP_RE.match(output or ""))
+
+
 def verdict_for(findings: list[dict]) -> str:
     """The pure mapping. `findings` are ADR 0077 dicts (post-report: refuted already dropped)."""
     worst = PASS
@@ -114,27 +201,42 @@ def render_findings_table(findings: list[dict]) -> str:
     return "\n".join(out)
 
 
-def reflow_report(report: str) -> str:
-    """Swap the report's trailing raw findings array for a human table, and tuck the raw
-    JSON into a collapsed <details> — still present, so `extract_findings_json` (and thus
-    prior-round recall) keeps reading it. A clean/empty array or an unparseable block is
-    left exactly as-is: nothing to tabulate, and never risk mangling the machine record."""
-    blocks = list(re.finditer(r"```json\s*\n(.*?)```", report or "", re.DOTALL))
-    if not blocks:
-        return report
-    m = blocks[-1]  # the findings array is the report's FINAL json block
-    text = m.group(1).strip()
-    if not text.startswith("["):
-        return report
-    try:
-        findings = json.loads(text)
-    except json.JSONDecodeError:
-        return report
-    if not isinstance(findings, list) or not findings:
-        return report  # a clean pass ([]) needs no table; leave the record untouched
-    table = render_findings_table(findings)
-    collapsed = f"<details>\n<summary>findings JSON (machine-readable)</summary>\n\n{m.group(0)}\n</details>"
-    return report[: m.start()] + f"### Findings\n\n{table}\n\n{collapsed}" + report[m.end() :]
+_DISPOSITION_MARK = {"fixed": "✅", "open": "🔴", "refuted": "🚫"}
+
+
+def render_dispositions_table(rows: list[dict]) -> str:
+    """What the panel says happened to each prior blocker/major. Rendered from the parsed
+    rows rather than by echoing the model's fenced block — nothing reads dispositions back
+    off a posted body (`parse_dispositions` runs on the raw output), so the body carries
+    the human form only, and the findings array stays the one JSON block in it."""
+    rows = [r for r in rows if isinstance(r, dict)]
+    if not rows:
+        return ""
+    out = ["| | Prior finding | Disposition | Why |", "|---|---|---|---|"]
+    for r in rows:
+        disp = str(r.get("disposition") or "").lower()
+        prior = r.get("prior") or r.get("file") or "(unanchored)"
+        out.append(
+            f"| {_DISPOSITION_MARK.get(disp, '•')} | `{_cell(prior, 80)}` | {disp or '?'} | {_cell(r.get('why'))} |"
+        )
+    return "\n".join(out)
+
+
+def render_findings_block(findings: list[dict]) -> str:
+    """The findings as a table plus the machine-readable array in a collapsed <details>.
+
+    The array is not decoration: `extract_findings_json` reads it back off the posted
+    body, which is how prior-round recall and `panel_rounds` reconstruct what a round
+    found (ADR 0078 D5 — GitHub is the store). It is emitted even when empty, so a clean
+    round records an explicit `[]` rather than an absence the next round has to guess at.
+    """
+    payload = json.dumps(findings, indent=2)
+    collapsed = (
+        f"<details>\n<summary>findings JSON (machine-readable)</summary>\n\n```json\n{payload}\n```\n</details>"
+    )
+    if not findings:
+        return f"_No findings — the review came back clean._\n\n{collapsed}"
+    return f"### Findings\n\n{render_findings_table(findings)}\n\n{collapsed}"
 
 
 CARRIED_NOTE = (
@@ -149,10 +251,10 @@ def _carry_key(finding: dict) -> tuple[str, object]:
     return (_norm_path(str(finding.get("file") or "")), finding.get("line"))
 
 
-def merge_carried_findings(report: str, carried: list[dict]) -> str:
-    """Write recovered prior blocker/major findings into the report's findings JSON, so the
-    debt survives into the recorded body — the store the next round recalls from (ADR 0078
-    D5). Returns the report unchanged when there's nothing to carry.
+def merge_carried_findings(findings: list[dict], carried: list[dict]) -> list[dict]:
+    """Add recovered prior blocker/major findings to the RECORDED findings list, so the
+    debt survives into the posted body — the store the next round recalls from (ADR 0078
+    D5). Returns the list unchanged when there's nothing to carry.
 
     `unaccounted_priors` recovers a still-open prior blocker/major every round, but it only
     rendered a PROSE note; the machine record (the findings array) kept whatever severity
@@ -168,22 +270,9 @@ def merge_carried_findings(report: str, carried: list[dict]) -> str:
     `carried: true` and re-annotated `verdict: confirmed`: an unproven downgrade does not
     un-confirm a finding the panel previously confirmed, and `verdict_for` must FAIL on it
     if the next round recalls it into its live findings."""
+    existing = [f for f in (findings or []) if isinstance(f, dict)]
     if not carried:
-        return report
-    target = None
-    existing: list[dict] = []
-    for m in reversed(list(re.finditer(r"```json\s*\n(.*?)```", report or "", re.DOTALL))):
-        text = m.group(1).strip()
-        if not text.startswith("["):
-            continue  # the findings array is the report's FINAL json array (dispositions precede it)
-        try:
-            parsed = json.loads(text)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(parsed, list):
-            target = m
-            existing = [f for f in parsed if isinstance(f, dict)]
-            break
+        return existing
     seen = {_carry_key(f) for f in existing}
     additions: list[dict] = []
     for finding in carried:
@@ -198,12 +287,7 @@ def merge_carried_findings(report: str, carried: list[dict]) -> str:
         note = str(finding.get("note") or "").strip()
         item["note"] = f"{note} — {CARRIED_NOTE}" if note else CARRIED_NOTE
         additions.append(item)
-    if not additions:
-        return report
-    payload = json.dumps(existing + additions, indent=2)
-    if target is None:  # the panel emitted no findings array (e.g. a clean pass) — append one
-        return f"{report.rstrip()}\n\n```json\n{payload}\n```\n"
-    return report[: target.start()] + f"```json\n{payload}\n```" + report[target.end() :]
+    return existing + additions
 
 
 def render_verdict_body(
@@ -212,16 +296,27 @@ def render_verdict_body(
     pr: int,
     head_sha: str,
     verdict: str,
-    report: str,
+    findings: list[dict],
     shadow: bool,
     recipe: str,
+    brief: str = "",
+    brief_found: bool = True,
+    dispositions: list[dict] | None = None,
+    truncated: bool = False,
     confined: list[dict] | None = None,
     notes: str = "",
     complete: bool = True,
 ) -> str:
-    """The comment body: marker line (machine) + header (human) + the panel's report,
-    plus a confinement footnote when findings were excluded — the report's own JSON
-    still shows them, so the reader needs to see why the verdict ignored them.
+    """The comment body, ASSEMBLED — marker line (machine), header (human), the brief,
+    the dispositions table, the findings table + machine-readable array, then the
+    footnotes. Plus a confinement footnote when findings were excluded: the recorded
+    array still shows them, so the reader needs to see why the verdict ignored them.
+
+    Nothing here interpolates raw model output. `brief` is the one model-authored field
+    and it arrives already extracted and bounded (`extract_brief`), which is what makes
+    a leaked chain-of-thought unpublishable rather than merely trimmed (protoAgent#2439).
+    `brief_found=False` renders that absence explicitly — a review whose brief could not
+    be read says so, instead of quietly shipping less than it looks like it shipped.
 
     `notes` is a pre-rendered trailing section (the convergence checklist, issue #23);
     it arrives as text so this module stays free of the round machinery that builds it."""
@@ -244,12 +339,24 @@ def render_verdict_body(
     if not complete:
         marker += " complete=false"
     marker += " -->"
-    return (
-        f"{marker}\n"
-        f"## QA panel review — **{verdict}**\n"
-        f"_{recipe} · head `{head_sha[:12]}` · {mode}_\n\n"
-        f"{reflow_report(report)}{footnote}{notes}"
-    )
+    sections = [
+        f"{marker}\n## QA panel review — **{verdict}**\n_{recipe} · head `{head_sha[:12]}` · {mode}_",
+    ]
+    if truncated:
+        sections.append(
+            "> ⚠️ The report pass was cut off at its turn limit — this round's findings may be incomplete."
+        )
+    if brief:
+        sections.append(brief)
+    elif not brief_found:
+        sections.append(
+            "_The panel's brief could not be read from this round's report (no delimited brief "
+            "block). The findings below are unaffected._"
+        )
+    if dispositions:
+        sections.append(f"### Prior requests\n\n{render_dispositions_table(dispositions)}")
+    sections.append(render_findings_block(findings))
+    return "\n\n".join(s for s in sections if s) + f"{footnote}{notes}"
 
 
 def parse_verdict_marker(body: str) -> dict | None:

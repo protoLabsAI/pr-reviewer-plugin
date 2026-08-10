@@ -289,8 +289,14 @@ def parse_dispositions(output: str) -> list[dict]:
 
     Absent block ⇒ empty list ⇒ the caller falls back to #27's narrower rule. A recipe
     that doesn't emit dispositions must not become *less* guarded than before.
+
+    Reads the LAST such block, not the first (protoAgent#2439). When the serving lane
+    leaves deliberation in `content`, a model that drafts a dispositions block mid-thought
+    and then revises it emits two — and a discarded draft must never outrank the decision
+    it was discarded for. This guard decides whether a prior blocker stays blocking, so
+    "which block did we read" is a correctness question, not a formatting one.
     """
-    for block in _DISPOSITIONS_RE.findall(output or ""):
+    for block in reversed(_DISPOSITIONS_RE.findall(output or "")):
         try:
             parsed = json.loads(block)
         except json.JSONDecodeError:
@@ -304,7 +310,7 @@ def parse_dispositions(output: str) -> list[dict]:
             and str(r.get("disposition") or "").lower() in _VALID_DISPOSITIONS
             and (r.get("prior") or r.get("file"))
         ]
-        if rows:  # the FIRST block shaped like dispositions; findings arrays have no
+        if rows:  # the LAST block shaped like dispositions; findings arrays have no
             return rows  # `disposition` key, so they can never match
     return []
 

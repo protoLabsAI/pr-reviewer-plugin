@@ -56,9 +56,11 @@ from .verdicts import (
     PASS,
     WARN,
     confine_findings,
+    extract_brief,
     merge_carried_findings,
     parse_verdict_marker,
     render_verdict_body,
+    report_hard_stopped,
     verdict_for,
 )
 
@@ -1103,7 +1105,13 @@ class Dispatcher:
         structural_unavailable = UNAVAILABLE_PREFIX in str(steps_out.get("find_structural") or "")
         complete = not structural_unavailable and not degraded
         output = str(result.get("output") or "")
-        findings, confined = confine_findings(self._parse_findings(output), paths)
+        # The raw output is read for BLOCKS and never published as text (protoAgent#2439
+        # — see verdicts.py). `reported` is what the panel said this round and what the
+        # body records; `findings` is the confined subset the verdict is computed from.
+        reported = self._parse_findings(output)
+        brief, brief_found = extract_brief(output)
+        truncated = report_hard_stopped(output)
+        findings, confined = confine_findings(reported, paths)
         if confined:
             # Server-side in-diff enforcement — prompt discipline made a promise,
             # this keeps it. The drops are telemetered (eval evidence) and footnoted
@@ -1178,11 +1186,14 @@ class Dispatcher:
             trailer += render_degraded_note(degraded)
         if unaccounted:
             trailer += render_unaccounted_note(unaccounted)
-            # Write the recovered majors into the recorded findings JSON, not just the prose
+            # Write the recovered majors into the recorded findings, not just the prose
             # trailer — else `panel_rounds` rebuilds this round from the (de-escalated) array
             # and the next round launders the debt away (protoAgent#2283 r3). The carry
             # propagates until a verified `fixed`/`refuted` clears it from `unaccounted`.
-            output = merge_carried_findings(output, unaccounted)
+            # It lands in `reported` (what the body records), NOT in `findings`: this
+            # round's verdict is already computed, and the carry gates via the NEXT round's
+            # recall — injecting it here would silently re-decide the verdict.
+            reported = merge_carried_findings(reported, unaccounted)
             self.telemetry.emit(
                 "unaccounted_priors",
                 repo=repo,
@@ -1210,8 +1221,12 @@ class Dispatcher:
             pr,
             head,
             verdict,
-            output,
+            reported,
             recipe,
+            brief=brief,
+            brief_found=brief_found,
+            dispositions=dispositions,
+            truncated=truncated,
             confined=confined,
             notes=trailer,
             hold_blocks=bool(dropped_finding) or bool(unaccounted),
@@ -1234,6 +1249,11 @@ class Dispatcher:
             # ran — twice tonight "grounding checked N and downgraded 0" had to be
             # reconstructed by hand-fetching blobs. Absence of an event is not evidence.
             converge_reason=reason,
+            # Did the report step delimit a brief? False means the body shipped with an
+            # explicit "brief could not be read" instead — the review still lands, but a
+            # rising count here is the panel drifting off its output contract (#2439).
+            brief_found=brief_found,
+            report_truncated=truncated or None,
             grounding_checked=grounding_checked,
             grounding_downgraded=len(ungrounded),
             dispositions=len(dispositions),
@@ -1270,8 +1290,12 @@ class Dispatcher:
         pr: int,
         head: str,
         verdict: str,
-        report: str,
+        findings: list[dict],
         recipe: str,
+        brief: str = "",
+        brief_found: bool = True,
+        dispositions: list[dict] | None = None,
+        truncated: bool = False,
         confined: list[dict] | None = None,
         notes: str = "",
         hold_blocks: bool = False,
@@ -1282,7 +1306,11 @@ class Dispatcher:
             pr=pr,
             head_sha=head,
             verdict=verdict,
-            report=report,
+            findings=findings,
+            brief=brief,
+            brief_found=brief_found,
+            dispositions=dispositions,
+            truncated=truncated,
             shadow=self.shadow,
             recipe=recipe,
             confined=confined,
