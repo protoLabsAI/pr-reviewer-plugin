@@ -1,5 +1,7 @@
 # CLAUDE.md
 
+See [PROTO.md](./PROTO.md) for full conventions — this file is kept for Claude Code compatibility.
+
 This plugin is the deterministic PR-review machinery for protoAgent's QA tier — the
 governing contracts are **protoAgent ADR 0078** (phases, guards, fail-closed posture)
 and **ADR 0077** (the findings convention; `source` attribution).
