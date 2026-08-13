@@ -256,7 +256,10 @@ async def test_confinement_stands_down_when_the_file_list_is_unreadable(tmp_path
 # ── exhaustion (D3) ───────────────────────────────────────────────────────────
 
 
-async def test_failed_panel_step_escalates_and_posts_nothing(tmp_path):
+async def test_failed_panel_step_escalates_and_posts_a_notice_but_no_verdict(tmp_path):
+    """D3 holds — no verdict is synthesized from a partial panel — but the PR is TOLD
+    (issue #54). Silence was indistinguishable from a clean review, and 24 of 44
+    exhausted PRs merged past the gate on that ambiguity."""
     gh = RoutedGH(pr_facts=facts())
     escalations = []
 
@@ -266,7 +269,15 @@ async def test_failed_panel_step_escalates_and_posts_nothing(tmp_path):
     d = make(tmp_path, gh=gh, runner=runner, inbox=lambda text, **kw: escalations.append((text, kw)))
     out = await d.handle_pr_event("o/r", 1, HEAD, "opened")
     assert out == "error:panel-exhausted"
-    assert gh.posted == []
+    # No REVIEW — a verdict is what D3 forbids, and a blocking event on an
+    # infrastructure failure would wedge merges on an outage.
+    assert [c for c in gh.calls if "/reviews" in " ".join(c) and "POST" in c] == []
+    # ...but exactly one notice comment, naming the failed step and the head.
+    notices = [p for p in gh.posted if "protoagent-qa-exhaustion" in p.get("body", "")]
+    assert len(notices) == 1
+    assert "find_crossfile" in notices[0]["body"]
+    assert HEAD[:7] in notices[0]["body"]
+    assert "unreviewed" in notices[0]["body"].lower()
     assert escalations and "UNREVIEWED" in escalations[0][0]
 
 
@@ -597,6 +608,49 @@ async def test_a_transient_panel_failure_is_retried_and_the_review_lands(tmp_pat
     assert gh.posted  # and the PR is no longer left UNREVIEWED
 
 
+async def test_exhaustion_notice_is_idempotent_per_head(tmp_path):
+    """A re-exhaustion on the SAME sha must not stack notices — the sweep retries this
+    PR every pass, and a comment per pass is its own kind of noise."""
+    existing = json.dumps([{"id": 9, "body": f"<!-- protoagent-qa-exhaustion head={HEAD} -->\nolder notice"}])
+
+    class GH(RoutedGH):
+        async def __call__(self, args, timeout=30):
+            if "/issues/1/comments" in " ".join(args) and "POST" not in args:
+                return 0, existing, ""
+            return await super().__call__(args, timeout)
+
+    gh = GH(pr_facts=facts())
+
+    async def runner(name, inputs):
+        return {"output": "partial", "failed": ["find_crossfile"]}
+
+    d = make(tmp_path, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "error:panel-exhausted"
+    assert [p for p in gh.posted if "protoagent-qa-exhaustion" in p.get("body", "")] == []
+
+
+async def test_a_later_verdict_clears_the_exhaustion_notice(tmp_path):
+    """The notice claims "no verdict was produced". A verdict makes that false, so the
+    notice is deleted rather than left to contradict the review above it."""
+    existing = json.dumps([{"id": 77, "body": "<!-- protoagent-qa-exhaustion head=deadbee -->\nstale notice"}])
+    deleted: list[str] = []
+
+    class GH(RoutedGH):
+        async def __call__(self, args, timeout=30):
+            joined = " ".join(args)
+            if "/issues/1/comments" in joined and "POST" not in args:
+                return 0, existing, ""
+            if "DELETE" in args and "/issues/comments/" in joined:
+                deleted.append(args[1])
+                return 0, "{}", ""
+            return await super().__call__(args, timeout)
+
+    gh = GH(pr_facts=facts())
+    d = make(tmp_path, gh=gh)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")).startswith("reviewed:")
+    assert deleted == ["repos/o/r/issues/comments/77"]
+
+
 async def test_retries_are_bounded_and_still_never_synthesize_a_partial_verdict(tmp_path):
     gh = RoutedGH(pr_facts=facts())
     attempts = []
@@ -609,7 +663,10 @@ async def test_retries_are_bounded_and_still_never_synthesize_a_partial_verdict(
     d = make(tmp_path, cfg={"panel_retries": 2}, gh=gh, runner=runner, inbox=lambda t, **kw: escalations.append(t))
     assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "error:panel-exhausted"
     assert len(attempts) == 3  # the original + 2 retries
-    assert gh.posted == []  # D3 holds: no verdict from a partial panel
+    # D3 holds: no verdict from a partial panel. The only thing posted is the
+    # non-blocking notice that no verdict exists (issue #54).
+    assert [c for c in gh.calls if "/reviews" in " ".join(c) and "POST" in c] == []
+    assert all("protoagent-qa-exhaustion" in p.get("body", "") for p in gh.posted)
     assert escalations and "UNREVIEWED" in escalations[0]
 
 

@@ -97,6 +97,9 @@ REGATE_MAX_FAILURES = 3
 # (or while it was down, or that exhausted its panel) never gets a first review.
 BACKFILL_ACTION = "sweep-backfill"
 
+# Marks our own "the panel could not finish" comments so we can find, dedupe and
+# delete them without touching anyone else's (issue #54).
+_EXHAUSTION_MARKER = "protoagent-qa-exhaustion"
 _NON_TERMINAL = {"queued", "in_progress", "waiting", "requested", "pending"}
 _GREEN = {"success", "neutral", "skipped"}
 
@@ -639,6 +642,13 @@ class Dispatcher:
                 f"after {self.panel_retries + 1} attempt(s) — no verdict posted; PR is UNREVIEWED.",
                 dedup_key=f"pr-reviewer-exhaustion:{repo}#{pr}@{head[:7]}",
             )
+            # ...and say so ON THE PR (issue #54). The escalation above reaches an
+            # operator inbox; nobody reading the PR can tell an exhausted panel from a
+            # clean one, and "no findings" then reads as tacit approval. Measured over
+            # 5 weeks on the fleet reviewer: 44 PRs exhausted, 24 of them merged with
+            # no verdict ever. The backfill's recovery window is real but not
+            # instantaneous — those 24 merged inside it.
+            await self._post_exhaustion_notice(repo, pr, head, failed)
             self.telemetry.emit(
                 "exhaustion", repo=repo, pr=pr, sha=head, failed=failed, attempts=self.panel_retries + 1
             )
@@ -861,6 +871,9 @@ class Dispatcher:
         if rc != 0:
             log.warning("[pr-reviewer] posting %s on %s#%s failed: %s", event, repo, pr, err[-300:])
             return False
+        # A verdict exists now, so any "no verdict was produced" notice we left on an
+        # earlier exhausted head is stale and actively misleading (issue #54).
+        await self._clear_exhaustion_notices(repo, pr)
         if not self.shadow and verdict != FAIL and not hold_blocks:
             # A cleared verdict must also LIFT our earlier block: PASS/WARN post as
             # COMMENT, and a comment never supersedes the same reviewer's REQUEST_CHANGES.
@@ -868,6 +881,70 @@ class Dispatcher:
             # prior blocker/major has not earned the dismissal yet (issue #26).
             await self._dismiss_stale_blocks(repo, pr)
         return True
+
+    # ── exhaustion notice: say on the PR that no review happened (issue #54) ──
+
+    async def _exhaustion_notices(self, repo: str, pr: int) -> list[dict]:
+        """Our own exhaustion-notice comments on this PR, newest last."""
+        rc, out, _err = await self._run_gh(
+            ["api", f"repos/{repo}/issues/{pr}/comments", "--paginate", "--jq", ".[] | {id, body}"],
+            timeout=60,
+        )
+        if rc != 0:
+            return []
+        # `--jq '.[] | ...'` emits ONE OBJECT PER LINE, but a plain `gh api` (and any
+        # caller/stub that ignores --jq) returns a single JSON array. Accept both rather
+        # than assuming the shape — the array form is what surfaced this.
+        items: list = []
+        try:
+            whole = json.loads(out)
+            items = whole if isinstance(whole, list) else [whole]
+        except ValueError:
+            for line in out.splitlines():
+                try:
+                    items.append(json.loads(line))
+                except ValueError:
+                    continue
+        return [i for i in items if isinstance(i, dict) and _EXHAUSTION_MARKER in str(i.get("body") or "")]
+
+    async def _post_exhaustion_notice(self, repo: str, pr: int, head: str, failed: list[str]) -> bool:
+        """Post a NON-BLOCKING comment recording that the panel produced no verdict.
+
+        Deliberately an issue comment, not a review: an infrastructure failure is not a
+        finding, and a REQUEST_CHANGES here would wedge merges on an outage. It is also
+        not a verdict, so it has no business in the Reviews list. Idempotent per head —
+        a re-exhaustion on the same SHA edits nothing and posts nothing.
+        """
+        if any(f"head={head}" in str(c.get("body") or "") for c in await self._exhaustion_notices(repo, pr)):
+            return True  # already said it for this head
+        steps = ", ".join(f"`{s}`" for s in failed) or "the panel"
+        body = (
+            f"<!-- {_EXHAUSTION_MARKER} head={head} -->\n"
+            f"⚠️ **The QA panel could not complete a review of `{head[:7]}`.**\n\n"
+            f"{steps} failed after {self.panel_retries + 1} attempt(s), so **no verdict was produced** — "
+            f"this PR is _unreviewed_, not approved. The absence of findings below means the panel did not "
+            f"finish, not that it found nothing.\n\n"
+            f"The sweep retries on a later pass, and a push re-runs the full panel; whichever lands first "
+            f"supersedes this notice."
+        )
+        rc, _out, err = await self._run_gh(
+            ["api", f"repos/{repo}/issues/{pr}/comments", "-X", "POST", "-f", f"body={body}"],
+            timeout=60,
+        )
+        if rc != 0:
+            log.warning("[pr-reviewer] posting exhaustion notice on %s#%s failed: %s", repo, pr, err[-300:])
+        self.telemetry.emit("exhaustion_notice", repo=repo, pr=pr, sha=head, ok=rc == 0)
+        return rc == 0
+
+    async def _clear_exhaustion_notices(self, repo: str, pr: int) -> None:
+        """Delete our exhaustion notices once a real verdict lands — the notice's whole
+        claim ("no verdict was produced") is false the moment one is."""
+        for comment in await self._exhaustion_notices(repo, pr):
+            rc, _out, err = await self._run_gh(
+                ["api", f"repos/{repo}/issues/comments/{comment['id']}", "-X", "DELETE"], timeout=60
+            )
+            if rc != 0:
+                log.warning("[pr-reviewer] clearing exhaustion notice on %s#%s failed: %s", repo, pr, err[-300:])
 
     async def _dismiss_stale_blocks(self, repo: str, pr: int) -> None:
         """Dismiss our own now-stale REQUEST_CHANGES reviews after a later head clears.

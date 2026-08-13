@@ -51,6 +51,33 @@ def _step_percentiles(reviewed: list[dict]) -> dict:
     return {sid: _percentile(v, 0.5) for sid, v in sorted(per.items())}
 
 
+def _unreviewed_prs(exhaustions: list[dict], reviewed: list[dict], limit: int = 20) -> dict:
+    """Exhausted PRs split by whether a verdict ever landed afterwards.
+
+    "Afterwards" is by timestamp, not by round: the sweep's backfill re-reviews a later
+    head, so recovery shows up as a posted `reviewed` event on the same PR with a bigger
+    `ts`. A PR exhausted twice counts once, keyed on its LAST exhaustion — an earlier
+    exhaustion already covered by a later verdict isn't outstanding.
+    """
+    last_exhausted: dict[tuple[str, int], float] = {}
+    for e in exhaustions:
+        key = (str(e.get("repo")), int(e.get("pr") or 0))
+        last_exhausted[key] = max(last_exhausted.get(key, 0.0), float(e.get("ts") or 0.0))
+    recovered = {
+        key
+        for e in reviewed
+        if e.get("posted")
+        and (key := (str(e.get("repo")), int(e.get("pr") or 0))) in last_exhausted
+        and float(e.get("ts") or 0.0) > last_exhausted[key]
+    }
+    outstanding = sorted(k for k in last_exhausted if k not in recovered)
+    return {
+        "count": len(outstanding),
+        "recovered": len(recovered),
+        "prs": [f"{repo}#{pr}" for repo, pr in outstanding][:limit],
+    }
+
+
 def build_report(events: list[dict]) -> dict:
     """The numeric summary over raw telemetry events."""
     dispatches = [e for e in events if e.get("event") == "dispatch"]
@@ -104,6 +131,14 @@ def build_report(events: list[dict]) -> dict:
         ),
         "drops": dict(drops),
         "exhaustions": len(exhaustions),
+        # The OUTCOME of those exhaustions (issue #54). `exhaustions` alone can't
+        # distinguish a panel that failed and was recovered by the sweep's backfill —
+        # noise — from one whose PR merged past the gate with no verdict ever, which is
+        # the gate silently not existing. Over the fleet reviewer's first 5 weeks the
+        # split was 44 exhausted PRs / 24 never reviewed, and nothing surfaced that
+        # second number: it took reading the operator inbox by hand to find it. This is
+        # the field to alert on.
+        "unreviewed_prs": _unreviewed_prs(exhaustions, reviewed),
         "promotion_decisions": dict(promotions),
     }
 
@@ -180,7 +215,9 @@ def render_report_markdown(summary: dict, rows: list[dict] | None = None) -> str
         f"- **Rounds/PR:** {summary.get('rounds_per_pr')} (max {summary.get('max_rounds')}) · "
         f"**converged to PASS-with-notes:** {summary.get('converged', 0)} — a climbing max is the "
         f"panel re-reviewing its own churn (issue #23)",
-        f"- **Exhaustions (fail-closed, no verdict):** {summary.get('exhaustions', 0)}",
+        f"- **Exhaustions (fail-closed, no verdict):** {summary.get('exhaustions', 0)} — "
+        f"of those, **{(summary.get('unreviewed_prs') or {}).get('count', 0)} PR(s) still have no verdict** "
+        f"({(summary.get('unreviewed_prs') or {}).get('recovered', 0)} recovered by a later pass)",
         f"- **Typed drops:** {summary.get('drops') or {}}",
         f"- **Promotion decisions:** {summary.get('promotion_decisions') or {}}",
     ]
