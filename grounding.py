@@ -185,6 +185,42 @@ def apply_grounding(findings: list[dict], sources: dict[str, str | None]) -> tup
     return out, downgraded
 
 
+def correct_line_numbers(findings: list[dict], blobs: dict[str, str]) -> list[dict]:
+    """Correct mislocated line numbers using the raw blob (without the patch).
+
+    For each grounded finding, locate WHERE in the blob the longest matched quote
+    actually appears. Exactly one match → set ``finding['line']`` to the real line
+    and emit ``line_corrected = True``. Multiple matches → ambiguous, leave as-is
+    (fail-open). Ungrounded findings and findings with no usable quotes are left
+    untouched. This never downgrades, never removes, never changes severity.
+    """
+    out: list[dict] = []
+    for finding in findings:
+        if finding.get("ungrounded"):
+            out.append(finding)
+            continue
+        file = str(finding.get("file") or "")
+        blob = blobs.get(file, "")
+        if not blob:
+            out.append(finding)
+            continue
+        quotes = quoted_snippets(finding)
+        if not quotes:
+            out.append(finding)
+            continue
+        best = max(quotes, key=len)
+        lines = blob.splitlines()
+        hits = [i + 1 for i, ln in enumerate(lines) if _present(best, _normalize(ln))]
+        if len(hits) == 1:
+            corrected = dict(finding)
+            corrected["line"] = hits[0]
+            corrected["line_corrected"] = True
+            out.append(corrected)
+        else:
+            out.append(finding)
+    return out
+
+
 def render_grounding_footnote(downgraded: list[dict]) -> str:
     """The posted-body note for downgraded findings — the verdict must never silently
     disagree with the report, the same contract the confinement footnote keeps."""

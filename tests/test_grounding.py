@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from pr_reviewer.grounding import (
     apply_grounding,
+    correct_line_numbers,
     ground_finding,
     quoted_snippets,
     render_grounding_footnote,
@@ -281,3 +282,110 @@ def test_an_ellipsis_leaving_only_tiny_fragments_does_not_ground():
     # ellipses is too short to be evidence — so the wildcard grounds nothing.
     finding = {"file": "x.py", "severity": "major", "claim": "quote: `res = ... + ...`"}
     assert ground_finding(finding, "res = writable.mkdir() + instance_paths()")[0] is False
+
+
+# ── correct_line_numbers ──────────────────────────────────────────────────────
+
+
+def test_correct_line_numbers_fixes_a_wrong_line():
+    blob = "def foo():\n    writable = Path(configured).expanduser()\n    return writable\n"
+    finding = {
+        "file": "foo.py",
+        "line": 99,
+        "severity": "major",
+        "verdict": "confirmed",
+        "claim": "The call `writable = Path(configured).expanduser()` runs unconditionally.",
+        "evidence": "",
+    }
+    result = correct_line_numbers([finding], {"foo.py": blob})
+    assert result[0]["line"] == 2
+    assert result[0].get("line_corrected") is True
+
+
+def test_correct_line_numbers_already_correct_still_sets_flag():
+    blob = "def foo():\n    writable = Path(configured).expanduser()\n    return writable\n"
+    finding = {
+        "file": "foo.py",
+        "line": 2,
+        "severity": "major",
+        "claim": "The call `writable = Path(configured).expanduser()` runs unconditionally.",
+        "evidence": "",
+    }
+    result = correct_line_numbers([finding], {"foo.py": blob})
+    assert result[0]["line"] == 2
+    assert result[0].get("line_corrected") is True
+
+
+def test_correct_line_numbers_multiple_matches_leaves_line_unchanged():
+    blob = "def foo():\n    x = Path(a).expanduser()\n    x = Path(a).expanduser()\n"
+    finding = {
+        "file": "foo.py",
+        "line": 99,
+        "severity": "major",
+        "claim": "The call `x = Path(a).expanduser()` runs unconditionally.",
+        "evidence": "",
+    }
+    result = correct_line_numbers([finding], {"foo.py": blob})
+    assert result[0]["line"] == 99
+    assert not result[0].get("line_corrected")
+
+
+def test_correct_line_numbers_never_downgrades_or_drops():
+    blob = "def foo():\n    writable = Path(configured).expanduser()\n    return writable\n"
+    finding = {
+        "file": "foo.py",
+        "line": 99,
+        "severity": "major",
+        "verdict": "confirmed",
+        "claim": "The call `writable = Path(configured).expanduser()` runs unconditionally.",
+        "evidence": "",
+    }
+    result = correct_line_numbers([finding], {"foo.py": blob})
+    assert len(result) == 1
+    assert result[0]["severity"] == "major"
+    assert result[0]["verdict"] == "confirmed"
+
+
+def test_correct_line_numbers_skips_ungrounded_findings():
+    blob = "def foo():\n    writable = Path(configured).expanduser()\n    return writable\n"
+    finding = {
+        "file": "foo.py",
+        "line": 99,
+        "severity": "major",
+        "ungrounded": True,
+        "claim": "The call `writable = Path(configured).expanduser()` runs unconditionally.",
+        "evidence": "",
+    }
+    result = correct_line_numbers([finding], {"foo.py": blob})
+    assert result[0]["line"] == 99
+    assert not result[0].get("line_corrected")
+
+
+def test_correct_line_numbers_no_blob_leaves_line_unchanged():
+    finding = {
+        "file": "foo.py",
+        "line": 99,
+        "severity": "major",
+        "claim": "The call `writable = Path(configured).expanduser()` runs unconditionally.",
+        "evidence": "",
+    }
+    result = correct_line_numbers([finding], {})
+    assert result[0]["line"] == 99
+    assert not result[0].get("line_corrected")
+
+
+def test_correct_line_numbers_uses_blob_not_combined():
+    # Verifies that line lookup uses only the raw blob. If blob+patch were used instead,
+    # the quote would appear in two places (blob line 2 and the patch hunk), giving
+    # multiple hits and a fail-open non-correction.
+    blob = "def foo():\n    writable = Path(configured).expanduser()\n    return writable\n"
+    finding = {
+        "file": "foo.py",
+        "line": 99,
+        "severity": "major",
+        "claim": "The call `writable = Path(configured).expanduser()` runs unconditionally.",
+        "evidence": "",
+    }
+    result = correct_line_numbers([finding], {"foo.py": blob})
+    assert result[0]["line"] == 2
+    assert result[0].get("line_corrected") is True
