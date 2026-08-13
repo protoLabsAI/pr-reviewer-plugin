@@ -361,20 +361,50 @@ def unaccounted_priors(
     re-graded the FINDINGS major→minor/nit, dropping the verdict FAIL→WARN and lifting the
     block on two real bugs (uncaught ValueError→500, session collision). An `open` blocker
     is still blocking — the disposition IS the panel confirming the defect persists — so it
-    is treated as unaccounted, whatever severity the re-report used. Only a verified `fixed`
-    or a `refuted` clears a prior blocker/major.
+    is treated as unaccounted, whatever severity the re-report used.
+
+    `refuted` against a *confirmed* prior finding is treated as `open` — the block stands
+    until the finding is delta-verified `fixed` or an operator dismisses it (issue #38).
+    A single model pass must not override a grounded, confirmed blocker. `refuted` is only
+    allowed to clear a prior finding graded `uncertain` (which has less grounding and where
+    refutation is plausible). The unaccounted list already serves as the telemetry-ready
+    signal: any `refuted` that was rejected appears in `missing` for `render_unaccounted_note`.
 
     Only the LAST substantive round is consulted, same as `unexplained_clearance`.
     """
     if not dispositions:
         return []
-    accounted = set()
+
+    # Find the last substantive round first — we need prior finding verdicts to decide
+    # whether a `refuted` disposition is grounded enough to clear the block (issue #38).
+    last_round_findings: list[dict] = []
+    for round_ in reversed(history or []):
+        prior = [f for f in (round_.get("findings") or []) if isinstance(f, dict)]
+        if prior:
+            last_round_findings = prior
+            break
+
+    # Index prior findings by anchor for O(1) verdict lookup during disposition processing.
+    prior_index: dict[str, dict] = {}
+    for f in last_round_findings:
+        prior_index[_anchor(f.get("file"), f.get("line"))] = f
+        prior_index.setdefault(_norm(str(f.get("file") or "")), f)
+
+    accounted: set[str] = set()
     for row in dispositions:
         disposition = str(row.get("disposition") or "").lower()
         file, line = _disposition_anchor(row)
         if disposition == "open":
             # Still present by the panel's own admission — never clears a blocker/major.
             continue
+        if disposition == "refuted":
+            # A `refuted` against a *confirmed* prior is treated as `open`: the block stands
+            # until delta-verified `fixed` or operator dismissal (issue #38). Only a prior
+            # finding graded `uncertain` can be cleared by refutation alone.
+            dkey = f"{file}:{line}" if isinstance(line, int) else file
+            prior_f = prior_index.get(dkey) or prior_index.get(file)
+            if prior_f is None or str(prior_f.get("verdict") or "").lower() != "uncertain":
+                continue  # confirmed (or unknown verdict) → refuted rejected; block held
         if disposition == "fixed":
             # An unverifiable "fixed" accounts for nothing — the finding stays a debt.
             if ranges is None:
@@ -385,22 +415,20 @@ def unaccounted_priors(
         anchor = f"{file}:{line}" if isinstance(line, int) else file
         accounted.add(anchor)
         accounted.add(file)
-    for round_ in reversed(history or []):
-        prior = [f for f in (round_.get("findings") or []) if isinstance(f, dict)]
-        if not prior:
+
+    if not last_round_findings:
+        return []
+    missing = []
+    for finding in last_round_findings:
+        severity = str(finding.get("severity") or "").lower()
+        if severity not in ("blocker", "major"):
             continue
-        missing = []
-        for finding in prior:
-            severity = str(finding.get("severity") or "").lower()
-            if severity not in ("blocker", "major"):
-                continue
-            if str(finding.get("verdict") or "").lower() == "refuted":
-                continue
-            anchor = _anchor(finding.get("file"), finding.get("line"))
-            if anchor not in accounted and _norm(str(finding.get("file") or "")) not in accounted:
-                missing.append(dict(finding))
-        return missing
-    return []
+        if str(finding.get("verdict") or "").lower() == "refuted":
+            continue
+        anchor = _anchor(finding.get("file"), finding.get("line"))
+        if anchor not in accounted and _norm(str(finding.get("file") or "")) not in accounted:
+            missing.append(dict(finding))
+    return missing
 
 
 def render_unaccounted_note(missing: list[dict]) -> str:

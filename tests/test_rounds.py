@@ -333,10 +333,10 @@ def test_an_undispositioned_major_is_unaccounted_at_ANY_verdict():
 
 def test_a_dispositioned_major_is_accounted():
     history = [{"head": HEAD_1, "verdict": "FAIL", "findings": [finding(severity="major")]}]
-    # `refuted` accounts with no delta. `fixed` REQUIRES the flagged line to have moved
-    # (protoAgent#2208). `open` does NOT account — an open blocker is still blocking
-    # (protoAgent#2283) — so it is asserted separately, below.
-    assert unaccounted_priors(history, [dispo("store.py:100", "refuted")]) == []
+    # `fixed` REQUIRES the flagged line to have moved (protoAgent#2208).
+    # `open` does NOT account — an open blocker is still blocking (protoAgent#2283).
+    # `refuted` against a *confirmed* prior no longer clears (issue #38).
+    assert len(unaccounted_priors(history, [dispo("store.py:100", "refuted")])) == 1
     fixed_patch = "@@ -97,3 +97,3 @@\n ctx\n-old\n+new line at 100\n"
     ranges = delta_ranges([{"filename": "store.py", "patch": fixed_patch}])
     assert unaccounted_priors(history, [dispo("store.py:100", "fixed")], ranges=ranges) == []
@@ -424,11 +424,11 @@ def test_fixed_fails_closed_when_the_delta_is_unreadable():
     assert len(unaccounted_priors(history, dispo, ranges=None)) == 1
 
 
-def test_refuted_does_not_need_a_delta_but_open_now_holds():
+def test_open_holds_and_refuted_against_confirmed_also_holds():
     history = [_major()]
     ranges = delta_ranges([{"filename": "unrelated.py", "patch": PATCH}])
-    # `refuted` is a validity claim, no diff to check → clears.
-    assert unaccounted_priors(history, [dispo("operator_api/config_routes.py:271", "refuted")], ranges=ranges) == []
+    # `refuted` against a *confirmed* prior no longer clears (issue #38).
+    assert len(unaccounted_priors(history, [dispo("operator_api/config_routes.py:271", "refuted")], ranges=ranges)) == 1
     # `open` = still present → holds, whatever the current re-report graded it (#2283).
     assert len(unaccounted_priors(history, [dispo("operator_api/config_routes.py:271", "open")], ranges=ranges)) == 1
 
@@ -477,10 +477,37 @@ def test_open_does_not_clear_even_when_the_line_moved():
     assert len(unaccounted_priors(history, [dispo("operator_api/config_routes.py:100", "open")], ranges=ranges)) == 1
 
 
-def test_fixed_and_refuted_still_clear_after_the_open_change():
-    # The fix must not break the legitimate clearances.
+def test_fixed_still_clears_after_the_open_change():
+    # Delta-verified `fixed` must still clear a confirmed prior — unchanged behavior.
     history = [_major(line=100)]
     fixed_patch = "@@ -97,3 +97,3 @@\n a\n-old\n+new at 100\n"
     ranges = delta_ranges([{"filename": "operator_api/config_routes.py", "patch": fixed_patch}])
     assert unaccounted_priors(history, [dispo("operator_api/config_routes.py:100", "fixed")], ranges=ranges) == []
-    assert unaccounted_priors(history, [dispo("operator_api/config_routes.py:100", "refuted")], ranges=None) == []
+    # `refuted` against a confirmed prior now holds (issue #38).
+    assert len(unaccounted_priors(history, [dispo("operator_api/config_routes.py:100", "refuted")], ranges=None)) == 1
+
+
+# ── refuted against confirmed vs uncertain (issue #38) ────────────────────────
+
+
+def test_refuted_against_confirmed_prior_does_not_clear_the_block():
+    # A model-emitted `refuted` on a grounded confirmed blocker must not clear it —
+    # only delta-verified `fixed` (or operator dismissal) discharges the debt.
+    history = [
+        {"head": HEAD_1, "verdict": "FAIL", "findings": [finding(severity="major", claim="null slips the guard")]}
+    ]
+    missing = unaccounted_priors(history, [dispo("store.py:100", "refuted")])
+    assert len(missing) == 1
+    assert missing[0]["claim"] == "null slips the guard"
+
+
+def test_refuted_against_uncertain_prior_still_clears():
+    # An uncertain finding has less grounding — refutation is plausible and still clears.
+    unc = {"head": HEAD_1, "verdict": "FAIL", "findings": [dict(finding(severity="major"), verdict="uncertain")]}
+    assert unaccounted_priors([unc], [dispo("store.py:100", "refuted")]) == []
+
+
+def test_refuted_against_confirmed_blocker_also_holds():
+    # Severity=blocker obeys the same rule as major.
+    conf = {"head": HEAD_1, "verdict": "FAIL", "findings": [dict(finding(severity="blocker"), verdict="confirmed")]}
+    assert len(unaccounted_priors([conf], [dispo("store.py:100", "refuted")])) == 1
