@@ -177,6 +177,7 @@ def apply_grounding(findings: list[dict], sources: dict[str, str | None]) -> tup
             continue
         annotated = dict(finding)
         annotated["verdict"] = "uncertain"
+        annotated["ungrounded"] = True
         note = str(annotated.get("note") or "").strip()
         annotated["note"] = f"{note} — {UNGROUNDED_NOTE}" if note else UNGROUNDED_NOTE
         out.append(annotated)
