@@ -65,9 +65,17 @@ _CODE_HINT_RE = re.compile(r"[=(){}\[\];]|\.\w|->|=>|::|\w_\w")
 #    ValueError. The exception propagates out of create_from_plan uncaught, ..."
 #
 # A quoted LINE OF CODE is short, has few tokens, and carries no narrative punctuation.
+# The semicolon pattern catches connective prose like `getData(); it then passes to
+# render(); the state updates` — a finder narrative that landed verbatim in evidence.
+# It is safe against for-loop code (`; i < n`, `; i++`) because those are never followed
+# by `it`, `this`, `that`, or `the` as a standalone word. Whether the prose arrives as
+# an inline backtick span or inside a fenced block, the same filter applies.
 MAX_QUOTE_CHARS = 120
 MAX_QUOTE_TOKENS = 14
-_PROSE_RE = re.compile(r"[—→…]|\.\s+[A-Z]|\b(?:then|because|which|so that|i\.e\.|e\.g\.)\b", re.IGNORECASE)
+_PROSE_RE = re.compile(
+    r"[—→…]|\.\s+[A-Z]|\b(?:then|because|which|so that|i\.e\.|e\.g\.)\b|;\s+(?:it|this|that|the)\s",
+    re.IGNORECASE,
+)
 
 # ...and must be STATEMENT-like: containing whitespace between tokens. A bare
 # `_writable_dir()` is a reference to a thing, not an assertion about the file's text —
@@ -89,10 +97,18 @@ _QUOTE_CHARS = str.maketrans({c: '"' for c in "'`‘’“”"})
 # The model abbreviates long quotes with an ellipsis — `options={[...].map(...)}`,
 # `[m for m in messages ...]`. A verbatim substring check can never match those, so a
 # real finding that quoted an abbreviated line got downgraded (protoAgent#2189 r2/r3 — a
-# `major` twice; #2283 r1). `...` (bare or `(...)`) is treated as a wildcard: every
-# substantial fragment around it must still appear, in order — so an abbreviation grounds
-# but a fabrication (no fragment present) still does not.
-_ELLIPSIS_RE = re.compile(r"\s*(?:\(\s*)?\.\.\.+(?:\s*\))?\s*")
+# `major` twice; #2283 r1). `...` (bare, `(...)`, `[...]`, or `{...}`) is treated as a
+# wildcard: every substantial fragment around it must still appear, in order — so an
+# abbreviation grounds but a fabrication (no fragment present) still does not.
+#
+# `[...]` and `{...}` are consumed as full units (not just the bare `...`) so that the
+# surrounding bracket characters are not left attached to the adjacent fragments, making
+# short-context quotes (e.g. `fn([...])`) unnecessarily hard to anchor.
+#
+# `_MIN_FRAGMENT` is kept at 6 (not lowered to 4): a 4-char fragment like `map(` or
+# `res =` appears in nearly every file and would ground fabrications by coincidence —
+# confirmed by the `res = ... + ...` test case which would falsely ground at threshold 4.
+_ELLIPSIS_RE = re.compile(r"\s*(?:[\(\[\{]\s*)?\.\.\.+(?:\s*[\)\]\}])?\s*")
 _MIN_FRAGMENT = 6  # a fragment shorter than this is too common to be evidence on its own
 
 

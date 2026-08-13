@@ -389,3 +389,143 @@ def test_correct_line_numbers_uses_blob_not_combined():
     result = correct_line_numbers([finding], {"foo.py": blob})
     assert result[0]["line"] == 2
     assert result[0].get("line_corrected") is True
+
+
+# ── cause 1: bracket-wrapped ellipsis styles ([...] and {...}) ────────────────
+#
+# The finder uses [...]  or {...} to abbreviate array/object contents. The _ELLIPSIS_RE
+# must consume the brackets as a full unit so they are not left attached to the adjacent
+# fragment, which can push short-context quotes below _MIN_FRAGMENT.
+
+
+def test_array_bracket_ellipsis_grounds():
+    # `[...]` style: code abbreviated as array of stuff.
+    src = "const result = transform([item1, item2, item3])"
+    finding = {
+        "file": "x.js",
+        "severity": "major",
+        "claim": "transform drops null items: `const result = transform([...])`",
+        "evidence": "",
+    }
+    assert ground_finding(finding, src)[0] is True
+
+
+def test_object_bracket_ellipsis_grounds():
+    # `{...}` style: code abbreviated as object of stuff.
+    src = 'const merged = Object.assign({}, defaults, {key: "value", extra: true})'
+    finding = {
+        "file": "x.js",
+        "severity": "major",
+        "claim": "Shallow merge: `const merged = Object.assign({}, defaults, {...})`",
+        "evidence": "",
+    }
+    assert ground_finding(finding, src)[0] is True
+
+
+def test_array_bracket_ellipsis_in_evidence_grounds():
+    # Same pattern appearing in the evidence field (fenced block).
+    src = "items = [apple, banana, cherry]"
+    finding = {
+        "file": "x.py",
+        "severity": "minor",
+        "claim": "List is unbounded.",
+        "evidence": "```python\nitems = [...]\n```",
+    }
+    assert ground_finding(finding, src)[0] is True
+
+
+def test_fabricated_bracket_ellipsis_still_downgrades():
+    # Safety control: brackets are not an amnesty. A fabricated function name that does
+    # not appear in the source still downgrades even with [...] abbreviation.
+    src = "const result = transform([item1, item2])"
+    finding = {
+        "file": "x.js",
+        "severity": "major",
+        "claim": "Bug in `const phantom = inventedFunction([...])`",
+        "evidence": "",
+    }
+    assert ground_finding(finding, src)[0] is False
+
+
+def test_mixed_bracket_and_paren_ellipsis_grounds():
+    # A quote with both [...]  and (...) abbreviations: each is consumed as a unit,
+    # and the fragments between them must still appear in the source in order.
+    src = 'options={["00", "15", "30", "45"].map((mm) => ({ value: mm, label: mm }))}'
+    finding = {
+        "file": "SchedulePanel.tsx",
+        "severity": "major",
+        "claim": "hard-coded: `options={[...].map(...)}`",
+        "evidence": "",
+    }
+    assert ground_finding(finding, src)[0] is True
+
+
+# ── cause 2: semicolon-separated prose narrative ──────────────────────────────
+#
+# The finder's connective narrative can land in the evidence field as an inline backtick
+# span or inside a fenced block. The _PROSE_RE semicolon heuristic catches multi-clause
+# spans that use `; it`, `; this`, `; that`, `; the` as sentence connectives — a pattern
+# that does not appear in real code (for-loop semicolons never precede these words).
+
+
+def test_semicolon_it_prose_excluded():
+    # `; it then` is a narrative connector, not code.
+    prose = {
+        "file": "x.py",
+        "severity": "major",
+        "claim": "Race condition in load.",
+        "evidence": "`getData(config); it then passes to render(view); the state updates`",
+    }
+    assert quoted_snippets(prose) == []
+    assert ground_finding(prose, "def getData(config): pass")[0] is True
+
+
+def test_semicolon_the_prose_excluded():
+    # `; the` is a narrative connector, not code.
+    prose = {
+        "file": "x.py",
+        "severity": "major",
+        "claim": "Side effect.",
+        "evidence": "`fetchUser(id); the response is cached; that triggers the watcher`",
+    }
+    assert quoted_snippets(prose) == []
+
+
+def test_semicolon_this_prose_excluded():
+    prose = {
+        "file": "x.py",
+        "severity": "major",
+        "claim": "Handler fails.",
+        "evidence": "`processItem(x); this triggers the cleanup path`",
+    }
+    assert quoted_snippets(prose) == []
+
+
+def test_semicolon_prose_fenced_excluded():
+    # Same prose inside a fenced block (not just inline backtick).
+    prose = {
+        "file": "x.py",
+        "severity": "major",
+        "claim": "Leak.",
+        "evidence": "```\nrunHandler(ctx); the lock is released; it then logs\n```",
+    }
+    assert quoted_snippets(prose) == []
+
+
+def test_for_loop_semicolons_not_excluded():
+    # A for-loop has `;` separators but NOT followed by `it/this/that/the` as words.
+    code = {
+        "file": "x.js",
+        "severity": "major",
+        "claim": "Off-by-one: `for (let i = 0; i < items.length; i++)`",
+        "evidence": "",
+    }
+    snippets = quoted_snippets(code)
+    assert len(snippets) > 0
+
+
+def test_semicolon_variable_named_i_not_excluded():
+    # `; i < n` must not be confused with prose — `i` is not in the prose word set.
+    from pr_reviewer.grounding import _PROSE_RE
+
+    assert not _PROSE_RE.search("; i < n; i++") and not _PROSE_RE.search("; i++, j--")
