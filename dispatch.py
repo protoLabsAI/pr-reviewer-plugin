@@ -32,7 +32,7 @@ import time
 from .approve import HOLD_NOT_OWNER, PROMOTE, Observations, promotion_decision
 from .chokepoint import DISPATCH_ACTIONS, Chokepoint
 from .gh_cli import bad_repo, run_gh
-from .grounding import apply_grounding, render_grounding_footnote
+from .grounding import apply_grounding, correct_line_numbers, render_grounding_footnote
 from .protopatch import UNAVAILABLE_PREFIX
 from .rounds import (
     DEFAULT_CONVERGENCE_ROUNDS,
@@ -396,14 +396,16 @@ class Dispatcher:
             return []
         return [str(b or "") for b in rows] if isinstance(rows, list) else []
 
-    async def _finding_sources(self, repo: str, pr: int, head: str, findings: list[dict]) -> dict[str, str | None]:
-        """{file: text-to-ground-against} for the files the findings cite.
+    async def _finding_sources(
+        self, repo: str, pr: int, head: str, findings: list[dict]
+    ) -> dict[str, tuple[str, str | None]]:
+        """{file: (blob, combined)} for the files the findings cite.
 
-        The haystack is the file AT THE REVIEWED HEAD plus this PR's patch for it. The
-        patch matters: a removed-behaviour finding legitimately quotes code the head no
-        longer contains, and grounding it against the head alone would downgrade the
-        panel's sharpest angle. An unreadable file maps to None — fail open, never
-        downgrade on a failed read (the `confine_findings` posture).
+        ``blob`` is the raw file at the reviewed head — used for line-number correction.
+        ``combined`` is ``blob + patch`` — used for grounding existence checks (a
+        removed-behaviour finding legitimately quotes code the head no longer has).
+        An unreadable file gives ``("", None)`` — fail open, never downgrade on a
+        failed read (the ``confine_findings`` posture).
         """
         patches: dict[str, str] = {}
         rc, out, _err = await self._run_gh(
@@ -416,7 +418,7 @@ class Dispatcher:
                         patches[str(row["f"])] = str(row.get("p") or "")
             except json.JSONDecodeError:
                 pass
-        sources: dict[str, str | None] = {}
+        sources: dict[str, tuple[str, str | None]] = {}
         for file in {str(f.get("file") or "") for f in findings if f.get("file")}:
             rc, out, _err = await self._run_gh(["api", f"repos/{repo}/contents/{file}?ref={head}", "--jq", ".content"])
             blob = ""
@@ -428,7 +430,8 @@ class Dispatcher:
                 except Exception:  # noqa: BLE001 — an undecodable blob is a failed read
                     blob = ""
             patch = patches.get(file, "")
-            sources[file] = f"{blob}\n{patch}" if (blob or patch) else None
+            combined = f"{blob}\n{patch}" if (blob or patch) else None
+            sources[file] = (blob, combined)
         return sources
 
     async def _delta_ranges(self, repo: str, base: str, head: str) -> dict | None:
@@ -730,10 +733,13 @@ class Dispatcher:
         grounded_findings, ungrounded = [], []
         grounding_checked = 0
         if self.grounding_enabled and findings:
-            sources = await self._finding_sources(repo, pr, head, findings)
-            grounded_findings, ungrounded = apply_grounding(findings, sources)
+            raw = await self._finding_sources(repo, pr, head, findings)
+            blobs = {f: v[0] for f, v in raw.items()}
+            grounding_sources = {f: v[1] for f, v in raw.items()}
+            grounded_findings, ungrounded = apply_grounding(findings, grounding_sources)
             grounding_checked = len(findings)
             findings = grounded_findings
+            findings = correct_line_numbers(findings, blobs)
         if ungrounded:
             self.telemetry.emit("ungrounded", repo=repo, pr=pr, sha=head, round=round_number, downgraded=ungrounded)
         verdict = verdict_for(findings)
