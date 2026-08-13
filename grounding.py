@@ -84,6 +84,42 @@ _PROSE_RE = re.compile(
 # `writable = Path(str(configured))`; only the latter is a claim this module can test.
 _STATEMENT_RE = re.compile(r"\S\s+\S")
 
+# ...and must not be the model's own CONNECTIVE PROSE. `_PROSE_RE` above catches
+# narrative punctuation, but a short clause with none of it still clears every filter
+# here — it is under the length/token caps, has whitespace, and a stray `(`/`:` reads as
+# a code hint. From production (protoAgent#2631 r2, a **blocker**): all three of
+#
+#   "; diff (scheduler, same pattern at ~new line 1692):"
+#   "; and the removed order-independent read:"
+#   "(untouched by this PR) still does"
+#
+# were extracted as checkable code and, being prose, could never be found — downgrading
+# a finding whose REAL evidence was never checked. Two signals separate them from code:
+#
+#  1. a leading `;`/`,` + lowercase word — a sentence fragment continuing the previous
+#     clause. A line lifted from a file does not begin that way.
+#  2. a high count of English function words. Code lines carry few.
+#
+# Validated against all 79 distinct failed quotes on record: this rejects exactly 4, and
+# all 4 are prose (these three plus one narrative sentence). The other 75 — real code,
+# JSX, TOML, Rust, shell — are untouched. That direction matters more than the catch: a
+# filter that is too eager silently stops checking genuine evidence, which is worse than
+# the bug it fixes.
+_PROSE_WORDS = frozenset(
+    """the this that these those it its by at to of on about above below after before
+    still same also already only just here there when while because since untouched
+    removed which whose our their""".split()
+)
+_FRAGMENT_START_RE = re.compile(r"^[;,]\s+[a-z]")
+_MAX_PROSE_WORDS = 2  # 3+ function words in one short span is a sentence, not a line
+
+
+def _is_connective_prose(text: str) -> bool:
+    if _FRAGMENT_START_RE.search(text):
+        return True
+    words = [w.lower() for w in re.findall(r"[A-Za-z][A-Za-z-]+", text)]
+    return sum(1 for w in words if w in _PROSE_WORDS) > _MAX_PROSE_WORDS
+
 # Diff decorations the panel copies into evidence; stripped before matching so a quote
 # lifted from a patch hunk still matches the file's own text.
 _DIFF_PREFIX_RE = re.compile(r"^[+\-]\s?", re.MULTILINE)
@@ -152,6 +188,8 @@ def quoted_snippets(finding: dict) -> list[str]:
             continue
         if len(text.split()) > MAX_QUOTE_TOKENS or _PROSE_RE.search(text):
             continue  # a sentence about the code, not a claim about the file's text
+        if _is_connective_prose(text):
+            continue  # the model's own narration, captured as if it were evidence
         if _CODE_HINT_RE.search(text) and _STATEMENT_RE.search(text):
             out.append(text)
     return out
