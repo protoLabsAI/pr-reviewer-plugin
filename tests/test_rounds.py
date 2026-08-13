@@ -511,3 +511,76 @@ def test_refuted_against_confirmed_blocker_also_holds():
     # Severity=blocker obeys the same rule as major.
     conf = {"head": HEAD_1, "verdict": "FAIL", "findings": [dict(finding(severity="blocker"), verdict="confirmed")]}
     assert len(unaccounted_priors([conf], [dispo("store.py:100", "refuted")])) == 1
+
+
+# ── grounding-downgraded findings are excluded from the prior ledger (#55) ────
+
+
+def _ungrounded_major(file="store.py", line=100, claim="fabricated"):
+    """A prior finding that grounding downgraded — carries ungrounded=True."""
+    return dict(finding(file=file, line=line, severity="major", claim=claim), ungrounded=True, verdict="uncertain")
+
+
+def test_an_ungrounded_prior_is_not_an_unaccounted_debt():
+    # The root cause of #55: grounding downgrades a finding to uncertain+ungrounded,
+    # but unaccounted_priors still sees it as a prior blocker/major and raises it as
+    # a debt every subsequent round, forever.
+    history = [{"head": HEAD_1, "verdict": WARN, "findings": [_ungrounded_major(claim="fabricated evidence")]}]
+    # With dispositions present, the ungrounded finding must not appear in missing.
+    missing = unaccounted_priors(history, [dispo("unrelated.py:1", "fixed")])
+    assert missing == []
+
+
+def test_ungrounded_prior_excluded_regardless_of_severity():
+    # Same rule for blocker severity.
+    ug_blocker = dict(finding(severity="blocker", claim="made up"), ungrounded=True, verdict="uncertain")
+    history = [{"head": HEAD_1, "verdict": WARN, "findings": [ug_blocker]}]
+    assert unaccounted_priors(history, [dispo("x:1", "fixed")]) == []
+
+
+def test_non_ungrounded_major_still_creates_debt():
+    # Control: a regular confirmed major (no ungrounded flag) continues to be accounted.
+    history = [{"head": HEAD_1, "verdict": "FAIL", "findings": [finding(severity="major", claim="real bug")]}]
+    missing = unaccounted_priors(history, [dispo("unrelated.py:9", "fixed")])
+    assert len(missing) == 1 and missing[0]["claim"] == "real bug"
+
+
+def test_mixed_round_only_excludes_the_ungrounded_one():
+    # One fabricated (ungrounded) + one real major in the same round.
+    # Only the real one should create a debt.
+    history = [
+        {
+            "head": HEAD_1,
+            "verdict": "FAIL",
+            "findings": [
+                _ungrounded_major(file="store.py", line=10, claim="fabricated"),
+                finding(file="store.py", line=200, severity="major", claim="real"),
+            ],
+        }
+    ]
+    missing = unaccounted_priors(history, [dispo("unrelated.py:1", "fixed")])
+    assert len(missing) == 1
+    assert missing[0]["claim"] == "real"
+
+
+def test_ungrounded_flag_survives_round_recall_and_is_still_excluded():
+    # Simulate the full lifecycle: grounding emits the flag, panel_rounds recalls it
+    # from the stored findings JSON, and unaccounted_priors still excludes it.
+    import json
+
+    from pr_reviewer.verdicts import render_verdict_body
+
+    ug = _ungrounded_major(file="x.py", line=5, claim="ghost quote")
+    body = render_verdict_body(
+        repo="o/r",
+        pr=1,
+        head_sha=HEAD_1,
+        verdict=WARN,
+        report=f"prose\n```json\n{json.dumps([ug])}\n```",
+        shadow=True,
+        recipe="code-review",
+    )
+    reviews = [{"head": HEAD_1, "verdict": WARN, "promoted": False, "body": body}]
+    history = panel_rounds(reviews)
+    assert history[0]["findings"][0].get("ungrounded") is True
+    assert unaccounted_priors(history, [dispo("unrelated.py:1", "fixed")]) == []

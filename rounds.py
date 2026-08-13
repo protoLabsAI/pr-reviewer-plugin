@@ -420,6 +420,9 @@ def unaccounted_priors(
         return []
     missing = []
     for finding in last_round_findings:
+        if finding.get("ungrounded"):
+            # grounding already decided the evidence is fabricated — not a debt
+            continue
         severity = str(finding.get("severity") or "").lower()
         if severity not in ("blocker", "major"):
             continue

@@ -57,6 +57,24 @@ def test_a_downgraded_blocker_can_no_longer_fail_the_verdict():
     assert "not found at the reviewed head" in out[0]["note"]
 
 
+def test_a_downgraded_finding_is_marked_ungrounded():
+    # The marker must be persisted in the findings JSON so it survives round recall
+    # and unaccounted_priors can exclude it from the prior-finding ledger.
+    out, _ = apply_grounding([FABRICATED], {FABRICATED["file"]: WRITABLE_DIR_SRC})
+    assert out[0].get("ungrounded") is True
+
+
+def test_a_grounded_finding_is_not_marked_ungrounded():
+    real = {
+        "file": "plugins/workflows/__init__.py",
+        "severity": "major",
+        "claim": "The guard `writable = Path(configured).expanduser()` runs only in one branch.",
+        "evidence": 'It sits under `if configured and not str(configured).startswith("/sandbox"):`',
+    }
+    out, _ = apply_grounding([real], {real["file"]: WRITABLE_DIR_SRC})
+    assert not out[0].get("ungrounded")
+
+
 def test_nothing_is_ever_dropped():
     out, _ = apply_grounding([FABRICATED], {FABRICATED["file"]: WRITABLE_DIR_SRC})
     assert len(out) == 1  # still posts, still readable, still a human's call
