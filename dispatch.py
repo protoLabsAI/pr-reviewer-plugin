@@ -158,6 +158,7 @@ class Dispatcher:
         self._viewer: str | None = None
         self._promote_failures: dict[str, int] = {}  # repo#pr@head -> consecutive APPROVE failures
         self._regate_failures: dict[str, int] = {}  # repo#pr@head -> consecutive REQUEST_CHANGES failures
+        self._round_cap: dict[str, float] = {}  # repo#pr -> monotonic timestamp when capped
 
     # ── config, resolved live ────────────────────────────────────────────────
     #
@@ -255,6 +256,23 @@ class Dispatcher:
             else _env_bool("PR_REVIEWER_EVIDENCE_GROUNDING", True)
         )
 
+    @property
+    def max_rounds(self) -> int:
+        """Maximum push-triggered panel reviews before the cap suppresses further pushes.
+        Zero disables the cap."""
+        cfg = self.cfg
+        return int(cfg["max_rounds"]) if "max_rounds" in cfg else _env_int("PR_REVIEWER_MAX_ROUNDS", 6)
+
+    @property
+    def max_rounds_cooldown_s(self) -> int:
+        """Seconds before the max-rounds cap resets without an explicit trigger."""
+        cfg = self.cfg
+        return (
+            int(cfg["max_rounds_cooldown"])
+            if "max_rounds_cooldown" in cfg
+            else _env_int("PR_REVIEWER_MAX_ROUNDS_COOLDOWN", 7200)
+        )
+
     # ── plumbing ──────────────────────────────────────────────────────────────
 
     def _runner(self):
@@ -324,6 +342,25 @@ class Dispatcher:
         )
         if rc != 0:
             log.warning("[pr-reviewer] exhaustion comment on %s#%s failed: %s", repo, pr, err[-300:])
+
+    async def _post_max_rounds_comment(self, repo: str, pr: int) -> None:
+        """Post a visible notice that the push-triggered review cap has been hit — fail-open."""
+        cooldown_h = self.max_rounds_cooldown_s // 3600
+        body = (
+            f"🛑 **Review cap reached** — this PR has had {self.max_rounds} automated review "
+            f"round(s). Further pushes will not trigger new reviews.\n\n"
+            f"The cap resets when:\n"
+            f"- The PR is marked **ready-for-review**\n"
+            f"- An operator runs `@vera review` (manual summon)\n"
+            f"- {cooldown_h} hour(s) elapse since the cap was hit\n\n"
+            f"<!-- protoagent-qa-max-rounds repo={repo} pr={pr} -->"
+        )
+        rc, _out, err = await self._run_gh(
+            ["api", f"repos/{repo}/issues/{pr}/comments", "-X", "POST", "-f", f"body={body}"],
+            timeout=60,
+        )
+        if rc != 0:
+            log.warning("[pr-reviewer] max-rounds comment on %s#%s failed: %s", repo, pr, err[-300:])
 
     async def _viewer_login(self) -> str:
         if self._viewer is None:
@@ -521,6 +558,10 @@ class Dispatcher:
 
     async def handle_pr_event(self, repo: str, pr: int, head_sha: str, action: str) -> str:
         """Webhook/manual entry. Returns 'reviewed:<verdict>' or a typed drop/outcome."""
+        # A draft→ready conversion resets the max-rounds cap before any other gate so
+        # the fresh-open review proceeds even if the PR was flood-capped while in draft.
+        if action == "ready_for_review":
+            self._round_cap.pop(f"{repo}#{pr}", None)
         if action not in DISPATCH_ACTIONS:
             self.telemetry.emit("drop", repo=repo, pr=pr, reason="not-a-dispatch-action", action=action)
             return "drop:not-a-dispatch-action"
@@ -529,12 +570,21 @@ class Dispatcher:
             # not trigger PR lookups on our credentials (Quinn's gate ordering).
             self.telemetry.emit("drop", repo=repo, pr=pr, reason="unlisted-repo")
             return "drop:unlisted-repo"
+        # Max-rounds cap: suppress push-triggered reviews after the limit, before the
+        # chokepoint so the in-flight slot is never consumed for a capped drop.
+        cap_key = f"{repo}#{pr}"
+        if cap_key in self._round_cap:
+            cap_age = time.monotonic() - self._round_cap[cap_key]
+            if cap_age < self.max_rounds_cooldown_s:
+                self.telemetry.emit("drop", repo=repo, pr=pr, sha=head_sha, reason="max-rounds-capped")
+                return "drop:max-rounds-capped"
+            del self._round_cap[cap_key]  # cooldown elapsed — let the next push through
         decision = self.chokepoint.admit(repo, pr, head_sha)
         if decision != "accept":
             self.telemetry.emit("drop", repo=repo, pr=pr, sha=head_sha, reason=decision)
             return f"drop:{decision}"
         try:
-            return await self._review(repo, pr)
+            return await self._review(repo, pr, push_triggered=True)
         finally:
             self.chokepoint.done(repo, pr)
 
@@ -558,12 +608,15 @@ class Dispatcher:
             self.telemetry.emit("drop", repo=repo, pr=pr, reason=decision, summon=actor)
             return f"drop:{decision}"
         self.telemetry.emit("summon", repo=repo, pr=pr, actor=actor)
+        # A manual summon resets the max-rounds cap — "I think you got this wrong" must
+        # override the flood guard, and the operator has implicitly acknowledged the cost.
+        self._round_cap.pop(f"{repo}#{pr}", None)
         try:
             return await self._review(repo, pr, force=True)
         finally:
             self.chokepoint.done(repo, pr)
 
-    async def _review(self, repo: str, pr: int, *, force: bool = False) -> str:
+    async def _review(self, repo: str, pr: int, *, force: bool = False, push_triggered: bool = False) -> str:
         started = time.monotonic()
         facts = await self._pr_facts(repo, pr)
         if not facts or facts.get("state") != "open" or facts.get("draft"):
@@ -611,6 +664,17 @@ class Dispatcher:
             return f"reaffirmed:{current['verdict']}"
         prior = history[-1] if history else None
         round_number = len(history) + 1
+        # Max-rounds cap: arm on the first push-triggered review that exceeds the limit so
+        # the panel is never spent — post the notice once, then drop all subsequent pushes.
+        # Backfill and summon calls pass push_triggered=False and are always exempt.
+        if push_triggered and self.max_rounds and round_number > self.max_rounds:
+            cap_key = f"{repo}#{pr}"
+            self._round_cap[cap_key] = time.monotonic()
+            if len(self._round_cap) > 1024:
+                self._round_cap = dict(list(self._round_cap.items())[-512:])
+            await self._post_max_rounds_comment(repo, pr)
+            self.telemetry.emit("drop", repo=repo, pr=pr, sha=head, reason="max-rounds-capped", round=round_number)
+            return "drop:max-rounds-capped"
         prior_findings = json.dumps(prior["findings"]) if prior and prior["findings"] else ""
         prior_requests = render_prior_requests(history)
 

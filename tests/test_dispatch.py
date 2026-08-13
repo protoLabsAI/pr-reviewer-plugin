@@ -4,6 +4,7 @@ reads/writes go through a canned fake `gh`; the workflow runner is a stub."""
 from __future__ import annotations
 
 import json
+import time
 
 from pr_reviewer.dispatch import Dispatcher
 from pr_reviewer.telemetry import Telemetry
@@ -1500,3 +1501,176 @@ async def test_exhaustion_comment_failure_does_not_prevent_escalation(tmp_path):
     assert escalations and "UNREVIEWED" in escalations[0][0]  # inbox still fires
     events = {e["event"]: e for e in d.telemetry.read_all()}
     assert "escalation" in events  # telemetry still fires
+
+
+# ── max-rounds cap: suppress push-triggered reviews after the limit (issue #60) ─
+
+
+def two_rounds():
+    """Two completed panel rounds in history (round_number would be 3 for the next)."""
+    return [review_row(OLD_HEAD, "WARN"), review_row(MID_HEAD, "WARN")]
+
+
+async def test_push_capped_after_max_rounds_posts_comment_and_drops(tmp_path):
+    """When push round_number > max_rounds, the panel is not spent and a comment is posted."""
+    gh = RoutedGH(pr_facts=facts(), reviews=two_rounds())
+    ran = []
+
+    async def runner(name, inputs):
+        ran.append(name)
+        return {"output": REPORT, "failed": []}
+
+    d = make(tmp_path, cfg={"max_rounds": 2}, gh=gh, runner=runner)
+    out = await d.handle_pr_event("o/r", 1, HEAD, "synchronize")
+    assert out == "drop:max-rounds-capped"
+    assert ran == []  # panel was not spent
+    # A comment explaining the cap was posted (not a review verdict — no `event` field).
+    comments = [p for p in gh.posted if "body" in p and "event" not in p]
+    assert len(comments) == 1
+    assert "Review cap reached" in comments[0]["body"]
+    assert "<!-- protoagent-qa-max-rounds" in comments[0]["body"]
+
+
+async def test_subsequent_push_drops_early_without_comment(tmp_path):
+    """After the cap is set, a second push drops in handle_pr_event before the panel or comment."""
+    gh = RoutedGH(pr_facts=facts(), reviews=two_rounds())
+    ran = []
+
+    async def runner(name, inputs):
+        ran.append(name)
+        return {"output": REPORT, "failed": []}
+
+    d = make(tmp_path, cfg={"max_rounds": 2}, gh=gh, runner=runner)
+    # First push sets the cap (posts one comment).
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "synchronize")) == "drop:max-rounds-capped"
+    posts_after_first = len(gh.posted)
+    # Second push (new head) is dropped early — no new comment, no panel.
+    new_head = "d" * 40
+    out = await d.handle_pr_event("o/r", 1, new_head, "synchronize")
+    assert out == "drop:max-rounds-capped"
+    assert ran == []
+    assert len(gh.posted) == posts_after_first  # no additional posts
+
+
+async def test_ready_for_review_resets_the_max_rounds_cap(tmp_path):
+    """ready_for_review event clears the cap so the next push can proceed."""
+    gh = RoutedGH(pr_facts=facts(), reviews=two_rounds())
+    d = make(tmp_path, cfg={"max_rounds": 2}, gh=gh)
+    # Hit the cap.
+    await d.handle_pr_event("o/r", 1, HEAD, "synchronize")
+    assert "o/r#1" in d._round_cap
+    # ready_for_review resets it (even when the action itself may be outside DISPATCH_ACTIONS).
+    await d.handle_pr_event("o/r", 1, HEAD, "ready_for_review")
+    assert "o/r#1" not in d._round_cap
+
+
+async def test_summon_resets_cap_and_runs_review(tmp_path):
+    """A manual summon clears the cap and runs the panel regardless of round count."""
+    gh = RoutedGH(pr_facts=facts(), reviews=two_rounds())
+    ran = []
+
+    async def runner(name, inputs):
+        ran.append(name)
+        return {"output": REPORT, "failed": []}
+
+    d = make(tmp_path, cfg={"max_rounds": 2}, gh=gh, runner=runner)
+    # Hit the cap.
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "synchronize")) == "drop:max-rounds-capped"
+    assert "o/r#1" in d._round_cap
+    # Summon overrides the cap: resets it and runs the panel.
+    out = await d.handle_summon("o/r", 1, "an-admin")
+    assert out == "reviewed:FAIL"
+    assert ran  # panel actually ran
+    assert "o/r#1" not in d._round_cap  # cap was cleared by the summon
+
+
+async def test_cap_resets_after_cooldown_elapses(tmp_path):
+    """After the cooldown period, the next push is accepted and treated as a new round."""
+    gh = RoutedGH(pr_facts=facts(), reviews=two_rounds())
+    ran = []
+
+    async def runner(name, inputs):
+        ran.append(name)
+        return {"output": REPORT, "failed": []}
+
+    d = make(tmp_path, cfg={"max_rounds": 2, "max_rounds_cooldown": 3600}, gh=gh, runner=runner)
+    # Hit the cap.
+    await d.handle_pr_event("o/r", 1, HEAD, "synchronize")
+    # Backdate the cap timestamp past the cooldown.
+    d._round_cap["o/r#1"] -= 3601
+    # The next push should be accepted (cooldown elapsed).
+    new_head = "d" * 40
+    out = await d.handle_pr_event("o/r", 1, new_head, "synchronize")
+    # round_number = 4 > max_rounds 2, so the cap fires again immediately — but this
+    # proves the EARLY check in handle_pr_event let us through (cooldown path).
+    assert out == "drop:max-rounds-capped"
+    assert "o/r#1" in d._round_cap  # re-capped on this fresh review attempt
+
+
+async def test_backfill_is_not_subject_to_max_rounds_cap(tmp_path):
+    """Backfill reviews bypass the cap — they are not push-triggered."""
+    gh = RoutedGH(pr_facts=facts(), reviews=two_rounds())
+    ran = []
+
+    async def runner(name, inputs):
+        ran.append(name)
+        return {"output": REPORT, "failed": []}
+
+    d = make(tmp_path, cfg={"max_rounds": 2}, gh=gh, runner=runner)
+    # Arm the cap manually.
+    d._round_cap["o/r#1"] = time.monotonic()
+    # Backfill goes through _review without push_triggered=True — cap never fires.
+    out = await d.backfill_review("o/r", 1, HEAD)
+    assert out.startswith("reviewed:")
+    assert ran  # panel ran
+
+
+async def test_summon_is_not_subject_to_max_rounds_cap(tmp_path):
+    """Summon calls bypass the cap even when round count exceeds max_rounds."""
+    gh = RoutedGH(pr_facts=facts(), reviews=two_rounds())
+    ran = []
+
+    async def runner(name, inputs):
+        ran.append(name)
+        return {"output": REPORT, "failed": []}
+
+    d = make(tmp_path, cfg={"max_rounds": 2}, gh=gh, runner=runner)
+    # No cap in _round_cap — summon should just work despite history > max_rounds.
+    out = await d.handle_summon("o/r", 1, "an-admin")
+    assert out == "reviewed:FAIL"
+    assert ran
+    # Summon itself does not set the cap.
+    assert "o/r#1" not in d._round_cap
+
+
+async def test_max_rounds_zero_disables_the_cap(tmp_path):
+    """max_rounds=0 disables the cap entirely — every push is reviewed."""
+    gh = RoutedGH(pr_facts=facts(), reviews=two_rounds())
+    ran = []
+
+    async def runner(name, inputs):
+        ran.append(name)
+        return {"output": REPORT, "failed": []}
+
+    d = make(tmp_path, cfg={"max_rounds": 0}, gh=gh, runner=runner)
+    out = await d.handle_pr_event("o/r", 1, HEAD, "synchronize")
+    assert out == "reviewed:FAIL"
+    assert ran  # panel ran — cap is disabled
+
+
+def test_max_rounds_env_fallback_and_default(monkeypatch, tmp_path):
+    monkeypatch.delenv("PR_REVIEWER_MAX_ROUNDS", raising=False)
+    monkeypatch.delenv("PR_REVIEWER_MAX_ROUNDS_COOLDOWN", raising=False)
+    d = Dispatcher({}, Telemetry(tmp_path))
+    assert d.max_rounds == 6
+    assert d.max_rounds_cooldown_s == 7200
+
+    monkeypatch.setenv("PR_REVIEWER_MAX_ROUNDS", "3")
+    monkeypatch.setenv("PR_REVIEWER_MAX_ROUNDS_COOLDOWN", "1800")
+    d2 = Dispatcher({}, Telemetry(tmp_path))
+    assert d2.max_rounds == 3
+    assert d2.max_rounds_cooldown_s == 1800
+
+    d3 = Dispatcher({"max_rounds": 4, "max_rounds_cooldown": 900}, Telemetry(tmp_path))
+    assert d3.max_rounds == 4
+    assert d3.max_rounds_cooldown_s == 900
