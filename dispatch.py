@@ -267,8 +267,20 @@ class Dispatcher:
         except Exception:  # noqa: BLE001 — host-free
             return None
 
-    def _escalate(self, text: str, dedup_key: str) -> None:
-        """Operator escalation — inbox when the host offers one, always telemetry."""
+    async def _escalate(
+        self,
+        text: str,
+        dedup_key: str,
+        *,
+        repo: str | None = None,
+        pr: int | None = None,
+        head_sha: str | None = None,
+    ) -> None:
+        """Operator escalation — inbox when the host offers one, always telemetry.
+
+        When repo/pr/head_sha are given (panel-exhaustion path), also posts a visible
+        comment on the PR — fail-open and deduplicated by head SHA.
+        """
         self.telemetry.emit("escalation", text=text, dedup_key=dedup_key)
         add = self._inbox_add
         if add is None:
@@ -283,6 +295,35 @@ class Dispatcher:
                 add(text, priority="next", source="pr-reviewer", dedup_key=dedup_key)
             except Exception:  # noqa: BLE001
                 log.exception("[pr-reviewer] inbox escalation failed")
+        if repo and pr is not None and head_sha:
+            await self._post_exhaustion_comment(repo, pr, head_sha)
+
+    async def _post_exhaustion_comment(self, repo: str, pr: int, head_sha: str) -> None:
+        """Post a visible exhaustion notice on the PR — fail-open, deduplicated by head SHA."""
+        marker = f"<!-- protoagent-qa-exhausted head={head_sha} -->"
+        rc, out, _err = await self._run_gh(
+            ["api", f"repos/{repo}/issues/{pr}/comments", "--paginate", "--jq", "[.[].body]"]
+        )
+        if rc == 0:
+            try:
+                bodies = json.loads(out)
+                if isinstance(bodies, list) and any(marker in str(b or "") for b in bodies):
+                    return
+            except json.JSONDecodeError:
+                pass  # unreadable → post anyway (fail-open)
+        retries = self.panel_retries + 1
+        body = (
+            f"⚠️ **QA panel exhausted** — this PR has not been reviewed.\n"
+            f"The review panel failed after {retries} attempt(s) on head `{head_sha[:12]}`. No verdict was posted.\n"
+            f"A new push will re-trigger the review.\n"
+            f"{marker}"
+        )
+        rc, _out, err = await self._run_gh(
+            ["api", f"repos/{repo}/issues/{pr}/comments", "-X", "POST", "-f", f"body={body}"],
+            timeout=60,
+        )
+        if rc != 0:
+            log.warning("[pr-reviewer] exhaustion comment on %s#%s failed: %s", repo, pr, err[-300:])
 
     async def _viewer_login(self) -> str:
         if self._viewer is None:
@@ -620,7 +661,7 @@ class Dispatcher:
                         "panel_retry", repo=repo, pr=pr, sha=head, attempt=attempt, crashed=type(exc).__name__
                     )
                     continue
-                self._escalate(
+                await self._escalate(
                     f"pr-reviewer: review run crashed on {repo}#{pr} ({type(exc).__name__}: {exc}) — PR is UNREVIEWED.",
                     dedup_key=f"pr-reviewer-crash:{repo}#{pr}@{head[:7]}",
                 )
@@ -634,10 +675,13 @@ class Dispatcher:
             # Retries spent: D3's other branch. No verdict, operator escalation — and
             # the sweep's backfill will try again on a later pass (issue #17), so an
             # exhausted PR is no longer abandoned for good.
-            self._escalate(
+            await self._escalate(
                 f"pr-reviewer: panel step(s) {failed} failed on {repo}#{pr} "
                 f"after {self.panel_retries + 1} attempt(s) — no verdict posted; PR is UNREVIEWED.",
                 dedup_key=f"pr-reviewer-exhaustion:{repo}#{pr}@{head[:7]}",
+                repo=repo,
+                pr=pr,
+                head_sha=head,
             )
             self.telemetry.emit(
                 "exhaustion", repo=repo, pr=pr, sha=head, failed=failed, attempts=self.panel_retries + 1
@@ -971,7 +1015,7 @@ class Dispatcher:
                 err[-300:],
             )
             if failures >= REGATE_MAX_FAILURES:
-                self._escalate(
+                await self._escalate(
                     f"pr-reviewer: re-gate keeps failing on {repo}#{pr} @{head[:7]} ({failures}× — backing off "
                     f"until a new head). A FAIL verdict is standing but NOT blocking. Last error: {err[-200:]}",
                     dedup_key=f"pr-reviewer-regate-backoff:{backoff_key[:64]}",
@@ -1066,7 +1110,7 @@ class Dispatcher:
                 err[-300:],
             )
             if failures >= PROMOTE_MAX_FAILURES:
-                self._escalate(
+                await self._escalate(
                     f"pr-reviewer: promotion APPROVE keeps failing on {repo}#{pr} @{head[:7]} "
                     f"({failures}× — backing off until a new head). Last error: {err[-200:]}",
                     dedup_key=f"pr-reviewer-promote-backoff:{backoff_key[:64]}",

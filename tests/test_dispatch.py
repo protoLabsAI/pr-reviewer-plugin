@@ -266,7 +266,8 @@ async def test_failed_panel_step_escalates_and_posts_nothing(tmp_path):
     d = make(tmp_path, gh=gh, runner=runner, inbox=lambda text, **kw: escalations.append((text, kw)))
     out = await d.handle_pr_event("o/r", 1, HEAD, "opened")
     assert out == "error:panel-exhausted"
-    assert gh.posted == []
+    # D3 holds: no verdict review posted (the exhaustion comment is not a verdict)
+    assert all("event" not in p for p in gh.posted)
     assert escalations and "UNREVIEWED" in escalations[0][0]
 
 
@@ -609,7 +610,8 @@ async def test_retries_are_bounded_and_still_never_synthesize_a_partial_verdict(
     d = make(tmp_path, cfg={"panel_retries": 2}, gh=gh, runner=runner, inbox=lambda t, **kw: escalations.append(t))
     assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "error:panel-exhausted"
     assert len(attempts) == 3  # the original + 2 retries
-    assert gh.posted == []  # D3 holds: no verdict from a partial panel
+    # D3 holds: no verdict review posted (the exhaustion comment is not a verdict)
+    assert all("event" not in p for p in gh.posted)
     assert escalations and "UNREVIEWED" in escalations[0]
 
 
@@ -1430,3 +1432,71 @@ async def test_summon_disabled_skips_the_pause_check_entirely(tmp_path):
     runner, _seen = capturing_runner()
     d = make(tmp_path, cfg={"summon": False}, gh=gh, runner=runner)
     assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "reviewed:FAIL"
+
+
+# ── panel-exhaustion PR comment (issue #54) ────────────────────────────────────
+
+
+async def test_exhaustion_comment_posted_on_pr_with_head_sha_and_marker(tmp_path):
+    """When the panel exhausts, a visible comment is posted naming the head and the marker."""
+    gh = RoutedGH(pr_facts=facts())
+    escalations = []
+
+    async def runner(name, inputs):
+        return {"output": "partial", "failed": ["find_crossfile"]}
+
+    d = make(tmp_path, gh=gh, runner=runner, inbox=lambda text, **kw: escalations.append((text, kw)))
+    out = await d.handle_pr_event("o/r", 1, HEAD, "opened")
+    assert out == "error:panel-exhausted"
+    # An exhaustion comment (no `event` key — this is not a review verdict) is posted.
+    comments = [p for p in gh.posted if "body" in p and "event" not in p]
+    assert len(comments) == 1
+    body = comments[0]["body"]
+    assert HEAD[:12] in body
+    assert "QA panel exhausted" in body
+    assert f"<!-- protoagent-qa-exhausted head={HEAD} -->" in body
+    # Inbox and telemetry still fire.
+    assert escalations and "UNREVIEWED" in escalations[0][0]
+
+
+async def test_exhaustion_comment_dedup_skips_if_same_head_already_commented(tmp_path):
+    """If the exhaustion marker for the current head already exists, no duplicate is posted."""
+    marker = f"<!-- protoagent-qa-exhausted head={HEAD} -->"
+    existing = f"⚠️ **QA panel exhausted** — this PR has not been reviewed.\n{marker}"
+    gh = PausedGH(comments=[existing], pr_facts=facts(), reviews=[])
+
+    async def runner(name, inputs):
+        return {"output": "partial", "failed": ["find_crossfile"]}
+
+    d = make(tmp_path, gh=gh, runner=runner)
+    await d.handle_pr_event("o/r", 1, HEAD, "opened")
+    # No new comment POST — the existing marker was found.
+    comments_posted = [p for p in gh.posted if "body" in p and "event" not in p]
+    assert comments_posted == []
+
+
+class FailingCommentGH(RoutedGH):
+    """Issues-comment POST always fails; reviews and other POSTs succeed normally."""
+
+    async def __call__(self, args, timeout=30):
+        joined = " ".join(args)
+        if "-X" in args and "POST" in args and "/issues/" in joined and "/comments" in joined:
+            self.calls.append(args)
+            return 1, "", "gh: 403 Forbidden"
+        return await super().__call__(args, timeout)
+
+
+async def test_exhaustion_comment_failure_does_not_prevent_escalation(tmp_path):
+    """If the comment POST fails, telemetry and inbox still fire (fail-open)."""
+    gh = FailingCommentGH(pr_facts=facts())
+    escalations = []
+
+    async def runner(name, inputs):
+        return {"output": "partial", "failed": ["find_crossfile"]}
+
+    d = make(tmp_path, gh=gh, runner=runner, inbox=lambda text, **kw: escalations.append((text, kw)))
+    out = await d.handle_pr_event("o/r", 1, HEAD, "opened")
+    assert out == "error:panel-exhausted"
+    assert escalations and "UNREVIEWED" in escalations[0][0]  # inbox still fires
+    events = {e["event"]: e for e in d.telemetry.read_all()}
+    assert "escalation" in events  # telemetry still fires
