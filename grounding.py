@@ -113,11 +113,25 @@ _PROSE_WORDS = frozenset(
 _FRAGMENT_START_RE = re.compile(r"^[;,]\s+[a-z]")
 _MAX_PROSE_WORDS = 2  # 3+ function words in one short span is a sentence, not a line
 
+# English INSIDE a string literal says nothing about whether the span is code — error
+# messages, log lines and docstrings are prose by design, and counting their contents
+# dropped genuine quotes like:
+#
+#   raise ValueError("the value at this index is already removed")
+#
+# That direction is the dangerous one. `ground_finding` fail-opens when NO quote survives
+# extraction, so dropping a real quote does not merely skip a check — it lets a FABRICATED
+# quote of the same shape through the #25 hallucination guard entirely, which is the exact
+# failure this module exists to prevent. `_normalize` has already unified every quote
+# character to `"`, so one mask covers all of them.
+_STRING_LITERAL_RE = re.compile(r'"[^"]*"')
+
 
 def _is_connective_prose(text: str) -> bool:
     if _FRAGMENT_START_RE.search(text):
         return True
-    words = [w.lower() for w in re.findall(r"[A-Za-z][A-Za-z-]+", text)]
+    outside_strings = _STRING_LITERAL_RE.sub('""', text)
+    words = [w.lower() for w in re.findall(r"[A-Za-z][A-Za-z-]+", outside_strings)]
     return sum(1 for w in words if w in _PROSE_WORDS) > _MAX_PROSE_WORDS
 
 # Diff decorations the panel copies into evidence; stripped before matching so a quote

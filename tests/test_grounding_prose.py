@@ -76,3 +76,38 @@ def test_a_fabricated_quote_alongside_prose_still_downgrades():
     grounded, missing = ground_finding(finding, source="something else entirely")
     assert grounded is False
     assert missing and "never_in_the_file" in missing[0]
+
+
+# ── English inside string literals (caught by Vera on PR #59, confirmed major) ────
+#
+# Counting prose words inside a string literal drops genuine code — error messages and
+# log lines are prose by design. The consequence is not a skipped check: `ground_finding`
+# fail-opens when nothing survives extraction, so a FABRICATED quote of the same shape
+# sails past the #25 hallucination guard. That is the failure this module exists to stop.
+
+CODE_WITH_ENGLISH_STRINGS = [
+    'raise ValueError("the value at this index is already removed")',
+    'log.warning("could not find the file at this path, it is already gone")',
+    'assert msg == "the same item is still here by design"',
+    'return {"error": "the request was already handled by this worker"}',
+]
+
+
+@pytest.mark.parametrize("code", CODE_WITH_ENGLISH_STRINGS)
+def test_english_inside_a_string_literal_does_not_drop_real_code(code):
+    assert quoted_snippets({"claim": f"see `{code}`", "evidence": ""}), f"dropped real code: {code}"
+
+
+@pytest.mark.parametrize("code", CODE_WITH_ENGLISH_STRINGS)
+def test_a_fabricated_quote_with_an_english_string_still_downgrades(code):
+    """The regression Vera named: if the quote is dropped, this finding grounds instead
+    of downgrading, and a hallucinated blocker keeps its teeth."""
+    grounded, missing = ground_finding({"claim": f"bug: `{code}`", "evidence": ""}, source="unrelated contents")
+    assert grounded is False, "fabricated quote failed OPEN — the #25 guard is bypassed"
+    assert missing
+
+
+def test_prose_outside_a_string_is_still_caught():
+    """The mask must not defeat the original fix: narration with a quoted fragment in it
+    is still narration."""
+    assert quoted_snippets({"claim": '`(untouched by this "PR") still does`', "evidence": ""}) == []
