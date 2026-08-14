@@ -5,11 +5,18 @@ every filter — under the length/token caps, has whitespace, and a stray `(`/`:
 a code hint — so the model's own narration got treated as a quote, could never be found,
 and downgraded a finding whose real evidence was never checked.
 
-The scope here is deliberately ONE signal (a leading `;`/`,` + lowercase word). A word-
-count heuristic was tried and withdrawn: every formulation of it produced a FALSE DROP,
-and a false drop is worse than the bug — `ground_finding` fail-opens when no quote
-survives, so dropping a real quote opens the #25 hallucination bypass rather than merely
-skipping a check. Those withdrawn cases are pinned below so they cannot creep back.
+The scope here is deliberately narrow: a leading `;`/`,` + lowercase word AND a trailing
+`:`. A word-count heuristic was tried and withdrawn, and so was the leading fragment on
+its own; every one of those produced a FALSE DROP, and a false drop is worse than the
+bug — `ground_finding` fail-opens when no quote survives, so dropping a real quote opens
+the #25 hallucination bypass rather than merely skipping a check. Those withdrawn cases
+are pinned below so they cannot creep back.
+
+Two fixture families do different jobs and both are needed. `FALSE_DROP_REGRESSIONS`
+pins the word-count casualties; none of them starts with `;`/`,`, so they never reach
+the leading-connective branch. `LEADING_CONNECTIVE_CODE` is the family that does reach
+it — real code that opens exactly like narration — and it is what `test_the_filter_is
+_actually_exercised` uses to prove the suite would fail if the rule were widened back.
 """
 
 from __future__ import annotations
@@ -91,6 +98,50 @@ def test_a_fabricated_quote_of_that_shape_still_downgrades(code):
     grounded, missing = ground_finding({"claim": f"bug: `{code}`", "evidence": ""}, source="unrelated contents")
     assert grounded is False, "fabricated quote failed OPEN — the #25 guard is bypassed"
     assert missing
+
+
+# ── The family that actually reaches the leading-connective branch ───────────────
+#
+# `_normalize` flattens a wrapped construct onto one line, so a quote lifted from the
+# middle of one genuinely begins with `; ` or `, ` + a lowercase word. The panel found
+# this on PR #59: the leading fragment alone dropped every shape below. They are kept by
+# also requiring the trailing `:` that narration ends on and code does not.
+
+LEADING_CONNECTIVE_CODE = [
+    ", key=value, timeout=30)",  # continuation of a wrapped call
+    "; i < n; i++) { total += i;",  # middle of a C-style for header
+    "; do_thing() } finally { close() }",  # a statement after an inline `;`
+    ", timeout: int = 30, retries: int = 3)",  # continuation of a wrapped signature
+]
+
+
+@pytest.mark.parametrize("code", LEADING_CONNECTIVE_CODE)
+def test_code_that_opens_like_narration_is_kept(code):
+    assert quoted_snippets({"claim": f"see `{code}`", "evidence": ""}), f"dropped real code: {code}"
+
+
+@pytest.mark.parametrize("code", LEADING_CONNECTIVE_CODE)
+def test_a_fabricated_leading_connective_quote_still_downgrades(code):
+    grounded, missing = ground_finding({"claim": f"bug: `{code}`", "evidence": ""}, source="unrelated contents")
+    assert grounded is False, "fabricated quote failed OPEN — the #25 guard is bypassed"
+    assert missing
+
+
+def test_the_filter_is_actually_exercised():
+    """Non-vacuity. Every fixture above must reach `_is_connective_prose` and be judged
+    there, or this file would pass just as well with the rule deleted.
+
+    `LEADING_CONNECTIVE_CODE` matches the leading-fragment half and is saved only by the
+    trailing-colon half; `CAUGHT_FROM_PRODUCTION` matches both. Drop either half of the
+    conjunction and one of these two assertions fails.
+    """
+    from pr_reviewer.grounding import _FRAGMENT_START_RE, _is_connective_prose
+
+    for code in LEADING_CONNECTIVE_CODE:
+        assert _FRAGMENT_START_RE.search(code), f"fixture never reaches the filter: {code}"
+        assert _is_connective_prose(code) is False, f"real code judged prose: {code}"
+    for prose in CAUGHT_FROM_PRODUCTION:
+        assert _is_connective_prose(prose) is True, f"production prose not judged prose: {prose}"
 
 
 def test_the_third_production_case_is_knowingly_not_caught():

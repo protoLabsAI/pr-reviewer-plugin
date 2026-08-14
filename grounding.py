@@ -96,9 +96,20 @@ _STATEMENT_RE = re.compile(r"\S\s+\S")
 # were extracted as checkable code and, being prose, could never be found — downgrading
 # a finding whose REAL evidence was never checked.
 #
-# ONE signal is used, deliberately: a leading `;`/`,` followed by a lowercase word — a
-# sentence fragment continuing the previous clause. A line lifted from a file does not
-# begin that way, so this cannot drop real code.
+# TWO signals are required together, deliberately: a leading `;`/`,` followed by a
+# lowercase word — a sentence fragment continuing the previous clause — AND a trailing
+# `:`, the colon that introduces the narration's next breath.
+#
+# The leading fragment ALONE is not enough. A quote lifted from a wrapped construct
+# begins exactly that way once `_normalize` has flattened it:
+#
+#   ", key=value, timeout=30)"        a continuation line of a wrapped call
+#   "; i < n; i++) { total += i;"     the middle of a C-style for header
+#   "; do_thing() } finally { … }"    a statement after an inline `;`
+#
+# Real code closes on a bracket or an operator; it does not end on a bare `:` after a
+# lowercase-led fragment. Requiring both ends keeps all three of those, and both
+# production prose strings still carry their colon.
 #
 # An English-function-word COUNT was tried for the third case and withdrawn; both of its
 # formulations were unsafe, and the asymmetry here is brutal:
@@ -121,7 +132,7 @@ _FRAGMENT_START_RE = re.compile(r"^[;,]\s+[a-z]")
 
 
 def _is_connective_prose(text: str) -> bool:
-    return bool(_FRAGMENT_START_RE.search(text))
+    return bool(_FRAGMENT_START_RE.search(text)) and text.rstrip().endswith(":")
 
 
 # Diff decorations the panel copies into evidence; stripped before matching so a quote
