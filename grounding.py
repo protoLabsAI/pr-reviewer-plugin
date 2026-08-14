@@ -87,52 +87,42 @@ _STATEMENT_RE = re.compile(r"\S\s+\S")
 # ...and must not be the model's own CONNECTIVE PROSE. `_PROSE_RE` above catches
 # narrative punctuation, but a short clause with none of it still clears every filter
 # here — it is under the length/token caps, has whitespace, and a stray `(`/`:` reads as
-# a code hint. From production (protoAgent#2631 r2, a **blocker**): all three of
+# a code hint. From production (protoAgent#2631 r2, a **blocker**), all three of
 #
 #   "; diff (scheduler, same pattern at ~new line 1692):"
 #   "; and the removed order-independent read:"
 #   "(untouched by this PR) still does"
 #
 # were extracted as checkable code and, being prose, could never be found — downgrading
-# a finding whose REAL evidence was never checked. Two signals separate them from code:
+# a finding whose REAL evidence was never checked.
 #
-#  1. a leading `;`/`,` + lowercase word — a sentence fragment continuing the previous
-#     clause. A line lifted from a file does not begin that way.
-#  2. a high count of English function words. Code lines carry few.
+# ONE signal is used, deliberately: a leading `;`/`,` followed by a lowercase word — a
+# sentence fragment continuing the previous clause. A line lifted from a file does not
+# begin that way, so this cannot drop real code.
 #
-# Validated against all 79 distinct failed quotes on record: this rejects exactly 4, and
-# all 4 are prose (these three plus one narrative sentence). The other 75 — real code,
-# JSX, TOML, Rust, shell — are untouched. That direction matters more than the catch: a
-# filter that is too eager silently stops checking genuine evidence, which is worse than
-# the bug it fixes.
-_PROSE_WORDS = frozenset(
-    """the this that these those it its by at to of on about above below after before
-    still same also already only just here there when while because since untouched
-    removed which whose our their""".split()
-)
+# An English-function-word COUNT was tried for the third case and withdrawn; both of its
+# formulations were unsafe, and the asymmetry here is brutal:
+#
+#   - counting words everywhere drops genuine code whose STRING LITERALS are English —
+#     `raise ValueError("the value at this index is already removed")`
+#   - masking string literals first re-admits prose that merely contains a quoted
+#     fragment — `the "removed read" bug (still present)` masks down to two function
+#     words and passes
+#   - and `this`/`that` are English function words AND JS/TS keywords, so any wordlist
+#     containing them drops `this.obj[this.key] = this.val`
+#
+# Each of those is a FALSE DROP, and a false drop is worse than the bug: `ground_finding`
+# fail-opens when no quote survives extraction, so dropping a real quote does not merely
+# skip a check — it lets a FABRICATED quote of the same shape past the #25 hallucination
+# guard entirely. A filter guarding against hallucination must never widen the hole it
+# guards. The unrecognised third case simply keeps the old behaviour (checked, not found,
+# downgraded), which is a bad verdict but not an open bypass.
 _FRAGMENT_START_RE = re.compile(r"^[;,]\s+[a-z]")
-_MAX_PROSE_WORDS = 2  # 3+ function words in one short span is a sentence, not a line
-
-# English INSIDE a string literal says nothing about whether the span is code — error
-# messages, log lines and docstrings are prose by design, and counting their contents
-# dropped genuine quotes like:
-#
-#   raise ValueError("the value at this index is already removed")
-#
-# That direction is the dangerous one. `ground_finding` fail-opens when NO quote survives
-# extraction, so dropping a real quote does not merely skip a check — it lets a FABRICATED
-# quote of the same shape through the #25 hallucination guard entirely, which is the exact
-# failure this module exists to prevent. `_normalize` has already unified every quote
-# character to `"`, so one mask covers all of them.
-_STRING_LITERAL_RE = re.compile(r'"[^"]*"')
 
 
 def _is_connective_prose(text: str) -> bool:
-    if _FRAGMENT_START_RE.search(text):
-        return True
-    outside_strings = _STRING_LITERAL_RE.sub('""', text)
-    words = [w.lower() for w in re.findall(r"[A-Za-z][A-Za-z-]+", outside_strings)]
-    return sum(1 for w in words if w in _PROSE_WORDS) > _MAX_PROSE_WORDS
+    return bool(_FRAGMENT_START_RE.search(text))
+
 
 # Diff decorations the panel copies into evidence; stripped before matching so a quote
 # lifted from a patch hunk still matches the file's own text.

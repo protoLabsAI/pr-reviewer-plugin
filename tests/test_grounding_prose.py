@@ -5,8 +5,11 @@ every filter — under the length/token caps, has whitespace, and a stray `(`/`:
 a code hint — so the model's own narration got treated as a quote, could never be found,
 and downgraded a finding whose real evidence was never checked.
 
-The regression direction matters as much as the catch: over-filtering silently stops
-grounding real quotes, which is worse than the bug.
+The scope here is deliberately ONE signal (a leading `;`/`,` + lowercase word). A word-
+count heuristic was tried and withdrawn: every formulation of it produced a FALSE DROP,
+and a false drop is worse than the bug — `ground_finding` fail-opens when no quote
+survives, so dropping a real quote opens the #25 hallucination bypass rather than merely
+skipping a check. Those withdrawn cases are pinned below so they cannot creep back.
 """
 
 from __future__ import annotations
@@ -15,36 +18,15 @@ import pytest
 from pr_reviewer.grounding import ground_finding, quoted_snippets
 
 # Verbatim from protoAgent#2631 round 2, where these downgraded a **blocker**.
-PROSE_FROM_PRODUCTION = [
+CAUGHT_FROM_PRODUCTION = [
     "; diff (scheduler, same pattern at ~new line 1692):",
     "; and the removed order-independent read:",
-    "(untouched by this PR) still does",
-]
-
-# Real failed quotes from the recorded corpus — code across several languages. These
-# must stay checkable; if the filter eats them, grounding quietly stops working.
-REAL_CODE = [
-    "next((l[len(LABEL_SOURCE_PREFIX):] for l in labels if l.startswith(LABEL_SOURCE_PREFIX)), '')",
-    'if not isinstance(messages, list): return {"error": "messages must be an array"}, 400',
-    "files = [base] if base.is_file() else [p for p in base.rglob('*') if p.is_file()]",
-    'let id = table.get("id").and_then(toml::Value::as_str).map(str::trim).unwrap_or_default();',
-    "await asyncio.to_thread(supervisor.down, names)",
-    '<Td className="plugin-cell-name">',
-    ".pl-drawer--top, .pl-drawer--bottom { max-height: 85vh; max-height: 85dvh; }",
-    "dry_run: bool = Body(False, embed=True)",
-    "assert memory_path() == \"/custom/mem\" # env override verbatim",
-    "impl fmt::Debug for FamilyDef",
 ]
 
 
-@pytest.mark.parametrize("prose", PROSE_FROM_PRODUCTION)
+@pytest.mark.parametrize("prose", CAUGHT_FROM_PRODUCTION)
 def test_connective_prose_is_not_extracted_as_a_quote(prose):
     assert quoted_snippets({"claim": f"the bug: `{prose}` as shown", "evidence": ""}) == []
-
-
-@pytest.mark.parametrize("code", REAL_CODE)
-def test_real_code_quotes_still_extract(code):
-    assert quoted_snippets({"claim": f"see `{code}`", "evidence": ""}), f"filter ate real code: {code}"
 
 
 def test_prose_only_evidence_fails_open_rather_than_downgrading():
@@ -60,7 +42,7 @@ def test_prose_only_evidence_fails_open_rather_than_downgrading():
 def test_a_real_quote_alongside_prose_is_still_checked():
     """Prose is dropped, not contagious: the code quote next to it must still ground."""
     finding = {
-        "claim": "`(untouched by this PR) still does` and `await asyncio.to_thread(supervisor.down, names)`",
+        "claim": "`; and the removed read:` and `await asyncio.to_thread(supervisor.down, names)`",
         "evidence": "",
     }
     quotes = quoted_snippets(finding)
@@ -72,42 +54,51 @@ def test_a_real_quote_alongside_prose_is_still_checked():
 def test_a_fabricated_quote_alongside_prose_still_downgrades():
     """The filter must not become an escape hatch — dropping prose cannot rescue a
     finding whose code quote is invented."""
-    finding = {"claim": "`(untouched by this PR) still does` and `zzz = never_in_the_file(1, 2)`", "evidence": ""}
+    finding = {"claim": "`; and the removed read:` and `zzz = never_in_the_file(1, 2)`", "evidence": ""}
     grounded, missing = ground_finding(finding, source="something else entirely")
     assert grounded is False
     assert missing and "never_in_the_file" in missing[0]
 
 
-# ── English inside string literals (caught by Vera on PR #59, confirmed major) ────
+# ── Regression pins: the false drops that killed the word-count rule ──────────────
 #
-# Counting prose words inside a string literal drops genuine code — error messages and
-# log lines are prose by design. The consequence is not a skipped check: `ground_finding`
-# fail-opens when nothing survives extraction, so a FABRICATED quote of the same shape
-# sails past the #25 hallucination guard. That is the failure this module exists to stop.
+# All three shapes below were dropped by one formulation or another of an English-
+# function-word count (found by the panel on PR #59). Each is genuine code, and dropping
+# genuine code is what opens the #25 bypass — so each stays extractable, and each stays
+# groundable when fabricated.
 
-CODE_WITH_ENGLISH_STRINGS = [
+FALSE_DROP_REGRESSIONS = [
+    # `this`/`that` are English function words AND JS/TS keywords.
+    "this.obj[this.key] = this.val",
+    "this.a && this.b || this.c",
+    "if (this.state) { this.emit(this.value) }",
+    # Error messages and log lines are English by design.
     'raise ValueError("the value at this index is already removed")',
     'log.warning("could not find the file at this path, it is already gone")',
-    'assert msg == "the same item is still here by design"',
     'return {"error": "the request was already handled by this worker"}',
 ]
 
 
-@pytest.mark.parametrize("code", CODE_WITH_ENGLISH_STRINGS)
-def test_english_inside_a_string_literal_does_not_drop_real_code(code):
+@pytest.mark.parametrize("code", FALSE_DROP_REGRESSIONS)
+def test_genuine_code_is_never_dropped(code):
     assert quoted_snippets({"claim": f"see `{code}`", "evidence": ""}), f"dropped real code: {code}"
 
 
-@pytest.mark.parametrize("code", CODE_WITH_ENGLISH_STRINGS)
-def test_a_fabricated_quote_with_an_english_string_still_downgrades(code):
-    """The regression Vera named: if the quote is dropped, this finding grounds instead
-    of downgrading, and a hallucinated blocker keeps its teeth."""
+@pytest.mark.parametrize("code", FALSE_DROP_REGRESSIONS)
+def test_a_fabricated_quote_of_that_shape_still_downgrades(code):
+    """The consequence of a false drop, stated directly: if the quote is dropped, this
+    finding grounds instead of downgrading, and a hallucinated blocker keeps its teeth."""
     grounded, missing = ground_finding({"claim": f"bug: `{code}`", "evidence": ""}, source="unrelated contents")
     assert grounded is False, "fabricated quote failed OPEN — the #25 guard is bypassed"
     assert missing
 
 
-def test_prose_outside_a_string_is_still_caught():
-    """The mask must not defeat the original fix: narration with a quoted fragment in it
-    is still narration."""
-    assert quoted_snippets({"claim": '`(untouched by this "PR") still does`', "evidence": ""}) == []
+def test_the_third_production_case_is_knowingly_not_caught():
+    """`(untouched by this PR) still does` has no leading-connective marker, so it is
+    still extracted and will downgrade its finding — the pre-existing behaviour.
+
+    This is a deliberate limit, not an oversight: every rule that caught it also dropped
+    genuine code. Documented so a future change that "fixes" this is forced to show it
+    does not reopen the bypass pinned above.
+    """
+    assert quoted_snippets({"claim": "`(untouched by this PR) still does`", "evidence": ""}) != []
