@@ -84,6 +84,57 @@ _PROSE_RE = re.compile(
 # `writable = Path(str(configured))`; only the latter is a claim this module can test.
 _STATEMENT_RE = re.compile(r"\S\s+\S")
 
+# ...and must not be the model's own CONNECTIVE PROSE. `_PROSE_RE` above catches
+# narrative punctuation, but a short clause with none of it still clears every filter
+# here — it is under the length/token caps, has whitespace, and a stray `(`/`:` reads as
+# a code hint. From production (protoAgent#2631 r2, a **blocker**), all three of
+#
+#   "; diff (scheduler, same pattern at ~new line 1692):"
+#   "; and the removed order-independent read:"
+#   "(untouched by this PR) still does"
+#
+# were extracted as checkable code and, being prose, could never be found — downgrading
+# a finding whose REAL evidence was never checked.
+#
+# TWO signals are required together, deliberately: a leading `;`/`,` followed by a
+# lowercase word — a sentence fragment continuing the previous clause — AND a trailing
+# `:`, the colon that introduces the narration's next breath.
+#
+# The leading fragment ALONE is not enough. A quote lifted from a wrapped construct
+# begins exactly that way once `_normalize` has flattened it:
+#
+#   ", key=value, timeout=30)"        a continuation line of a wrapped call
+#   "; i < n; i++) { total += i;"     the middle of a C-style for header
+#   "; do_thing() } finally { … }"    a statement after an inline `;`
+#
+# Real code closes on a bracket or an operator; it does not end on a bare `:` after a
+# lowercase-led fragment. Requiring both ends keeps all three of those, and both
+# production prose strings still carry their colon.
+#
+# An English-function-word COUNT was tried for the third case and withdrawn; both of its
+# formulations were unsafe, and the asymmetry here is brutal:
+#
+#   - counting words everywhere drops genuine code whose STRING LITERALS are English —
+#     `raise ValueError("the value at this index is already removed")`
+#   - masking string literals first re-admits prose that merely contains a quoted
+#     fragment — `the "removed read" bug (still present)` masks down to two function
+#     words and passes
+#   - and `this`/`that` are English function words AND JS/TS keywords, so any wordlist
+#     containing them drops `this.obj[this.key] = this.val`
+#
+# Each of those is a FALSE DROP, and a false drop is worse than the bug: `ground_finding`
+# fail-opens when no quote survives extraction, so dropping a real quote does not merely
+# skip a check — it lets a FABRICATED quote of the same shape past the #25 hallucination
+# guard entirely. A filter guarding against hallucination must never widen the hole it
+# guards. The unrecognised third case simply keeps the old behaviour (checked, not found,
+# downgraded), which is a bad verdict but not an open bypass.
+_FRAGMENT_START_RE = re.compile(r"^[;,]\s+[a-z]")
+
+
+def _is_connective_prose(text: str) -> bool:
+    return bool(_FRAGMENT_START_RE.search(text)) and text.rstrip().endswith(":")
+
+
 # Diff decorations the panel copies into evidence; stripped before matching so a quote
 # lifted from a patch hunk still matches the file's own text.
 _DIFF_PREFIX_RE = re.compile(r"^[+\-]\s?", re.MULTILINE)
@@ -152,6 +203,8 @@ def quoted_snippets(finding: dict) -> list[str]:
             continue
         if len(text.split()) > MAX_QUOTE_TOKENS or _PROSE_RE.search(text):
             continue  # a sentence about the code, not a claim about the file's text
+        if _is_connective_prose(text):
+            continue  # the model's own narration, captured as if it were evidence
         if _CODE_HINT_RE.search(text) and _STATEMENT_RE.search(text):
             out.append(text)
     return out
