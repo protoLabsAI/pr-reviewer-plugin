@@ -97,6 +97,11 @@ REGATE_MAX_FAILURES = 3
 # (or while it was down, or that exhausted its panel) never gets a first review.
 BACKFILL_ACTION = "sweep-backfill"
 
+# Marks our "the panel could not finish" comments (#61) so they can be deduplicated when
+# posted AND found again when a later verdict makes them false. Shared by both sides on
+# purpose: two copies of this string is how a notice gets posted but never cleared.
+EXHAUSTION_MARKER = "protoagent-qa-exhausted"
+
 _NON_TERMINAL = {"queued", "in_progress", "waiting", "requested", "pending"}
 _GREEN = {"success", "neutral", "skipped"}
 
@@ -318,7 +323,7 @@ class Dispatcher:
 
     async def _post_exhaustion_comment(self, repo: str, pr: int, head_sha: str) -> None:
         """Post a visible exhaustion notice on the PR — fail-open, deduplicated by head SHA."""
-        marker = f"<!-- protoagent-qa-exhausted head={head_sha} -->"
+        marker = f"<!-- {EXHAUSTION_MARKER} head={head_sha} -->"
         rc, out, _err = await self._run_gh(
             ["api", f"repos/{repo}/issues/{pr}/comments", "--paginate", "--jq", "[.[].body]"]
         )
@@ -975,6 +980,9 @@ class Dispatcher:
         if rc != 0:
             log.warning("[pr-reviewer] posting %s on %s#%s failed: %s", event, repo, pr, err[-300:])
             return False
+        # A verdict exists now, so any "this PR has not been reviewed" notice we left on
+        # an earlier exhausted head (#61) is stale and contradicts the review above it.
+        await self._clear_exhaustion_comments(repo, pr)
         if not self.shadow and verdict != FAIL and not hold_blocks:
             # A cleared verdict must also LIFT our earlier block: PASS/WARN post as
             # COMMENT, and a comment never supersedes the same reviewer's REQUEST_CHANGES.
@@ -982,6 +990,46 @@ class Dispatcher:
             # prior blocker/major has not earned the dismissal yet (issue #26).
             await self._dismiss_stale_blocks(repo, pr)
         return True
+
+    async def _clear_exhaustion_comments(self, repo: str, pr: int) -> None:
+        """Delete our exhaustion notices once a real verdict lands (#54 follow-on to #61).
+
+        The notice claims "this PR has not been reviewed". A verdict makes that false, and
+        leaving it sitting above the review is worse than never posting it — a reader has
+        to work out which of two contradictory bot comments is current.
+
+        Every failure path LOGS. The notice is cosmetic, so a failure here must not fail
+        the verdict that just posted; but swallowing `rc != 0` silently means a permanently
+        contradictory PR with nothing in the log to explain it, which is how the original
+        exhaustion silence went unnoticed for five weeks in the first place.
+        """
+        rc, out, err = await self._run_gh(
+            ["api", f"repos/{repo}/issues/{pr}/comments", "--paginate", "--jq", ".[] | {id, body}"],
+            timeout=60,
+        )
+        if rc != 0:
+            log.warning("[pr-reviewer] listing comments to clear on %s#%s failed: %s", repo, pr, err[-300:])
+            return
+        # `--jq '.[] | ...'` emits one object per line; a plain `gh api` (or any caller
+        # ignoring --jq) returns a single array. Accept both rather than assume.
+        items: list = []
+        try:
+            whole = json.loads(out)
+            items = whole if isinstance(whole, list) else [whole]
+        except ValueError:
+            for line in out.splitlines():
+                try:
+                    items.append(json.loads(line))
+                except ValueError:
+                    continue
+        for item in items:
+            if not isinstance(item, dict) or EXHAUSTION_MARKER not in str(item.get("body") or ""):
+                continue
+            rc, _out, err = await self._run_gh(
+                ["api", f"repos/{repo}/issues/comments/{item['id']}", "-X", "DELETE"], timeout=60
+            )
+            if rc != 0:
+                log.warning("[pr-reviewer] clearing exhaustion notice on %s#%s failed: %s", repo, pr, err[-300:])
 
     async def _dismiss_stale_blocks(self, repo: str, pr: int) -> None:
         """Dismiss our own now-stale REQUEST_CHANGES reviews after a later head clears.
