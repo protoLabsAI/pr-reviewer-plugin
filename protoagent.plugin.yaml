@@ -2,7 +2,7 @@
 # Keep `version` in lockstep with pyproject.toml (tests/test_version.py asserts it).
 id: pr-reviewer
 name: PR reviewer (review machinery + structural engine)
-version: 0.27.0
+version: 0.28.0
 description: >-
   The deterministic half of the PR-review QA tier (protoAgent ADR 0078). Ships the
   `protopatch_review` tool — a budgeted, checkout-cached run of the protoPatch
@@ -22,9 +22,10 @@ config_section: pr_reviewer
 config:
   default_repo: ""             # repo the tool falls back to when `repo` is omitted (owner/name)
   repos: []                    # repos the DISPATCHER manages (owner/name) — NARROWS scope when set.
-                               # empty = every repo the GitHub App installation covers: the webhook
-                               # accepts any delivery and the sweep enumerates the installation.
-                               # Installing/uninstalling the App is the gate; this list is the override.
+                               # empty HERE falls back to PR_REVIEWER_REPOS; empty in BOTH = every
+                               # repo the GitHub App installation covers (webhook accepts any
+                               # delivery, sweep enumerates the installation). Installing /
+                               # uninstalling the App is then the gate, and this list the override.
   shadow_mode: true            # true = every verdict posts as a COMMENT review (never blocks)
   promotion_owner: false       # true (AND shadow_mode false) = this agent owns COMMENTED→APPROVE
                                # promotion for its repos; two promoters racing double-merges

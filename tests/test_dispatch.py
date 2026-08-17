@@ -103,6 +103,32 @@ async def test_non_dispatch_actions_drop(tmp_path):
     assert (await d.handle_pr_event("o/r", 1, HEAD, "labeled")) == "drop:not-a-dispatch-action"
 
 
+async def test_an_unknown_viewer_login_stops_the_review_instead_of_disabling_the_rail(tmp_path):
+    """A failed `api user` lookup used to cache "" forever (the retry was gated on
+    `is None`), so ONE transient failure permanently disabled the never-review-your-own-PR
+    rail — and as promotion owner that is self-approval. Same shape as issue #71: a failed
+    read remembered as a definitive answer."""
+
+    class NoViewerGH(RoutedGH):
+        async def __call__(self, args, timeout=30):
+            if len(args) > 1 and args[1] == "user":
+                return 1, "", "HTTP 503"
+            return await super().__call__(args, timeout)
+
+    gh = NoViewerGH(pr_facts=facts(), reviews=[])
+    d = make(tmp_path, gh=gh)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "drop:viewer-unknown"
+    assert gh.posted == []
+    assert d._viewer is None  # NOT "" — caching "" as the answer is the bug itself
+
+    # …and once the lookup recovers, the rail works again in the SAME process — the
+    # point of the fix: the earlier failure must not have poisoned the cache. A second
+    # SHA, because the chokepoint cooldown is keyed repo#pr@sha and would drop a replay.
+    gh2 = RoutedGH(pr_facts=facts(head=OLD_HEAD, author="qa-bot[bot]"), reviews=[])
+    d._run_gh = gh2
+    assert (await d.handle_pr_event("o/r", 1, OLD_HEAD, "opened")) == "drop:self-authored"
+
+
 async def test_self_authored_pr_drops(tmp_path):
     # RoutedGH's viewer login is "qa-bot" — a PR authored by qa-bot[bot] is ours.
     gh = RoutedGH(pr_facts=facts(author="qa-bot[bot]"))
@@ -144,7 +170,7 @@ class RoutedGH(FakeGH):
     ):
         super().__init__()
         self.pr_facts, self.reviews, self.checks, self.files = pr_facts, reviews or [], checks, files
-        self.threads = threads  # None → the generic graphql "0" (fetch degrades to no block)
+        self.threads = threads  # None → an empty connection: no threads, so nothing unresolved
         self.compare = compare  # None → the compare read fails (no convergence relief)
         self.dismissed: list[str] = []
         # reviews_rc != 0 → the reviews READ fails, the shape that made `_our_reviews`
@@ -183,9 +209,17 @@ class RoutedGH(FakeGH):
         if "/check-runs" in joined:
             return (0, json.dumps(self.checks), "") if self.checks is not None else (1, "", "403")
         if "comments(first" in joined:  # the threads fetch (before the count query below)
-            return (0, json.dumps(self.threads), "") if self.threads is not None else (0, "null", "")
+            # The jq selects the reviewThreads CONNECTION now (nodes + pageInfo), so the
+            # fake serves one complete page rather than a bare node list.
+            if self.threads is None:
+                return 0, "null", ""
+            page = {"pageInfo": {"hasNextPage": False, "endCursor": ""}, "nodes": self.threads}
+            return 0, json.dumps(page), ""
         if "graphql" in joined:
-            return 0, "0", ""
+            # The unresolved-COUNT query (isResolved only, no bodies). It now reads a
+            # paginated connection like the fetch above, not a scalar count.
+            nodes = [{"isResolved": bool(t.get("isResolved"))} for t in (self.threads or [])]
+            return 0, json.dumps({"pageInfo": {"hasNextPage": False, "endCursor": ""}, "nodes": nodes}), ""
         if "/pulls/1" in joined:
             return 0, json.dumps(self.pr_facts), ""
         if "/pulls?" in joined:
