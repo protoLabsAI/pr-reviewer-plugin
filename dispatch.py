@@ -270,7 +270,10 @@ class Dispatcher:
         if explicit:
             return explicit
         now = time.monotonic()
-        if self._installation_repos and now - self._installation_repos_at < INSTALLATION_REPOS_TTL_S:
+        # Freshness is the TIMESTAMP, not the contents. Gating the cache hit on a
+        # non-empty list makes an authoritatively-empty scope re-enumerate every tick —
+        # the same conflation of "empty" with "absent" as below, one line up.
+        if self._installation_repos_at and now - self._installation_repos_at < INSTALLATION_REPOS_TTL_S:
             return self._installation_repos
         # NOTE: no `[...]` wrapper in the jq — with --paginate, gh applies the filter
         # per page and concatenates, so an array-wrapping filter emits `[..][..]`,
@@ -285,11 +288,15 @@ class Dispatcher:
                 len(self._installation_repos),
             )
             return self._installation_repos
+        # rc == 0 is AUTHORITATIVE, including when it lists nothing: "the App is
+        # installed nowhere" is a real answer, not a failure. Treating empty as a
+        # failure and reusing the cache meant an uninstalled repo kept being swept
+        # for as long as the process lived — the uninstall silently did nothing.
         found = [line.strip() for line in out.splitlines() if line.strip()]
-        if not found:
-            return self._installation_repos
         if set(found) != set(self._installation_repos):
             log.info("[pr-reviewer] installation scope: %d repo(s)", len(found))
+        if not found:
+            log.warning("[pr-reviewer] installation covers NO repositories — the sweep has nothing to do")
         self._installation_repos, self._installation_repos_at = found, now
         return found
 

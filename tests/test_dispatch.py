@@ -918,6 +918,22 @@ async def test_installation_scope_is_cached_between_sweeps(tmp_path):
     assert gh.enumerations == 1  # the sweep ticks every ~3min; don't re-ask each time
 
 
+async def test_a_successful_empty_enumeration_is_authoritative(tmp_path):
+    """ "The App is installed nowhere" is an ANSWER, not a failure. Reusing the cache
+    for it meant uninstalling the App from a repo silently did nothing — the sweep
+    kept walking it for the life of the process."""
+    gh = InstallGH(["o/a", "o/b"])
+    d = make(tmp_path, cfg={"repos": []}, gh=gh)
+    assert (await d.sweep_repos()) == ["o/a", "o/b"]
+
+    gh.repos_out = []  # uninstalled from everything
+    d._installation_repos_at = 0.0
+    assert (await d.sweep_repos()) == []
+    # …and the empty answer is CACHED, not re-asked on every tick
+    assert (await d.sweep_repos()) == []
+    assert gh.enumerations == 2
+
+
 async def test_a_failed_enumeration_reuses_the_last_good_scope(tmp_path):
     """Fail closed on scope: reuse what we knew, never invent or silently widen."""
     gh = InstallGH(["o/a", "o/b"])

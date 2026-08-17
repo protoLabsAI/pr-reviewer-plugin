@@ -21,8 +21,10 @@ min_protoagent_version: "0.95.0"   # needs the findings `source` field (ADR 0078
 config_section: pr_reviewer
 config:
   default_repo: ""             # repo the tool falls back to when `repo` is omitted (owner/name)
-  repos: []                    # repos the DISPATCHER manages (owner/name) — the allowlist gate;
-                               # empty = manual dispatch only, webhook drops everything
+  repos: []                    # repos the DISPATCHER manages (owner/name) — NARROWS scope when set.
+                               # empty = every repo the GitHub App installation covers: the webhook
+                               # accepts any delivery and the sweep enumerates the installation.
+                               # Installing/uninstalling the App is the gate; this list is the override.
   shadow_mode: true            # true = every verdict posts as a COMMENT review (never blocks)
   promotion_owner: false       # true (AND shadow_mode false) = this agent owns COMMENTED→APPROVE
                                # promotion for its repos; two promoters racing double-merges
@@ -50,7 +52,7 @@ secrets: [webhook_secret, app_private_key]
 
 # Settings (ADR 0019) — surfaced as editable fields in the console.
 settings:
-  - {key: repos, label: "Managed repos (owner/name)", type: string_list}
+  - {key: repos, label: "Managed repos (owner/name) — empty = the App installation's scope", type: string_list}
   - {key: shadow_mode, label: "Shadow mode (verdicts as comments only)", type: bool}
   - {key: promotion_owner, label: "Own approve-on-green promotion (formal mode only)", type: bool}
   - {key: webhook_secret, label: "GitHub webhook secret", type: secret}
