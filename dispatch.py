@@ -155,6 +155,45 @@ _NON_TERMINAL = {"queued", "in_progress", "waiting", "requested", "pending"}
 _GREEN = {"success", "neutral", "skipped"}
 
 
+def gh_json_rows(out: str) -> list | None:
+    """Parse `gh api --paginate --jq '.[] | …'` output → rows, or None if unparseable.
+
+    `--paginate` applies the jq filter PER PAGE and concatenates the results, so an
+    array-wrapping filter (`[.[] | …]`) emits `[…][…]` on the second page — not valid
+    JSON, and every such read silently broke the moment a PR crossed 30 items
+    (issue #75). Emitting one object per line instead is pagination-safe by
+    construction: `gh` prints compact JSON, so embedded newlines stay escaped and one
+    row really is one line.
+
+    A single unparseable line makes the WHOLE read None rather than a short list.
+    These rows drive "has this been reviewed", "did an operator pause this" and "are
+    the checks green" — a silently-short answer is the failure mode of #71, where a
+    partial read was indistinguishable from an absence.
+
+    Still accepts a whole-array body, so a caller that drops --jq (or a fake that
+    returns one array) keeps working.
+    """
+    text = (out or "").strip()
+    if not text:
+        return []
+    try:
+        whole = json.loads(text)
+    except ValueError:
+        pass
+    else:
+        return whole if isinstance(whole, list) else [whole]
+    rows = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rows.append(json.loads(line))
+        except ValueError:
+            return None  # a partial read is worse than none — it looks complete
+    return rows
+
+
 def _env_repos() -> list[str]:
     """Managed allowlist from PR_REVIEWER_REPOS — comma/space/newline separated."""
     return [r for r in re.split(r"[,\s]+", os.environ.get("PR_REVIEWER_REPOS", "").strip()) if r]
@@ -436,15 +475,16 @@ class Dispatcher:
         """Post a visible exhaustion notice on the PR — fail-open, deduplicated by head SHA."""
         marker = f"<!-- {EXHAUSTION_MARKER} head={head_sha} -->"
         rc, out, _err = await self._run_gh(
-            ["api", f"repos/{repo}/issues/{pr}/comments", "--paginate", "--jq", "[.[].body]"]
+            # `| tojson` because a BARE string prints raw, so a body containing
+            # newlines spans several lines and stops being one-row-per-line. Objects
+            # already print compact; only scalars need the encode.
+            ["api", f"repos/{repo}/issues/{pr}/comments", "--paginate", "--jq", ".[] | .body | tojson"]
         )
         if rc == 0:
-            try:
-                bodies = json.loads(out)
-                if isinstance(bodies, list) and any(marker in str(b or "") for b in bodies):
-                    return
-            except json.JSONDecodeError:
-                pass  # unreadable → post anyway (fail-open)
+            bodies = gh_json_rows(out)
+            if bodies is not None and any(marker in str(b or "") for b in bodies):
+                return
+            # unreadable → post anyway (fail-open: a duplicate notice beats silence)
         retries = self.panel_retries + 1
         body = (
             f"⚠️ **QA panel exhausted** — this PR has not been reviewed.\n"
@@ -539,17 +579,21 @@ class Dispatcher:
                 f"repos/{repo}/pulls/{pr}/reviews",
                 "--paginate",
                 "--jq",
-                "[.[] | {id: .id, state: .state, body: .body}]",
+                # One object per line, NOT `[.[] | …]`: with --paginate the wrapper
+                # emits `[…][…]` past 30 reviews and this read — the one everything
+                # about review history depends on — went permanently unreadable (#75).
+                ".[] | {id: .id, state: .state, body: .body}",
             ],
         )
         if rc != 0:
             return None
-        try:
-            rows = json.loads(out)
-        except json.JSONDecodeError:
+        rows = gh_json_rows(out)
+        if rows is None:
             return None
         ours = []
-        for row in rows if isinstance(rows, list) else []:
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
             marker = parse_verdict_marker(row.get("body") or "")
             if marker:
                 ours.append(
@@ -560,15 +604,15 @@ class Dispatcher:
     async def _pr_comments(self, repo: str, pr: int) -> list[str]:
         """This PR's issue-comment bodies, oldest→newest — where pause markers live."""
         rc, out, _err = await self._run_gh(
-            ["api", f"repos/{repo}/issues/{pr}/comments", "--paginate", "--jq", "[.[].body]"]
+            ["api", f"repos/{repo}/issues/{pr}/comments", "--paginate", "--jq", ".[] | .body | tojson"]
         )
         if rc != 0:
             return []
-        try:
-            rows = json.loads(out)
-        except json.JSONDecodeError:
-            return []
-        return [str(b or "") for b in rows] if isinstance(rows, list) else []
+        rows = gh_json_rows(out)
+        # A truncated read here would drop a `@vera pause` an operator posted late in a
+        # busy thread and resume reviewing a PR they asked to be left alone (#28), so an
+        # unreadable list stays empty rather than partially populated.
+        return [str(b or "") for b in rows] if rows is not None else []
 
     async def _finding_sources(
         self, repo: str, pr: int, head: str, findings: list[dict]
@@ -583,15 +627,15 @@ class Dispatcher:
         """
         patches: dict[str, str] = {}
         rc, out, _err = await self._run_gh(
-            ["api", f"repos/{repo}/pulls/{pr}/files", "--paginate", "--jq", "[.[] | {f: .filename, p: .patch}]"]
+            ["api", f"repos/{repo}/pulls/{pr}/files", "--paginate", "--jq", ".[] | {f: .filename, p: .patch}"]
         )
         if rc == 0:
-            try:
-                for row in json.loads(out) or []:
-                    if isinstance(row, dict) and row.get("f"):
-                        patches[str(row["f"])] = str(row.get("p") or "")
-            except json.JSONDecodeError:
-                pass
+            # A PR touching 30+ files paginates, and this feeds grounding: a missing
+            # patch makes a removed-behaviour finding look unquotable and get
+            # downgraded. Fail open (empty patches) exactly as before, never partial.
+            for row in gh_json_rows(out) or []:
+                if isinstance(row, dict) and row.get("f"):
+                    patches[str(row["f"])] = str(row.get("p") or "")
         sources: dict[str, tuple[str, str | None]] = {}
         for file in {str(f.get("file") or "") for f in findings if f.get("file")}:
             rc, out, _err = await self._run_gh(["api", f"repos/{repo}/contents/{file}?ref={head}", "--jq", ".content"])
@@ -642,15 +686,17 @@ class Dispatcher:
                 f"repos/{repo}/commits/{sha}/check-runs",
                 "--paginate",
                 "--jq",
-                "[.check_runs[] | {status: .status, conclusion: .conclusion}]",
+                # Not `[…]`: a commit with 30+ check runs paginates, and a truncated
+                # read here decides PROMOTION — dropping the one pending or failed run
+                # on page 2 reads as all-green (#75).
+                ".check_runs[] | {status: .status, conclusion: .conclusion}",
             ],
         )
         if rc != 0:
             return None
-        try:
-            runs = json.loads(out)
-        except json.JSONDecodeError:
-            return None
+        runs = gh_json_rows(out)
+        if runs is None:
+            return None  # unreadable ⇒ checks-unknown, which holds promotion
         if not runs:
             return "no-checks"
         if any(r.get("status") in _NON_TERMINAL for r in runs):
@@ -1245,19 +1291,10 @@ class Dispatcher:
         if rc != 0:
             log.warning("[pr-reviewer] listing comments to clear on %s#%s failed: %s", repo, pr, err[-300:])
             return
-        # `--jq '.[] | ...'` emits one object per line; a plain `gh api` (or any caller
-        # ignoring --jq) returns a single array. Accept both rather than assume.
-        items: list = []
-        try:
-            whole = json.loads(out)
-            items = whole if isinstance(whole, list) else [whole]
-        except ValueError:
-            for line in out.splitlines():
-                try:
-                    items.append(json.loads(line))
-                except ValueError:
-                    continue
-        for item in items:
+        # This read already used the one-object-per-line form (it is the shape the rest
+        # of the file should have had all along); it now shares the parser. Clearing a
+        # cosmetic notice is fail-open, so an unreadable list simply clears nothing.
+        for item in gh_json_rows(out) or []:
             if not isinstance(item, dict) or EXHAUSTION_MARKER not in str(item.get("body") or ""):
                 continue
             rc, _out, err = await self._run_gh(
