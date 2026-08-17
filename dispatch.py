@@ -1032,27 +1032,37 @@ class Dispatcher:
             # the next push/sweep re-evaluates.
             checks = await self._checks_state(repo, head)
             event = "REQUEST_CHANGES" if checks in ("green", "failed", "no-checks") else "COMMENT"
-        rc, err = await self._post_review_with_retry(repo, pr, event, body)
+        rc, err, attempts = await self._post_review_with_retry(repo, pr, head, event, body)
         if rc != 0:
             # The verdict is GONE — the panel ran, the judgement was made and paid for,
             # and the only copy of it was in this call frame (issue #72). ERROR, not
             # WARNING: a discarded verdict evaded every `grep ERROR` health check we had,
             # which is how three of them went unnoticed for hours on 2026-08-17.
+            # `attempts` is what actually happened, not POST_MAX_ATTEMPTS — a 422 gives
+            # up after one, and an alert that rounds that up to "3 attempts" is telling
+            # the operator a story about a retry storm that never occurred.
             log.error(
                 "[pr-reviewer] VERDICT LOST — posting %s on %s#%s failed after %d attempt(s): %s",
                 event,
                 repo,
                 pr,
-                POST_MAX_ATTEMPTS,
+                attempts,
                 err[-300:],
             )
             # `review_event`, not `event`: Telemetry.emit takes the event NAME first.
             self.telemetry.emit(
-                "verdict-lost", repo=repo, pr=pr, sha=head, verdict=verdict, review_event=event, error=err[-300:]
+                "verdict-lost",
+                repo=repo,
+                pr=pr,
+                sha=head,
+                verdict=verdict,
+                review_event=event,
+                attempts=attempts,
+                error=err[-300:],
             )
             await self._escalate(
                 f"QA verdict LOST on {repo}#{pr} — the panel produced {verdict} on head "
-                f"{head[:12]} and GitHub refused the post after {POST_MAX_ATTEMPTS} attempts. "
+                f"{head[:12]} and GitHub refused the post after {attempts} attempt(s). "
                 f"The PR shows no verdict. Last error: {err[-200:]}",
                 dedup_key=f"verdict-lost:{repo}#{pr}@{head}",
             )
@@ -1068,15 +1078,26 @@ class Dispatcher:
             await self._dismiss_stale_blocks(repo, pr)
         return True
 
-    async def _post_review_with_retry(self, repo: str, pr: int, event: str, body: str) -> tuple[int, str]:
-        """POST the verdict review, retrying TRANSIENT refusals only → (rc, last error).
+    async def _post_review_with_retry(
+        self, repo: str, pr: int, head: str, event: str, body: str
+    ) -> tuple[int, str, int]:
+        """POST the verdict review, retrying TRANSIENT refusals → (rc, last error, attempts).
 
         Bounded on purpose (issue #6: a promotion GitHub keeps refusing must not
         re-attempt forever). Only transient classes are retried — a 422 is GitHub
         telling us the request is wrong, and sleeping changes nothing.
+
+        A review POST is NOT idempotent, so a retry is only safe when the previous
+        attempt definitely did not land. A timeout is the one failure where that is
+        unknown — we killed the call, GitHub may still have accepted it — so a timeout
+        re-reads the PR before re-sending. Without that check the retry turns a
+        timed-out-but-landed post into a duplicate review, which is the very pathology
+        this release exists to stop. `while True` rather than a bounded `for`: every
+        exit is an explicit return, so there is no unreachable tail.
         """
-        err = ""
-        for attempt in range(1, POST_MAX_ATTEMPTS + 1):
+        attempt = 0
+        while True:
+            attempt += 1
             rc, _out, err = await self._run_gh(
                 ["api", f"repos/{repo}/pulls/{pr}/reviews", "-X", "POST", "-f", f"event={event}", "-f", f"body={body}"],
                 timeout=60,
@@ -1084,9 +1105,22 @@ class Dispatcher:
             if rc == 0:
                 if attempt > 1:
                     log.info("[pr-reviewer] posting %s on %s#%s succeeded on attempt %d", event, repo, pr, attempt)
-                return 0, ""
-            if attempt == POST_MAX_ATTEMPTS or not transient_gh_failure(rc, err):
-                return rc, err
+                return 0, "", attempt
+            if rc == 124:
+                # Ambiguous: our timeout, not GitHub's refusal. Ask GitHub what it has.
+                landed = await self._verdict_landed(repo, pr, head)
+                if landed is True:
+                    log.warning(
+                        "[pr-reviewer] posting %s on %s#%s timed out but LANDED — not re-sending", event, repo, pr
+                    )
+                    return 0, "", attempt
+                if landed is None:
+                    # Cannot confirm either way. Re-sending risks a duplicate review,
+                    # which is permanent; giving up loses the verdict, which escalates
+                    # and is recoverable. Prefer the recoverable failure (issue #71).
+                    return rc, f"{err} (post outcome unconfirmed — not re-sent)", attempt
+            if attempt >= POST_MAX_ATTEMPTS or not transient_gh_failure(rc, err):
+                return rc, err, attempt
             delay = POST_RETRY_BACKOFF_S[min(attempt - 1, len(POST_RETRY_BACKOFF_S) - 1)]
             log.warning(
                 "[pr-reviewer] posting %s on %s#%s failed (attempt %d/%d), retrying in %ss: %s",
@@ -1099,7 +1133,18 @@ class Dispatcher:
                 err[-200:],
             )
             await asyncio.sleep(delay)
-        return 1, err
+
+    async def _verdict_landed(self, repo: str, pr: int, head: str) -> bool | None:
+        """Did a verdict of ours for `head` reach the PR? None when we cannot tell.
+
+        Only meaningful after an ambiguous POST (a timeout). Reuses the marker that
+        `_our_reviews` already parses, so "did it land" is answered by the same source
+        of truth that decides everything else about review history.
+        """
+        ours = await self._our_reviews(repo, pr)
+        if ours is None:
+            return None
+        return any(r["head"] == head for r in ours)
 
     async def _clear_exhaustion_comments(self, repo: str, pr: int) -> None:
         """Delete our exhaustion notices once a real verdict lands (#54 follow-on to #61).

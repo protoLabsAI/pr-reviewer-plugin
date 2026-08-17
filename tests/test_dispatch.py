@@ -162,7 +162,10 @@ class RoutedGH(FakeGH):
             return 0, "{}", ""
         if "-X" in args and "POST" in args:
             fields = {a.split("=", 1)[0]: a.split("=", 1)[1] for a in args if "=" in a and not a.startswith("query=")}
-            self.posted.append(fields)
+            # Record the URL like FakeGH does: without it a test asserting on `posted`
+            # cannot tell a review POST from any other write, so an unintended extra
+            # write passes unnoticed — the exact duplicate-post risk under test here.
+            self.posted.append({"url": args[1] if len(args) > 1 else "", **fields})
             if self.post_results:
                 rc, err = self.post_results.pop(0)
                 return rc, "" if rc else "{}", err
@@ -332,6 +335,48 @@ async def test_verdict_post_does_not_retry_a_422(tmp_path, monkeypatch):
     d = make(tmp_path, gh=gh)
     await d.handle_pr_event("o/r", 1, HEAD, "opened")
     assert len(gh.posted) == 1  # gave up immediately — a retry cannot fix a 422
+
+
+async def test_a_timed_out_post_that_landed_is_not_re_sent(tmp_path, monkeypatch):
+    """A timeout is our kill, not GitHub's refusal — the POST may have been accepted.
+    Re-sending it duplicates the review, which is the pathology this release fixes.
+    The retry re-reads the PR first and stands down when the verdict is already there.
+    """
+    monkeypatch.setattr("asyncio.sleep", _no_sleep)
+    gh = RoutedGH(pr_facts=facts(), reviews=[review_row(HEAD, "FAIL")], post_results=[(124, "timed out")])
+    d = make(tmp_path, gh=gh)
+    # `force` bypasses the reaffirm short-circuit so the panel actually posts.
+    assert await d._post_verdict("o/r", 1, HEAD, "FAIL", REPORT, "code-review")
+    assert len(gh.posted) == 1  # timed out, confirmed landed, NOT re-sent
+
+
+async def test_a_timed_out_post_is_re_sent_when_it_demonstrably_did_not_land(tmp_path, monkeypatch):
+    monkeypatch.setattr("asyncio.sleep", _no_sleep)
+    gh = RoutedGH(pr_facts=facts(), reviews=[], post_results=[(124, "timed out"), (0, "")])
+    d = make(tmp_path, gh=gh)
+    assert await d._post_verdict("o/r", 1, HEAD, "FAIL", REPORT, "code-review")
+    assert len(gh.posted) == 2  # no verdict on the PR ⇒ safe to re-send
+
+
+async def test_a_timed_out_post_is_not_re_sent_when_the_outcome_cannot_be_confirmed(tmp_path, monkeypatch):
+    """Blind after a timeout: a duplicate review is permanent, a lost verdict escalates
+    and is recoverable. Prefer the recoverable failure."""
+    monkeypatch.setattr("asyncio.sleep", _no_sleep)
+    gh = RoutedGH(pr_facts=facts(), reviews_rc=1, reviews_err="HTTP 503", post_results=[(124, "timed out")])
+    d = make(tmp_path, gh=gh)
+    assert not await d._post_verdict("o/r", 1, HEAD, "FAIL", REPORT, "code-review")
+    assert len(gh.posted) == 1
+
+
+async def test_a_lost_verdict_reports_the_attempts_that_actually_happened(tmp_path, monkeypatch):
+    """A 422 gives up after ONE attempt; an alert claiming three describes a retry
+    storm that never occurred."""
+    monkeypatch.setattr("asyncio.sleep", _no_sleep)
+    gh = RoutedGH(pr_facts=facts(), post_results=[(1, "HTTP 422: Validation Failed")])
+    escalations = []
+    d = make(tmp_path, gh=gh, inbox=lambda text, **kw: escalations.append(text))
+    await d.handle_pr_event("o/r", 1, HEAD, "opened")
+    assert escalations and "after 1 attempt(s)" in escalations[0]
 
 
 async def test_a_lost_verdict_escalates_instead_of_vanishing(tmp_path, monkeypatch):
