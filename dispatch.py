@@ -68,6 +68,48 @@ DROP_SELF_AUTHORED = "self-authored"
 DROP_PR_NOT_ELIGIBLE = "pr-not-eligible"  # closed, draft, or facts unreadable
 DROP_NO_RUNNER = "no-workflow-runner"
 DROP_PAUSED = "paused-by-operator"  # `@vera pause` (issue #28)
+DROP_REVIEWS_UNREADABLE = "reviews-unreadable"  # blind on our own history (issue #71)
+
+# Our own reviews could not be read this pass (issue #71). Distinct from every other
+# hold because it says nothing about the PR — only that we are blind — and blind is
+# precisely when acting is most expensive. Emitted rather than folded into a
+# neighbouring hold so a degradation is VISIBLE in telemetry: the 2026-08-17 loop ran
+# 2.5h without a single log line naming the read failure that caused it.
+HOLD_REVIEWS_UNREADABLE = "hold:reviews-unreadable"
+
+# Posting a verdict is the LAST step of the most expensive thing this plugin does, and
+# it used to be the only step with no retry — a transient refusal discarded the whole
+# panel run (issue #72). Bounded, because #6: a refusal GitHub means must not re-attempt
+# forever. Backoff is per-retry; the tuple's last value repeats if attempts ever grow.
+POST_MAX_ATTEMPTS = 3
+POST_RETRY_BACKOFF_S = (2, 8)
+
+# gh exit codes / stderr shapes worth a second attempt. 5xx and the secondary
+# rate-limit texts are the ones observed in production; a 4xx other than 429 is GitHub
+# rejecting the REQUEST, and retrying an unchanged request cannot fix it.
+_TRANSIENT_GH_TEXT = (
+    "http 500",
+    "http 502",
+    "http 503",
+    "http 504",
+    "no server is currently available",
+    "secondary rate limit",
+    "api rate limit exceeded",
+    "was submitted too quickly",
+    "timed out",
+    "connection reset",
+    "eof occurred",
+)
+
+
+def transient_gh_failure(rc: int, err: str) -> bool:
+    """Is this `gh` failure worth retrying? Timeout (124) always; else by stderr shape."""
+    if rc == 124:  # our own timeout kill
+        return True
+    if rc == 127:  # gh missing — no amount of retrying installs it
+        return False
+    return any(t in (err or "").lower() for t in _TRANSIENT_GH_TEXT)
+
 
 HOLD_PROMOTE_BACKOFF = "hold:promote-backoff"
 # Consecutive APPROVE failures on one repo#pr@head before the sweep stops retrying
@@ -399,8 +441,16 @@ class Dispatcher:
         )
         return [line.strip() for line in out.splitlines() if line.strip()] if rc == 0 else []
 
-    async def _our_reviews(self, repo: str, pr: int) -> list[dict]:
-        """Our posted reviews (marker-bearing), oldest→newest: [{head, verdict, promoted, state, body, id}]."""
+    async def _our_reviews(self, repo: str, pr: int) -> list[dict] | None:
+        """Our posted reviews (marker-bearing), oldest→newest: [{head, verdict, promoted, state, body, id}].
+
+        **None means the read FAILED — it is not the same as `[]` (this PR has no
+        reviews), and callers must not collapse the two** (issue #71). Returning `[]`
+        on an unreadable read is a fail-OPEN: `needs_backfill` reads it as "no verdict
+        exists" and re-reviews a PR that is already reviewed, which cost two PRs ten
+        full panels each on a static head during a GitHub degradation. Every caller
+        here decides explicitly, and every one of them fails CLOSED.
+        """
         rc, out, _err = await self._run_gh(
             [
                 "api",
@@ -411,11 +461,11 @@ class Dispatcher:
             ],
         )
         if rc != 0:
-            return []
+            return None
         try:
             rows = json.loads(out)
         except json.JSONDecodeError:
-            return []
+            return None
         ours = []
         for row in rows if isinstance(rows, list) else []:
             marker = parse_verdict_marker(row.get("body") or "")
@@ -656,6 +706,15 @@ class Dispatcher:
         recipe = "code-review-structural" if fires else "code-review"
 
         ours = await self._our_reviews(repo, pr)
+        if ours is None:
+            # Blind on our own history, and EVERY downstream decision here reads it:
+            # the reaffirm short-circuit below sees no verdict at this head and spends
+            # the panel again, and `round_number` resets to 1 so the max-rounds cap and
+            # the convergence rule both disarm. That combination is what posted ten
+            # CHANGES_REQUESTED on one static head (issue #71). Drop instead — the
+            # sweep's backfill re-reaches this PR once the read recovers.
+            self.telemetry.emit("drop", repo=repo, pr=pr, sha=head, reason=DROP_REVIEWS_UNREADABLE)
+            return f"drop:{DROP_REVIEWS_UNREADABLE}"
         # ROUNDS, not reviews (issue #23): promotion bodies carry our marker and no
         # findings, so `ours[-1]` after an approve-on-green was an empty recall — the
         # delta re-review silently degraded to a cold one, which is what kept #88
@@ -973,12 +1032,40 @@ class Dispatcher:
             # the next push/sweep re-evaluates.
             checks = await self._checks_state(repo, head)
             event = "REQUEST_CHANGES" if checks in ("green", "failed", "no-checks") else "COMMENT"
-        rc, _out, err = await self._run_gh(
-            ["api", f"repos/{repo}/pulls/{pr}/reviews", "-X", "POST", "-f", f"event={event}", "-f", f"body={body}"],
-            timeout=60,
-        )
+        rc, err, attempts = await self._post_review_with_retry(repo, pr, head, event, body)
         if rc != 0:
-            log.warning("[pr-reviewer] posting %s on %s#%s failed: %s", event, repo, pr, err[-300:])
+            # The verdict is GONE — the panel ran, the judgement was made and paid for,
+            # and the only copy of it was in this call frame (issue #72). ERROR, not
+            # WARNING: a discarded verdict evaded every `grep ERROR` health check we had,
+            # which is how three of them went unnoticed for hours on 2026-08-17.
+            # `attempts` is what actually happened, not POST_MAX_ATTEMPTS — a 422 gives
+            # up after one, and an alert that rounds that up to "3 attempts" is telling
+            # the operator a story about a retry storm that never occurred.
+            log.error(
+                "[pr-reviewer] VERDICT LOST — posting %s on %s#%s failed after %d attempt(s): %s",
+                event,
+                repo,
+                pr,
+                attempts,
+                err[-300:],
+            )
+            # `review_event`, not `event`: Telemetry.emit takes the event NAME first.
+            self.telemetry.emit(
+                "verdict-lost",
+                repo=repo,
+                pr=pr,
+                sha=head,
+                verdict=verdict,
+                review_event=event,
+                attempts=attempts,
+                error=err[-300:],
+            )
+            await self._escalate(
+                f"QA verdict LOST on {repo}#{pr} — the panel produced {verdict} on head "
+                f"{head[:12]} and GitHub refused the post after {attempts} attempt(s). "
+                f"The PR shows no verdict. Last error: {err[-200:]}",
+                dedup_key=f"verdict-lost:{repo}#{pr}@{head}",
+            )
             return False
         # A verdict exists now, so any "this PR has not been reviewed" notice we left on
         # an earlier exhausted head (#61) is stale and contradicts the review above it.
@@ -990,6 +1077,74 @@ class Dispatcher:
             # prior blocker/major has not earned the dismissal yet (issue #26).
             await self._dismiss_stale_blocks(repo, pr)
         return True
+
+    async def _post_review_with_retry(
+        self, repo: str, pr: int, head: str, event: str, body: str
+    ) -> tuple[int, str, int]:
+        """POST the verdict review, retrying TRANSIENT refusals → (rc, last error, attempts).
+
+        Bounded on purpose (issue #6: a promotion GitHub keeps refusing must not
+        re-attempt forever). Only transient classes are retried — a 422 is GitHub
+        telling us the request is wrong, and sleeping changes nothing.
+
+        A review POST is NOT idempotent, so a retry is only safe when the previous
+        attempt definitely did not land. A timeout is the one failure where that is
+        unknown — we killed the call, GitHub may still have accepted it — so a timeout
+        re-reads the PR before re-sending. Without that check the retry turns a
+        timed-out-but-landed post into a duplicate review, which is the very pathology
+        this release exists to stop. `while True` rather than a bounded `for`: every
+        exit is an explicit return, so there is no unreachable tail.
+        """
+        attempt = 0
+        while True:
+            attempt += 1
+            rc, _out, err = await self._run_gh(
+                ["api", f"repos/{repo}/pulls/{pr}/reviews", "-X", "POST", "-f", f"event={event}", "-f", f"body={body}"],
+                timeout=60,
+            )
+            if rc == 0:
+                if attempt > 1:
+                    log.info("[pr-reviewer] posting %s on %s#%s succeeded on attempt %d", event, repo, pr, attempt)
+                return 0, "", attempt
+            if rc == 124:
+                # Ambiguous: our timeout, not GitHub's refusal. Ask GitHub what it has.
+                landed = await self._verdict_landed(repo, pr, head)
+                if landed is True:
+                    log.warning(
+                        "[pr-reviewer] posting %s on %s#%s timed out but LANDED — not re-sending", event, repo, pr
+                    )
+                    return 0, "", attempt
+                if landed is None:
+                    # Cannot confirm either way. Re-sending risks a duplicate review,
+                    # which is permanent; giving up loses the verdict, which escalates
+                    # and is recoverable. Prefer the recoverable failure (issue #71).
+                    return rc, f"{err} (post outcome unconfirmed — not re-sent)", attempt
+            if attempt >= POST_MAX_ATTEMPTS or not transient_gh_failure(rc, err):
+                return rc, err, attempt
+            delay = POST_RETRY_BACKOFF_S[min(attempt - 1, len(POST_RETRY_BACKOFF_S) - 1)]
+            log.warning(
+                "[pr-reviewer] posting %s on %s#%s failed (attempt %d/%d), retrying in %ss: %s",
+                event,
+                repo,
+                pr,
+                attempt,
+                POST_MAX_ATTEMPTS,
+                delay,
+                err[-200:],
+            )
+            await asyncio.sleep(delay)
+
+    async def _verdict_landed(self, repo: str, pr: int, head: str) -> bool | None:
+        """Did a verdict of ours for `head` reach the PR? None when we cannot tell.
+
+        Only meaningful after an ambiguous POST (a timeout). Reuses the marker that
+        `_our_reviews` already parses, so "did it land" is answered by the same source
+        of truth that decides everything else about review history.
+        """
+        ours = await self._our_reviews(repo, pr)
+        if ours is None:
+            return None
+        return any(r["head"] == head for r in ours)
 
     async def _clear_exhaustion_comments(self, repo: str, pr: int) -> None:
         """Delete our exhaustion notices once a real verdict lands (#54 follow-on to #61).
@@ -1038,7 +1193,10 @@ class Dispatcher:
         comment. APPROVE stays reserved for the promotion owner, so the gate lifts
         itself by dismissal. Every non-dismissed blocker goes (GitHub rolls the
         reviewer's effective state back to the previous one otherwise)."""
-        for review in await self._our_reviews(repo, pr):
+        # Unreadable ⇒ dismiss nothing. Same shape as before (an unreadable read used
+        # to yield `[]`, which also dismissed nothing), but now it says so (issue #71):
+        # a block left standing is recoverable next tick, a wrongly-lifted one is not.
+        for review in await self._our_reviews(repo, pr) or []:
             if review.get("state") != "CHANGES_REQUESTED" or not review.get("id"):
                 continue
             rc, _out, err = await self._run_gh(
@@ -1081,6 +1239,11 @@ class Dispatcher:
             return "hold:pr-not-eligible"
         head = str(facts["head"])
         ours = await self._our_reviews(repo, pr)
+        if ours is None:
+            # Blind: `latest` would read as "no FAIL standing" and silently skip a
+            # re-gate that IS owed. Hold and re-look next tick (issue #71).
+            self.telemetry.emit("regate", repo=repo, pr=pr, sha=head, decision=HOLD_REVIEWS_UNREADABLE)
+            return HOLD_REVIEWS_UNREADABLE
         latest = ours[-1] if ours else None
         if not latest or latest["head"] != head or latest["verdict"] != FAIL:
             # No FAIL standing against the current head — a later PASS/WARN supersedes
@@ -1163,6 +1326,12 @@ class Dispatcher:
             return "hold:pr-not-eligible"
         head = str(facts["head"])
         ours = await self._our_reviews(repo, pr)
+        if ours is None:
+            # `promoted` below is computed FROM `ours`, so a blind pass reads as
+            # "never promoted" and re-approves a head we already approved — the exact
+            # every-tick re-approval loop the marker-parse regression caused (issue #71).
+            self.telemetry.emit("promotion", repo=repo, pr=pr, sha=head, decision=HOLD_REVIEWS_UNREADABLE)
+            return HOLD_REVIEWS_UNREADABLE
         # The latest PANEL ROUND decides — not `ours[-1]`, which can be our own promotion
         # body (marker-bearing, no findings). Same shadowing that made delta re-reviews
         # recall nothing before #24; here it would silently promote with an empty
@@ -1265,6 +1434,13 @@ class Dispatcher:
             return None
         head = str(facts["head"])
         ours = await self._our_reviews(repo, pr)
+        if ours is None:
+            # Reviews unreadable ⇒ we cannot know whether a verdict exists, and
+            # backfilling on a guess costs a full panel AND posts a duplicate review
+            # on a PR that may already be reviewed (issue #71). The cost is asymmetric:
+            # a skipped backfill is retried on the very next tick, a spurious one is
+            # permanent on the PR. Fail CLOSED and wait for a readable pass.
+            return None
         if any(r["head"] == head for r in ours):
             return None  # a verdict for the CURRENT head exists — nothing to backfill
         return head

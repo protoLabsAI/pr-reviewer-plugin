@@ -53,6 +53,11 @@ class FakeGH:
         return 0, "", ""
 
 
+async def _no_sleep(_delay):
+    """Retry backoff, without the wall-clock cost, for the post-retry tests."""
+    return None
+
+
 def facts(**over):
     base = {
         "head": HEAD,
@@ -124,12 +129,30 @@ def review_row(head, verdict, state="COMMENTED", findings_json="", id=None, comp
 
 
 class RoutedGH(FakeGH):
-    def __init__(self, *, pr_facts, reviews=None, checks=None, files="x.py\n", threads=None, compare=None):
+    def __init__(
+        self,
+        *,
+        pr_facts,
+        reviews=None,
+        checks=None,
+        files="x.py\n",
+        threads=None,
+        compare=None,
+        reviews_rc=0,
+        reviews_err="",
+        post_results=None,
+    ):
         super().__init__()
         self.pr_facts, self.reviews, self.checks, self.files = pr_facts, reviews or [], checks, files
         self.threads = threads  # None → the generic graphql "0" (fetch degrades to no block)
         self.compare = compare  # None → the compare read fails (no convergence relief)
         self.dismissed: list[str] = []
+        # reviews_rc != 0 → the reviews READ fails, the shape that made `_our_reviews`
+        # fail open before issue #71. Kept separate from `reviews=[]`, which is the
+        # legitimate "this PR has no reviews".
+        self.reviews_rc, self.reviews_err = reviews_rc, reviews_err
+        # Successive (rc, err) results for the verdict POST — for the retry path (#72).
+        self.post_results = list(post_results or [])
 
     async def __call__(self, args, timeout=30):
         self.calls.append(args)
@@ -139,7 +162,13 @@ class RoutedGH(FakeGH):
             return 0, "{}", ""
         if "-X" in args and "POST" in args:
             fields = {a.split("=", 1)[0]: a.split("=", 1)[1] for a in args if "=" in a and not a.startswith("query=")}
-            self.posted.append(fields)
+            # Record the URL like FakeGH does: without it a test asserting on `posted`
+            # cannot tell a review POST from any other write, so an unintended extra
+            # write passes unnoticed — the exact duplicate-post risk under test here.
+            self.posted.append({"url": args[1] if len(args) > 1 else "", **fields})
+            if self.post_results:
+                rc, err = self.post_results.pop(0)
+                return rc, "" if rc else "{}", err
             return 0, "{}", ""
         if args[1] == "user":
             return 0, "qa-bot", ""
@@ -148,6 +177,8 @@ class RoutedGH(FakeGH):
         if "/files" in joined:
             return 0, self.files, ""
         if "/reviews" in joined:
+            if self.reviews_rc:
+                return self.reviews_rc, "", self.reviews_err
             return 0, json.dumps(self.reviews), ""
         if "/check-runs" in joined:
             return (0, json.dumps(self.checks), "") if self.checks is not None else (1, "", "403")
@@ -270,6 +301,95 @@ async def test_failed_panel_step_escalates_and_posts_nothing(tmp_path):
     # D3 holds: no verdict review posted (the exhaustion comment is not a verdict)
     assert all("event" not in p for p in gh.posted)
     assert escalations and "UNREVIEWED" in escalations[0][0]
+
+
+# ── posting: a verdict must survive a transient refusal (issue #72) ───────────
+
+
+def test_transient_gh_failure_classifies_by_shape():
+    from pr_reviewer.dispatch import transient_gh_failure
+
+    assert transient_gh_failure(1, "gh: No server is currently available ... (HTTP 503)")
+    assert transient_gh_failure(1, "HTTP 502 Bad Gateway")
+    assert transient_gh_failure(1, "You have exceeded a secondary rate limit")
+    assert transient_gh_failure(124, "")  # our own timeout kill
+    # A request GitHub means to refuse — sleeping and re-sending changes nothing.
+    assert not transient_gh_failure(1, "HTTP 422: Validation Failed")
+    assert not transient_gh_failure(1, "HTTP 404: Not Found")
+    assert not transient_gh_failure(127, "gh: command not found")
+
+
+async def test_verdict_post_retries_a_transient_refusal_and_survives(tmp_path, monkeypatch):
+    """The panel run is the expensive part; the post is the last step. A 503 on the
+    post used to discard the whole verdict with a WARNING and no retry."""
+    monkeypatch.setattr("asyncio.sleep", _no_sleep)
+    gh = RoutedGH(pr_facts=facts(), post_results=[(1, "HTTP 503"), (0, "")])
+    d = make(tmp_path, gh=gh)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "reviewed:FAIL"
+    assert len(gh.posted) == 2  # first refused, second landed
+
+
+async def test_verdict_post_does_not_retry_a_422(tmp_path, monkeypatch):
+    monkeypatch.setattr("asyncio.sleep", _no_sleep)
+    gh = RoutedGH(pr_facts=facts(), post_results=[(1, "HTTP 422: Validation Failed"), (0, "")])
+    d = make(tmp_path, gh=gh)
+    await d.handle_pr_event("o/r", 1, HEAD, "opened")
+    assert len(gh.posted) == 1  # gave up immediately — a retry cannot fix a 422
+
+
+async def test_a_timed_out_post_that_landed_is_not_re_sent(tmp_path, monkeypatch):
+    """A timeout is our kill, not GitHub's refusal — the POST may have been accepted.
+    Re-sending it duplicates the review, which is the pathology this release fixes.
+    The retry re-reads the PR first and stands down when the verdict is already there.
+    """
+    monkeypatch.setattr("asyncio.sleep", _no_sleep)
+    gh = RoutedGH(pr_facts=facts(), reviews=[review_row(HEAD, "FAIL")], post_results=[(124, "timed out")])
+    d = make(tmp_path, gh=gh)
+    # `force` bypasses the reaffirm short-circuit so the panel actually posts.
+    assert await d._post_verdict("o/r", 1, HEAD, "FAIL", REPORT, "code-review")
+    assert len(gh.posted) == 1  # timed out, confirmed landed, NOT re-sent
+
+
+async def test_a_timed_out_post_is_re_sent_when_it_demonstrably_did_not_land(tmp_path, monkeypatch):
+    monkeypatch.setattr("asyncio.sleep", _no_sleep)
+    gh = RoutedGH(pr_facts=facts(), reviews=[], post_results=[(124, "timed out"), (0, "")])
+    d = make(tmp_path, gh=gh)
+    assert await d._post_verdict("o/r", 1, HEAD, "FAIL", REPORT, "code-review")
+    assert len(gh.posted) == 2  # no verdict on the PR ⇒ safe to re-send
+
+
+async def test_a_timed_out_post_is_not_re_sent_when_the_outcome_cannot_be_confirmed(tmp_path, monkeypatch):
+    """Blind after a timeout: a duplicate review is permanent, a lost verdict escalates
+    and is recoverable. Prefer the recoverable failure."""
+    monkeypatch.setattr("asyncio.sleep", _no_sleep)
+    gh = RoutedGH(pr_facts=facts(), reviews_rc=1, reviews_err="HTTP 503", post_results=[(124, "timed out")])
+    d = make(tmp_path, gh=gh)
+    assert not await d._post_verdict("o/r", 1, HEAD, "FAIL", REPORT, "code-review")
+    assert len(gh.posted) == 1
+
+
+async def test_a_lost_verdict_reports_the_attempts_that_actually_happened(tmp_path, monkeypatch):
+    """A 422 gives up after ONE attempt; an alert claiming three describes a retry
+    storm that never occurred."""
+    monkeypatch.setattr("asyncio.sleep", _no_sleep)
+    gh = RoutedGH(pr_facts=facts(), post_results=[(1, "HTTP 422: Validation Failed")])
+    escalations = []
+    d = make(tmp_path, gh=gh, inbox=lambda text, **kw: escalations.append(text))
+    await d.handle_pr_event("o/r", 1, HEAD, "opened")
+    assert escalations and "after 1 attempt(s)" in escalations[0]
+
+
+async def test_a_lost_verdict_escalates_instead_of_vanishing(tmp_path, monkeypatch):
+    """Three 503s in 15 minutes discarded three verdicts silently on 2026-08-17.
+    Exhausting the retries must leave a trace an operator actually sees."""
+    monkeypatch.setattr("asyncio.sleep", _no_sleep)
+    gh = RoutedGH(pr_facts=facts(), post_results=[(1, "HTTP 503")] * 3)
+    escalations = []
+    d = make(tmp_path, gh=gh, inbox=lambda text, **kw: escalations.append(text))
+    await d.handle_pr_event("o/r", 1, HEAD, "opened")
+    assert len(gh.posted) == 3  # bounded — not forever (issue #6)
+    assert escalations and "LOST" in escalations[0]
+    assert "o/r#1" in escalations[0]
 
 
 # ── posting + trigger ─────────────────────────────────────────────────────────
@@ -755,6 +875,60 @@ async def test_backfill_skips_drafts_and_closed_prs(tmp_path):
 
     gh2 = RoutedGH(pr_facts=facts(state="closed"), reviews=[])
     assert (await make(tmp_path, gh=gh2).needs_backfill("o/r", 1)) is None
+
+
+# ── blind on our own reviews: every path fails CLOSED (issue #71) ─────────────
+
+
+async def test_unreadable_reviews_never_backfill(tmp_path):
+    """The 2026-08-17 loop, in one assertion.
+
+    An unreadable reviews read used to yield `[]`, indistinguishable from "this PR has
+    no verdict" — so the sweep backfilled a PR that WAS already reviewed, spent a full
+    panel, and posted a duplicate review. Ten times each on two PRs against a static
+    head. A read failure must never be read as an absence.
+    """
+    gh = RoutedGH(pr_facts=facts(), reviews_rc=1, reviews_err="gh: ... (HTTP 503)")
+    assert (await make(tmp_path, gh=gh).needs_backfill("o/r", 1)) is None
+
+    # And the contrast that must keep working: genuinely no reviews ⇒ backfill.
+    gh2 = RoutedGH(pr_facts=facts(), reviews=[])
+    assert (await make(tmp_path, gh=gh2).needs_backfill("o/r", 1)) == HEAD
+
+
+async def test_unreadable_reviews_drop_the_review_instead_of_spending_the_panel(tmp_path):
+    """Blind, the reaffirm short-circuit misses and `round_number` resets to 1 — which
+    disarms the max-rounds cap and the convergence rule together. Drop instead."""
+    gh = RoutedGH(pr_facts=facts(), reviews_rc=1, reviews_err="HTTP 502")
+    ran = []
+
+    async def runner(name, inputs):
+        ran.append(name)
+        return {"output": REPORT, "failed": []}
+
+    d = make(tmp_path, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "drop:reviews-unreadable"
+    assert ran == []  # the panel was never spent
+    assert gh.posted == []  # and nothing was posted on the PR
+
+
+async def test_unreadable_reviews_hold_promotion_and_regate(tmp_path):
+    from pr_reviewer.dispatch import HOLD_REVIEWS_UNREADABLE
+
+    gh = RoutedGH(pr_facts=facts(), reviews_rc=1, reviews_err="HTTP 503", checks=[])
+    d = make(tmp_path, cfg={"promotion_owner": True, "shadow_mode": False}, gh=gh)
+    assert (await d.evaluate_promotion("o/r", 1)) == HOLD_REVIEWS_UNREADABLE
+    assert gh.posted == []  # no APPROVE on a head we cannot confirm we haven't approved
+
+    gh2 = RoutedGH(pr_facts=facts(), reviews_rc=1, reviews_err="HTTP 503", checks=[])
+    d2 = make(tmp_path, cfg={"shadow_mode": False, "regate": True}, gh=gh2)
+    assert (await d2.evaluate_regate("o/r", 1)) == HOLD_REVIEWS_UNREADABLE
+
+
+async def test_unreadable_reviews_dismiss_no_blocks(tmp_path):
+    gh = RoutedGH(pr_facts=facts(), reviews_rc=1, reviews_err="HTTP 503")
+    await make(tmp_path, gh=gh)._dismiss_stale_blocks("o/r", 1)
+    assert gh.dismissed == []
 
 
 async def test_sweep_backfills_a_never_reviewed_pr(tmp_path):
