@@ -139,6 +139,12 @@ REGATE_MAX_FAILURES = 3
 # (or while it was down, or that exhausted its panel) never gets a first review.
 BACKFILL_ACTION = "sweep-backfill"
 
+# How long an enumerated GitHub App installation scope is reused before re-reading it.
+# The sweep ticks every ~3 min and installation membership changes rarely, so this
+# keeps the extra call to roughly one per TTL while a newly-installed repo still comes
+# under review within a few minutes.
+INSTALLATION_REPOS_TTL_S = 600
+
 # Marks our "the panel could not finish" comments (#61) so they can be deduplicated when
 # posted AND found again when a later verdict makes them false. Shared by both sides on
 # purpose: two copies of this string is how a notice gets posted but never cleared.
@@ -206,6 +212,8 @@ class Dispatcher:
         self._promote_failures: dict[str, int] = {}  # repo#pr@head -> consecutive APPROVE failures
         self._regate_failures: dict[str, int] = {}  # repo#pr@head -> consecutive REQUEST_CHANGES failures
         self._round_cap: dict[str, float] = {}  # repo#pr -> monotonic timestamp when capped
+        self._installation_repos: list[str] = []  # last good App-installation scope
+        self._installation_repos_at: float = 0.0
 
     # ── config, resolved live ────────────────────────────────────────────────
     #
@@ -230,9 +238,60 @@ class Dispatcher:
 
     @property
     def repos(self) -> list[str]:
-        """Managed allowlist. Config wins only when NON-empty — a seed shipping
-        `repos: []` must fall through to the env."""
+        """Managed allowlist, or EMPTY meaning "whatever the GitHub App installation
+        covers" — GitHub is the gate, not a second list maintained here.
+
+        Empty has always meant allow-all on the webhook path (`self.repos and ...`
+        below), but the sweep iterated this list literally, so an empty list silently
+        turned off backfill, re-gate and promotion — the level-triggered half of the
+        reviewer — while the edge-triggered half kept working. `sweep_repos()` closes
+        that: it resolves the installation's own repositories when this is empty.
+
+        Config wins only when NON-empty, so a seed shipping `repos: []` still falls
+        through to the env.
+        """
         return [str(r) for r in (self.cfg.get("repos") or []) if r] or _env_repos()
+
+    async def sweep_repos(self) -> list[str]:
+        """The repos the sweep should walk: the explicit allowlist when one is set,
+        else every repo the App installation can see.
+
+        Installing the App on a repo is already an explicit, revocable, audited grant.
+        Requiring a second enumeration here meant every new repo silently got
+        "webhooks delivered, nothing reviewed" until someone remembered to add it —
+        four repos were sitting in exactly that state (qaEngineer#38).
+
+        Cached: the sweep runs every ~3 min and installation membership changes rarely,
+        so this is roughly one extra API call per TTL. A failed enumeration reuses the
+        last good list and, failing that, returns empty — the sweep skips a pass rather
+        than inventing scope.
+        """
+        explicit = self.repos
+        if explicit:
+            return explicit
+        now = time.monotonic()
+        if self._installation_repos and now - self._installation_repos_at < INSTALLATION_REPOS_TTL_S:
+            return self._installation_repos
+        # NOTE: no `[...]` wrapper in the jq — with --paginate, gh applies the filter
+        # per page and concatenates, so an array-wrapping filter emits `[..][..]`,
+        # which is not valid JSON. Newline-separated scalars concatenate cleanly.
+        rc, out, err = await self._run_gh(
+            ["api", "/installation/repositories", "--paginate", "--jq", ".repositories[].full_name"]
+        )
+        if rc != 0:
+            log.warning(
+                "[pr-reviewer] could not enumerate installation repositories (%s); sweeping the last known %d repo(s)",
+                err[-200:],
+                len(self._installation_repos),
+            )
+            return self._installation_repos
+        found = [line.strip() for line in out.splitlines() if line.strip()]
+        if not found:
+            return self._installation_repos
+        if set(found) != set(self._installation_repos):
+            log.info("[pr-reviewer] installation scope: %d repo(s)", len(found))
+        self._installation_repos, self._installation_repos_at = found, now
+        return found
 
     @property
     def shadow(self) -> bool:
@@ -1483,7 +1542,7 @@ class Dispatcher:
         (backfill → re-gate → promote). Returns PRs evaluated. Never raises."""
         count = 0
         budget = self.backfill_per_pass
-        for repo in self.repos:
+        for repo in await self.sweep_repos():
             try:
                 rc, out, _err = await self._run_gh(
                     ["api", f"repos/{repo}/pulls?state=open&per_page=100", "--jq", "[.[].number]"]
