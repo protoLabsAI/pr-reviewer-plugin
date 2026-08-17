@@ -216,7 +216,10 @@ class RoutedGH(FakeGH):
             page = {"pageInfo": {"hasNextPage": False, "endCursor": ""}, "nodes": self.threads}
             return 0, json.dumps(page), ""
         if "graphql" in joined:
-            return 0, "0", ""
+            # The unresolved-COUNT query (isResolved only, no bodies). It now reads a
+            # paginated connection like the fetch above, not a scalar count.
+            nodes = [{"isResolved": bool(t.get("isResolved"))} for t in (self.threads or [])]
+            return 0, json.dumps({"pageInfo": {"hasNextPage": False, "endCursor": ""}, "nodes": nodes}), ""
         if "/pulls/1" in joined:
             return 0, json.dumps(self.pr_facts), ""
         if "/pulls?" in joined:

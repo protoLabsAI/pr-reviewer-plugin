@@ -52,16 +52,61 @@ def _safe_login(value: object) -> str:
     return "unknown"
 
 
-async def fetch_threads(run_gh, repo: str, pr: int) -> list[dict] | None:
-    """The PR's inline review threads via GraphQL, or None when unreadable.
+async def count_unresolved_threads(run_gh, repo: str, pr: int) -> int | None:
+    """How many review threads are UNRESOLVED, or None when unreadable.
 
-    Paginated: a single `reviewThreads(first: 100)` silently truncated at 100, and the
-    consumer counts UNRESOLVED threads to decide whether promotion may proceed. Missing
-    threads therefore round toward "nothing unresolved" — a PR with 100+ threads could
-    auto-approve over unresolved review conversations, which is the one direction this
-    count must never be wrong in. Page count is bounded so a pathological PR cannot
-    stall the sweep; hitting the bound returns None (unreadable) rather than a partial
-    count, because a truncated count is worse than none — it looks authoritative.
+    This is the number the promotion gate consults, so it is the one that must not
+    truncate: a missed thread rounds toward "nothing unresolved", and the PR can
+    auto-approve over an open review conversation. It deliberately selects only
+    `isResolved` — the gate needs a count, not bodies — so it stays cheap enough to
+    run on every sweep tick even when paginating.
+
+    Kept beside `fetch_threads` because the two used to be independently truncated at
+    100 and fixing one is easy to mistake for fixing both (they are different queries;
+    only this one gates promotion).
+    """
+    unresolved = 0
+    cursor = ""
+    owner, name = repo.split("/", 1)
+    for _page in range(MAX_THREAD_PAGES):
+        after = f', after: "{cursor}"' if cursor else ""
+        rc, out, _err = await run_gh(
+            [
+                "api",
+                "graphql",
+                "-f",
+                f'query=query {{ repository(owner: "{owner}", name: "{name}") '
+                f"{{ pullRequest(number: {pr}) {{ reviewThreads(first: 100{after}) {{ "
+                f"pageInfo {{ hasNextPage endCursor }} nodes {{ isResolved }} }} }} }} }}",
+                "--jq",
+                ".data.repository.pullRequest.reviewThreads",
+            ],
+        )
+        if rc != 0:
+            return None
+        try:
+            page = json.loads(out)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(page, dict) or not isinstance(page.get("nodes"), list):
+            return None
+        unresolved += sum(1 for n in page["nodes"] if isinstance(n, dict) and n.get("isResolved") is False)
+        info = page.get("pageInfo") or {}
+        if not info.get("hasNextPage"):
+            return unresolved
+        cursor = str(info.get("endCursor") or "")
+        if not cursor:
+            return unresolved
+    return None  # bounded out — a partial count is worse than none; it looks authoritative
+
+
+async def fetch_threads(run_gh, repo: str, pr: int) -> list[dict] | None:
+    """The PR's inline review threads WITH bodies, for the panel's context block —
+    or None when unreadable. Not the promotion gate; see `count_unresolved_threads`.
+
+    Paginated for the same reason: a single `reviewThreads(first: 100)` silently
+    truncated, so a long-running PR showed the panel only its oldest hundred threads.
+    Page count is bounded so a pathological PR cannot stall the sweep.
     """
     owner, name = repo.split("/", 1)
     threads: list[dict] = []

@@ -660,24 +660,15 @@ class Dispatcher:
         return "failed"
 
     async def _unresolved_threads(self, repo: str, pr: int) -> int | None:
-        owner, name = repo.split("/", 1)
-        rc, out, _err = await self._run_gh(
-            [
-                "api",
-                "graphql",
-                "-f",
-                f'query=query {{ repository(owner: "{owner}", name: "{name}") '
-                f"{{ pullRequest(number: {pr}) {{ reviewThreads(first: 100) {{ nodes {{ isResolved }} }} }} }} }}",
-                "--jq",
-                "[.data.repository.pullRequest.reviewThreads.nodes[].isResolved] | map(select(. == false)) | length",
-            ],
-        )
-        if rc != 0:
-            return None
-        try:
-            return int(out.strip())
-        except ValueError:
-            return None
+        """Unresolved-thread count for the promotion gate — paginated in threads.py.
+
+        This is the query the gate reads. `fetch_threads` (the panel's context block)
+        is a DIFFERENT query that was truncated the same way; paginating that one alone
+        looks like a fix and leaves the gate still counting only the first hundred.
+        """
+        from .threads import count_unresolved_threads
+
+        return await count_unresolved_threads(self._run_gh, repo, pr)
 
     async def _existing_threads_block(self, repo: str, pr: int) -> str:
         """The rendered <pr_review_threads> block, or "" (unreadable/none — the

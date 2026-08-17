@@ -94,6 +94,35 @@ async def test_fetch_follows_pagination_past_the_first_hundred():
     assert len(seen) == 2
 
 
+async def test_the_promotion_gates_count_paginates_too():
+    """The gate reads a DIFFERENT query than fetch_threads. Paginating only the fetch
+    looks like a fix and leaves the gate counting its first hundred threads — which is
+    exactly the miss this test exists to prevent."""
+    from pr_reviewer.threads import count_unresolved_threads
+
+    def page(nodes, has_next=False, cursor=""):
+        return json.dumps({"pageInfo": {"hasNextPage": has_next, "endCursor": cursor}, "nodes": nodes})
+
+    async def paging_gh(args, timeout=30):
+        joined = " ".join(args)
+        assert "comments(first" not in joined  # the count query stays cheap: no bodies
+        if "after:" not in joined:
+            return 0, page([{"isResolved": True}, {"isResolved": False}], has_next=True, cursor="C1"), ""
+        return 0, page([{"isResolved": False}]), ""
+
+    assert (await count_unresolved_threads(paging_gh, "o/r", 1)) == 2  # 1 on page 1 + 1 on page 2
+
+    async def bad_gh(args, timeout=30):
+        return 1, "", "boom"
+
+    assert (await count_unresolved_threads(bad_gh, "o/r", 1)) is None
+
+    async def endless_gh(args, timeout=30):
+        return 0, page([{"isResolved": False}], has_next=True, cursor="MORE"), ""
+
+    assert (await count_unresolved_threads(endless_gh, "o/r", 1)) is None
+
+
 async def test_fetch_gives_up_rather_than_returning_a_truncated_count():
     """A partial count is worse than none — it looks authoritative."""
 
