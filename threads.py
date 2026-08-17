@@ -28,6 +28,9 @@ import re
 MAX_THREADS = 50
 MAX_BODY_CHARS = 2000
 MAX_COMMENTS_PER_THREAD = 10
+# Pages of 100 review threads to walk before giving up. 10 pages = 1000 threads; a PR
+# past that is pathological and must not stall the sweep walking it.
+MAX_THREAD_PAGES = 10
 
 # GitHub login grammar: alphanumerics with single inner hyphens, ≤39 chars,
 # optional "[bot]" suffix. Anything else becomes "unknown".
@@ -50,29 +53,55 @@ def _safe_login(value: object) -> str:
 
 
 async def fetch_threads(run_gh, repo: str, pr: int) -> list[dict] | None:
-    """The PR's inline review threads via GraphQL, or None when unreadable."""
+    """The PR's inline review threads via GraphQL, or None when unreadable.
+
+    Paginated: a single `reviewThreads(first: 100)` silently truncated at 100, and the
+    consumer counts UNRESOLVED threads to decide whether promotion may proceed. Missing
+    threads therefore round toward "nothing unresolved" — a PR with 100+ threads could
+    auto-approve over unresolved review conversations, which is the one direction this
+    count must never be wrong in. Page count is bounded so a pathological PR cannot
+    stall the sweep; hitting the bound returns None (unreadable) rather than a partial
+    count, because a truncated count is worse than none — it looks authoritative.
+    """
     owner, name = repo.split("/", 1)
-    rc, out, _err = await run_gh(
-        [
-            "api",
-            "graphql",
-            "-f",
-            f'query=query {{ repository(owner: "{owner}", name: "{name}") '
-            f"{{ pullRequest(number: {pr}) {{ reviewThreads(first: 100) {{ nodes {{ "
-            f"isResolved isOutdated path line originalLine "
-            f"comments(first: {MAX_COMMENTS_PER_THREAD}) {{ nodes {{ author {{ login }} body }} }} "
-            f"}} }} }} }} }}",
-            "--jq",
-            ".data.repository.pullRequest.reviewThreads.nodes",
-        ],
-    )
-    if rc != 0:
-        return None
-    try:
-        nodes = json.loads(out)
-    except json.JSONDecodeError:
-        return None
-    return nodes if isinstance(nodes, list) else None
+    threads: list[dict] = []
+    cursor = ""
+    for _page in range(MAX_THREAD_PAGES):
+        after = f', after: "{cursor}"' if cursor else ""
+        rc, out, _err = await run_gh(
+            [
+                "api",
+                "graphql",
+                "-f",
+                f'query=query {{ repository(owner: "{owner}", name: "{name}") '
+                f"{{ pullRequest(number: {pr}) {{ reviewThreads(first: 100{after}) {{ "
+                f"pageInfo {{ hasNextPage endCursor }} nodes {{ "
+                f"isResolved isOutdated path line originalLine "
+                f"comments(first: {MAX_COMMENTS_PER_THREAD}) {{ nodes {{ author {{ login }} body }} }} "
+                f"}} }} }} }} }}",
+                "--jq",
+                ".data.repository.pullRequest.reviewThreads",
+            ],
+        )
+        if rc != 0:
+            return None
+        try:
+            page = json.loads(out)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(page, dict):
+            return None
+        nodes = page.get("nodes")
+        if not isinstance(nodes, list):
+            return None
+        threads.extend(nodes)
+        info = page.get("pageInfo") or {}
+        if not info.get("hasNextPage"):
+            return threads
+        cursor = str(info.get("endCursor") or "")
+        if not cursor:
+            return threads
+    return None
 
 
 def render_threads_block(threads: list[dict]) -> str:

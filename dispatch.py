@@ -69,6 +69,7 @@ DROP_PR_NOT_ELIGIBLE = "pr-not-eligible"  # closed, draft, or facts unreadable
 DROP_NO_RUNNER = "no-workflow-runner"
 DROP_PAUSED = "paused-by-operator"  # `@vera pause` (issue #28)
 DROP_REVIEWS_UNREADABLE = "reviews-unreadable"  # blind on our own history (issue #71)
+DROP_VIEWER_UNKNOWN = "viewer-unknown"  # blind on our own IDENTITY — can't rule out self-review
 
 # Our own reviews could not be read this pass (issue #71). Distinct from every other
 # hold because it says nothing about the PR — only that we are blind — and blind is
@@ -248,7 +249,9 @@ class Dispatcher:
         that: it resolves the installation's own repositories when this is empty.
 
         Config wins only when NON-empty, so a seed shipping `repos: []` still falls
-        through to the env.
+        through to the env — meaning "empty = the installation's scope" holds only when
+        PR_REVIEWER_REPOS is ALSO unset. A deployment that wants installation-wide scope
+        has to clear both; setting either one narrows to it.
         """
         return [str(r) for r in (self.cfg.get("repos") or []) if r] or _env_repos()
 
@@ -476,9 +479,22 @@ class Dispatcher:
             log.warning("[pr-reviewer] max-rounds comment on %s#%s failed: %s", repo, pr, err[-300:])
 
     async def _viewer_login(self) -> str:
-        if self._viewer is None:
+        """Our own login, cached — ONLY on success.
+
+        Caching `""` on a failed lookup and gating the retry on `is None` meant one
+        transient failure permanently disabled the never-review-your-own-PR rail for
+        the life of the process: `viewer` stays empty, the self-authored comparison
+        never matches, and the reviewer reviews (and, as promotion owner, can
+        approve-on-green) its own PRs. Same shape as issue #71 — a failed read cached
+        as a definitive answer — so it fails the same way: retry, don't remember the
+        failure.
+        """
+        if not self._viewer:
             rc, out, _err = await self._run_gh(["api", "user", "--jq", ".login"])
-            self._viewer = out.strip().lower() if rc == 0 else ""
+            if rc == 0 and out.strip():
+                self._viewer = out.strip().lower()
+            else:
+                return ""  # unknown this pass; the self-authored guard fails CLOSED below
         return self._viewer
 
     # ── facts (all server-side) ───────────────────────────────────────────────
@@ -745,9 +761,16 @@ class Dispatcher:
             return f"drop:{DROP_PR_NOT_ELIGIBLE}"
         viewer = await self._viewer_login()
         author = str(facts.get("author") or "").lower()
+        allow_self = bool(self.cfg.get("allow_self_review", False))
+        if not viewer and not allow_self:
+            # We do not know who we are, so we cannot rule out that this PR is ours.
+            # Reviewing it risks self-review — and, as promotion owner, self-approval.
+            # Skipping costs one pass, which the sweep retries with a fresh lookup.
+            self.telemetry.emit("drop", repo=repo, pr=pr, reason=DROP_VIEWER_UNKNOWN)
+            return f"drop:{DROP_VIEWER_UNKNOWN}"
         if (
             viewer
-            and not bool(self.cfg.get("allow_self_review", False))
+            and not allow_self
             and (author == viewer or author.removesuffix("[bot]") == viewer.removesuffix("[bot]"))
         ):
             self.telemetry.emit("drop", repo=repo, pr=pr, reason=DROP_SELF_AUTHORED, author=author)
