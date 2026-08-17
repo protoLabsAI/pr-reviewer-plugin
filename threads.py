@@ -96,7 +96,10 @@ async def count_unresolved_threads(run_gh, repo: str, pr: int) -> int | None:
             return unresolved
         cursor = str(info.get("endCursor") or "")
         if not cursor:
-            return unresolved
+            # More pages exist but we were given no way to reach them. Returning what
+            # we have is the truncated-but-authoritative-looking count this function
+            # exists to avoid, so it is unreadable, same as bounding out.
+            return None
     return None  # bounded out — a partial count is worse than none; it looks authoritative
 
 
@@ -145,7 +148,7 @@ async def fetch_threads(run_gh, repo: str, pr: int) -> list[dict] | None:
             return threads
         cursor = str(info.get("endCursor") or "")
         if not cursor:
-            return threads
+            return None  # more pages, no cursor to reach them — unreadable, not partial
     return None
 
 

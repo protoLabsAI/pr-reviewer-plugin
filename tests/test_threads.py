@@ -100,15 +100,12 @@ async def test_the_promotion_gates_count_paginates_too():
     exactly the miss this test exists to prevent."""
     from pr_reviewer.threads import count_unresolved_threads
 
-    def page(nodes, has_next=False, cursor=""):
-        return json.dumps({"pageInfo": {"hasNextPage": has_next, "endCursor": cursor}, "nodes": nodes})
-
     async def paging_gh(args, timeout=30):
         joined = " ".join(args)
         assert "comments(first" not in joined  # the count query stays cheap: no bodies
         if "after:" not in joined:
-            return 0, page([{"isResolved": True}, {"isResolved": False}], has_next=True, cursor="C1"), ""
-        return 0, page([{"isResolved": False}]), ""
+            return 0, _page([{"isResolved": True}, {"isResolved": False}], has_next=True, cursor="C1"), ""
+        return 0, _page([{"isResolved": False}]), ""
 
     assert (await count_unresolved_threads(paging_gh, "o/r", 1)) == 2  # 1 on page 1 + 1 on page 2
 
@@ -118,9 +115,22 @@ async def test_the_promotion_gates_count_paginates_too():
     assert (await count_unresolved_threads(bad_gh, "o/r", 1)) is None
 
     async def endless_gh(args, timeout=30):
-        return 0, page([{"isResolved": False}], has_next=True, cursor="MORE"), ""
+        return 0, _page([{"isResolved": False}], has_next=True, cursor="MORE"), ""
 
     assert (await count_unresolved_threads(endless_gh, "o/r", 1)) is None
+
+
+async def test_more_pages_but_no_cursor_reads_as_unreadable_not_partial():
+    """hasNextPage with no endCursor: more threads exist and we cannot reach them.
+    Returning the running total would be the authoritative-looking truncation both of
+    these functions exist to avoid."""
+    from pr_reviewer.threads import count_unresolved_threads
+
+    async def cursorless_gh(args, timeout=30):
+        return 0, _page([{"isResolved": False}], has_next=True, cursor=""), ""
+
+    assert (await count_unresolved_threads(cursorless_gh, "o/r", 1)) is None
+    assert (await fetch_threads(cursorless_gh, "o/r", 1)) is None
 
 
 async def test_fetch_gives_up_rather_than_returning_a_truncated_count():

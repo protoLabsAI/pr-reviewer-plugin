@@ -119,7 +119,7 @@ async def test_an_unknown_viewer_login_stops_the_review_instead_of_disabling_the
     d = make(tmp_path, gh=gh)
     assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "drop:viewer-unknown"
     assert gh.posted == []
-    assert d._viewer in (None, "")  # the failure was NOT cached as an answer
+    assert d._viewer is None  # NOT "" — caching "" as the answer is the bug itself
 
     # …and once the lookup recovers, the rail works again in the SAME process — the
     # point of the fix: the earlier failure must not have poisoned the cache. A second
@@ -170,7 +170,7 @@ class RoutedGH(FakeGH):
     ):
         super().__init__()
         self.pr_facts, self.reviews, self.checks, self.files = pr_facts, reviews or [], checks, files
-        self.threads = threads  # None → the generic graphql "0" (fetch degrades to no block)
+        self.threads = threads  # None → an empty connection: no threads, so nothing unresolved
         self.compare = compare  # None → the compare read fails (no convergence relief)
         self.dismissed: list[str] = []
         # reviews_rc != 0 → the reviews READ fails, the shape that made `_our_reviews`
