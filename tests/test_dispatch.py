@@ -877,6 +877,85 @@ async def test_backfill_skips_drafts_and_closed_prs(tmp_path):
     assert (await make(tmp_path, gh=gh2).needs_backfill("o/r", 1)) is None
 
 
+# ── sweep scope comes from the App installation when no allowlist is set ──────
+
+
+class InstallGH(FakeGH):
+    """Serves /installation/repositories; counts how often it is asked."""
+
+    def __init__(self, repos, rc=0):
+        super().__init__()
+        self.repos_out, self.rc, self.enumerations = repos, rc, 0
+
+    async def __call__(self, args, timeout=30):
+        self.calls.append(args)
+        if "/installation/repositories" in " ".join(args):
+            self.enumerations += 1
+            if self.rc:
+                return self.rc, "", "HTTP 503"
+            return 0, "\n".join(self.repos_out), ""
+        return 0, "[]", ""
+
+
+async def test_sweep_scope_falls_back_to_the_installation_when_no_allowlist(tmp_path):
+    gh = InstallGH(["o/a", "o/b"])
+    d = make(tmp_path, cfg={"repos": []}, gh=gh)
+    assert (await d.sweep_repos()) == ["o/a", "o/b"]
+
+
+async def test_an_explicit_allowlist_still_wins(tmp_path):
+    gh = InstallGH(["o/a", "o/b"])
+    d = make(tmp_path, cfg={"repos": ["o/only"]}, gh=gh)
+    assert (await d.sweep_repos()) == ["o/only"]
+    assert gh.enumerations == 0  # no reason to ask GitHub
+
+
+async def test_installation_scope_is_cached_between_sweeps(tmp_path):
+    gh = InstallGH(["o/a"])
+    d = make(tmp_path, cfg={"repos": []}, gh=gh)
+    for _ in range(4):
+        assert (await d.sweep_repos()) == ["o/a"]
+    assert gh.enumerations == 1  # the sweep ticks every ~3min; don't re-ask each time
+
+
+async def test_a_successful_empty_enumeration_is_authoritative(tmp_path):
+    """ "The App is installed nowhere" is an ANSWER, not a failure. Reusing the cache
+    for it meant uninstalling the App from a repo silently did nothing — the sweep
+    kept walking it for the life of the process."""
+    gh = InstallGH(["o/a", "o/b"])
+    d = make(tmp_path, cfg={"repos": []}, gh=gh)
+    assert (await d.sweep_repos()) == ["o/a", "o/b"]
+
+    gh.repos_out = []  # uninstalled from everything
+    d._installation_repos_at = 0.0
+    assert (await d.sweep_repos()) == []
+    # …and the empty answer is CACHED, not re-asked on every tick
+    assert (await d.sweep_repos()) == []
+    assert gh.enumerations == 2
+
+
+async def test_a_failed_enumeration_reuses_the_last_good_scope(tmp_path):
+    """Fail closed on scope: reuse what we knew, never invent or silently widen."""
+    gh = InstallGH(["o/a", "o/b"])
+    d = make(tmp_path, cfg={"repos": []}, gh=gh)
+    assert (await d.sweep_repos()) == ["o/a", "o/b"]
+    d._installation_repos_at = 0.0  # force a refresh
+    gh.rc = 1
+    assert (await d.sweep_repos()) == ["o/a", "o/b"]
+
+    # and with nothing cached at all, the sweep simply skips a pass
+    gh2 = InstallGH([], rc=1)
+    assert (await make(tmp_path, cfg={"repos": []}, gh=gh2).sweep_repos()) == []
+
+
+async def test_empty_allowlist_reviews_any_repo_the_webhook_delivers(tmp_path):
+    """The webhook half already allowed all on an empty list; assert it, because the
+    sweep half quietly did the opposite until sweep_repos existed."""
+    gh = RoutedGH(pr_facts=facts(), reviews=[])
+    d = make(tmp_path, cfg={"repos": []}, gh=gh)
+    assert (await d.handle_pr_event("brand/new", 1, HEAD, "opened")) != "drop:unlisted-repo"
+
+
 # ── blind on our own reviews: every path fails CLOSED (issue #71) ─────────────
 
 
