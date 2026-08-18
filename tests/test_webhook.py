@@ -354,3 +354,66 @@ async def test_replay_endpoint_503s_without_a_runner(tmp_path):
     app.include_router(api, prefix="/api/plugins/pr-reviewer")
     r = TestClient(app).post("/api/plugins/pr-reviewer/replay", json={"row": {"repo": "o/r", "pr": 1, "head": "a"}})
     assert r.status_code == 503
+
+
+# ── summon health must not confuse "no" with "I don't know" (post-mortem) ─────
+
+
+def _health_app(tmp_path, cfg):
+    """A dispatcher whose cfg drives the health endpoint's App-credential lookup."""
+
+    class D(SpyDispatcher):
+        pass
+
+    d = D()
+    d.cfg = cfg
+    telemetry = Telemetry(tmp_path)
+    public, api = build_routers(d, telemetry, lambda: SECRET)
+    app = FastAPI()
+    app.include_router(public, prefix="/plugins/pr-reviewer")
+    app.include_router(api, prefix="/api/plugins/pr-reviewer")
+    return app
+
+
+def test_unreadable_app_events_report_unknown_not_missing(tmp_path, monkeypatch):
+    """The bug this endpoint shipped with: `GET /app` is JWT-only, so on installation-
+    token auth it always failed, the failure was recorded as `subscribed: []`, and a
+    WORKING summon surface was reported dead — on a deployment that had already taken
+    331 `pull_request_review_comment` deliveries. Unknown must read as unknown."""
+    # AppAuthConfig falls back to the ENV, so "no credentials" is only true if the env
+    # is clear too — otherwise this passes on a laptop and takes a different path on any
+    # box that actually has the App configured (vera's container, CI with secrets).
+    monkeypatch.delenv("PROTOREVIEW_APP_ID", raising=False)
+    monkeypatch.delenv("PROTOREVIEW_APP_PRIVATE_KEY", raising=False)
+    app = _health_app(tmp_path, {"summon_handle": "vera"})
+    body = TestClient(app).get("/api/plugins/pr-reviewer/summon/health").json()
+
+    assert body["summon_reachable"] is None  # NOT False
+    assert body["subscribed"] is None
+    assert body["missing"] is None
+    assert "says nothing about whether summons work" in body["note"]
+    assert "help" in body["note"]  # points at the check that actually answers it
+
+
+def test_subscribed_events_are_reported_when_the_app_read_succeeds(tmp_path, monkeypatch):
+    async def fake_events(_config, **_kw):
+        return ["pull_request", "issue_comment", "pull_request_review_comment"]
+
+    monkeypatch.setattr("pr_reviewer.app_auth.fetch_app_events", fake_events)
+    app = _health_app(tmp_path, {"app_id": "1", "app_private_key": "pem"})
+    body = TestClient(app).get("/api/plugins/pr-reviewer/summon/health").json()
+
+    assert body["summon_reachable"] is True
+    assert body["missing"] == []
+
+
+def test_a_genuinely_missing_event_is_still_reported(tmp_path, monkeypatch):
+    async def fake_events(_config, **_kw):
+        return ["pull_request"]  # the shape the feature actually shipped with
+
+    monkeypatch.setattr("pr_reviewer.app_auth.fetch_app_events", fake_events)
+    app = _health_app(tmp_path, {"app_id": "1", "app_private_key": "pem"})
+    body = TestClient(app).get("/api/plugins/pr-reviewer/summon/health").json()
+
+    assert body["summon_reachable"] is False
+    assert "issue_comment" in body["missing"]
