@@ -129,6 +129,29 @@ async def test_an_unknown_viewer_login_stops_the_review_instead_of_disabling_the
     assert (await d.handle_pr_event("o/r", 1, OLD_HEAD, "opened")) == "drop:self-authored"
 
 
+async def test_configured_viewer_login_is_used_without_probing(tmp_path):
+    """On GitHub App auth `gh api user` 403s every time — an installation token is not
+    a user — so identity has to be configured. Without this the fail-closed rail drops
+    every eligible PR, which it did in production for ~30 events before this landed."""
+
+    class NoUserGH(RoutedGH):
+        async def __call__(self, args, timeout=30):
+            if len(args) > 1 and args[1] == "user":
+                return 1, "", "HTTP 403: Resource not accessible by integration"
+            return await super().__call__(args, timeout)
+
+    gh = NoUserGH(pr_facts=facts(author="qa-bot[bot]"), reviews=[])
+    d = make(tmp_path, cfg={"viewer_login": "QA-Bot[bot]"}, gh=gh)
+    # Configured identity ⇒ the rail works even though the probe cannot: this PR is ours.
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "drop:self-authored"
+    assert not any(a[1] == "user" for a in gh.calls if len(a) > 1)  # never probed
+
+    # …and a PR by someone else still reviews normally.
+    gh2 = NoUserGH(pr_facts=facts(author="someone"), reviews=[])
+    d2 = make(tmp_path, cfg={"viewer_login": "qa-bot[bot]"}, gh=gh2)
+    assert (await d2.handle_pr_event("o/r", 1, HEAD, "opened")).startswith("reviewed:")
+
+
 async def test_self_authored_pr_drops(tmp_path):
     # RoutedGH's viewer login is "qa-bot" — a PR authored by qa-bot[bot] is ours.
     gh = RoutedGH(pr_facts=facts(author="qa-bot[bot]"))
@@ -909,6 +932,74 @@ async def test_backfill_skips_drafts_and_closed_prs(tmp_path):
 
     gh2 = RoutedGH(pr_facts=facts(state="closed"), reviews=[])
     assert (await make(tmp_path, gh=gh2).needs_backfill("o/r", 1)) is None
+
+
+# ── paginated reads: one row per line, never a concatenated array (issue #75) ─
+
+
+def test_gh_json_rows_accepts_both_shapes_and_refuses_a_partial():
+    from pr_reviewer.dispatch import gh_json_rows
+
+    # whole array — a caller that drops --jq, or a fake that returns one array
+    assert gh_json_rows('[{"id": 1}, {"id": 2}]') == [{"id": 1}, {"id": 2}]
+    # one row per line — what `--jq '.[] | …'` emits
+    assert gh_json_rows('{"id": 1}\n{"id": 2}') == [{"id": 1}, {"id": 2}]
+    assert gh_json_rows("") == []
+    # THE BUG: `--paginate` + `[.[] | …]` concatenates one array per page. Not valid
+    # JSON, and not salvageable line-wise either — it must read as unreadable, never
+    # as the first page's worth of rows.
+    assert gh_json_rows('[{"id": 1}][{"id": 2}]') is None
+    assert gh_json_rows('{"id": 1}\nnot json\n{"id": 2}') is None
+
+
+async def test_our_reviews_reads_every_page_not_just_the_first(tmp_path):
+    """A PR crossing 30 reviews used to make this read permanently unparseable, and
+    post-#71's fail-closed posture that is a permanent stall: never backfilled, never
+    promoted, never re-gated."""
+    rows = [review_row(HEAD, "PASS"), review_row(OLD_HEAD, "FAIL")]
+
+    class PagedGH(RoutedGH):
+        async def __call__(self, args, timeout=30):
+            if "/reviews" in " ".join(args):
+                # two pages, each already filtered to one object per line
+                return 0, "\n".join(json.dumps(r) for r in rows), ""
+            return await super().__call__(args, timeout)
+
+    d = make(tmp_path, gh=PagedGH(pr_facts=facts()))
+    ours = await d._our_reviews("o/r", 1)
+    assert ours is not None and len(ours) == 2
+    assert {r["head"] for r in ours} == {HEAD, OLD_HEAD}
+
+
+async def test_our_reviews_fails_closed_on_the_concatenated_array_shape(tmp_path):
+    """Belt and braces: if the old filter ever comes back, this read must go None
+    (unreadable ⇒ every caller holds) rather than silently yield page one."""
+
+    class LegacyGH(RoutedGH):
+        async def __call__(self, args, timeout=30):
+            if "/reviews" in " ".join(args):
+                page = json.dumps([{"id": 1, "state": "COMMENTED", "body": "x"}])
+                return 0, page + page, ""
+            return await super().__call__(args, timeout)
+
+    assert (await make(tmp_path, gh=LegacyGH(pr_facts=facts()))._our_reviews("o/r", 1)) is None
+
+
+async def test_checks_state_sees_a_failure_on_the_second_page(tmp_path):
+    """A commit with 30+ check runs paginates, and this decides PROMOTION — dropping
+    the one failed run on page 2 would read as all-green."""
+
+    class PagedChecksGH(RoutedGH):
+        async def __call__(self, args, timeout=30):
+            if "/check-runs" in " ".join(args):
+                lines = [
+                    json.dumps({"status": "completed", "conclusion": "success"}),
+                    json.dumps({"status": "completed", "conclusion": "failure"}),
+                ]
+                return 0, "\n".join(lines), ""
+            return await super().__call__(args, timeout)
+
+    assert (await make(tmp_path, gh=PagedChecksGH(pr_facts=facts()))._checks_state("o/r", HEAD)) == "failed"
 
 
 # ── sweep scope comes from the App installation when no allowlist is set ──────
