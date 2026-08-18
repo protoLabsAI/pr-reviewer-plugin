@@ -6,7 +6,7 @@ from __future__ import annotations
 import json
 import time
 
-from pr_reviewer.dispatch import Dispatcher
+from pr_reviewer.dispatch import POST_MAX_FAILURES, Dispatcher
 from pr_reviewer.telemetry import Telemetry
 from pr_reviewer.verdicts import render_verdict_body
 
@@ -64,6 +64,7 @@ def facts(**over):
         "base_ref": "main",
         "state": "open",
         "draft": False,
+        "locked": False,
         "changed_files": 2,
         "additions": 10,
         "deletions": 5,
@@ -358,6 +359,74 @@ async def test_failed_panel_step_escalates_and_posts_nothing(tmp_path):
     # D3 holds: no verdict review posted (the exhaustion comment is not a verdict)
     assert all("event" not in p for p in gh.posted)
     assert escalations and "UNREVIEWED" in escalations[0][0]
+
+
+# ── a PR GitHub will not accept a review on (issue #78) ──────────────────────
+
+
+async def test_a_locked_pr_is_never_reviewed(tmp_path):
+    """GitHub answers a review on a locked conversation with `422 lock prevents
+    review`, so the panel would run in full and the verdict die at the post. Two
+    auto-locked dependabot PRs burned a panel every ~7 minutes this way."""
+    gh = RoutedGH(pr_facts=facts(locked=True), reviews=[])
+    ran = []
+
+    async def runner(name, inputs):
+        ran.append(name)
+        return {"output": REPORT, "failed": []}
+
+    d = make(tmp_path, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "drop:pr-not-eligible"
+    assert ran == []  # the panel was never spent
+    assert (await d.needs_backfill("o/r", 1)) is None  # and the sweep won't pick it up
+
+
+async def test_api_error_detail_is_folded_into_the_log(tmp_path):
+    """`gh` puts its status on stderr and GitHub's REASON in the JSON on stdout.
+    Logging stderr alone gives 'Unprocessable Entity (HTTP 422)' and nothing to act on —
+    `lock prevents review` sat unread in that body while verdicts were lost."""
+    from pr_reviewer.dispatch import _with_api_detail
+
+    body = '{"message": "Unprocessable Entity", "errors": ["lock prevents review"]}'
+    out = _with_api_detail("gh: Unprocessable Entity (HTTP 422)", body)
+    assert "lock prevents review" in out
+    # object-shaped errors[] entries survive too
+    obj = '{"message": "Validation Failed", "errors": [{"resource": "PullRequestReview", "code": "custom"}]}'
+    assert "PullRequestReview" in _with_api_detail("x", obj)
+    # non-JSON and empty bodies degrade quietly
+    assert _with_api_detail("stderr only", "") == "stderr only"
+    assert "some html" in _with_api_detail("x", "some html")
+
+
+async def test_a_repeatedly_refused_post_stops_costing_a_panel(tmp_path, monkeypatch):
+    """Retry handles a GitHub blip; this handles a GitHub DECISION. Without it the
+    sweep re-reviews forever: panel → 422 → discarded → backfill → panel."""
+    monkeypatch.setattr("asyncio.sleep", _no_sleep)
+    runs = []
+
+    async def runner(name, inputs):
+        runs.append(name)
+        return {"output": REPORT, "failed": []}
+
+    d = make(tmp_path, gh=RoutedGH(pr_facts=facts(), reviews=[], post_results=[(1, "HTTP 422")] * 9), runner=runner)
+    for _ in range(POST_MAX_FAILURES):
+        assert (await d._review("o/r", 1)) == "error:post-failed:FAIL"  # verdict computed, post refused
+    assert len(runs) == POST_MAX_FAILURES
+    # …and now the panel is no longer spent on it
+    assert (await d._review("o/r", 1)) == "drop:post-refused"
+    assert len(runs) == POST_MAX_FAILURES  # unchanged — no further panel
+    # an operator summon still overrides
+    assert (await d._review("o/r", 1, force=True)) == "error:post-failed:FAIL"
+
+
+async def test_a_transient_refusal_never_latches_a_pr_out_of_review(tmp_path, monkeypatch):
+    """A degradation must not become a lasting gap — only non-transient refusals count."""
+    monkeypatch.setattr("asyncio.sleep", _no_sleep)
+    gh = RoutedGH(pr_facts=facts(), reviews=[], post_results=[(1, "HTTP 503")] * 30)
+    d = make(tmp_path, gh=gh)
+    for _ in range(4):
+        assert (await d._review("o/r", 1)) == "error:post-failed:FAIL"
+    assert d._post_failures == {}  # 503s left no latch
 
 
 # ── posting: a verdict must survive a transient refusal (issue #72) ───────────
