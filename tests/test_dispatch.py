@@ -201,6 +201,8 @@ class RoutedGH(FakeGH):
         # fail open before issue #71. Kept separate from `reviews=[]`, which is the
         # legitimate "this PR has no reviews".
         self.reviews_rc, self.reviews_err = reviews_rc, reviews_err
+        # Author stamped on served reviews — feeds the viewer_login cross-check.
+        self.review_author = "qa-bot"
         # Successive (rc, err) results for the verdict POST — for the retry path (#72).
         self.post_results = list(post_results or [])
 
@@ -229,7 +231,9 @@ class RoutedGH(FakeGH):
         if "/reviews" in joined:
             if self.reviews_rc:
                 return self.reviews_rc, "", self.reviews_err
-            return 0, json.dumps(self.reviews), ""
+            # `author` is what the viewer_login cross-check reads; the real jq selects
+            # `.user.login` into that key.
+            return 0, json.dumps([{**r, "author": self.review_author} for r in self.reviews]), ""
         if "/check-runs" in joined:
             return (0, json.dumps(self.checks), "") if self.checks is not None else (1, "", "403")
         if "comments(first" in joined:  # the threads fetch (before the count query below)
@@ -381,6 +385,39 @@ async def test_a_locked_pr_is_never_reviewed(tmp_path):
     assert (await d.needs_backfill("o/r", 1)) is None  # and the sweep won't pick it up
 
 
+def test_ineligible_reason_names_the_condition():
+    from pr_reviewer.dispatch import ineligible_reason
+
+    assert ineligible_reason(facts()) is None
+    assert ineligible_reason(None) == "facts-unreadable"
+    assert ineligible_reason(facts(state="closed")) == "not-open"
+    assert ineligible_reason(facts(draft=True)) == "draft"
+    assert ineligible_reason(facts(locked=True)) == "locked"
+
+
+async def test_a_skipped_pr_says_why_including_the_silent_backfill_path(tmp_path):
+    """Four conditions used to collapse into one opaque `pr-not-eligible`, and the
+    backfill path emitted NOTHING — so a permanently-skipped PR looked identical to one
+    the sweep had not reached yet. That is the invisibility that made a 2.5h duplicate
+    loop and an all-evening 422 loop expensive to find."""
+    gh = RoutedGH(pr_facts=facts(locked=True), reviews=[])
+    d = make(tmp_path, gh=gh)
+
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "drop:pr-not-eligible"
+    assert (await d.needs_backfill("o/r", 1)) is None
+
+    # glob rather than recompute the UTC day — the file rolls at midnight and a test
+    # that computes the date races it.
+    rows = [
+        json.loads(line)
+        for f in (tmp_path / "telemetry").glob("*.jsonl")
+        for line in f.read_text().splitlines()
+        if line.strip()
+    ]
+    whys = [r.get("why") for r in rows if r.get("event") == "drop"]
+    assert whys.count("locked") == 2  # BOTH paths now say it, backfill included
+
+
 async def test_a_locked_pr_holds_promotion_and_regate_too(tmp_path):
     """`locked` was added to all four eligibility checks, but only the review and
     backfill paths were covered. A locked conversation refuses an APPROVE and a
@@ -394,6 +431,42 @@ async def test_a_locked_pr_holds_promotion_and_regate_too(tmp_path):
     d2 = make(tmp_path, cfg={"shadow_mode": False, "regate": True}, gh=gh2)
     assert (await d2.evaluate_regate("o/r", 1)) == "hold:pr-not-eligible"
     assert gh2.posted == []
+
+
+async def test_a_wrong_viewer_login_is_caught_by_our_own_posted_reviews(tmp_path):
+    """`viewer_login` is a string an operator typed — a typo silently disarms the
+    self-authored rail instead of erroring. But only WE write the verdict marker, so
+    the author of a marker-bearing review is proof of who we are; the rows are already
+    fetched, so checking costs nothing."""
+    gh = RoutedGH(pr_facts=facts(), reviews=[review_row(HEAD, "PASS")])
+    gh.review_author = "protoreview[bot]"
+    d = make(tmp_path, cfg={"viewer_login": "protoreviw[bot]"}, gh=gh)  # typo
+    await d._viewer_login()
+    await d._our_reviews("o/r", 1)
+
+    rows = [
+        json.loads(line)
+        for f in (tmp_path / "telemetry").glob("*.jsonl")
+        for line in f.read_text().splitlines()
+        if line.strip()
+    ]
+    mism = [r for r in rows if r.get("event") == "viewer-mismatch"]
+    assert mism and mism[0]["actual"] == "protoreview[bot]"
+    assert len(mism) == 1  # warned once, not once per review
+
+    # the correct login is silent
+    gh2 = RoutedGH(pr_facts=facts(), reviews=[review_row(HEAD, "PASS")])
+    gh2.review_author = "protoreview[bot]"
+    d2 = make(tmp_path / "ok", cfg={"viewer_login": "protoreview[bot]"}, gh=gh2)
+    await d2._viewer_login()
+    await d2._our_reviews("o/r", 1)
+    rows2 = [
+        json.loads(line)
+        for f in (tmp_path / "ok" / "telemetry").glob("*.jsonl")
+        for line in f.read_text().splitlines()
+        if line.strip()
+    ]
+    assert not [r for r in rows2 if r.get("event") == "viewer-mismatch"]
 
 
 async def test_api_error_detail_is_folded_into_the_log(tmp_path):

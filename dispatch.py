@@ -113,6 +113,26 @@ _TRANSIENT_GH_TEXT = (
 )
 
 
+def ineligible_reason(facts: dict | None) -> str | None:
+    """Why this PR cannot be reviewed, or None if it can.
+
+    Four conditions used to collapse into one opaque `pr-not-eligible`, and one of
+    them (`locked`) skipped silently in the sweep with no telemetry at all — so
+    "ignored because the conversation is locked" was indistinguishable from "never
+    seen". That is the same invisibility that let a duplicate-review loop run 2.5h
+    and a 422 loop run all evening: the system knew, and never said.
+    """
+    if not facts:
+        return "facts-unreadable"
+    if facts.get("state") != "open":
+        return "not-open"
+    if facts.get("draft"):
+        return "draft"
+    if facts.get("locked"):
+        return "locked"  # GitHub refuses reviews here: `422 lock prevents review`
+    return None
+
+
 def _with_api_detail(err: str, out: str) -> str:
     """Fold GitHub's own error text (on stdout) into `gh`'s terse stderr line.
 
@@ -289,6 +309,7 @@ class Dispatcher:
         self._promote_failures: dict[str, int] = {}  # repo#pr@head -> consecutive APPROVE failures
         self._regate_failures: dict[str, int] = {}  # repo#pr@head -> consecutive REQUEST_CHANGES failures
         self._post_failures: dict[str, int] = {}  # repo#pr@head -> NON-transient verdict-post refusals
+        self._viewer_checked = False  # viewer_login vs our reviews' real author, warned once
         self._round_cap: dict[str, float] = {}  # repo#pr -> monotonic timestamp when capped
         self._installation_repos: list[str] = []  # last good App-installation scope
         self._installation_repos_at: float = 0.0
@@ -556,6 +577,34 @@ class Dispatcher:
         if rc != 0:
             log.warning("[pr-reviewer] max-rounds comment on %s#%s failed: %s", repo, pr, err[-300:])
 
+    def _check_viewer_matches(self, author: str) -> None:
+        """Warn once if `viewer_login` disagrees with who actually posted our reviews.
+
+        `viewer_login` is unvalidated by construction — it is a string an operator
+        typed. A typo does not error; it silently makes the self-authored comparison
+        never match, which is precisely the disabled rail this config exists to
+        prevent. But a marker-bearing review is proof of identity: only we write that
+        marker, so its author IS us. Comparing the two costs nothing (the rows are
+        already fetched) and turns a silent misconfiguration into one loud line.
+
+        Warn, never correct: an operator who set this deliberately (a migration, a
+        renamed app) should not have the reviewer quietly overrule them, and being
+        wrong in the SAFE direction — comparing against a login that never matches —
+        only ever causes extra review, not self-approval.
+        """
+        author = (author or "").strip().lower()
+        if not author or self._viewer_checked or not self._viewer:
+            return
+        self._viewer_checked = True
+        if author.removesuffix("[bot]") != self._viewer.removesuffix("[bot]"):
+            log.warning(
+                "[pr-reviewer] viewer_login is %r but our own posted reviews are authored by %r — "
+                "the never-review-your-own-PR rail will not fire. Fix pr_reviewer.viewer_login.",
+                self._viewer,
+                author,
+            )
+            self.telemetry.emit("viewer-mismatch", configured=self._viewer, actual=author)
+
     async def _viewer_login(self) -> str:
         """Our own login, cached — ONLY on success.
 
@@ -632,7 +681,7 @@ class Dispatcher:
                 # One object per line, NOT `[.[] | …]`: with --paginate the wrapper
                 # emits `[…][…]` past 30 reviews and this read — the one everything
                 # about review history depends on — went permanently unreadable (#75).
-                ".[] | {id: .id, state: .state, body: .body}",
+                ".[] | {id: .id, state: .state, body: .body, author: .user.login}",
             ],
         )
         if rc != 0:
@@ -646,6 +695,7 @@ class Dispatcher:
                 continue
             marker = parse_verdict_marker(row.get("body") or "")
             if marker:
+                self._check_viewer_matches(str(row.get("author") or ""))
                 ours.append(
                     {**marker, "state": row.get("state", ""), "body": row.get("body") or "", "id": row.get("id")}
                 )
@@ -849,8 +899,12 @@ class Dispatcher:
         # way burned a panel every ~7 minutes indefinitely (issue #78) — the sweep saw
         # no verdict, backfilled, and posted into the same lock forever. Cheapest fix is
         # not to start: never review what cannot receive a review.
-        if not facts or facts.get("state") != "open" or facts.get("draft") or facts.get("locked"):
-            self.telemetry.emit("drop", repo=repo, pr=pr, reason=DROP_PR_NOT_ELIGIBLE)
+        why = ineligible_reason(facts)
+        if why:
+            # `why` alongside the reason: four different conditions used to arrive here
+            # as one opaque `pr-not-eligible`, so a PR being skipped told you nothing
+            # about whether that was correct.
+            self.telemetry.emit("drop", repo=repo, pr=pr, reason=DROP_PR_NOT_ELIGIBLE, why=why)
             return f"drop:{DROP_PR_NOT_ELIGIBLE}"
         viewer = await self._viewer_login()
         author = str(facts.get("author") or "").lower()
@@ -1438,7 +1492,9 @@ class Dispatcher:
         if not self.regate_enabled:
             return HOLD_REGATE_DISABLED
         facts = await self._pr_facts(repo, pr)
-        if not facts or facts.get("state") != "open" or facts.get("draft") or facts.get("locked"):
+        why = ineligible_reason(facts)
+        if why:
+            self.telemetry.emit("regate", repo=repo, pr=pr, decision="hold:pr-not-eligible", why=why)
             return "hold:pr-not-eligible"
         head = str(facts["head"])
         ours = await self._our_reviews(repo, pr)
@@ -1525,7 +1581,9 @@ class Dispatcher:
             self.telemetry.emit("promotion", repo=repo, pr=pr, decision=HOLD_NOT_OWNER)
             return HOLD_NOT_OWNER
         facts = await self._pr_facts(repo, pr)
-        if not facts or facts.get("state") != "open" or facts.get("draft") or facts.get("locked"):
+        why = ineligible_reason(facts)
+        if why:
+            self.telemetry.emit("promotion", repo=repo, pr=pr, decision="hold:pr-not-eligible", why=why)
             return "hold:pr-not-eligible"
         head = str(facts["head"])
         ours = await self._our_reviews(repo, pr)
@@ -1633,7 +1691,14 @@ class Dispatcher:
         never be promoted. Cheap checks first; this runs per-PR per-pass.
         """
         facts = await self._pr_facts(repo, pr)
-        if not facts or facts.get("state") != "open" or facts.get("draft") or facts.get("locked"):
+        why = ineligible_reason(facts)
+        if why:
+            # Previously returned None with NO telemetry, so a permanently-skipped PR
+            # (a locked conversation, say) looked exactly like one the sweep never
+            # reached. `locked` is worth a log line because it is not self-correcting.
+            self.telemetry.emit("drop", repo=repo, pr=pr, reason=DROP_PR_NOT_ELIGIBLE, why=why, action=BACKFILL_ACTION)
+            if why == "locked":
+                log.info("[pr-reviewer] %s#%s is locked — GitHub refuses reviews there; skipping", repo, pr)
             return None
         head = str(facts["head"])
         ours = await self._our_reviews(repo, pr)
