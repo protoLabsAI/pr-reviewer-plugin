@@ -75,6 +75,48 @@ class AppAuthConfig:
         return bool(self.app_id and self.private_key)
 
 
+async def fetch_app_events(config: AppAuthConfig, *, http_get=None) -> list[str] | None:
+    """The App's subscribed webhook events, or None when the question can't be answered.
+
+    `GET /app` is JWT-only: an installation token authenticates an installation, not the
+    App, so `gh api /app` — which uses GH_TOKEN — can never succeed here. Reading the
+    failure as "subscribed to nothing" is how the summon health check came to report a
+    working feature as dead (it claimed `pull_request_review_comment` was missing while
+    331 of them had been delivered).
+
+    None means UNKNOWN and callers must say so. Only a 200 is an answer.
+    """
+    if not config.configured:
+        return None
+    try:
+        jwt = mint_jwt(config.app_id, config.private_key)
+    except Exception:  # noqa: BLE001 — a diagnostic must never raise into the caller
+        log.warning("[pr-reviewer] could not mint an App JWT to read /app events")
+        return None
+    headers = {
+        "Authorization": f"Bearer {jwt}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    if http_get is None:
+        import httpx
+
+        async def _get(url, hdrs):
+            async with httpx.AsyncClient(timeout=15) as client:
+                r = await client.get(url, headers=hdrs)
+                return r.status_code, r.json()
+
+        http_get = _get
+    try:
+        status, data = await http_get(f"{GITHUB_API}/app", headers)
+    except Exception:  # noqa: BLE001
+        return None
+    if status != 200 or not isinstance(data, dict):
+        return None
+    events = data.get("events")
+    return [str(e) for e in events] if isinstance(events, list) else None
+
+
 async def fetch_installation_token(config: AppAuthConfig, *, http_post=None, http_get=None) -> tuple[str, float]:
     """(token, expires_at_epoch). Raises on failure — the caller owns retry policy.
     `http_get`/`http_post` are seams for tests; None = httpx."""

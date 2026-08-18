@@ -185,21 +185,35 @@ def build_routers(dispatcher, telemetry, get_secret, run_gh_fn=None):
         code is correct, the event simply does not exist. This endpoint answers that
         question directly instead of requiring a JWT and an App settings page.
         """
+        from .app_auth import AppAuthConfig, fetch_app_events
         from .summon import required_app_events
 
-        rc, out, _err = await run_gh_fn(["api", "/app", "--jq", ".events"], timeout=20)
-        subscribed = []
-        if rc == 0:
-            try:
-                subscribed = json.loads(out) or []
-            except json.JSONDecodeError:
-                subscribed = []
+        # `GET /app` is JWT-only. This used to go through `gh api`, which authenticates
+        # with the INSTALLATION token — a credential that can never read /app — and the
+        # resulting failure was recorded as "subscribed to []", i.e. everything missing.
+        # It reported a working summon surface as dead, on a deployment that had already
+        # received 331 `pull_request_review_comment` deliveries. A diagnostic that cannot
+        # tell "no" from "I don't know" is worse than no diagnostic: it is believed.
+        subscribed = await fetch_app_events(AppAuthConfig(dispatcher.cfg or {}))
+        if subscribed is None:
+            return {
+                "subscribed": None,
+                "required": required_app_events(),
+                "missing": None,
+                "summon_reachable": None,  # UNKNOWN — not False
+                "note": (
+                    "Could not read the App's event subscriptions (GET /app needs the App JWT: "
+                    "set app_id + app_private_key, or check them). This says nothing about "
+                    "whether summons work — verify by commenting `@<handle> help` on a PR, "
+                    "which needs no admin and spends no panel."
+                ),
+            }
         missing = [e for e in required_app_events() if e not in subscribed]
         return {
             "subscribed": subscribed,
             "required": required_app_events(),
             "missing": missing,
-            "summon_reachable": rc == 0 and not missing,
+            "summon_reachable": not missing,
             "note": (
                 "Add the missing event(s) to the GitHub App's subscriptions — the webhook "
                 "URL and secret are unchanged. Without `issue_comment` a summon never arrives."
