@@ -582,17 +582,18 @@ def test_mixed_round_only_excludes_the_ungrounded_one():
 def test_ungrounded_flag_survives_round_recall_and_is_still_excluded():
     # Simulate the full lifecycle: grounding emits the flag, panel_rounds recalls it
     # from the stored findings JSON, and unaccounted_priors still excludes it.
-    import json
-
     from pr_reviewer.verdicts import render_verdict_body
 
     ug = _ungrounded_major(file="x.py", line=5, claim="ghost quote")
+    # Structured params, not a `report` blob: this release stops echoing model text
+    # and assembles the body from parsed blocks, so findings arrive as data.
     body = render_verdict_body(
         repo="o/r",
         pr=1,
         head_sha=HEAD_1,
         verdict=WARN,
-        report=f"prose\n```json\n{json.dumps([ug])}\n```",
+        brief="prose",
+        findings=[ug],
         shadow=True,
         recipe="code-review",
     )
