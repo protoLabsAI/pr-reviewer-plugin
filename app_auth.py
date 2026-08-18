@@ -75,6 +75,17 @@ class AppAuthConfig:
         return bool(self.app_id and self.private_key)
 
 
+async def _httpx_get(url, hdrs):
+    """The default GET transport. Shared, because it was written twice — and the copy
+    in `fetch_app_events` was byte-identical to the one inside `fetch_installation_token`,
+    so a timeout or retry change would have landed on one caller and not the other."""
+    import httpx
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.get(url, headers=hdrs)
+        return r.status_code, r.json()
+
+
 async def fetch_app_events(config: AppAuthConfig, *, http_get=None) -> list[str] | None:
     """The App's subscribed webhook events, or None when the question can't be answered.
 
@@ -98,15 +109,7 @@ async def fetch_app_events(config: AppAuthConfig, *, http_get=None) -> list[str]
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
-    if http_get is None:
-        import httpx
-
-        async def _get(url, hdrs):
-            async with httpx.AsyncClient(timeout=15) as client:
-                r = await client.get(url, headers=hdrs)
-                return r.status_code, r.json()
-
-        http_get = _get
+    http_get = http_get or _httpx_get
     try:
         status, data = await http_get(f"{GITHUB_API}/app", headers)
     except Exception:  # noqa: BLE001
@@ -129,17 +132,12 @@ async def fetch_installation_token(config: AppAuthConfig, *, http_post=None, htt
     if http_get is None or http_post is None:
         import httpx
 
-        async def _get(url, hdrs):
-            async with httpx.AsyncClient(timeout=15) as client:
-                r = await client.get(url, headers=hdrs)
-                return r.status_code, r.json()
-
         async def _post(url, hdrs):
             async with httpx.AsyncClient(timeout=15) as client:
                 r = await client.post(url, headers=hdrs)
                 return r.status_code, r.json()
 
-        http_get, http_post = http_get or _get, http_post or _post
+        http_get, http_post = http_get or _httpx_get, http_post or _post
 
     installation_id = config.installation_id
     if not installation_id:

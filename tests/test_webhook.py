@@ -375,12 +375,16 @@ def _health_app(tmp_path, cfg):
     return app
 
 
-def test_unreadable_app_events_report_unknown_not_missing(tmp_path):
+def test_unreadable_app_events_report_unknown_not_missing(tmp_path, monkeypatch):
     """The bug this endpoint shipped with: `GET /app` is JWT-only, so on installation-
     token auth it always failed, the failure was recorded as `subscribed: []`, and a
     WORKING summon surface was reported dead — on a deployment that had already taken
     331 `pull_request_review_comment` deliveries. Unknown must read as unknown."""
-    # No app_id / private key ⇒ the question cannot be answered.
+    # AppAuthConfig falls back to the ENV, so "no credentials" is only true if the env
+    # is clear too — otherwise this passes on a laptop and takes a different path on any
+    # box that actually has the App configured (vera's container, CI with secrets).
+    monkeypatch.delenv("PROTOREVIEW_APP_ID", raising=False)
+    monkeypatch.delenv("PROTOREVIEW_APP_PRIVATE_KEY", raising=False)
     app = _health_app(tmp_path, {"summon_handle": "vera"})
     body = TestClient(app).get("/api/plugins/pr-reviewer/summon/health").json()
 
