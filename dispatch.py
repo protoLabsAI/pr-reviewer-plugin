@@ -702,16 +702,27 @@ class Dispatcher:
         return ours
 
     async def _pr_comments(self, repo: str, pr: int) -> list[str]:
-        """This PR's issue-comment bodies, oldest→newest — where pause markers live."""
+        """This PR's issue-comment bodies, oldest→newest — where pause markers live.
+
+        The ONE read here that deliberately fails OPEN, so it is worth being exact
+        about what that means rather than leaving it looking like the oversight the
+        rest of this file just finished fixing: unreadable ⇒ `[]` ⇒ `is_paused()` is
+        False ⇒ we review. During a comments-read failure we can therefore review a PR
+        an operator asked quiet for (#28).
+
+        That is the better of two bad options. The alternative — refusing to review
+        whenever this read fails — turns any GitHub degradation into a full review
+        outage, while the cost here is one unwanted review on one PR: annoying,
+        visible, and immediately recoverable by re-pausing. Truncation is handled
+        separately: a PARTIAL list could silently drop a late `@vera pause`, so
+        `gh_json_rows` returns None on a bad line and that lands here as empty too.
+        """
         rc, out, _err = await self._run_gh(
             ["api", f"repos/{repo}/issues/{pr}/comments", "--paginate", "--jq", ".[] | .body | tojson"]
         )
         if rc != 0:
             return []
         rows = gh_json_rows(out)
-        # A truncated read here would drop a `@vera pause` an operator posted late in a
-        # busy thread and resume reviewing a PR they asked to be left alone (#28), so an
-        # unreadable list stays empty rather than partially populated.
         return [str(b or "") for b in rows] if rows is not None else []
 
     async def _finding_sources(
