@@ -428,9 +428,22 @@ async def test_a_locked_pr_holds_promotion_and_regate_too(tmp_path):
     assert gh.posted == []  # no APPROVE attempted into the lock
 
     gh2 = RoutedGH(pr_facts=facts(locked=True), reviews=[review_row(HEAD, "FAIL")], checks=[])
-    d2 = make(tmp_path, cfg={"shadow_mode": False, "regate": True}, gh=gh2)
+    d2 = make(tmp_path / "regate", cfg={"shadow_mode": False, "regate": True}, gh=gh2)
     assert (await d2.evaluate_regate("o/r", 1)) == "hold:pr-not-eligible"
     assert gh2.posted == []
+
+    # …and BOTH sweep legs say why. Asserting the return value alone would let a
+    # regression drop `why=` silently, which is the exact class of gap this PR closes.
+    def _whys(root, event):
+        return [
+            json.loads(line).get("why")
+            for f in (root / "telemetry").glob("*.jsonl")
+            for line in f.read_text().splitlines()
+            if line.strip() and json.loads(line).get("event") == event
+        ]
+
+    assert "locked" in _whys(tmp_path, "promotion")
+    assert "locked" in _whys(tmp_path / "regate", "regate")
 
 
 async def test_a_wrong_viewer_login_is_caught_by_our_own_posted_reviews(tmp_path):
