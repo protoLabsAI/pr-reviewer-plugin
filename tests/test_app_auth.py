@@ -117,3 +117,61 @@ async def test_refresh_loop_publishes_token_and_backs_off_on_failure(monkeypatch
 def test_apply_token_sets_both_env_names(monkeypatch):
     apply_token("ghs_x")
     assert os.environ["GH_TOKEN"] == "ghs_x" and os.environ["GITHUB_TOKEN"] == "ghs_x"
+
+
+# ── /app events: the read the summon health check depends on ─────────────────
+
+
+async def test_fetch_app_events_returns_the_subscribed_list(keypair):
+    """`GET /app` is JWT-only, which is why the health check could not use `gh api`
+    (installation token). Assert the credential AND the parse, not just the parse."""
+    from pr_reviewer.app_auth import fetch_app_events
+
+    pem, _ = keypair
+    seen = []
+
+    async def get(url, headers):
+        seen.append((url, headers))
+        return 200, {"slug": "protoreview", "events": ["pull_request", "issue_comment"]}
+
+    cfg = AppAuthConfig({"app_id": "12345", "app_private_key": pem})
+    assert (await fetch_app_events(cfg, http_get=get)) == ["pull_request", "issue_comment"]
+    assert seen[0][0].endswith("/app")
+    assert seen[0][1]["Authorization"].startswith("Bearer ey")  # a JWT, not ghs_
+
+
+async def test_fetch_app_events_is_none_for_anything_that_is_not_an_answer(keypair):
+    """None means UNKNOWN. Returning [] for these is what made a working summon
+    surface report as dead — every required event read as 'missing'."""
+    from pr_reviewer.app_auth import fetch_app_events
+
+    pem, _ = keypair
+    cfg = AppAuthConfig({"app_id": "12345", "app_private_key": pem})
+
+    async def forbidden(url, headers):
+        return 403, {"message": "Resource not accessible by integration"}
+
+    async def no_events_key(url, headers):
+        return 200, {"slug": "protoreview"}
+
+    async def boom(url, headers):
+        raise RuntimeError("network")
+
+    assert (await fetch_app_events(cfg, http_get=forbidden)) is None
+    assert (await fetch_app_events(cfg, http_get=no_events_key)) is None
+    assert (await fetch_app_events(cfg, http_get=boom)) is None
+
+    # …and with no App credentials at all, there is nothing to ask with.
+    assert (await fetch_app_events(AppAuthConfig({}), http_get=forbidden)) is None
+
+
+async def test_fetch_app_events_survives_an_unusable_private_key():
+    """A malformed PEM must degrade to unknown, not raise into the health endpoint."""
+    from pr_reviewer.app_auth import fetch_app_events
+
+    cfg = AppAuthConfig({"app_id": "12345", "app_private_key": "-----BEGIN PRIVATE KEY-----\nnope\n"})
+
+    async def get(url, headers):  # pragma: no cover — must never be reached
+        raise AssertionError("should not have got as far as the request")
+
+    assert (await fetch_app_events(cfg, http_get=get)) is None
