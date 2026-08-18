@@ -380,6 +380,11 @@ steps:
       pass), then the canonical fenced findings JSON as the FINAL block of
       your reply.
 
+      The PR comment is BUILT from your blocks, per your output discipline: put the
+      brief between `<!-- brief -->` and `<!-- /brief -->`, ahead of the findings JSON.
+      Deliberate as much as you like outside them — none of it is published, and a
+      brief outside them is not published either.
+
       ## Account for what this panel said before
 
       If the prior-requests block below is non-empty, then BEFORE the findings

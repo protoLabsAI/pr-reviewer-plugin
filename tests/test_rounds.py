@@ -38,7 +38,8 @@ def panel_review(head, verdict, findings, state="COMMENTED"):
             pr=88,
             head_sha=head,
             verdict=verdict,
-            report=f"prose\n```json\n{json.dumps(findings)}\n```",
+            brief="prose",
+            findings=findings,
             shadow=True,
             recipe="code-review",
         ),
@@ -318,6 +319,21 @@ def test_dispositions_parse_and_findings_arrays_never_match():
     assert len(rows) == 1 and rows[0]["disposition"] == "fixed"
 
 
+def test_a_drafted_disposition_never_outranks_the_decided_one():
+    # protoAgent#2439: with deliberation left in `content`, the model drafted "fixed",
+    # reconsidered, and published "open". Reading the FIRST block would have let a
+    # discarded draft lift a standing block — the guard reads its conclusion instead.
+    out = (
+        "Let me see. The verifier didn't address it.\n\n```json\n"
+        + json.dumps([dispo("store.py:100", "fixed", "draft")])
+        + "\n```\n\nActually, reconsidering.\n\n"
+        + report_with([dispo("store.py:100", "open", "not addressed this pass")])
+    )
+    rows = parse_dispositions(out)
+    assert len(rows) == 1
+    assert rows[0]["disposition"] == "open" and rows[0]["why"] == "not addressed this pass"
+
+
 def test_no_dispositions_block_parses_empty_so_the_caller_falls_back():
     assert parse_dispositions("prose\n```json\n" + json.dumps([finding()]) + "\n```") == []
     assert parse_dispositions("") == []
@@ -566,17 +582,18 @@ def test_mixed_round_only_excludes_the_ungrounded_one():
 def test_ungrounded_flag_survives_round_recall_and_is_still_excluded():
     # Simulate the full lifecycle: grounding emits the flag, panel_rounds recalls it
     # from the stored findings JSON, and unaccounted_priors still excludes it.
-    import json
-
     from pr_reviewer.verdicts import render_verdict_body
 
     ug = _ungrounded_major(file="x.py", line=5, claim="ghost quote")
+    # Structured params, not a `report` blob: this release stops echoing model text
+    # and assembles the body from parsed blocks, so findings arrive as data.
     body = render_verdict_body(
         repo="o/r",
         pr=1,
         head_sha=HEAD_1,
         verdict=WARN,
-        report=f"prose\n```json\n{json.dumps([ug])}\n```",
+        brief="prose",
+        findings=[ug],
         shadow=True,
         recipe="code-review",
     )

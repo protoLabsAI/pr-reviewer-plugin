@@ -2,7 +2,7 @@
 # Keep `version` in lockstep with pyproject.toml (tests/test_version.py asserts it).
 id: pr-reviewer
 name: PR reviewer (review machinery + structural engine)
-version: 0.33.0
+version: 0.34.0
 description: >-
   The deterministic half of the PR-review QA tier (protoAgent ADR 0078). Ships the
   `protopatch_review` tool — a budgeted, checkout-cached run of the protoPatch
@@ -16,6 +16,12 @@ description: >-
 enabled: false                 # SHIP DISABLED — enabling is the operator's trust decision
 repository: https://github.com/protoLabsAI/pr-reviewer-plugin
 min_protoagent_version: "0.95.0"   # needs the findings `source` field (ADR 0078 B2 core half)
+# NOT raised for v0.25.0's built-not-echoed comment body (protoAgent#2439). The LEAK is
+# closed by this plugin alone — the body is assembled from parsed blocks, so an older
+# core that never learned the brief delimiters cannot leak deliberation into a review,
+# it just posts "the panel's brief could not be read" in place of a brief. Bump the core
+# alongside to get briefs back; `brief_found=false` in the `reviewed` telemetry counts
+# the reviews still landing without one.
 
 # Config (ADR 0019): defaults are the source of truth; langgraph-config.yaml overlays.
 config_section: pr_reviewer
