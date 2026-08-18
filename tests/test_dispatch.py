@@ -381,6 +381,21 @@ async def test_a_locked_pr_is_never_reviewed(tmp_path):
     assert (await d.needs_backfill("o/r", 1)) is None  # and the sweep won't pick it up
 
 
+async def test_a_locked_pr_holds_promotion_and_regate_too(tmp_path):
+    """`locked` was added to all four eligibility checks, but only the review and
+    backfill paths were covered. A locked conversation refuses an APPROVE and a
+    REQUEST_CHANGES exactly as it refuses a review, so both sweep legs must hold."""
+    gh = RoutedGH(pr_facts=facts(locked=True), reviews=[review_row(HEAD, "PASS")], checks=[])
+    d = make(tmp_path, cfg={"promotion_owner": True, "shadow_mode": False}, gh=gh)
+    assert (await d.evaluate_promotion("o/r", 1)) == "hold:pr-not-eligible"
+    assert gh.posted == []  # no APPROVE attempted into the lock
+
+    gh2 = RoutedGH(pr_facts=facts(locked=True), reviews=[review_row(HEAD, "FAIL")], checks=[])
+    d2 = make(tmp_path, cfg={"shadow_mode": False, "regate": True}, gh=gh2)
+    assert (await d2.evaluate_regate("o/r", 1)) == "hold:pr-not-eligible"
+    assert gh2.posted == []
+
+
 async def test_api_error_detail_is_folded_into_the_log(tmp_path):
     """`gh` puts its status on stderr and GitHub's REASON in the JSON on stdout.
     Logging stderr alone gives 'Unprocessable Entity (HTTP 422)' and nothing to act on —

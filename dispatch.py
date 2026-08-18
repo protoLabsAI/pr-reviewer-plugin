@@ -65,7 +65,7 @@ from .verdicts import (
 log = logging.getLogger("protoagent.plugins.pr_reviewer")
 
 DROP_SELF_AUTHORED = "self-authored"
-DROP_PR_NOT_ELIGIBLE = "pr-not-eligible"  # closed, draft, or facts unreadable
+DROP_PR_NOT_ELIGIBLE = "pr-not-eligible"  # closed, draft, LOCKED, or facts unreadable
 DROP_NO_RUNNER = "no-workflow-runner"
 DROP_PAUSED = "paused-by-operator"  # `@vera pause` (issue #28)
 DROP_REVIEWS_UNREADABLE = "reviews-unreadable"  # blind on our own history (issue #71)
