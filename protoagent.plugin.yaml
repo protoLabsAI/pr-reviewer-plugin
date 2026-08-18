@@ -2,7 +2,7 @@
 # Keep `version` in lockstep with pyproject.toml (tests/test_version.py asserts it).
 id: pr-reviewer
 name: PR reviewer (review machinery + structural engine)
-version: 0.29.0
+version: 0.30.0
 description: >-
   The deterministic half of the PR-review QA tier (protoAgent ADR 0078). Ships the
   `protopatch_review` tool — a budgeted, checkout-cached run of the protoPatch
@@ -31,6 +31,11 @@ config:
                                # promotion for its repos; two promoters racing double-merges
   cooldown_s: 30               # chokepoint window per repo#pr@sha (webhook burst collapse)
   allow_self_review: false     # TESTING ONLY: lift the never-review-your-own-PR rail
+  viewer_login: ""             # OUR login, for the never-review-your-own-PR rail. REQUIRED on
+                               # GitHub App auth: an installation token is not a user, so
+                               # `GET /user` 403s and identity cannot be discovered. Set the
+                               # app's bot login, e.g. "protoreview[bot]" (or
+                               # PR_REVIEWER_VIEWER_LOGIN). Empty + PAT auth = auto-detected.
   sweep_interval_s: 180        # approve-on-green level sweep cadence
   webhook_secret: ""           # HMAC secret (or PR_REVIEWER_WEBHOOK_SECRET env; empty = 403 all)
   app_id: ""                   # GitHub App identity (or PROTOREVIEW_APP_ID env) — with the
@@ -60,6 +65,7 @@ settings:
   - {key: app_id, label: "GitHub App ID (App identity)", type: string}
   - {key: app_private_key, label: "GitHub App private key (PEM)", type: secret}
   - {key: default_repo, label: "Default repo (owner/name)", type: string}
+  - {key: viewer_login, label: "Our own login (required on App auth, e.g. myapp[bot])", type: string}
   - {key: time_budget_s, label: "protoPatch time budget (seconds)", type: int}
   - {key: model, label: "protoPatch model override", type: string}
 

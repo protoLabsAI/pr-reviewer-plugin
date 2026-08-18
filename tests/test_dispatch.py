@@ -129,6 +129,29 @@ async def test_an_unknown_viewer_login_stops_the_review_instead_of_disabling_the
     assert (await d.handle_pr_event("o/r", 1, OLD_HEAD, "opened")) == "drop:self-authored"
 
 
+async def test_configured_viewer_login_is_used_without_probing(tmp_path):
+    """On GitHub App auth `gh api user` 403s every time — an installation token is not
+    a user — so identity has to be configured. Without this the fail-closed rail drops
+    every eligible PR, which it did in production for ~30 events before this landed."""
+
+    class NoUserGH(RoutedGH):
+        async def __call__(self, args, timeout=30):
+            if len(args) > 1 and args[1] == "user":
+                return 1, "", "HTTP 403: Resource not accessible by integration"
+            return await super().__call__(args, timeout)
+
+    gh = NoUserGH(pr_facts=facts(author="qa-bot[bot]"), reviews=[])
+    d = make(tmp_path, cfg={"viewer_login": "QA-Bot[bot]"}, gh=gh)
+    # Configured identity ⇒ the rail works even though the probe cannot: this PR is ours.
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "drop:self-authored"
+    assert not any(a[1] == "user" for a in gh.calls if len(a) > 1)  # never probed
+
+    # …and a PR by someone else still reviews normally.
+    gh2 = NoUserGH(pr_facts=facts(author="someone"), reviews=[])
+    d2 = make(tmp_path, cfg={"viewer_login": "qa-bot[bot]"}, gh=gh2)
+    assert (await d2.handle_pr_event("o/r", 1, HEAD, "opened")).startswith("reviewed:")
+
+
 async def test_self_authored_pr_drops(tmp_path):
     # RoutedGH's viewer login is "qa-bot" — a PR authored by qa-bot[bot] is ours.
     gh = RoutedGH(pr_facts=facts(author="qa-bot[bot]"))

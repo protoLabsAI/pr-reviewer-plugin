@@ -526,10 +526,22 @@ class Dispatcher:
         the life of the process: `viewer` stays empty, the self-authored comparison
         never matches, and the reviewer reviews (and, as promotion owner, can
         approve-on-green) its own PRs. Same shape as issue #71 — a failed read cached
-        as a definitive answer — so it fails the same way: retry, don't remember the
-        failure.
+        as a definitive answer — so it fails the same way: retry, don't remember it.
+
+        `GET /user` is the WRONG source under GitHub App auth and cannot be made to
+        work: an installation token authenticates an installation, not a user, so the
+        call 403s every time. A deployment on App auth therefore has no discoverable
+        identity, and once the guard started failing closed on that (correctly — it
+        cannot rule out self-review) it dropped a large share of its own reviews.
+        `viewer_login` is the answer: the App's bot login (`<app-slug>[bot]`) is a
+        deployment fact the operator already knows, so it is configured, not probed.
         """
         if not self._viewer:
+            # Configured identity first — reliable, and the only option on App auth.
+            configured = str(self.cfg.get("viewer_login") or os.environ.get("PR_REVIEWER_VIEWER_LOGIN") or "").strip()
+            if configured:
+                self._viewer = configured.lower()
+                return self._viewer
             rc, out, _err = await self._run_gh(["api", "user", "--jq", ".login"])
             if rc == 0 and out.strip():
                 self._viewer = out.strip().lower()
@@ -803,6 +815,15 @@ class Dispatcher:
             # We do not know who we are, so we cannot rule out that this PR is ours.
             # Reviewing it risks self-review — and, as promotion owner, self-approval.
             # Skipping costs one pass, which the sweep retries with a fresh lookup.
+            # LOUD, because on App auth this is not transient: `gh api user` can never
+            # succeed, so every eligible PR drops here until `viewer_login` is set.
+            log.warning(
+                "[pr-reviewer] identity unknown — dropping %s#%s rather than risk self-review. "
+                "On GitHub App auth set pr_reviewer.viewer_login (or PR_REVIEWER_VIEWER_LOGIN) "
+                "to the app's bot login, e.g. 'myapp[bot]'.",
+                repo,
+                pr,
+            )
             self.telemetry.emit("drop", repo=repo, pr=pr, reason=DROP_VIEWER_UNKNOWN)
             return f"drop:{DROP_VIEWER_UNKNOWN}"
         if (
