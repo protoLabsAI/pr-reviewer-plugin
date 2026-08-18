@@ -182,8 +182,13 @@ def build_routers(dispatcher, telemetry, get_secret, run_gh_fn=None):
         `@vera review` is delivered as an `issue_comment` webhook. If the GitHub App
         subscribes only to `pull_request` — which it did when the feature shipped — the
         comment never arrives and the feature looks broken with no error anywhere: the
-        code is correct, the event simply does not exist. This endpoint answers that
-        question directly instead of requiring a JWT and an App settings page.
+        code is correct, the event simply does not exist. This endpoint saves a trip to
+        the App settings page to find that out.
+
+        It does need the App JWT (`app_id` + `app_private_key`): `GET /app` takes no
+        other credential. Without it the honest answer is UNKNOWN, and that is what it
+        returns — the earlier version claimed to work without a JWT, read the resulting
+        failure as "subscribed to nothing", and reported a live summon surface as dead.
         """
         from .app_auth import AppAuthConfig, fetch_app_events
         from .summon import required_app_events
