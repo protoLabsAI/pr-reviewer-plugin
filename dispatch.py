@@ -65,11 +65,12 @@ from .verdicts import (
 log = logging.getLogger("protoagent.plugins.pr_reviewer")
 
 DROP_SELF_AUTHORED = "self-authored"
-DROP_PR_NOT_ELIGIBLE = "pr-not-eligible"  # closed, draft, or facts unreadable
+DROP_PR_NOT_ELIGIBLE = "pr-not-eligible"  # closed, draft, LOCKED, or facts unreadable
 DROP_NO_RUNNER = "no-workflow-runner"
 DROP_PAUSED = "paused-by-operator"  # `@vera pause` (issue #28)
 DROP_REVIEWS_UNREADABLE = "reviews-unreadable"  # blind on our own history (issue #71)
 DROP_VIEWER_UNKNOWN = "viewer-unknown"  # blind on our own IDENTITY — can't rule out self-review
+DROP_POST_REFUSED = "post-refused"  # GitHub keeps rejecting this verdict post (issue #78)
 
 # Our own reviews could not be read this pass (issue #71). Distinct from every other
 # hold because it says nothing about the PR — only that we are blind — and blind is
@@ -84,6 +85,15 @@ HOLD_REVIEWS_UNREADABLE = "hold:reviews-unreadable"
 # forever. Backoff is per-retry; the tuple's last value repeats if attempts ever grow.
 POST_MAX_ATTEMPTS = 3
 POST_RETRY_BACKOFF_S = (2, 8)
+
+# Consecutive NON-transient post refusals on one repo#pr@head before the panel stops
+# being spent on it (issue #78). Retry (above) handles a GitHub blip; this handles a
+# GitHub *decision* — a locked conversation, a body it will not accept — where the
+# review runs in full, is refused, is discarded, and the sweep backfills it again on
+# the next tick, forever. Transient failures deliberately do NOT count: a degradation
+# must not latch a PR out of review. A new head is a new key, so a real fix re-enters,
+# and it is in-memory, so a restart grants one more look.
+POST_MAX_FAILURES = 2
 
 # gh exit codes / stderr shapes worth a second attempt. 5xx and the secondary
 # rate-limit texts are the ones observed in production; a 4xx other than 429 is GitHub
@@ -101,6 +111,33 @@ _TRANSIENT_GH_TEXT = (
     "connection reset",
     "eof occurred",
 )
+
+
+def _with_api_detail(err: str, out: str) -> str:
+    """Fold GitHub's own error text (on stdout) into `gh`'s terse stderr line.
+
+    A failed `gh api` prints its status to stderr and the API's JSON body to stdout.
+    The body is where the reason lives — `{"message": "...", "errors": [...]}` — so a
+    log built from stderr alone says "Unprocessable Entity (HTTP 422)" and nothing an
+    operator can act on. Best-effort: a non-JSON body is appended verbatim, truncated.
+    """
+    text = (out or "").strip()
+    if not text:
+        return err
+    detail = ""
+    try:
+        payload = json.loads(text)
+    except ValueError:
+        detail = text[:200]
+    else:
+        if isinstance(payload, dict):
+            parts = [str(payload.get("message") or "").strip()]
+            errors = payload.get("errors")
+            if isinstance(errors, list):
+                # entries are either strings or {resource, field, code} objects
+                parts += [e if isinstance(e, str) else json.dumps(e) for e in errors[:3]]
+            detail = " — ".join(p for p in parts if p)[:300]
+    return f"{err} :: {detail}" if detail else err
 
 
 def transient_gh_failure(rc: int, err: str) -> bool:
@@ -251,6 +288,7 @@ class Dispatcher:
         self._viewer: str | None = None
         self._promote_failures: dict[str, int] = {}  # repo#pr@head -> consecutive APPROVE failures
         self._regate_failures: dict[str, int] = {}  # repo#pr@head -> consecutive REQUEST_CHANGES failures
+        self._post_failures: dict[str, int] = {}  # repo#pr@head -> NON-transient verdict-post refusals
         self._round_cap: dict[str, float] = {}  # repo#pr -> monotonic timestamp when capped
         self._installation_repos: list[str] = []  # last good App-installation scope
         self._installation_repos_at: float = 0.0
@@ -557,7 +595,7 @@ class Dispatcher:
                 "api",
                 f"repos/{repo}/pulls/{pr}",
                 "--jq",
-                "{head: .head.sha, base_ref: .base.ref, state: .state, draft: .draft, "
+                "{head: .head.sha, base_ref: .base.ref, state: .state, draft: .draft, locked: .locked, "
                 "changed_files: .changed_files, additions: .additions, deletions: .deletions, "
                 "author: .user.login}",
             ],
@@ -805,7 +843,13 @@ class Dispatcher:
     async def _review(self, repo: str, pr: int, *, force: bool = False, push_triggered: bool = False) -> str:
         started = time.monotonic()
         facts = await self._pr_facts(repo, pr)
-        if not facts or facts.get("state") != "open" or facts.get("draft"):
+        # `locked` matters as much as closed/draft: GitHub refuses a review on a locked
+        # conversation with `422 lock prevents review`, so the panel would run in full
+        # and the verdict be discarded at the post. Two dependabot PRs auto-locked this
+        # way burned a panel every ~7 minutes indefinitely (issue #78) — the sweep saw
+        # no verdict, backfilled, and posted into the same lock forever. Cheapest fix is
+        # not to start: never review what cannot receive a review.
+        if not facts or facts.get("state") != "open" or facts.get("draft") or facts.get("locked"):
             self.telemetry.emit("drop", repo=repo, pr=pr, reason=DROP_PR_NOT_ELIGIBLE)
             return f"drop:{DROP_PR_NOT_ELIGIBLE}"
         viewer = await self._viewer_login()
@@ -835,6 +879,13 @@ class Dispatcher:
             return f"drop:{DROP_SELF_AUTHORED}"
 
         head = str(facts["head"])
+        # GitHub has already refused this exact verdict post more than once for a reason
+        # that will not change on its own (issue #78). Running the panel again produces a
+        # verdict with nowhere to go. `force` (an operator summon) overrides — asking
+        # explicitly is a reason to try once more.
+        if not force and self._post_failures.get(f"{repo}#{pr}@{head}", 0) >= POST_MAX_FAILURES:
+            self.telemetry.emit("drop", repo=repo, pr=pr, sha=head, reason=DROP_POST_REFUSED)
+            return f"drop:{DROP_POST_REFUSED}"
         if not force and self.summon_enabled:
             # An operator asked for quiet (issue #28). Push-triggered review stops; an
             # explicit `@vera review` still runs, because "stop reviewing every push" and
@@ -1213,7 +1264,16 @@ class Dispatcher:
                 f"The PR shows no verdict. Last error: {err[-200:]}",
                 dedup_key=f"verdict-lost:{repo}#{pr}@{head}",
             )
+            # Count only a refusal GitHub MEANS. A transient failure already exhausted
+            # its retries above, and latching a PR out of review over a blip would turn
+            # a degradation into a lasting gap.
+            if not transient_gh_failure(rc, err):
+                key = f"{repo}#{pr}@{head}"
+                self._post_failures[key] = self._post_failures.get(key, 0) + 1
+                if len(self._post_failures) > 1024:  # bounded, like the promote counter
+                    self._post_failures = dict(list(self._post_failures.items())[-512:])
             return False
+        self._post_failures.pop(f"{repo}#{pr}@{head}", None)
         # A verdict exists now, so any "this PR has not been reviewed" notice we left on
         # an earlier exhausted head (#61) is stale and contradicts the review above it.
         await self._clear_exhaustion_comments(repo, pr)
@@ -1245,7 +1305,7 @@ class Dispatcher:
         attempt = 0
         while True:
             attempt += 1
-            rc, _out, err = await self._run_gh(
+            rc, out, err = await self._run_gh(
                 ["api", f"repos/{repo}/pulls/{pr}/reviews", "-X", "POST", "-f", f"event={event}", "-f", f"body={body}"],
                 timeout=60,
             )
@@ -1253,6 +1313,11 @@ class Dispatcher:
                 if attempt > 1:
                     log.info("[pr-reviewer] posting %s on %s#%s succeeded on attempt %d", event, repo, pr, attempt)
                 return 0, "", attempt
+            # `gh` puts "Unprocessable Entity (HTTP 422)" on stderr and GitHub's actual
+            # reason in the JSON on STDOUT, so logging stderr alone records that
+            # something was refused and never why. `lock prevents review` sat in that
+            # body unread while two PRs lost a verdict every 7 minutes (#78).
+            err = _with_api_detail(err, out)
             if rc == 124:
                 # Ambiguous: our timeout, not GitHub's refusal. Ask GitHub what it has.
                 landed = await self._verdict_landed(repo, pr, head)
@@ -1373,7 +1438,7 @@ class Dispatcher:
         if not self.regate_enabled:
             return HOLD_REGATE_DISABLED
         facts = await self._pr_facts(repo, pr)
-        if not facts or facts.get("state") != "open" or facts.get("draft"):
+        if not facts or facts.get("state") != "open" or facts.get("draft") or facts.get("locked"):
             return "hold:pr-not-eligible"
         head = str(facts["head"])
         ours = await self._our_reviews(repo, pr)
@@ -1460,7 +1525,7 @@ class Dispatcher:
             self.telemetry.emit("promotion", repo=repo, pr=pr, decision=HOLD_NOT_OWNER)
             return HOLD_NOT_OWNER
         facts = await self._pr_facts(repo, pr)
-        if not facts or facts.get("state") != "open" or facts.get("draft"):
+        if not facts or facts.get("state") != "open" or facts.get("draft") or facts.get("locked"):
             return "hold:pr-not-eligible"
         head = str(facts["head"])
         ours = await self._our_reviews(repo, pr)
@@ -1568,7 +1633,7 @@ class Dispatcher:
         never be promoted. Cheap checks first; this runs per-PR per-pass.
         """
         facts = await self._pr_facts(repo, pr)
-        if not facts or facts.get("state") != "open" or facts.get("draft"):
+        if not facts or facts.get("state") != "open" or facts.get("draft") or facts.get("locked"):
             return None
         head = str(facts["head"])
         ours = await self._our_reviews(repo, pr)
