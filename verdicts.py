@@ -25,6 +25,17 @@ import re
 
 PASS, WARN, FAIL = "PASS", "WARN", "FAIL"
 
+# The per-finding status a mid-round push demotes `confirmed` to (issue #82). The round
+# verified its findings against the head it pinned at dispatch; a commit pushed while
+# the finders ran may have addressed them, so the finding keeps rendering and keeps
+# being recalled — it just stops claiming an authority the verification no longer has.
+POSSIBLY_ADDRESSED = "possibly addressed"
+
+STALE_NOTE = (
+    "the PR head advanced while this round ran and the new commits touch this finding's "
+    "region — verified against the superseded head, so it may already be addressed"
+)
+
 # The marker must tolerate attributes it does not know about. It anchors on head +
 # verdict, accepts `promoted`, and then allows ANY further `key=value` pairs before the
 # close. v0.13.0 appended `findings=N` after `promoted=true` and this regex — which
@@ -134,7 +145,9 @@ def verdict_for(findings: list[dict]) -> str:
         sev = str(f.get("severity") or "").lower()
         verdict = str(f.get("verdict") or "").lower()
         if sev in ("blocker", "major"):
-            if verdict == "uncertain":
+            if verdict in ("uncertain", POSSIBLY_ADDRESSED):
+                # Unproven, or verified against a head the PR has since replaced —
+                # worth a human glance, never a block.
                 worst = WARN if worst != FAIL else worst
             else:  # confirmed, or no verify annotation — trust the panel
                 return FAIL
@@ -168,7 +181,12 @@ def confine_findings(findings: list[dict], changed_paths: list[str]) -> tuple[li
 
 
 _SEV_MARK = {"blocker": "🔴", "major": "🟠", "minor": "🟡", "nit": "⚪"}
-_VERDICT_MARK = {"confirmed": "confirmed", "uncertain": "⚠️ uncertain", "refuted": "~~refuted~~"}
+_VERDICT_MARK = {
+    "confirmed": "confirmed",
+    "uncertain": "⚠️ uncertain",
+    "refuted": "~~refuted~~",
+    POSSIBLY_ADDRESSED: "⏳ possibly addressed",
+}
 
 
 def _cell(text: object, limit: int = 160) -> str:
@@ -288,6 +306,44 @@ def merge_carried_findings(findings: list[dict], carried: list[dict]) -> list[di
     return existing + additions
 
 
+def demote_stale_findings(findings: list[dict], ranges: dict[str, list[tuple[int, int]]]) -> tuple[list[dict], int]:
+    """(findings, demoted). Strip `confirmed` authority from findings whose region the
+    PR rewrote while the panel was still running (issue #82).
+
+    The round verified against the head it pinned at dispatch; a fix pushed mid-round
+    makes those findings claims about code the PR no longer has, and posting them as
+    `confirmed` misleads the human reader (protoAgent#2854 r2 and #2868 r2 — one of
+    them on an already-merged PR). Only findings the delta actually touches are demoted
+    — a finding on untouched code is exactly as true at the new head as the old — and a
+    `refuted` row is left alone (no authority left to strip). `ranges` comes from the
+    pinned→current compare, same `in_delta` semantics as convergence: a file-level
+    finding (no line) on a touched file counts as touched.
+
+    Returns NEW dicts, never mutating the caller's (the `merge_carried_findings`
+    contract). The demoted status lands in the recorded findings array, so the next
+    round's recall re-verifies it rather than trusting it.
+    """
+    from .rounds import in_delta  # lazy — rounds imports this module at import time
+
+    out: list[dict] = []
+    demoted = 0
+    for finding in findings or []:
+        if not isinstance(finding, dict):
+            out.append(finding)
+            continue
+        verdict = str(finding.get("verdict") or "").lower()
+        if verdict == "refuted" or not in_delta(finding, ranges):
+            out.append(finding)
+            continue
+        item = dict(finding)
+        item["verdict"] = POSSIBLY_ADDRESSED
+        note = str(item.get("note") or "").strip()
+        item["note"] = f"{note} — {STALE_NOTE}" if note else STALE_NOTE
+        out.append(item)
+        demoted += 1
+    return out, demoted
+
+
 def render_verdict_body(
     *,
     repo: str,
@@ -304,6 +360,7 @@ def render_verdict_body(
     confined: list[dict] | None = None,
     notes: str = "",
     complete: bool = True,
+    stale_note: str = "",
 ) -> str:
     """The comment body, ASSEMBLED — marker line (machine), header (human), the brief,
     the dispositions table, the findings table + machine-readable array, then the
@@ -317,7 +374,12 @@ def render_verdict_body(
     be read says so, instead of quietly shipping less than it looks like it shipped.
 
     `notes` is a pre-rendered trailing section (the convergence checklist, issue #23);
-    it arrives as text so this module stays free of the round machinery that builds it."""
+    it arrives as text so this module stays free of the round machinery that builds it.
+
+    `stale_note` is the stale-head synthesis header (issue #82) — the PR moved while
+    the panel ran, or its current head could not be checked. It leads the human-readable
+    body: everything below it was verified against the head the MARKER names, and the
+    reader must know that before reading a single finding."""
     mode = "shadow — comment-only" if shadow else "formal"
     footnote = ""
     if confined:
@@ -340,6 +402,8 @@ def render_verdict_body(
     sections = [
         f"{marker}\n## QA panel review — **{verdict}**\n_{recipe} · head `{head_sha[:12]}` · {mode}_",
     ]
+    if stale_note:
+        sections.append(f"> ⚠️ {stale_note}")
     if truncated:
         sections.append("> ⚠️ The report pass was cut off at its turn limit — this round's findings may be incomplete.")
     if brief:
