@@ -7,8 +7,10 @@ import json
 from pr_reviewer.verdicts import (
     FAIL,
     PASS,
+    POSSIBLY_ADDRESSED,
     WARN,
     confine_findings,
+    demote_stale_findings,
     extract_brief,
     extract_findings_json,
     merge_carried_findings,
@@ -386,3 +388,69 @@ def test_carried_debt_propagates_and_then_clears():
     assert len(r_n1) == 1
     # once positively cleared, unaccounted is empty → nothing carried → clean record
     assert merge_carried_findings([], []) == []
+
+
+# ── stale-head demotion: the PR moved while the panel ran (issue #82) ─────────
+#
+# protoAgent#2854 r2 / #2868 r2: a fix commit pushed while the finders were running,
+# and the round posted its findings as `confirmed` against the superseded head — once
+# on an already-merged PR. Findings the pinned→current delta touches lose that
+# authority before the body is built; findings on untouched code keep it.
+
+_STALE = {"file": "x.py", "line": 3, "severity": "major", "claim": "bug", "verdict": "confirmed"}
+
+
+def test_a_finding_in_the_stale_delta_loses_confirmed():
+    demoted, n = demote_stale_findings([_STALE], {"x.py": [(1, 10)]})
+    assert n == 1
+    assert demoted[0]["verdict"] == POSSIBLY_ADDRESSED
+    assert "may already be addressed" in demoted[0]["note"]
+    assert _STALE["verdict"] == "confirmed"  # the input dict is never mutated
+
+
+def test_a_finding_outside_the_delta_keeps_its_authority():
+    # A finding on code the mid-round push never touched is exactly as true at the new
+    # head as the old one — demoting it would launder real debt out of the round.
+    untouched_file, n1 = demote_stale_findings([_STALE], {"other.py": [(1, 10)]})
+    assert n1 == 0 and untouched_file == [_STALE]
+    untouched_span, n2 = demote_stale_findings([_STALE], {"x.py": [(50, 60)]})
+    assert n2 == 0 and untouched_span == [_STALE]
+
+
+def test_a_file_level_finding_on_a_touched_file_is_demoted():
+    # line 0 is the findings contract's "no particular line" — same in_delta semantics
+    # as convergence: a changed file counts as touching a file-level finding.
+    file_level = {"file": "x.py", "line": 0, "severity": "minor", "claim": "c", "verdict": "confirmed"}
+    demoted, n = demote_stale_findings([file_level], {"x.py": [(1, 2)]})
+    assert n == 1 and demoted[0]["verdict"] == POSSIBLY_ADDRESSED
+
+
+def test_a_refuted_finding_is_left_alone():
+    refuted = {"file": "x.py", "line": 3, "severity": "major", "claim": "c", "verdict": "refuted"}
+    kept, n = demote_stale_findings([refuted], {"x.py": [(1, 10)]})
+    assert n == 0 and kept == [refuted]
+
+
+def test_a_possibly_addressed_major_warns_instead_of_failing():
+    # Defensive symmetry with "uncertain": if a later round ever recalls a demoted
+    # major into its live findings, it is worth a glance, never a block.
+    assert verdict_for([f("major", POSSIBLY_ADDRESSED)]) == WARN
+    assert verdict_for([f("blocker", POSSIBLY_ADDRESSED)]) == WARN
+    assert verdict_for([f("major", POSSIBLY_ADDRESSED), f("major", "confirmed")]) == FAIL
+
+
+def test_the_stale_header_rides_the_body_and_the_demotion_survives_recall():
+    demoted, _ = demote_stale_findings([_STALE], {"x.py": [(1, 10)]})
+    note = "PR advanced 2 commit(s) during this round (`aaaa` → `bbbb`); 1 finding(s) in the delta were demoted."
+    body = _body(verdict=FAIL, findings=demoted, stale_note=note)
+    assert "> ⚠️ PR advanced 2 commit(s)" in body  # leads the human-readable body
+    assert "⏳ possibly addressed" in body  # the table shows the demoted status
+    # The machine record carries the demotion (next-round recall re-verifies, not trusts)…
+    assert json.loads(extract_findings_json(body))[0]["verdict"] == POSSIBLY_ADDRESSED
+    # …and the marker still names the reviewed head/verdict — promotion must keep holding.
+    assert parse_verdict_marker(body) == {"head": "a" * 40, "verdict": FAIL, "promoted": False, "complete": True}
+
+
+def test_no_stale_note_leaves_the_body_unchanged():
+    assert "⚠️ PR advanced" not in _body(findings=[])
+    assert _body(findings=[]) == _body(findings=[], stale_note="")  # the default is a no-op

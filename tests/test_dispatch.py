@@ -2272,3 +2272,135 @@ def test_max_rounds_env_fallback_and_default(monkeypatch, tmp_path):
     d3 = Dispatcher({"max_rounds": 4, "max_rounds_cooldown": 900}, Telemetry(tmp_path))
     assert d3.max_rounds == 4
     assert d3.max_rounds_cooldown_s == 900
+
+
+# ── stale-head demotion: the PR advanced mid-round (issue #82) ────────────────
+#
+# protoAgent#2854 r2 / #2868 r2: a fix commit pushed while the finders were running,
+# and the round posted `confirmed` findings verified against the superseded head —
+# once on an already-merged PR. _post_verdict re-resolves the head at post time and
+# demotes the findings the pinned→current delta touches.
+
+PUSHED_HEAD = "e" * 40
+
+STALE_ROUND_REPORT = (
+    "<!-- brief -->\nBrief prose.\n<!-- /brief -->\n\n```json\n"
+    + json.dumps(
+        [
+            {
+                "file": "x.py",
+                "line": 3,
+                "severity": "major",
+                "category": "correctness",
+                "claim": "Bug the push may have fixed.",
+                "evidence": "e",
+                "verdict": "confirmed",
+            },
+            {
+                "file": "z.py",
+                "line": 5,
+                "severity": "major",
+                "category": "correctness",
+                "claim": "Bug the push never touched.",
+                "evidence": "e",
+                "verdict": "confirmed",
+            },
+        ]
+    )
+    + "\n```"
+)
+
+
+class MidRoundPushGH(RoutedGH):
+    """The head advances while the panel runs: the FIRST /pulls/1 read (the round's pin)
+    serves the old head; every later one — including _post_verdict's re-resolution —
+    serves the pushed head, or fails outright for the degradation path. The
+    pinned…pushed compare is served from `stale_compare` (an OBJECT: {commits, files}),
+    distinct from RoutedGH.compare (the prior-round convergence compare, a files list)."""
+
+    def __init__(self, *, pushed_head, stale_compare=None, head_lookup_rc=0, **kw):
+        super().__init__(**kw)
+        self.pushed_head = pushed_head
+        self.stale_compare = stale_compare  # None → the pinned…pushed compare is unreadable
+        self.head_lookup_rc = head_lookup_rc  # non-zero → post-time facts reads fail
+        self.facts_reads = 0
+
+    async def __call__(self, args, timeout=30):
+        joined = " ".join(args)
+        if f"/compare/{HEAD}...{self.pushed_head}" in joined:
+            self.calls.append(args)
+            if self.stale_compare is None:
+                return 1, "", "HTTP 404"
+            return 0, json.dumps(self.stale_compare), ""
+        if len(args) > 1 and args[1] == "repos/o/r/pulls/1":
+            self.facts_reads += 1
+            if self.facts_reads > 1:
+                self.calls.append(args)
+                if self.head_lookup_rc:
+                    return self.head_lookup_rc, "", "HTTP 502"
+                return 0, json.dumps({**self.pr_facts, "head": self.pushed_head}), ""
+        return await super().__call__(args, timeout)
+
+
+async def test_a_mid_round_push_demotes_only_the_findings_it_touched(tmp_path):
+    # The push rewrote x.py around line 3; z.py:5 is untouched and keeps `confirmed`.
+    compare = {"commits": 2, "files": [{"filename": "x.py", "patch": "@@ -1,3 +1,5 @@\n a\n+b\n+c\n d\n"}]}
+    gh = MidRoundPushGH(
+        pushed_head=PUSHED_HEAD, stale_compare=compare, pr_facts=facts(), reviews=[], files="x.py\nz.py\n"
+    )
+    runner, _seen = capturing_runner(STALE_ROUND_REPORT)
+    d = make(tmp_path, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "reviewed:FAIL"
+    body = gh.posted[0]["body"]
+    # The synthesis header names the move and the demotion count…
+    assert f"PR advanced 2 commit(s) during this round (`{HEAD[:12]}` → `{PUSHED_HEAD[:12]}`)" in body
+    assert "1 finding(s) in the delta were demoted to *possibly addressed*" in body
+    # …while the marker still records the head the round RAN AGAINST — the promotion
+    # gate's stale-head hold depends on it naming the reviewed head, not the current one.
+    assert f"head={HEAD} verdict=FAIL" in body
+    recorded = {f["file"]: f for f in json.loads(extract_findings_json(body))}
+    assert recorded["x.py"]["verdict"] == "possibly addressed"
+    assert recorded["z.py"]["verdict"] == "confirmed"
+    events = [e for e in d.telemetry.read_all() if e.get("event") == "stale_head"]
+    assert events and events[0]["demoted"] == 1 and events[0]["current"] == PUSHED_HEAD
+
+
+async def test_an_unresolvable_current_head_posts_as_is_with_a_note(tmp_path):
+    # Blind on the current head, the verdict still posts — findings untouched, plus a
+    # note that the staleness check could not run. Degrade, never raise: a lost verdict
+    # is worse than a stale-marked one.
+    gh = MidRoundPushGH(pushed_head=PUSHED_HEAD, head_lookup_rc=1, pr_facts=facts(), reviews=[], files="x.py\nz.py\n")
+    runner, _seen = capturing_runner(STALE_ROUND_REPORT)
+    d = make(tmp_path, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "reviewed:FAIL"
+    body = gh.posted[0]["body"]
+    assert "could not be resolved at post time" in body
+    assert all(f["verdict"] == "confirmed" for f in json.loads(extract_findings_json(body)))
+    assert not any("/compare/" in " ".join(c) for c in gh.calls)  # nothing to compare against
+
+
+async def test_an_unreadable_stale_delta_notes_the_move_but_demotes_nothing(tmp_path):
+    # The head moved but the compare is unreadable: demotion fails CLOSED (no relief
+    # without proof the region was touched — the converge posture) while the move
+    # itself is still stated for the reader.
+    gh = MidRoundPushGH(pushed_head=PUSHED_HEAD, stale_compare=None, pr_facts=facts(), reviews=[], files="x.py\nz.py\n")
+    runner, _seen = capturing_runner(STALE_ROUND_REPORT)
+    d = make(tmp_path, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "reviewed:FAIL"
+    body = gh.posted[0]["body"]
+    assert "the delta could not be read" in body
+    assert all(f["verdict"] == "confirmed" for f in json.loads(extract_findings_json(body)))
+
+
+async def test_an_unmoved_head_posts_the_unchanged_body_with_no_stale_machinery(tmp_path):
+    # The common case pays nothing: no compare read, no header, no telemetry event —
+    # the posting path is byte-identical to before the guard existed.
+    gh = RoutedGH(pr_facts=facts(), reviews=[], files="x.py\nz.py\n")
+    runner, _seen = capturing_runner(STALE_ROUND_REPORT)
+    d = make(tmp_path, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "reviewed:FAIL"
+    body = gh.posted[0]["body"]
+    assert "PR advanced" not in body and "possibly addressed" not in body
+    assert "could not be resolved at post time" not in body
+    assert not any("/compare/" in " ".join(c) for c in gh.calls)
+    assert not [e for e in d.telemetry.read_all() if e.get("event") == "stale_head"]

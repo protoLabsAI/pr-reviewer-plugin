@@ -56,6 +56,7 @@ from .verdicts import (
     PASS,
     WARN,
     confine_findings,
+    demote_stale_findings,
     extract_brief,
     merge_carried_findings,
     parse_verdict_marker,
@@ -1284,6 +1285,82 @@ class Dispatcher:
             except json.JSONDecodeError:
                 return []
 
+    # ── stale-head demotion: the PR moved while the panel ran (issue #82) ──────
+
+    async def _stale_head_delta(self, repo: str, pinned: str, current: str) -> tuple[dict, int] | None:
+        """(changed ranges, commit count) for pinned→current, or None (unreadable).
+
+        A separate read from `_delta_ranges` because the synthesis header needs the
+        COMMIT COUNT too, and both must come from the same compare — a count from one
+        read and ranges from another could straddle yet another push.
+        """
+        rc, out, _err = await self._run_gh(
+            [
+                "api",
+                f"repos/{repo}/compare/{pinned}...{current}",
+                "--jq",
+                "{commits: .total_commits, files: [.files[]? | {filename: .filename, patch: .patch}]}",
+            ],
+        )
+        if rc != 0:
+            return None
+        try:
+            payload = json.loads(out)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(payload, dict) or not isinstance(payload.get("files"), list):
+            return None
+        commits = payload.get("commits")
+        return delta_ranges(payload["files"]), (commits if isinstance(commits, int) and commits >= 0 else 0)
+
+    async def _stale_head_guard(self, repo: str, pr: int, head: str, findings: list[dict]) -> tuple[list[dict], str]:
+        """Re-resolve the PR's head at POST time → (findings, synthesis header or "").
+
+        The panel runs for minutes and the round pins `head` at dispatch, so a fix
+        commit pushed while the finders run leaves the verdict verified against a head
+        the PR no longer has. The promotion gate already refuses that verdict
+        (`verdict_head != head_sha`), so nothing auto-approves off it — but the POSTED
+        review still tells a human `confirmed` about code the push may have just fixed
+        (protoAgent#2854 r2 and #2868 r2, one on an already-merged PR). Cheapest viable
+        fix: post-filter, don't cancel — the round is already paid for.
+
+        Resolved server-side (`_pr_facts`, the same read the round opened with) — never
+        a model-supplied ref. Every failure DEGRADES to posting with a note, never
+        raising: a lost verdict is worse than a stale-marked one (the #72 posture). And
+        demotion itself fails CLOSED like every other relief here: an unreadable delta
+        demotes nothing — the head having moved is stated, the findings keep their
+        authority (the `converge` posture: no relief without a readable delta).
+        """
+        facts = await self._pr_facts(repo, pr)
+        current = str(facts.get("head") or "") if facts else ""
+        if not current:
+            self.telemetry.emit("stale_head", repo=repo, pr=pr, sha=head, current=None, demoted=0)
+            return findings, (
+                f"The PR's current head could not be resolved at post time — this review was "
+                f"verified against `{head[:12]}` and may not reflect later pushes."
+            )
+        if current == head:
+            return findings, ""  # the common case: byte-identical body, no note, no event
+        delta = await self._stale_head_delta(repo, head, current)
+        if delta is None:
+            self.telemetry.emit(
+                "stale_head", repo=repo, pr=pr, sha=head, current=current, demoted=0, delta="unreadable"
+            )
+            return findings, (
+                f"PR advanced during this round (`{head[:12]}` → `{current[:12]}`) and the delta "
+                f"could not be read — findings were verified against the older head and some may "
+                f"already be addressed."
+            )
+        ranges, commits = delta
+        demoted = 0
+        if isinstance(findings, list):
+            findings, demoted = demote_stale_findings(findings, ranges)
+        self.telemetry.emit("stale_head", repo=repo, pr=pr, sha=head, current=current, commits=commits, demoted=demoted)
+        return findings, (
+            f"PR advanced {commits} commit(s) during this round (`{head[:12]}` → `{current[:12]}`); "
+            f"{demoted} finding(s) in the delta were demoted to *possibly addressed*."
+        )
+
     async def _post_verdict(
         self,
         repo: str,
@@ -1301,6 +1378,10 @@ class Dispatcher:
         hold_blocks: bool = False,
         complete: bool = True,
     ) -> bool:
+        # Immediately before posting — the last moment a mid-round push can be caught.
+        # The marker keeps the PINNED head on purpose: the round ran against it, and
+        # rewriting it would tell the promotion gate the verdict covers code it never saw.
+        findings, stale_note = await self._stale_head_guard(repo, pr, head, findings)
         body = render_verdict_body(
             repo=repo,
             pr=pr,
@@ -1316,6 +1397,7 @@ class Dispatcher:
             confined=confined,
             notes=notes,
             complete=complete,
+            stale_note=stale_note,
         )
         event = "COMMENT"
         if not self.shadow and verdict == FAIL:
