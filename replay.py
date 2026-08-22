@@ -106,6 +106,47 @@ async def replay_review(
 
     # Same guard pipeline as the live path, same order, same functions.
     paths = await _changed_paths(run_gh, repo, pr)
+
+    # GitHub's pulls/{pr}/files endpoint returns an empty list for merged PRs — the diff
+    # is gone, not clean. Running the guard pipeline against nothing produces verdict:PASS
+    # with findings:[], which corrupts eval corpora (issue #84). Short-circuit here with
+    # SKIP before any guard runs. An open PR with genuinely zero changed files proceeds
+    # normally: same empty paths, but merged==false means SKIP never fires.
+    if not paths:
+        _, merged_out, _ = await run_gh(["api", f"repos/{repo}/pulls/{pr}", "--jq", ".merged"])
+        if (merged_out or "").strip() == "true":
+            return {
+                "run": {
+                    "repo": repo,
+                    "pr": pr,
+                    "head": head,
+                    "recipe": recipe,
+                    "round": round_number,
+                    "model": str(row.get("model") or ""),
+                    "trial": trial,
+                    "stamp": stamp,
+                },
+                "verdict": "SKIP",
+                "findings": [],
+                **({"raw_report": output} if include_raw else {}),
+                "dispositions": [],
+                "telemetry": {
+                    "failed_steps": failed,
+                    "degraded_steps": degraded,
+                    "truncated": False,
+                    "empty_diff": True,
+                    "confined": 0,
+                    "grounding_checked": 0,
+                    "grounding_downgraded": 0,
+                    "converge_reason": "",
+                    "converge_notes": 0,
+                    "dispositions": 0,
+                    "unaccounted_priors": 0,
+                    "step_seconds": timings,
+                    "token_usage": usage,
+                },
+            }
+
     findings, confined = confine_findings(parse_findings(output), paths)
 
     grounding_checked = 0
@@ -155,6 +196,7 @@ async def replay_review(
             "failed_steps": failed,
             "degraded_steps": degraded,  # finders the engine cut off at their `timeout` (graceful)
             "truncated": truncated,
+            "empty_diff": False,
             "confined": len(confined),
             "grounding_checked": grounding_checked,
             "grounding_downgraded": len(ungrounded),

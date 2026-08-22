@@ -22,13 +22,14 @@ def _parse(output: str) -> list[dict]:
 
 
 class ReplayGH:
-    """Read-only fake gh: PR files, a file blob, and a compare. Records every call so a
-    test can assert replay NEVER writes."""
+    """Read-only fake gh: PR files, a file blob, a compare, and the PR merged state.
+    Records every call so a test can assert replay NEVER writes."""
 
-    def __init__(self, *, files="x.py\n", blob="", patches=None, compare=None):
+    def __init__(self, *, files="x.py\n", blob="", patches=None, compare=None, merged=False):
         self.files, self.blob = files, blob
         self.patches = patches if patches is not None else [{"f": "x.py", "p": ""}]
         self.compare = compare
+        self.merged = merged
         self.calls: list[list[str]] = []
 
     async def __call__(self, args, timeout=30):
@@ -45,6 +46,8 @@ class ReplayGH:
             return 0, json.dumps(self.patches), ""
         if "/files" in j:
             return 0, self.files, ""
+        if "/pulls/" in j and "/files" not in j:
+            return (0, "true" if self.merged else "false", "")
         return 0, "", ""
 
 
@@ -214,3 +217,88 @@ async def test_include_raw_adds_the_report_text_for_faithfulness_debugging():
     on = await replay_review(row, run_gh=gh, runner=_runner(CLEAN_REPORT), parse_findings=_parse, include_raw=True)
     assert "raw_report" not in off  # large; off by default
     assert on["raw_report"] == CLEAN_REPORT  # the exact panel text, to tell found-then-lost from never-found
+
+
+# ── merged PR short-circuit (issue #84) ──────────────────────────────────────
+
+
+async def test_merged_pr_with_empty_diff_returns_skip_not_pass():
+    # GitHub returns an empty file list for merged PRs — that's not a clean bill of health.
+    run = _runner(CLEAN_REPORT)
+    gh = ReplayGH(files="", merged=True)
+    row = {"repo": "o/r", "pr": 42, "head": "c" * 40, "model": "protolabs/fast"}
+    out = await replay_review(row, run_gh=gh, runner=run, parse_findings=_parse, trial=3, stamp="S")
+    assert out["verdict"] == "SKIP"
+    assert out["findings"] == []
+    assert out["telemetry"]["empty_diff"] is True
+    assert out["telemetry"]["truncated"] is False
+    # run header is still fully populated
+    assert out["run"] == {
+        "repo": "o/r",
+        "pr": 42,
+        "head": "c" * 40,
+        "recipe": "code-review-structural",
+        "round": 1,
+        "model": "protolabs/fast",
+        "trial": 3,
+        "stamp": "S",
+    }
+    # the panel runner WAS called — we short-circuit after the run, not before
+    assert run.seen is not None
+
+
+async def test_open_pr_with_files_has_empty_diff_false():
+    gh = ReplayGH()  # files="x.py\n", merged=False
+    out = await replay_review(
+        {"repo": "o/r", "pr": 1, "head": "a" * 40},
+        run_gh=gh,
+        runner=_runner(CLEAN_REPORT),
+        parse_findings=_parse,
+    )
+    assert out["telemetry"]["empty_diff"] is False
+    assert out["verdict"] != "SKIP"
+
+
+async def test_open_pr_with_zero_files_is_not_skip():
+    # A genuinely empty PR (no changed files, not merged) is not a SKIP — proceed normally.
+    gh = ReplayGH(files="", merged=False)
+    out = await replay_review(
+        {"repo": "o/r", "pr": 1, "head": "a" * 40},
+        run_gh=gh,
+        runner=_runner(CLEAN_REPORT),
+        parse_findings=_parse,
+    )
+    assert out["verdict"] != "SKIP"
+    assert out["telemetry"]["empty_diff"] is False
+
+
+async def test_merged_pr_skip_does_not_run_guards():
+    # The guard pipeline must NOT run on an empty merged-PR diff — no confine, no grounding,
+    # no converge, no _finding_sources (which would make /contents/ calls).
+    gh = ReplayGH(files="", merged=True)
+    out = await replay_review(
+        {"repo": "o/r", "pr": 1, "head": "a" * 40},
+        run_gh=gh,
+        runner=_runner(REPORT),  # a report that would produce findings if guards ran
+        parse_findings=_parse,
+    )
+    assert out["verdict"] == "SKIP"
+    assert out["telemetry"]["grounding_checked"] == 0
+    assert out["telemetry"]["confined"] == 0
+    assert out["telemetry"]["converge_reason"] == ""
+    # _finding_sources fetches /contents/ — must never have been called
+    assert not any("/contents/" in " ".join(call) for call in gh.calls)
+
+
+async def test_merged_pr_skip_includes_raw_when_requested():
+    gh = ReplayGH(files="", merged=True)
+    out = await replay_review(
+        {"repo": "o/r", "pr": 1, "head": "a" * 40},
+        run_gh=gh,
+        runner=_runner(CLEAN_REPORT),
+        parse_findings=_parse,
+        include_raw=True,
+    )
+    assert out["verdict"] == "SKIP"
+    assert "raw_report" in out
+    assert out["raw_report"] == CLEAN_REPORT
