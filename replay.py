@@ -22,6 +22,15 @@ final answer (the `fast` incident: 6k tokens, no output) produces an empty repor
 explicit `[]`. The scorer needs to see the difference or a truncated run reads as "found
 nothing," inflating the miss rate against the model unfairly.
 
+An empty diff on a merged PR is first-class the same way. GitHub's `pulls/{pr}/files`
+returns an EMPTY list once a PR is merged (the head ref is gone), so replaying a merged
+PR runs the panel against nothing and grades it a clean PASS — a manufactured favourable
+data point, and merged PRs are the majority of any historical corpus. Replay refuses the
+verdict instead: `verdict="SKIP"` with `telemetry.empty_diff=true`, short-circuiting
+before the finders run. The scorer must filter these rows, same as `truncated`. The live
+path never sees this shape — dispatch only reviews open PRs — so the check lives here,
+pre-guard, and the shared guard functions stay untouched.
+
 The output contract here matches issue #20's description; reconcile with
 `protoLab:evals/review-eval/SCHEMA.md` (lab-side, not yet pushed where the plugin can read
 it) before wiring the scorer — the field NAMES may need aligning, the SHAPE is right.
@@ -97,6 +106,47 @@ async def replay_review(
         inputs["prior_requests"] = str(row["prior_requests"])
         inputs["review_round"] = str(round_number)
 
+    run_meta = {
+        "repo": repo,
+        "pr": pr,
+        "head": head,
+        "recipe": recipe,
+        "round": round_number,
+        "model": str(row.get("model") or ""),
+        "trial": trial,
+        "stamp": stamp,
+    }
+
+    # An empty file list on a MERGED PR is GitHub telling us the diff is gone, not that
+    # the PR changed nothing — and a panel run against nothing grades as a clean PASS.
+    # Refuse the verdict (SKIP, `empty_diff`) and short-circuit before the finders spend
+    # seconds on an empty input and before any guard runs on it. Specifically "empty
+    # because merged": an open PR with genuinely zero changed files replays normally.
+    paths = await _changed_paths(run_gh, repo, pr)
+    empty_diff = not paths and await _pr_is_merged(run_gh, repo, pr)
+    if empty_diff:
+        return {
+            "run": run_meta,
+            "verdict": "SKIP",
+            "findings": [],
+            "dispositions": [],
+            "telemetry": {
+                "failed_steps": [],
+                "degraded_steps": [],
+                "truncated": False,
+                "empty_diff": True,
+                "confined": 0,
+                "grounding_checked": 0,
+                "grounding_downgraded": 0,
+                "converge_reason": "",
+                "converge_notes": 0,
+                "dispositions": 0,
+                "unaccounted_priors": 0,
+                "step_seconds": {},  # nothing ran — the short-circuit is before the panel
+                "token_usage": {},
+            },
+        }
+
     result = await runner(recipe, inputs)
     output = str(result.get("output") or "")
     failed = list(result.get("failed") or [])
@@ -105,7 +155,6 @@ async def replay_review(
     usage = result.get("usage") if isinstance(result.get("usage"), dict) else {}
 
     # Same guard pipeline as the live path, same order, same functions.
-    paths = await _changed_paths(run_gh, repo, pr)
     findings, confined = confine_findings(parse_findings(output), paths)
 
     grounding_checked = 0
@@ -133,16 +182,7 @@ async def replay_review(
     truncated = looks_truncated(output, findings) and not failed
 
     return {
-        "run": {
-            "repo": repo,
-            "pr": pr,
-            "head": head,
-            "recipe": recipe,
-            "round": round_number,
-            "model": str(row.get("model") or ""),
-            "trial": trial,
-            "stamp": stamp,
-        },
+        "run": run_meta,
         "verdict": verdict,
         "findings": findings,
         **({"raw_report": output} if include_raw else {}),
@@ -155,6 +195,7 @@ async def replay_review(
             "failed_steps": failed,
             "degraded_steps": degraded,  # finders the engine cut off at their `timeout` (graceful)
             "truncated": truncated,
+            "empty_diff": False,  # a merged-PR empty diff short-circuits above, never here
             "confined": len(confined),
             "grounding_checked": grounding_checked,
             "grounding_downgraded": len(ungrounded),
@@ -172,12 +213,21 @@ async def replay_review(
 #
 # These mirror the Dispatcher's own helpers rather than importing them: replay must not
 # depend on constructing a full Dispatcher (chokepoint, telemetry, config), and the reads
-# are three plain `gh api` calls. Kept in lockstep with dispatch.py by shape.
+# are a few plain `gh api` calls. Kept in lockstep with dispatch.py by shape.
 
 
 async def _changed_paths(run_gh, repo: str, pr: int) -> list[str]:
     rc, out, _e = await run_gh(["api", f"repos/{repo}/pulls/{pr}/files", "--paginate", "--jq", ".[].filename"])
     return [ln.strip() for ln in out.splitlines() if ln.strip()] if rc == 0 else []
+
+
+async def _pr_is_merged(run_gh, repo: str, pr: int) -> bool:
+    """Only consulted when the file list came back empty — the empty-because-merged
+    check. An unreadable state reads as not-merged: the replay then proceeds, and
+    `confine_findings` already fails open on an empty path list, so any findings the
+    panel does produce still count — nothing is laundered into a PASS."""
+    rc, out, _e = await run_gh(["api", f"repos/{repo}/pulls/{pr}", "--jq", ".merged"])
+    return rc == 0 and out.strip() == "true"
 
 
 async def _finding_sources(run_gh, repo: str, pr: int, head: str, findings: list[dict]) -> dict:

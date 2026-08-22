@@ -22,13 +22,14 @@ def _parse(output: str) -> list[dict]:
 
 
 class ReplayGH:
-    """Read-only fake gh: PR files, a file blob, and a compare. Records every call so a
-    test can assert replay NEVER writes."""
+    """Read-only fake gh: PR files, a file blob, a compare, and the PR's merged state.
+    Records every call so a test can assert replay NEVER writes."""
 
-    def __init__(self, *, files="x.py\n", blob="", patches=None, compare=None):
+    def __init__(self, *, files="x.py\n", blob="", patches=None, compare=None, merged=False):
         self.files, self.blob = files, blob
         self.patches = patches if patches is not None else [{"f": "x.py", "p": ""}]
         self.compare = compare
+        self.merged = merged
         self.calls: list[list[str]] = []
 
     async def __call__(self, args, timeout=30):
@@ -45,6 +46,8 @@ class ReplayGH:
             return 0, json.dumps(self.patches), ""
         if "/files" in j:
             return 0, self.files, ""
+        if ".merged" in j:
+            return 0, ("true" if self.merged else "false"), ""
         return 0, "", ""
 
 
@@ -205,6 +208,62 @@ async def test_a_hallucinated_fixed_disposition_is_counted_unaccounted():
     assert out["telemetry"]["unaccounted_priors"] == 1  # the false `fixed` did not account for it
     # the OBJECTS, not just the count — the honesty axis is scored from these (SCHEMA.md)
     assert out["dispositions"] == [{"prior": "config.py:271", "disposition": "fixed", "why": "resolved"}]
+
+
+# ── an empty diff on a merged PR refuses the verdict (never a silent PASS) ────
+
+
+async def test_a_merged_pr_with_an_empty_diff_is_skip_not_pass():
+    # `pulls/{pr}/files` comes back empty once a PR is merged — the panel would run
+    # against nothing and grade a clean PASS, manufacturing a favourable eval point.
+    gh = ReplayGH(files="", merged=True)
+    r = _runner(REPORT)
+    out = await replay_review(
+        {"repo": "o/r", "pr": 9, "head": "c" * 40, "model": "protolabs/fast"},
+        run_gh=gh,
+        runner=r,
+        parse_findings=_parse,
+        trial=1,
+        stamp="T",
+    )
+    assert out["verdict"] == "SKIP"  # a data-quality signal, not a review outcome
+    assert out["findings"] == [] and out["dispositions"] == []
+    assert out["telemetry"]["empty_diff"] is True
+    assert out["telemetry"]["truncated"] is False  # distinct axes; the scorer filters both
+    assert out["run"]["pr"] == 9 and out["run"]["stamp"] == "T"  # the run block still lands
+
+
+async def test_the_merged_pr_short_circuit_is_before_the_panel_and_the_guards():
+    gh = ReplayGH(files="", merged=True)
+    r = _runner(REPORT)
+    out = await replay_review({"repo": "o/r", "pr": 9, "head": "c" * 40}, run_gh=gh, runner=r, parse_findings=_parse)
+    assert not hasattr(r, "seen")  # the finders never ran — no multi-second panel spend
+    assert out["telemetry"]["step_seconds"] == {}  # and the timings say so
+    joined = [" ".join(c) for c in gh.calls]
+    assert not any("/contents/" in c or "/compare/" in c for c in joined)  # no guard reads either
+
+
+async def test_an_open_pr_with_zero_changed_files_still_replays():
+    # Empty-because-nothing-changed is NOT empty-because-merged: the panel still runs
+    # and the verdict is computed normally.
+    gh = ReplayGH(files="", merged=False)
+    r = _runner(CLEAN_REPORT)
+    out = await replay_review({"repo": "o/r", "pr": 5, "head": "e" * 40}, run_gh=gh, runner=r, parse_findings=_parse)
+    assert out["telemetry"]["empty_diff"] is False
+    assert out["verdict"] == "PASS"
+    assert r.seen["inputs"]["pr"] == "5"  # the panel ran
+
+
+async def test_an_open_pr_with_files_never_queries_pr_state():
+    gh = ReplayGH(blob="x")
+    out = await replay_review(
+        {"repo": "o/r", "pr": 1, "head": "a" * 40},
+        run_gh=gh,
+        runner=_runner(CLEAN_REPORT),
+        parse_findings=_parse,
+    )
+    assert out["telemetry"]["empty_diff"] is False
+    assert not any(".merged" in " ".join(c) for c in gh.calls)  # the state read is empty-list-only
 
 
 async def test_include_raw_adds_the_report_text_for_faithfulness_debugging():
