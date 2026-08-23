@@ -188,6 +188,7 @@ class ProtoPatchRunner:
         )
         self._run_clawpatch = run_clawpatch or _default_run_clawpatch
         self._run_git = run_git  # tests inject; None = the cache's default runner
+        self._startup_pruned = False  # one-time cache sweep, deferred to first use
 
     async def _resolve_git_token(self) -> str | None:
         if token := resolve_token():
@@ -223,9 +224,35 @@ class ProtoPatchRunner:
             return None  # unknown — report unconfined rather than dropping everything
         return {line.strip() for line in out.splitlines() if line.strip()}
 
+    def _prune(self) -> int:
+        """Best-effort checkout-cache maintenance (TTL sweep + LRU entry/byte caps).
+        Degrades, never raises — a failed prune must not void the review (ADR 0078 D3)."""
+        try:
+            removed = self.cache.prune()
+        except Exception:  # noqa: BLE001 — maintenance is best-effort, never fatal
+            log.exception("[pr-reviewer] checkout cache prune failed")
+            return 0
+        if removed:
+            log.info("[pr-reviewer] pruned %d stale checkout(s) from the cache", removed)
+        return removed
+
     async def review(self, pr: int, repo: str) -> str:
         """The full structural pass → prose header + fenced ADR 0077 findings JSON,
-        or an `unavailable(...)` degradation message. Never raises."""
+        or an `unavailable(...)` degradation message. Never raises.
+
+        Cache maintenance rides on this entry point (pr-reviewer#87): a one-time
+        startup prune clears any garbage accumulated before this wiring existed, and a
+        prune after every run — win or fail — holds the checkout cache under its TTL +
+        entry/byte caps. Maintenance cadence, never the hot path."""
+        if not self._startup_pruned:
+            self._startup_pruned = True
+            self._prune()  # first use: sweep pre-fix accumulation before anything runs
+        try:
+            return await self._run_review(pr, repo)
+        finally:
+            self._prune()  # after each use — success or degradation alike
+
+    async def _run_review(self, pr: int, repo: str) -> str:
         if err := bad_repo(repo):
             return unavailable(err)
         gateway_key, gateway_base = self._gateway_creds()
