@@ -208,3 +208,88 @@ async def test_clean_run_emits_an_empty_array(tmp_path, gateway_env, pr_refs):
 def test_unavailable_message_prescribes_the_gap_verbatim():
     msg = unavailable("timed out after 300s")
     assert "Gap: structural pass unavailable — timed out after 300s" in msg
+
+
+# ── cache pruning: wire CheckoutCache.prune() into the review lifecycle (#87) ────
+
+
+def _count_prunes(monkeypatch, r):
+    """Replace the runner's cache.prune with a call counter; return the list."""
+    calls: list[int] = []
+    monkeypatch.setattr(r.cache, "prune", lambda: (calls.append(1), 0)[1])
+    return calls
+
+
+async def test_prune_runs_on_first_use_then_after_every_review(tmp_path, gateway_env, pr_refs, monkeypatch):
+    r = runner(tmp_path, run_clawpatch=make_clawpatch())
+    calls = _count_prunes(monkeypatch, r)
+
+    # First review: a one-time startup sweep PLUS the post-run prune.
+    await r.review(12, "octo/repo")
+    assert len(calls) == 2
+
+    # Subsequent reviews: only the post-run prune (the startup sweep never repeats).
+    await r.review(13, "octo/repo")
+    assert len(calls) == 3
+
+
+async def test_construction_does_not_prune(tmp_path, gateway_env, monkeypatch):
+    # The startup sweep is deferred to first use, not registration time — building a
+    # runner (as get_tools does) must not touch the filesystem.
+    r = runner(tmp_path)
+    calls = _count_prunes(monkeypatch, r)
+    assert calls == []
+
+
+async def test_prune_runs_after_a_failed_review(tmp_path, gateway_env, pr_refs, monkeypatch):
+    # A non-zero clawpatch exit degrades — the post-run prune must still fire.
+    r = runner(tmp_path, run_clawpatch=make_clawpatch(rc=4, stderr="boom"))
+    calls = _count_prunes(monkeypatch, r)
+    out = await r.review(12, "octo/repo")
+    assert out.startswith("PROTOPATCH UNAVAILABLE")
+    assert len(calls) == 2  # startup sweep + post-run prune, even on the failure path
+
+
+async def test_prune_runs_even_when_it_never_reaches_clawpatch(tmp_path, gateway_env, monkeypatch):
+    # An early degradation (bad repo) still gets the startup + post-run prune via the
+    # try/finally, so garbage is cleaned regardless of how the review exits.
+    r = runner(tmp_path)
+    calls = _count_prunes(monkeypatch, r)
+    out = await r.review(1, "nope")
+    assert out.startswith("PROTOPATCH UNAVAILABLE")
+    assert len(calls) == 2
+
+
+async def test_prune_failure_never_voids_the_review(tmp_path, gateway_env, pr_refs, monkeypatch):
+    # Maintenance is best-effort: a raising prune must not bubble out of review().
+    r = runner(tmp_path, run_clawpatch=make_clawpatch())
+
+    def boom():
+        raise OSError("disk gone")
+
+    monkeypatch.setattr(r.cache, "prune", boom)
+    out = await r.review(12, "octo/repo")
+    assert "reportable finding(s)" in out  # the review still returns its result
+
+
+async def test_first_review_cleans_a_preexisting_oversized_cache(tmp_path, gateway_env, pr_refs):
+    # Simulate the reference deployment: entries accumulated past TTL before the fix.
+    import os
+    import time
+
+    co = tmp_path / "co"
+    stale = co / "old-repo"
+    stale.mkdir(parents=True)
+    now = time.time()
+    for i in range(5):
+        d = stale / (str(i) * 40)
+        d.mkdir()
+        (d / "blob").write_text("x" * 1000)
+        os.utime(d, (now - 10_000, now - 10_000))  # well past the configured TTL
+
+    r = runner(tmp_path, cfg={"checkout_ttl_s": 100}, run_clawpatch=make_clawpatch())
+    await r.review(12, "octo/repo")
+
+    # The pre-fix garbage is gone; the fresh checkout for this review survives.
+    assert list(stale.iterdir()) == []
+    assert (co / "octo-repo" / SHA_HEAD).is_dir()
