@@ -136,6 +136,37 @@ def ineligible_reason(facts: dict | None) -> str | None:
     return None
 
 
+# Severity order for the strictest-verdict-wins tie-break (issue #89): a higher rank
+# is stricter, so a FAIL for a head can never be shadowed by a co-landed PASS.
+_VERDICT_RANK = {PASS: 0, WARN: 1, FAIL: 2}
+
+
+def strictest_head_round(reviews: list[dict], head: str) -> dict | None:
+    """The STRICTEST panel round posted for `head`, or None when the head has none.
+
+    Two concurrent reviews can complete for the same head and land as two separate
+    reviews — a FAIL and a PASS — and GitHub returns them in an arbitrary order.
+    `panel_rounds` folds a head's reviews into ONE round, keeping whichever it saw
+    LAST, so a PASS arriving after a co-landed FAIL would shadow it and auto-approve
+    straight past the blocker (issue #89). Collapsing by STRICTEST verdict instead
+    (FAIL > WARN > PASS) fails closed: the harsher verdict wins the tie regardless of
+    arrival order. Findings/`complete` come from the NEWEST round bearing that verdict,
+    so a promoted WARN still carries its most recent findings forward (issue #22).
+
+    Promotions (`promoted=true`) are not rounds and are excluded, same as `panel_rounds`.
+    """
+    rounds = [
+        r
+        for rev in reviews or []
+        if not rev.get("promoted") and str(rev.get("head") or "") == head
+        for r in panel_rounds([rev])
+    ]
+    if not rounds:
+        return None
+    strictest = max(_VERDICT_RANK.get(r["verdict"], -1) for r in rounds)
+    return next(r for r in reversed(rounds) if _VERDICT_RANK.get(r["verdict"], -1) == strictest)
+
+
 def _with_api_detail(err: str, out: str) -> str:
     """Fold GitHub's own error text (on stdout) into `gh`'s terse stderr line.
 
@@ -1722,6 +1753,16 @@ class Dispatcher:
         # PASS/WARN are non-blocking (promotable — Quinn's WARN "does NOT block merge");
         # a latest FAIL holds until a re-review clears it.
         latest = history[-1] if history else None
+        # Strictest-verdict-wins for the CURRENT head (issue #89). When the newest round
+        # is for the current head, re-derive its verdict as the STRICTEST across EVERY
+        # panel round that names this head. `panel_rounds` folds a head's reviews into
+        # one round keeping whichever GitHub returned LAST — a last-writer-wins race when
+        # two reviews land concurrently for the same head. A PASS arriving after a
+        # co-landed FAIL would otherwise shadow it and auto-approve straight past the
+        # blocker. Fails closed: FAIL > WARN > PASS, the harsher verdict wins the tie. A
+        # stale-head `latest` is left untouched — it holds regardless of its verdict.
+        if latest is not None and latest["head"] == head:
+            latest = strictest_head_round(ours, head) or latest
         clear = latest if latest and latest["verdict"] in (PASS, WARN) else None
         promoted = any(r["state"] == "APPROVED" and r["head"] == head for r in ours)
         obs = Observations(
