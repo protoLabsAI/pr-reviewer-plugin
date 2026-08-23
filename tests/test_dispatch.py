@@ -863,6 +863,27 @@ async def test_latest_fail_holds_even_after_an_earlier_pass(tmp_path):
     assert (await d.evaluate_promotion("o/r", 1)) == "hold:no-clear-verdict"
 
 
+async def test_strictest_verdict_wins_for_the_same_head(tmp_path):
+    # #89: two concurrent reviews land for the SAME head — one FAIL, one PASS. GitHub
+    # returns them in an arbitrary order, and panel_rounds' dedup-by-head keeps whichever
+    # it saw LAST. With the PASS returned last (the losing ordering for the old code), a
+    # last-writer-wins read would auto-approve straight past the FAIL. The strictest
+    # verdict must hold regardless of arrival order — auto-approval does NOT fire.
+    green = [{"status": "completed", "conclusion": "success"}]
+    pass_last = [review_row(HEAD, "FAIL"), review_row(HEAD, "PASS")]
+    gh = RoutedGH(pr_facts=facts(), reviews=pass_last, checks=green)
+    d = make(tmp_path, cfg={"shadow_mode": False, "promotion_owner": True}, gh=gh)
+    assert (await d.evaluate_promotion("o/r", 1)) == "hold:no-clear-verdict"
+    assert gh.posted == []  # no APPROVE posted — the strictest (FAIL) wins the tie
+
+    # ...and symmetrically with the FAIL returned last, so the guarantee is order-free.
+    fail_last = [review_row(HEAD, "PASS"), review_row(HEAD, "FAIL")]
+    gh2 = RoutedGH(pr_facts=facts(), reviews=fail_last, checks=green)
+    d2 = make(tmp_path, cfg={"shadow_mode": False, "promotion_owner": True}, gh=gh2)
+    assert (await d2.evaluate_promotion("o/r", 1)) == "hold:no-clear-verdict"
+    assert gh2.posted == []
+
+
 class FailingApproveGH(RoutedGH):
     """APPROVE POSTs always fail (GitHub 422-style); everything else routed normally."""
 
