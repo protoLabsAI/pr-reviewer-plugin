@@ -40,6 +40,13 @@ class FakeGH:
         self.posted: list[dict] = []
         self.responses = responses or {}
 
+    @property
+    def reviews_posted(self) -> list[dict]:
+        """The POSTs that were REVIEWS. `posted` also carries the `QA panel` check-run
+        writes now, so a test that means "the review we posted" must filter — asserting
+        on `posted[0]` would silently start reading a different write."""
+        return [p for p in self.posted if "/reviews" in p.get("url", "")]
+
     async def __call__(self, args, timeout=30):
         self.calls.append(args)
         url = args[1] if len(args) > 1 else ""
@@ -431,7 +438,7 @@ async def test_a_locked_pr_holds_promotion_and_regate_too(tmp_path):
     gh2 = RoutedGH(pr_facts=facts(locked=True), reviews=[review_row(HEAD, "FAIL")], checks=[])
     d2 = make(tmp_path / "regate", cfg={"shadow_mode": False, "regate": True}, gh=gh2)
     assert (await d2.evaluate_regate("o/r", 1)) == "hold:pr-not-eligible"
-    assert gh2.posted == []
+    assert gh2.reviews_posted == []
 
     # …and BOTH sweep legs say why. Asserting the return value alone would let a
     # regression drop `why=` silently, which is the exact class of gap this PR closes.
@@ -662,7 +669,7 @@ async def test_a_leaked_chain_of_thought_never_reaches_the_posted_body(tmp_path)
 
     d = make(tmp_path, gh=gh, runner=runner)
     assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "reviewed:FAIL"
-    body = gh.posted[0]["body"]
+    body = gh.reviews_posted[0]["body"]
     assert "let me reconsider" not in body.lower()
     assert "review-synthesizer completed" not in body
     # Nor the deliberation's DRAFT disposition — the decided one is what the panel is
@@ -682,7 +689,7 @@ async def test_a_report_with_no_delimited_brief_still_posts_and_says_so(tmp_path
 
     d = make(tmp_path, gh=gh, runner=runner)
     assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "reviewed:FAIL"
-    body = gh.posted[0]["body"]
+    body = gh.reviews_posted[0]["body"]
     assert "undelimited thinking" not in body  # fails CLOSED — the old cut failed open here
     assert "brief could not be read" in body
     assert json.loads(extract_findings_json(body))[0]["file"] == "x.py"  # the review still lands
@@ -756,7 +763,7 @@ async def test_promotion_green_path_approves_when_owned(tmp_path):
     gh = RoutedGH(pr_facts=facts(), reviews=[review_row(HEAD, "PASS")], checks=green)
     d = make(tmp_path, cfg={"shadow_mode": False, "promotion_owner": True}, gh=gh)
     assert (await d.evaluate_promotion("o/r", 1)) == "promote"
-    assert gh.posted[0]["event"] == "APPROVE" and "promoted=true" in gh.posted[0]["body"]
+    assert gh.reviews_posted[0]["event"] == "APPROVE" and "promoted=true" in gh.reviews_posted[0]["body"]
 
 
 async def test_promotion_holds_in_shadow_or_without_ownership(tmp_path):
@@ -777,7 +784,7 @@ async def test_promotion_holds_on_an_incomplete_clear_verdict(tmp_path):
     gh = RoutedGH(pr_facts=facts(), reviews=[review_row(HEAD, "PASS", complete=False)], checks=green)
     d = make(tmp_path, cfg={"shadow_mode": False, "promotion_owner": True}, gh=gh)
     assert (await d.evaluate_promotion("o/r", 1)) == "hold:incomplete-coverage"
-    assert gh.posted == []  # held, not approved
+    assert gh.reviews_posted == []  # held, not approved
 
 
 async def test_a_structural_gateway_failure_stamps_complete_false_on_the_verdict(tmp_path):
@@ -852,7 +859,7 @@ async def test_warn_verdict_is_non_blocking_and_promotes_on_green(tmp_path):
     gh = RoutedGH(pr_facts=facts(), reviews=[review_row(HEAD, "WARN")], checks=green)
     d = make(tmp_path, cfg={"shadow_mode": False, "promotion_owner": True}, gh=gh)
     assert (await d.evaluate_promotion("o/r", 1)) == "promote"
-    assert "WARN verdict" in gh.posted[0]["body"]
+    assert "WARN verdict" in gh.reviews_posted[0]["body"]
 
 
 async def test_latest_fail_holds_even_after_an_earlier_pass(tmp_path):
@@ -874,14 +881,14 @@ async def test_strictest_verdict_wins_for_the_same_head(tmp_path):
     gh = RoutedGH(pr_facts=facts(), reviews=pass_last, checks=green)
     d = make(tmp_path, cfg={"shadow_mode": False, "promotion_owner": True}, gh=gh)
     assert (await d.evaluate_promotion("o/r", 1)) == "hold:no-clear-verdict"
-    assert gh.posted == []  # no APPROVE posted — the strictest (FAIL) wins the tie
+    assert gh.reviews_posted == []  # no APPROVE posted — the strictest (FAIL) wins the tie
 
     # ...and symmetrically with the FAIL returned last, so the guarantee is order-free.
     fail_last = [review_row(HEAD, "PASS"), review_row(HEAD, "FAIL")]
     gh2 = RoutedGH(pr_facts=facts(), reviews=fail_last, checks=green)
     d2 = make(tmp_path, cfg={"shadow_mode": False, "promotion_owner": True}, gh=gh2)
     assert (await d2.evaluate_promotion("o/r", 1)) == "hold:no-clear-verdict"
-    assert gh2.posted == []
+    assert gh2.reviews_posted == []
 
 
 class FailingApproveGH(RoutedGH):
@@ -1462,7 +1469,7 @@ async def test_disabling_regate_leaves_promotion_working(tmp_path):
     d = make(tmp_path, cfg={"shadow_mode": False, "promotion_owner": True, "regate": False}, gh=gh)
     outcome, _ = await d.reconcile_pr("o/r", 1, backfill_budget=0)
     assert outcome == "promote"
-    assert gh.posted[0]["event"] == "APPROVE"
+    assert gh.reviews_posted[0]["event"] == "APPROVE"
 
 
 def test_regate_env_fallback_and_default(monkeypatch, tmp_path):
@@ -1556,7 +1563,7 @@ async def test_round_three_minor_in_delta_posts_pass_with_notes(tmp_path):
     runner, _seen = capturing_runner(MINOR_REPORT)
     d = make(tmp_path, gh=gh, runner=runner)
     assert (await d.handle_pr_event("o/r", 1, HEAD, "synchronize")) == "reviewed:PASS"
-    body = gh.posted[0]["body"]
+    body = gh.reviews_posted[0]["body"]
     assert f"head={HEAD} verdict=PASS" in body
     assert "notes, not gates" in body and "- [ ] `x.py:12`" in body  # nothing hidden
     assert '"claim": "dup"' in body  # the findings JSON still ships
@@ -1629,7 +1636,7 @@ async def test_a_clean_pass_that_drops_a_prior_major_does_not_dismiss_the_block(
     d = make(tmp_path, cfg={"shadow_mode": False}, gh=gh, runner=runner)
     assert (await d.handle_pr_event("o/r", 1, HEAD, "synchronize")) == "reviewed:PASS"
     assert gh.dismissed == []  # the standing REQUEST_CHANGES stays up
-    body = gh.posted[0]["body"]
+    body = gh.reviews_posted[0]["body"]
     assert "does not lift the standing block" in body
     assert "real bug" in body  # the dropped finding is named, not merely counted
 
@@ -1729,7 +1736,7 @@ async def test_a_fabricated_blocker_is_downgraded_and_cannot_fail(tmp_path):
     runner, _seen = capturing_runner(FABRICATED_REPORT)
     d = make(tmp_path, cfg={"shadow_mode": False}, gh=gh, runner=runner)
     assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "reviewed:WARN"
-    body = gh.posted[0]["body"]
+    body = gh.reviews_posted[0]["body"]
     assert gh.posted[0]["event"] == "COMMENT"  # not REQUEST_CHANGES
     assert "downgraded to **uncertain**" in body
     assert "Path(str(configured))" in body  # the absent quote is named
@@ -1854,8 +1861,8 @@ async def test_promoting_a_warn_carries_its_findings_into_the_approval(tmp_path)
     gh = RoutedGH(pr_facts=facts(), reviews=[review_row(HEAD, "WARN", findings_json=WARN_FINDING)], checks=green)
     d = make(tmp_path, cfg={"shadow_mode": False, "promotion_owner": True}, gh=gh)
     assert (await d.evaluate_promotion("o/r", 1)) == "promote"
-    body = gh.posted[0]["body"]
-    assert gh.posted[0]["event"] == "APPROVE"  # still non-blocking — NOT a gate
+    body = gh.reviews_posted[0]["body"]
+    assert gh.reviews_posted[0]["event"] == "APPROVE"  # still non-blocking — NOT a gate
     assert "findings=1" in body  # machine-readable, no prose parsing needed
     assert "Open findings carried by this approval" in body
     assert "malformed diff: label" in body
@@ -1866,7 +1873,7 @@ async def test_a_clean_pass_promotion_is_unchanged(tmp_path):
     gh = RoutedGH(pr_facts=facts(), reviews=[review_row(HEAD, "PASS")], checks=green)
     d = make(tmp_path, cfg={"shadow_mode": False, "promotion_owner": True}, gh=gh)
     assert (await d.evaluate_promotion("o/r", 1)) == "promote"
-    body = gh.posted[0]["body"]
+    body = gh.reviews_posted[0]["body"]
     assert "findings=" not in body and "Open findings carried" not in body
 
 
@@ -1934,13 +1941,13 @@ async def test_a_promotion_carrying_findings_is_not_re_promoted(tmp_path):
     gh = RoutedGH(pr_facts=facts(), reviews=[review_row(HEAD, "WARN", findings_json=warn_finding)], checks=green)
     d = make(tmp_path, cfg={"shadow_mode": False, "promotion_owner": True}, gh=gh)
     assert (await d.evaluate_promotion("o/r", 1)) == "promote"
-    body = gh.posted[0]["body"]
+    body = gh.reviews_posted[0]["body"]
     assert "findings=1" in body
 
     # Feed our own promotion back in, exactly as _our_reviews would see it next tick.
     gh.reviews.append({"state": "APPROVED", "body": body, "id": 99})
     assert (await d.evaluate_promotion("o/r", 1)) == "hold:already-promoted"
-    assert len(gh.posted) == 1  # not a second APPROVE
+    assert len(gh.reviews_posted) == 1  # not a second APPROVE
 
 
 # ── a summon forces a review the reaffirm path would have skipped (#28) ──────
@@ -2372,7 +2379,7 @@ async def test_a_mid_round_push_demotes_only_the_findings_it_touched(tmp_path):
     runner, _seen = capturing_runner(STALE_ROUND_REPORT)
     d = make(tmp_path, gh=gh, runner=runner)
     assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "reviewed:FAIL"
-    body = gh.posted[0]["body"]
+    body = gh.reviews_posted[0]["body"]
     # The synthesis header names the move and the demotion count…
     assert f"PR advanced 2 commit(s) during this round (`{HEAD[:12]}` → `{PUSHED_HEAD[:12]}`)" in body
     assert "1 finding(s) in the delta were demoted to *possibly addressed*" in body
@@ -2394,7 +2401,7 @@ async def test_an_unresolvable_current_head_posts_as_is_with_a_note(tmp_path):
     runner, _seen = capturing_runner(STALE_ROUND_REPORT)
     d = make(tmp_path, gh=gh, runner=runner)
     assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "reviewed:FAIL"
-    body = gh.posted[0]["body"]
+    body = gh.reviews_posted[0]["body"]
     assert "could not be resolved at post time" in body
     assert all(f["verdict"] == "confirmed" for f in json.loads(extract_findings_json(body)))
     assert not any("/compare/" in " ".join(c) for c in gh.calls)  # nothing to compare against
@@ -2408,7 +2415,7 @@ async def test_an_unreadable_stale_delta_notes_the_move_but_demotes_nothing(tmp_
     runner, _seen = capturing_runner(STALE_ROUND_REPORT)
     d = make(tmp_path, gh=gh, runner=runner)
     assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "reviewed:FAIL"
-    body = gh.posted[0]["body"]
+    body = gh.reviews_posted[0]["body"]
     assert "the delta could not be read" in body
     assert all(f["verdict"] == "confirmed" for f in json.loads(extract_findings_json(body)))
 
@@ -2420,7 +2427,7 @@ async def test_an_unmoved_head_posts_the_unchanged_body_with_no_stale_machinery(
     runner, _seen = capturing_runner(STALE_ROUND_REPORT)
     d = make(tmp_path, gh=gh, runner=runner)
     assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "reviewed:FAIL"
-    body = gh.posted[0]["body"]
+    body = gh.reviews_posted[0]["body"]
     assert "PR advanced" not in body and "possibly addressed" not in body
     assert "could not be resolved at post time" not in body
     assert not any("/compare/" in " ".join(c) for c in gh.calls)

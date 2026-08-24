@@ -195,7 +195,38 @@ compose env (re-applied every roll) to keep the config volume disposable:
 | `PR_REVIEWER_EVIDENCE_GROUNDING` | `pr_reviewer.evidence_grounding` | `true` | A finding whose quoted code appears nowhere in the cited file at the reviewed head (nor in this PR's patch for it) is annotated `uncertain` — it still posts, it just can't carry a FAIL. Fails open on an unreadable blob or unquotable evidence. |
 | `PR_REVIEWER_HOLD_UNEXPLAINED_CLEARANCE` | `pr_reviewer.hold_unexplained_clearance` | `true` | A zero-finding PASS does not dismiss our standing block when a prior round confirmed a blocker/major it neither reports nor explains. A second consecutive clean PASS lifts it. `false` restores the old always-dismiss behaviour. |
 | `PR_REVIEWER_CONVERGENCE_ROUNDS` | `pr_reviewer.convergence_rounds` | `3` | The round from which an all-minor, all-in-delta WARN retires to PASS-with-notes. `0` disables the rule — the panel keeps re-reviewing rather than ever floor a minor. |
+| `PR_REVIEWER_QA_CHECK` | `pr_reviewer.qa_check` | `true` | Publish the **`QA panel` check run** (below). Rides the promotion-owner gate, so a shadow repo publishes nothing. `false` keeps approve-on-green without the check. |
 | `PR_REVIEWER_REGATE` | `pr_reviewer.regate` | `true` | Master switch for step 2 below. `false` stops arming blocks while KEEPING the formal seat, promotion and backfill — the lever to pull when the panel is emitting false FAILs. |
+
+### The `QA panel` check run — the verdict as an enforceable gate
+
+An App's **approval never satisfies a required approving review**: GitHub counts
+approvals from reviewers with write access, and an App is not one (its reviews carry
+`author_association: NONE`). So on a repo that requires review, the panel could approve
+and the merge stayed `BLOCKED` — the verdict had no way to gate anything.
+
+A **check run** from the same App is a first-class required status, so the panel now
+publishes one, named **`QA panel`**, driven by the same decision as approve-on-green:
+
+| The panel's state | The check |
+|---|---|
+| Clear verdict, findings resolved (or already promoted) | ✅ success |
+| Findings still open — unresolved review threads | ❌ failure |
+| `FAIL` verdict standing against this head | ❌ failure |
+| No verdict yet / stale head / incomplete pass | ⏳ in progress |
+| CI pending, red, or unreadable | ⏳ in progress — CI already blocks; we don't say it twice |
+
+Note the WARN rule is unchanged: a WARN whose threads are all resolved goes **green**.
+What blocks is feedback nobody addressed.
+
+**To make it enforce**, add `QA panel` to the branch's required status checks (ruleset →
+*Require status checks to pass*). Everything inherits it — a human's PR, and
+projectBoard-plugin's auto-merge, which gates on `mergeStateStatus`.
+
+Requires the App installation to carry **Checks: read & write**; without it the write
+logs a warning naming that permission and the panel otherwise behaves as before. The
+check is written only where this agent owns promotion — a *required* check that nobody
+drives would block every merge in that repo forever.
 
 ### What the sweep does (every `sweep_interval_s`, default 180s)
 

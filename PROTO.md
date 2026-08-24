@@ -96,4 +96,5 @@ Approve-on-green posts a marker-bearing review with no findings. Anything readin
 | `rounds.py` | Convergence logic — tracks panel rounds and approval history |
 | `verdicts.py` | Verdict logic — `verdict_for` maps findings to a verdict |
 | `protopatch.py` | Structural engine bridge — wraps the protopatch analyser |
+| `checks.py` | The `QA panel` check run — the pure decision→check mapping (the writer lives in `dispatch.py`) |
 | `webhook.py` | Inbound — receives GitHub webhook events |

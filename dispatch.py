@@ -28,8 +28,10 @@ import logging
 import os
 import re
 import time
+from urllib.parse import quote
 
 from .approve import HOLD_NOT_OWNER, PROMOTE, Observations, promotion_decision
+from .checks import CHECK_NAME, CheckRun, check_for
 from .chokepoint import DISPATCH_ACTIONS, Chokepoint
 from .gh_cli import bad_repo, run_gh
 from .grounding import apply_grounding, correct_line_numbers, render_grounding_footnote
@@ -450,6 +452,17 @@ class Dispatcher:
         )
 
     @property
+    def qa_check(self) -> bool:
+        """Publish the `QA panel` check run (checks.py) alongside the verdict review.
+
+        On by default, and inert until a repo's ruleset lists `QA panel` as a required
+        status — until then it is one more line in the PR's check list. It rides the same
+        promotion-owner gate as approve-on-green, so a shadow-mode repo publishes nothing:
+        a REQUIRED check that nobody drives blocks every merge in that repo forever."""
+        cfg = self.cfg
+        return bool(cfg["qa_check"]) if "qa_check" in cfg else _env_bool("PR_REVIEWER_QA_CHECK", True)
+
+    @property
     def panel_retries(self) -> int:
         """D3 says an exhausted run is "retry or escalate" — we do both, in that order.
         A failed panel step is usually transient, and the alternative to retrying is a
@@ -834,7 +847,7 @@ class Dispatcher:
                 # Not `[…]`: a commit with 30+ check runs paginates, and a truncated
                 # read here decides PROMOTION — dropping the one pending or failed run
                 # on page 2 reads as all-green (#75).
-                ".check_runs[] | {status: .status, conclusion: .conclusion}",
+                ".check_runs[] | {status: .status, conclusion: .conclusion, name: .name}",
             ],
         )
         if rc != 0:
@@ -842,6 +855,11 @@ class Dispatcher:
         runs = gh_json_rows(out)
         if runs is None:
             return None  # unreadable ⇒ checks-unknown, which holds promotion
+        # Our OWN check run is not one of the checks we are waiting on. It sits
+        # `in_progress` until the panel clears the head, so counting it makes this read
+        # "pending" forever: the panel would hold on checks-pending, never clear, and
+        # never conclude its own check. A gate deadlocked on itself.
+        runs = [r for r in runs if r.get("name") != CHECK_NAME]
         if not runs:
             return "no-checks"
         if any(r.get("status") in _NON_TERMINAL for r in runs):
@@ -1782,6 +1800,21 @@ class Dispatcher:
             return HOLD_PROMOTE_BACKOFF
         decision = promotion_decision(obs)
         self.telemetry.emit("promotion", repo=repo, pr=pr, sha=head, decision=decision)
+        # The gate GitHub can enforce (checks.py). Written from the SAME decision that
+        # drives approve-on-green — one judgement, published two ways — and before the
+        # early return, so a hold is what the check reports too. It deliberately does not
+        # wait on the APPROVE below: the check states what the PANEL concluded about this
+        # head, which is true whether or not the courtesy review posts.
+        await self._publish_qa_check(
+            repo,
+            head,
+            check_for(
+                decision,
+                # The latest verdict FOR THIS HEAD — a stale one is not this head's.
+                verdict=(latest["verdict"] if latest and latest["head"] == head else None),
+                unresolved=obs.unresolved_threads,
+            ),
+        )
         if decision != PROMOTE:
             return decision
         verdict = clear["verdict"] if clear else PASS
@@ -1836,6 +1869,82 @@ class Dispatcher:
             armed = rc2 == 0
         self.telemetry.emit("promoted", repo=repo, pr=pr, sha=head, auto_merge_armed=armed)
         return PROMOTE
+
+    async def _publish_qa_check(self, repo: str, sha: str, run: CheckRun) -> None:
+        """Publish (or update) this head's `QA panel` check run. Degrades, never raises.
+
+        Idempotent by state, not by call: the sweep re-evaluates every open PR every few
+        minutes, and re-POSTing would stack a new check run per pass — GitHub keeps them
+        all, so a week-old PR would carry hundreds and the PR's check list would become
+        unreadable. So: read ours for this SHA, PATCH it when what we would say changed,
+        and write nothing at all when it hasn't.
+        """
+        if not self.qa_check:
+            return
+        rc, out, _err = await self._run_gh(
+            [
+                "api",
+                f"repos/{repo}/commits/{sha}/check-runs?check_name={quote(CHECK_NAME)}",
+                "--jq",
+                ".check_runs[0] | {id: .id, status: .status, conclusion: .conclusion, title: .output.title}",
+            ],
+        )
+        existing: dict = {}
+        if rc == 0 and out.strip() and out.strip() != "null":
+            try:
+                parsed = json.loads(out)
+            except json.JSONDecodeError:
+                parsed = None
+            # Anything but an object means the read didn't answer the question we asked
+            # (a jq that matched nothing, a shape change) — treat it as "no run yet" and
+            # create one, rather than subscripting whatever came back.
+            existing = parsed if isinstance(parsed, dict) else {}
+        if (
+            existing.get("status") == run.status
+            and (existing.get("conclusion") or None) == run.conclusion
+            and (existing.get("title") or "") == run.title
+        ):
+            return  # already says exactly this
+        fields = [
+            "-f",
+            f"status={run.status}",
+            "-f",
+            f"output[title]={run.title}",
+            "-f",
+            f"output[summary]={run.summary}",
+        ]
+        if run.conclusion:
+            fields += ["-f", f"conclusion={run.conclusion}"]
+        if existing.get("id"):
+            args = ["api", f"repos/{repo}/check-runs/{existing['id']}", "-X", "PATCH", *fields]
+        else:
+            args = [
+                "api",
+                f"repos/{repo}/check-runs",
+                "-X",
+                "POST",
+                "-f",
+                f"name={CHECK_NAME}",
+                "-f",
+                f"head_sha={sha}",
+                *fields,
+            ]
+        rc, _out, err = await self._run_gh(args, timeout=60)
+        if rc != 0:
+            # A missing `checks: write` on the App installation lands here on every pass;
+            # say which permission, once you read the log, rather than a bare 403.
+            log.warning(
+                "[pr-reviewer] could not publish the %s check on %s@%s (needs App permission "
+                "`Checks: read & write`): %s",
+                CHECK_NAME,
+                repo,
+                sha[:7],
+                err[-200:],
+            )
+            return
+        self.telemetry.emit(
+            "qa_check", repo=repo, sha=sha, status=run.status, conclusion=run.conclusion or "", title=run.title
+        )
 
     async def _map_checks_for_promotion(self, repo: str, sha: str) -> str | None:
         state = await self._checks_state(repo, sha)
