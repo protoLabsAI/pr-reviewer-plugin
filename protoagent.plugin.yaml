@@ -2,7 +2,7 @@
 # Keep `version` in lockstep with pyproject.toml (tests/test_version.py asserts it).
 id: pr-reviewer
 name: PR reviewer (review machinery + structural engine)
-version: 0.35.0
+version: 0.36.0
 description: >-
   The deterministic half of the PR-review QA tier (protoAgent ADR 0078). Ships the
   `protopatch_review` tool — a budgeted, checkout-cached run of the protoPatch
@@ -35,6 +35,9 @@ config:
   shadow_mode: true            # true = every verdict posts as a COMMENT review (never blocks)
   promotion_owner: false       # true (AND shadow_mode false) = this agent owns COMMENTED→APPROVE
                                # promotion for its repos; two promoters racing double-merges
+  qa_check: true               # publish the `QA panel` check run (the verdict as a gate a
+                               # ruleset can require). Needs App perm Checks: read & write;
+                               # written only where this agent owns promotion.
   cooldown_s: 30               # chokepoint window per repo#pr@sha (webhook burst collapse)
   allow_self_review: false     # TESTING ONLY: lift the never-review-your-own-PR rail
   viewer_login: ""             # OUR login, for the never-review-your-own-PR rail. REQUIRED on
