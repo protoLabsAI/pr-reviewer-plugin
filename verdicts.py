@@ -367,7 +367,19 @@ def verification_ran(verify_output: str, findings: list[dict] | None) -> bool:
     if VERIFY_GAP_PREFIX in verify_output or NOTHING_TO_VERIFY in verify_output:
         # The verifier says it saw nothing while the panel is reporting findings.
         return False
-    return any(str(f.get("verdict") or "").strip() for f in findings)
+    # EVERY finding, not merely one. A round that annotates some and silently drops the
+    # rest reads as verified while carrying unchecked claims beside checked ones — which
+    # is how a stale finding survived a round on protoAgent#3113, sitting verdict-less
+    # next to a verified peer. Findings carried forward from a prior round are stamped
+    # `verdict: confirmed` by `merge_carried_findings`, so legitimate debt does not trip
+    # this; only a finding this round's verifier failed to reach does.
+    unverified = [f for f in findings if not str(f.get("verdict") or "").strip()]
+    if unverified:
+        return False
+    # And when the verifier states its own coverage, believe it over the annotations: a
+    # count short of the findings it was handed is the verifier telling us it ran out.
+    m = re.search(r"VERIFY_STATUS:\s*annotated\s+n=(\d+)", verify_output)
+    return not (m and int(m.group(1)) < len(findings))
 
 
 def render_verdict_body(

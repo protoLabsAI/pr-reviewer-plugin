@@ -487,6 +487,29 @@ def test_findings_with_no_verdicts_are_unverified():
     assert verification_ran("VERIFY_STATUS: annotated n=2", findings) is False
 
 
+def test_a_partially_verified_round_is_unverified():
+    """One annotated finding does not vouch for the unannotated one beside it.
+
+    The protoAgent#3113 shape: a stale finding rode a round verdict-less next to a
+    verified peer, and the round still read as verified.
+    """
+    findings = [{"summary": "a", "verdict": "confirmed"}, {"summary": "b"}]
+    assert verification_ran("VERIFY_STATUS: annotated n=1", findings) is False
+
+
+def test_a_coverage_count_short_of_the_findings_is_unverified():
+    """Believe the verifier's own count even when every finding happens to carry one."""
+    findings = [{"summary": "a", "verdict": "confirmed"}, {"summary": "b", "verdict": "confirmed"}]
+    assert verification_ran("VERIFY_STATUS: annotated n=1", findings) is False
+
+
+def test_carried_findings_do_not_trip_the_coverage_rule():
+    """merge_carried_findings stamps `confirmed`, so durable debt stays verified."""
+    carried = merge_carried_findings([], [{"file": "a.py", "line": 1, "claim": "x"}])
+    assert carried and all(f.get("verdict") for f in carried)
+    assert verification_ran(f"VERIFY_STATUS: annotated n={len(carried)}", carried) is True
+
+
 def test_verifier_reporting_nothing_while_findings_exist_is_unverified():
     """The exact observed failure: findings raised, verifier saw an empty array."""
     findings = [{"summary": "a", "verdict": "confirmed"}]
