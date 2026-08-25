@@ -344,6 +344,32 @@ def demote_stale_findings(findings: list[dict], ranges: dict[str, list[tuple[int
     return out, demoted
 
 
+NOTHING_TO_VERIFY = "VERIFY_STATUS: nothing-to-verify"
+VERIFY_GAP_PREFIX = "VERIFY_GAP:"
+
+
+def verification_ran(verify_output: str, findings: list[dict] | None) -> bool:
+    """Did the verify pass actually check the findings the panel is reporting?
+
+    The distinction this exists to draw: an empty verify pass on a clean PR is the
+    NORMAL result — there was nothing to check — while an empty verify pass over real
+    findings means the verdict rests on claims nobody grounded. Those two looked
+    identical downstream, so every clean review carried an alarming "no structural
+    invariants were independently confirmed" note, which trains a reader to ignore the
+    one case where it matters.
+
+    Conservative by construction: unparseable output over real findings reads as
+    unverified, because wrongly trusting an unverified PASS merges a defect behind a
+    green badge, while wrongly withholding costs one human glance.
+    """
+    if not findings:
+        return True  # nothing to verify is not a failure to verify
+    if VERIFY_GAP_PREFIX in verify_output or NOTHING_TO_VERIFY in verify_output:
+        # The verifier says it saw nothing while the panel is reporting findings.
+        return False
+    return any(str(f.get("verdict") or "").strip() for f in findings)
+
+
 def render_verdict_body(
     *,
     repo: str,
@@ -360,6 +386,7 @@ def render_verdict_body(
     confined: list[dict] | None = None,
     notes: str = "",
     complete: bool = True,
+    verified: bool = True,
     stale_note: str = "",
 ) -> str:
     """The comment body, ASSEMBLED — marker line (machine), header (human), the brief,
@@ -395,9 +422,17 @@ def render_verdict_body(
     # finder timeout) — the promotion gate reads it to refuse auto-approve on a clean
     # verdict over incomplete coverage (#49). Emitted only when incomplete, so a normal
     # marker is unchanged and an older marker parses as complete by default.
+    # `verified=false` records that findings existed but the verify pass annotated none
+    # of them — the panel's evidence step did not actually run. Distinct from
+    # `complete=false` (a FINDER didn't run): coverage was fine, the checking wasn't.
+    # Both withhold auto-approve for the same reason — a clean verdict nobody checked is
+    # not a clean verdict. Emitted only when true, so a normal marker is unchanged and an
+    # older one parses as verified by default.
     marker = f"<!-- protoagent-qa-review head={head_sha} verdict={verdict} promoted=false"
     if not complete:
         marker += " complete=false"
+    if not verified:
+        marker += " verified=false"
     marker += " -->"
     sections = [
         f"{marker}\n## QA panel review — **{verdict}**\n_{recipe} · head `{head_sha[:12]}` · {mode}_",
@@ -428,11 +463,13 @@ def parse_verdict_marker(body: str) -> dict | None:
     # it out of the matched marker text. Absent ⇒ True (markers predate the attribute and
     # a plain review IS complete) — only an explicit `complete=false` withholds promotion.
     complete = "complete=false" not in m.group(0)
+    verified = "verified=false" not in m.group(0)
     return {
         "head": m.group("head"),
         "verdict": m.group("verdict"),
         "promoted": m.group("promoted") == "true",
         "complete": complete,
+        "verified": verified,
     }
 
 

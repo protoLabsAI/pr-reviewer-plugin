@@ -34,6 +34,7 @@ HOLD_STALE_HEAD = "hold:stale-head"
 HOLD_ALREADY_PROMOTED = "hold:already-promoted"
 HOLD_NOT_OWNER = "hold:not-promotion-owner"
 HOLD_INCOMPLETE = "hold:incomplete-coverage"
+HOLD_UNVERIFIED = "hold:unverified"
 
 
 @dataclass(frozen=True)
@@ -57,6 +58,9 @@ class Observations:
     # incomplete analysis, and must not auto-approve (#49). Defaults True so a marker
     # from before this field existed is not retroactively treated as incomplete.
     complete: bool = True
+    # False when findings existed but none carry a verdict — the verify pass did not
+    # run. Defaults True so a marker from before this field is not retroactively held.
+    verified: bool = True
 
 
 def promotion_decision(obs: Observations) -> str:
@@ -70,6 +74,11 @@ def promotion_decision(obs: Observations) -> str:
         return HOLD_STALE_HEAD
     if obs.verdict_promoted:
         return HOLD_ALREADY_PROMOTED
+    if not obs.verified:
+        # A PASS nobody verified has not earned approve-on-green. This is the same
+        # argument as incomplete coverage one step later in the pipeline: there, a
+        # finder never looked; here, nothing checked what the finders claimed.
+        return HOLD_UNVERIFIED
     if not obs.complete:
         # A clear verdict on incomplete coverage is not earned: a finder that was meant
         # to run didn't (protoPatch down, a finder timed out), so "no findings" is

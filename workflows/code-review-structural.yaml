@@ -282,6 +282,19 @@ steps:
       confirmed/refuted/uncertain + a one-line note. Return the same fenced
       findings array, annotated — preserve every field, including `source`.
 
+      **Begin your reply with exactly one status line**, before anything else:
+
+      - `VERIFY_STATUS: annotated n=<count>` — you received findings and annotated
+        every one of them with a verdict.
+      - `VERIFY_STATUS: nothing-to-verify` — you received an empty findings array.
+        This is the normal result for a clean PR and is NOT a problem; say it plainly
+        rather than describing it as a gap or a pass that failed to run.
+
+      Downstream cannot otherwise distinguish "there was nothing to check" from "the
+      check did not happen", and those two mean opposite things about how much the
+      verdict is worth. If you annotated some findings but not all, use `annotated`
+      with the count you actually annotated and say which you skipped and why.
+
       Server-resolved refs (empty when not provided): head SHA
       "{{inputs.head_sha}}", base ref "{{inputs.base_ref}}".
 
@@ -376,9 +389,26 @@ steps:
       annotated the findings below. Drop the "refuted" ones, keep "uncertain"
       ones marked as such, re-rank, and produce the deliverable: the prose
       brief first (overall risk, fix-first item, what the panel disagreed on,
-      what verification changed, any Gaps — including a skipped structural
-      pass), then the canonical fenced findings JSON as the FINAL block of
-      your reply.
+      what verification changed, any Gaps), then the canonical fenced findings
+      JSON as the FINAL block of your reply.
+
+      ## Whether verification actually happened — say the true one
+
+      You are given the synthesized findings AND the verifier's reply, because the
+      verifier's reply alone cannot tell these apart, and reporting the wrong one
+      either cries wolf on every clean PR or hides a real gap:
+
+      - Synthesized findings were EMPTY and the verifier said `nothing-to-verify`:
+        the panel found nothing. Write "no findings were raised, so there was nothing
+        to verify." That is **not** a Gap — do not mention a skipped or empty
+        structural pass, and do not suggest re-running anything.
+      - Findings existed and the verifier returned `annotated n=<count>` covering
+        them: normal. Report what verification changed.
+      - **Findings existed but the verifier returned no status line, no annotations,
+        or a count short of the findings it was given: that is a real Gap.** Say so
+        prominently, name how many went unverified, and state that the verdict rests
+        on unverified findings. Emit `VERIFY_GAP: unverified=<count>` on its own line
+        inside the brief so the publisher can withhold auto-approval.
 
       The PR comment is BUILT from your blocks, per your output discipline: put the
       brief between `<!-- brief -->` and `<!-- /brief -->`, ahead of the findings JSON.
@@ -415,5 +445,11 @@ steps:
       `evidence` re-breaks its grounding (the verifier normalized it to the file's
       exact text on purpose; keep it byte-for-byte).
 
+      ## The findings as synthesized, BEFORE verification
+      <synthesized>
+      {{steps.synthesize.output}}
+      </synthesized>
+
+      ## The verifier's reply
       {{steps.verify.output}}
 output: "{{steps.report.output}}"

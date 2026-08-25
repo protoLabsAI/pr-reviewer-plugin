@@ -13,6 +13,7 @@ from pr_reviewer.approve import (
     HOLD_STALE_HEAD,
     HOLD_THREADS_UNKNOWN,
     HOLD_THREADS_UNRESOLVED,
+    HOLD_UNVERIFIED,
     PROMOTE,
     Observations,
     promotion_decision,
@@ -70,3 +71,16 @@ def test_incomplete_coverage_holds_even_on_a_perfectly_green_pass():
     assert promotion_decision(obs(complete=True)) == PROMOTE
     # completeness defaults True, so a marker from before the field promotes as before.
     assert promotion_decision(obs()) == PROMOTE
+
+
+def test_an_unverified_pass_is_not_auto_approved():
+    """A clean verdict nobody checked has not earned approve-on-green.
+
+    Same argument as incomplete coverage one step earlier: there a finder never
+    looked, here nothing grounded what the finders claimed.
+    """
+    assert promotion_decision(obs(verified=False)) == HOLD_UNVERIFIED
+
+
+def test_a_verified_pass_still_promotes():
+    assert promotion_decision(obs(verified=True)) == PROMOTE
