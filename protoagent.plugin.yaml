@@ -39,6 +39,12 @@ config:
                                # ruleset can require). Needs App perm Checks: read & write;
                                # written only where this agent owns promotion.
   cooldown_s: 30               # chokepoint window per repo#pr@sha (webhook burst collapse)
+  max_concurrent_panels: 3     # CROSS-PR cap on panels running at once (webhook dispatch layer).
+                               # A burst of N events would otherwise launch N panels × ~5 finders =
+                               # ~5N concurrent LLM calls (a 14-PR burst measured 70). Sized so the
+                               # peak (× 5 finders) stays within one gateway lane; excess dispatches
+                               # QUEUE on the semaphore rather than drop. The chokepoint already stops
+                               # the SAME PR twice; this bounds DIFFERENT PRs.
   allow_self_review: false     # TESTING ONLY: lift the never-review-your-own-PR rail
   viewer_login: ""             # OUR login, for the never-review-your-own-PR rail. REQUIRED on
                                # GitHub App auth: an installation token is not a user, so

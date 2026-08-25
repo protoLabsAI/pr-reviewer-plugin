@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
 
+import httpx
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from httpx import ASGITransport
 from pr_reviewer.telemetry import Telemetry
 from pr_reviewer.webhook import build_routers
 
@@ -475,3 +478,163 @@ def test_a_genuinely_missing_event_is_still_reported(tmp_path, monkeypatch):
 
     assert body["summon_reachable"] is False
     assert "issue_comment" in body["missing"]
+
+
+# ── cross-PR panel concurrency cap (#96) ─────────────────────────────────────
+#
+# A burst of N eligible events fired N background panels at once, each fanning to
+# ~5 finders (a 14-PR burst measured 70 concurrent LLM calls). build_routers now
+# sizes an asyncio.Semaphore from `max_concurrent_panels` and holds a slot across
+# each dispatch; the overflow QUEUES rather than dropping. These tests drive the
+# real router over an async transport so the background tasks run concurrently in
+# one event loop, and gate the dispatcher's panels on an Event to observe the peak.
+
+
+class GatedDispatcher:
+    """A dispatcher whose panels block until the test releases them, so the test can
+    observe how many run at once. Each panel registers as running, records the peak,
+    then parks on `release`; the semaphore is what keeps that peak at the cap."""
+
+    def __init__(self, max_concurrent_panels=2):
+        self.max_concurrent_panels = max_concurrent_panels
+        self.cfg = {"summon_handle": "vera"}
+        self.running = 0
+        self.peak = 0
+        self.completed = 0
+        self.release = asyncio.Event()
+
+    async def _panel(self):
+        self.running += 1
+        self.peak = max(self.peak, self.running)
+        try:
+            await self.release.wait()
+        finally:
+            self.running -= 1
+            self.completed += 1
+
+    async def handle_pr_event(self, repo, pr, head, action):
+        await self._panel()
+        return "reviewed:PASS"
+
+    async def handle_summon(self, repo, pr, actor):
+        await self._panel()
+        return "reviewed:PASS"
+
+    async def _viewer_login(self):
+        return "qa-bot"
+
+
+def _gated_app(tmp_path, dispatcher, *, run_gh_fn=None):
+    telemetry = Telemetry(tmp_path)
+    public, _api = build_routers(dispatcher, telemetry, lambda: SECRET, run_gh_fn=run_gh_fn)
+    app = FastAPI()
+    app.include_router(public, prefix="/plugins/pr-reviewer")
+    return app, telemetry
+
+
+def pr_payload(pr: int) -> bytes:
+    return json.dumps(
+        {
+            "action": "opened",
+            "repository": {"full_name": "o/r"},
+            "pull_request": {"number": pr, "head": {"sha": f"{pr:040x}"}},
+        }
+    ).encode()
+
+
+def summon_comment(text: str, pr: int, login: str = "dev") -> bytes:
+    return json.dumps(
+        {
+            "action": "created",
+            "repository": {"full_name": "o/r"},
+            "issue": {"number": pr, "pull_request": {"url": "..."}},
+            "comment": {"body": text, "user": {"login": login}},
+        }
+    ).encode()
+
+
+async def _yield_until(predicate, *, limit=500):
+    """Cycle the event loop until `predicate()` holds or `limit` turns elapse — never
+    hangs, so a broken bound fails the assertion instead of deadlocking the suite."""
+    for _ in range(limit):
+        if predicate():
+            return True
+        await asyncio.sleep(0)
+    return predicate()
+
+
+def test_the_panel_semaphore_is_sized_from_config_and_injected(tmp_path):
+    """r1/r2: build_routers reads `max_concurrent_panels` and injects a semaphore of
+    that size onto the dispatcher (so the sweep's backfill can share it)."""
+    dispatcher = GatedDispatcher(max_concurrent_panels=2)
+    build_routers(dispatcher, Telemetry(tmp_path), lambda: SECRET)
+    sem = dispatcher.panel_sem
+    assert isinstance(sem, asyncio.Semaphore)
+
+    async def _exhaust():
+        await sem.acquire()
+        assert not sem.locked()  # one slot left
+        await sem.acquire()
+        assert sem.locked()  # cap reached at 2 — a third dispatch would queue, not drop
+
+    asyncio.run(_exhaust())
+
+
+async def test_concurrent_webhook_dispatch_is_bounded_and_excess_queues(tmp_path):
+    """A burst of five eligible events must not run five panels at once: the semaphore
+    caps concurrency at two, and the overflow queues (still dispatched) — none dropped."""
+    dispatcher = GatedDispatcher(max_concurrent_panels=2)
+    app, telemetry = _gated_app(tmp_path, dispatcher)
+
+    async with httpx.AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as client:
+        for pr in range(1, 6):
+            body = pr_payload(pr)
+            r = await client.post("/plugins/pr-reviewer/webhook", content=body, headers=signed(body))
+            assert r.json()["dispatched"] is True  # accepted, not dropped
+
+        await _yield_until(lambda: dispatcher.running >= 2)
+        for _ in range(10):  # let the overflow tasks reach (and park on) the full semaphore
+            await asyncio.sleep(0)
+        assert dispatcher.running == 2 and dispatcher.peak == 2  # BOUNDED — never five
+
+        queued = [e for e in telemetry.read_all() if e["event"] == "queued"]
+        assert queued and queued[0]["limit"] == 2  # the queue depth is visible in telemetry
+
+        dispatcher.release.set()  # slots free — every queued dispatch now proceeds
+        await _yield_until(lambda: dispatcher.completed >= 5)
+        assert dispatcher.completed == 5  # all five eventually reviewed; queued != dropped
+
+
+async def test_concurrent_summons_are_bounded_by_the_same_cap(tmp_path):
+    """A summon is still a panel: several admin `@vera review`s at once queue behind the
+    same cross-PR cap rather than firing a panel each (r4)."""
+    dispatcher = GatedDispatcher(max_concurrent_panels=2)
+
+    async def fake_gh(args, timeout=30):
+        if "/collaborators/" in " ".join(args):
+            return 0, "admin", ""
+        return 0, "", ""
+
+    app, telemetry = _gated_app(tmp_path, dispatcher, run_gh_fn=fake_gh)
+
+    async with httpx.AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as client:
+        for pr in range(1, 6):
+            body = summon_comment("@vera review", pr=pr)
+            r = await client.post(
+                "/plugins/pr-reviewer/webhook",
+                content=body,
+                headers={**signed(body), "X-GitHub-Event": "issue_comment"},
+            )
+            assert r.json() == {"ok": True, "dispatched": True, "reason": "summon:review"}
+
+        await _yield_until(lambda: dispatcher.running >= 2)
+        for _ in range(10):
+            await asyncio.sleep(0)
+        assert dispatcher.running == 2 and dispatcher.peak == 2  # summons bounded too
+
+        queued = [e for e in telemetry.read_all() if e["event"] == "queued" and e["kind"] == "summon"]
+        assert queued
+
+        dispatcher.release.set()
+        await _yield_until(lambda: dispatcher.completed >= 5)
+        assert dispatcher.completed == 5  # queued summons all proceed
