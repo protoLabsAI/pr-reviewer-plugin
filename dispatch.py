@@ -66,6 +66,7 @@ from .verdicts import (
     render_verdict_body,
     report_hard_stopped,
     verdict_for,
+    verification_ran,
 )
 
 log = logging.getLogger("protoagent.plugins.pr_reviewer")
@@ -1346,6 +1347,10 @@ class Dispatcher:
             hold_blocks=bool(dropped_finding) or bool(unaccounted),
             complete=complete,
             review_check_id=review_check_id,
+            # Did anything actually CHECK these findings? Empty over a clean panel is
+            # normal; empty over real findings means the verdict is ungrounded, and the
+            # promotion gate must not auto-approve it (mirrors `complete` one step up).
+            verified=verification_ran(str(steps_out.get("verify") or ""), reported),
         )
         self.telemetry.emit(
             "reviewed",
@@ -1492,6 +1497,7 @@ class Dispatcher:
         hold_blocks: bool = False,
         complete: bool = True,
         review_check_id: int | None = None,
+        verified: bool = True,
     ) -> bool:
         # Immediately before posting — the last moment a mid-round push can be caught.
         # The marker keeps the PINNED head on purpose: the round ran against it, and
@@ -1512,6 +1518,7 @@ class Dispatcher:
             confined=confined,
             notes=notes,
             complete=complete,
+            verified=verified,
             stale_note=stale_note,
         )
         event = "COMMENT"
@@ -1880,6 +1887,7 @@ class Dispatcher:
             # Only a clear verdict from a COMPLETE panel may auto-approve (#49): an
             # incomplete pass (a finder was down) holds until a full pass clears the head.
             complete=bool(clear.get("complete", True)) if clear else True,
+            verified=bool(clear.get("verified", True)) if clear else True,
         )
         backoff_key = f"{repo}#{pr}@{head}"
         if self._promote_failures.get(backoff_key, 0) >= PROMOTE_MAX_FAILURES:

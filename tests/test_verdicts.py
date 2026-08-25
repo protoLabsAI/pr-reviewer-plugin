@@ -6,6 +6,7 @@ import json
 
 from pr_reviewer.verdicts import (
     FAIL,
+    NOTHING_TO_VERIFY,
     PASS,
     POSSIBLY_ADDRESSED,
     WARN,
@@ -18,6 +19,7 @@ from pr_reviewer.verdicts import (
     render_verdict_body,
     report_hard_stopped,
     verdict_for,
+    verification_ran,
 )
 
 
@@ -159,7 +161,7 @@ def test_body_marker_roundtrip():
         recipe="code-review",
     )
     marker = parse_verdict_marker(body)
-    assert marker == {"head": "a" * 40, "verdict": WARN, "promoted": False, "complete": True}
+    assert marker == {"head": "a" * 40, "verdict": WARN, "promoted": False, "complete": True, "verified": True}
     assert "shadow" in body and "QA panel review" in body
 
 
@@ -227,7 +229,7 @@ def test_a_marker_with_trailing_attributes_still_parses():
     # every sweep tick. 20+ duplicate APPROVE reviews before it was caught.
     body = "<!-- protoagent-qa-review head=abc1234 verdict=WARN promoted=true findings=1 -->\nPromoting..."
     m = parse_verdict_marker(body)
-    assert m == {"head": "abc1234", "verdict": "WARN", "promoted": True, "complete": True}
+    assert m == {"head": "abc1234", "verdict": "WARN", "promoted": True, "complete": True, "verified": True}
 
 
 def test_unknown_future_attributes_do_not_break_the_marker():
@@ -448,9 +450,79 @@ def test_the_stale_header_rides_the_body_and_the_demotion_survives_recall():
     # The machine record carries the demotion (next-round recall re-verifies, not trusts)…
     assert json.loads(extract_findings_json(body))[0]["verdict"] == POSSIBLY_ADDRESSED
     # …and the marker still names the reviewed head/verdict — promotion must keep holding.
-    assert parse_verdict_marker(body) == {"head": "a" * 40, "verdict": FAIL, "promoted": False, "complete": True}
+    assert parse_verdict_marker(body) == {
+        "head": "a" * 40,
+        "verdict": FAIL,
+        "promoted": False,
+        "complete": True,
+        "verified": True,
+    }
 
 
 def test_no_stale_note_leaves_the_body_unchanged():
     assert "⚠️ PR advanced" not in _body(findings=[])
     assert _body(findings=[]) == _body(findings=[], stale_note="")  # the default is a no-op
+
+
+# ── "nothing to verify" vs "verification did not happen" ──────────────────────
+#
+# These looked identical downstream, so every clean review shipped an alarming
+# "no structural invariants were independently confirmed" note — which teaches the
+# reader to ignore the one case that means the verdict is ungrounded.
+
+
+def test_no_findings_is_not_a_verification_failure():
+    assert verification_ran("", []) is True
+    assert verification_ran(NOTHING_TO_VERIFY, []) is True
+    assert verification_ran("", None) is True
+
+
+def test_findings_annotated_with_verdicts_count_as_verified():
+    findings = [{"summary": "a", "verdict": "confirmed"}, {"summary": "b", "verdict": "refuted"}]
+    assert verification_ran("VERIFY_STATUS: annotated n=2", findings) is True
+
+
+def test_findings_with_no_verdicts_are_unverified():
+    findings = [{"summary": "a"}, {"summary": "b"}]
+    assert verification_ran("VERIFY_STATUS: annotated n=2", findings) is False
+
+
+def test_verifier_reporting_nothing_while_findings_exist_is_unverified():
+    """The exact observed failure: findings raised, verifier saw an empty array."""
+    findings = [{"summary": "a", "verdict": "confirmed"}]
+    assert verification_ran(NOTHING_TO_VERIFY, findings) is False
+
+
+def test_explicit_verify_gap_is_unverified():
+    findings = [{"summary": "a", "verdict": "confirmed"}]
+    assert verification_ran("VERIFY_GAP: unverified=1", findings) is False
+
+
+def test_unverified_marker_round_trips():
+    body = render_verdict_body(
+        repo="o/r",
+        pr=1,
+        head_sha="a" * 40,
+        verdict="PASS",
+        findings=[],
+        shadow=False,
+        recipe="code-review-structural",
+        verified=False,
+    )
+    assert "verified=false" in body
+    assert parse_verdict_marker(body)["verified"] is False
+
+
+def test_marker_without_the_field_parses_as_verified():
+    """An older marker must not be retroactively treated as unverified."""
+    body = render_verdict_body(
+        repo="o/r",
+        pr=1,
+        head_sha="b" * 40,
+        verdict="PASS",
+        findings=[],
+        shadow=False,
+        recipe="code-review-structural",
+    )
+    assert "verified=false" not in body
+    assert parse_verdict_marker(body)["verified"] is True
