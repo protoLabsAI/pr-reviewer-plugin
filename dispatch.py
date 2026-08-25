@@ -31,7 +31,7 @@ import time
 from urllib.parse import quote
 
 from .approve import HOLD_NOT_OWNER, PROMOTE, Observations, promotion_decision
-from .checks import CHECK_NAME, CheckRun, check_for
+from .checks import CHECK_NAME, COMPLETED, FAILURE, IN_PROGRESS, SUCCESS, CheckRun, check_for
 from .chokepoint import DISPATCH_ACTIONS, Chokepoint
 from .gh_cli import bad_repo, run_gh
 from .grounding import apply_grounding, correct_line_numbers, render_grounding_footnote
@@ -246,6 +246,22 @@ EXHAUSTION_MARKER = "protoagent-qa-exhausted"
 
 _NON_TERMINAL = {"queued", "in_progress", "waiting", "requested", "pending"}
 _GREEN = {"success", "neutral", "skipped"}
+
+# The dispatch-path check run (#95), keyed to the reviewed head. Distinct from checks.py's
+# `QA panel` (the promotion gate): that one reports whether a head is CLEARED for merge and
+# only writes where this agent owns promotion, so a shadow deployment publishes nothing and
+# an EXHAUSTED panel — no verdict — leaves it sitting `in_progress`, indistinguishable from
+# a head still under review. `protoReview` is different in kind: opened for every panel that
+# proceeds past the drop/skip gates, and concluded by the SAME review that opened it, so it
+# never dangles and is safe to require even in shadow mode. Its whole job is the closure an
+# advisory review could not give — an exhausted panel leaves a red X, not the silence that
+# let 12 PRs merge unreviewed. The name is the required-status context branch protection
+# pins, so it is a constant, not config (renaming it silently unrequires the gate).
+REVIEW_CHECK_NAME = "protoReview"
+
+# Both of our own check runs sit `in_progress` while the panel runs; neither is a check we
+# WAIT on (see `_checks_state`), or the gate deadlocks on itself.
+OUR_CHECK_NAMES = frozenset({CHECK_NAME, REVIEW_CHECK_NAME})
 
 
 def gh_json_rows(out: str) -> list | None:
@@ -855,11 +871,13 @@ class Dispatcher:
         runs = gh_json_rows(out)
         if runs is None:
             return None  # unreadable ⇒ checks-unknown, which holds promotion
-        # Our OWN check run is not one of the checks we are waiting on. It sits
-        # `in_progress` until the panel clears the head, so counting it makes this read
+        # Our OWN check runs are not among the checks we are waiting on. Both the
+        # promotion gate's `QA panel` and the dispatch lifecycle's `protoReview` (#95) sit
+        # `in_progress` until we conclude them, so counting either makes this read
         # "pending" forever: the panel would hold on checks-pending, never clear, and
-        # never conclude its own check. A gate deadlocked on itself.
-        runs = [r for r in runs if r.get("name") != CHECK_NAME]
+        # never conclude its own check (and a FAIL would post as a comment, not a block).
+        # A gate deadlocked on itself.
+        runs = [r for r in runs if r.get("name") not in OUR_CHECK_NAMES]
         if not runs:
             return "no-checks"
         if any(r.get("status") in _NON_TERMINAL for r in runs):
@@ -1071,6 +1089,11 @@ class Dispatcher:
             delta=bool(prior_findings),
             round=round_number,
         )
+        # Open the `protoReview` check the moment we commit to a panel — every drop/skip
+        # gate is already behind us (r5), so this fires for exactly the reviews that run
+        # (r1). The id threads through to `_post_verdict` / the exhaustion path, whichever
+        # concludes it. Keyed on the SERVER-resolved head, never the webhook's `head_sha`.
+        review_check_id = await self._start_review_check(repo, head)
         # Server-resolved refs ride along: finders pin code reads to the head SHA
         # and policy-doc reads to the base ref (a PR must not rewrite the rules it
         # is judged by). A host recipe without these declared just ignores them.
@@ -1107,6 +1130,14 @@ class Dispatcher:
                         "panel_retry", repo=repo, pr=pr, sha=head, attempt=attempt, crashed=type(exc).__name__
                     )
                     continue
+                await self._conclude_review_check(
+                    repo,
+                    review_check_id,
+                    FAILURE,
+                    "QA panel crashed — no verdict",
+                    f"The review run crashed on head `{head[:12]}` ({type(exc).__name__}). "
+                    f"No verdict was posted; push a fix to re-trigger the review.",
+                )
                 await self._escalate(
                     f"pr-reviewer: review run crashed on {repo}#{pr} ({type(exc).__name__}: {exc}) — PR is UNREVIEWED.",
                     dedup_key=f"pr-reviewer-crash:{repo}#{pr}@{head[:7]}",
@@ -1121,6 +1152,17 @@ class Dispatcher:
             # Retries spent: D3's other branch. No verdict, operator escalation — and
             # the sweep's backfill will try again on a later pass (issue #17), so an
             # exhausted PR is no longer abandoned for good.
+            # THE key closure (#95): this is the state that used to leave NO signal at
+            # all — a red X here is the difference between "exhausted" and "approved".
+            await self._conclude_review_check(
+                repo,
+                review_check_id,
+                FAILURE,
+                "QA panel exhausted — no verdict",
+                f"The review panel failed on head `{head[:12]}` after {self.panel_retries + 1} "
+                f"attempt(s) (step(s) {', '.join(str(s) for s in failed)}). No verdict was posted; "
+                f"push a fix to re-trigger the review.",
+            )
             await self._escalate(
                 f"pr-reviewer: panel step(s) {failed} failed on {repo}#{pr} "
                 f"after {self.panel_retries + 1} attempt(s) — no verdict posted; PR is UNREVIEWED.",
@@ -1281,6 +1323,7 @@ class Dispatcher:
             notes=trailer,
             hold_blocks=bool(dropped_finding) or bool(unaccounted),
             complete=complete,
+            review_check_id=review_check_id,
         )
         self.telemetry.emit(
             "reviewed",
@@ -1426,6 +1469,7 @@ class Dispatcher:
         notes: str = "",
         hold_blocks: bool = False,
         complete: bool = True,
+        review_check_id: int | None = None,
     ) -> bool:
         # Immediately before posting — the last moment a mid-round push can be caught.
         # The marker keeps the PINNED head on purpose: the round ran against it, and
@@ -1496,6 +1540,17 @@ class Dispatcher:
                 self._post_failures[key] = self._post_failures.get(key, 0) + 1
                 if len(self._post_failures) > 1024:  # bounded, like the promote counter
                     self._post_failures = dict(list(self._post_failures.items())[-512:])
+            # A verdict that never landed is, for the gate, an exhaustion: conclude the
+            # check red rather than leave it dangling `in_progress` (which would read as
+            # "still reviewing" — the very ambiguity #95 exists to remove).
+            await self._conclude_review_check(
+                repo,
+                review_check_id,
+                FAILURE,
+                f"{verdict} verdict — post refused",
+                f"The panel returned **{verdict}** for head `{head[:12]}`, but GitHub refused the "
+                f"review post after {attempts} attempt(s), so no verdict is recorded on the PR.",
+            )
             return False
         self._post_failures.pop(f"{repo}#{pr}@{head}", None)
         # A verdict exists now, so any "this PR has not been reviewed" notice we left on
@@ -1507,6 +1562,16 @@ class Dispatcher:
             # `hold_blocks` is the one exception — a clean PASS that silently dropped a
             # prior blocker/major has not earned the dismissal yet (issue #26).
             await self._dismiss_stale_blocks(repo, pr)
+        # The verdict landed — conclude the check with it (r2/r3). PASS/WARN clear the
+        # gate; a FAIL holds it. This runs AFTER the post, so a check-write failure can
+        # never cost the verdict (r7). The verdict text rides in the summary (r6).
+        await self._conclude_review_check(
+            repo,
+            review_check_id,
+            SUCCESS if verdict != FAIL else FAILURE,
+            f"QA panel: {verdict}",
+            self._review_check_summary(verdict, findings),
+        )
         return True
 
     async def _post_review_with_retry(
@@ -1869,6 +1934,117 @@ class Dispatcher:
             armed = rc2 == 0
         self.telemetry.emit("promoted", repo=repo, pr=pr, sha=head, auto_merge_armed=armed)
         return PROMOTE
+
+    # ── the dispatch-path `protoReview` check (#95) ───────────────────────────
+
+    async def _start_review_check(self, repo: str, sha: str) -> int | None:
+        """Open an `in_progress` `protoReview` check run for this head → its id, or None.
+
+        Posted for every panel that proceeds past the drop/skip gates, regardless of
+        shadow/ownership: unlike the `QA panel` promotion gate, this check is driven by
+        the review itself (the same `_review` call opens AND concludes it), so it never
+        dangles and is safe to require even in shadow mode.
+
+        Degrades, never raises (r7): a failure is logged at WARNING and returns None; the
+        review is the job and must not be lost to bookkeeping. A None id makes every later
+        `_conclude_review_check` a no-op, so the whole lifecycle no-ops without the App
+        permission rather than half-writing a check that can never conclude.
+        """
+        rc, out, err = await self._run_gh(
+            [
+                "api",
+                f"repos/{repo}/check-runs",
+                "-X",
+                "POST",
+                "-f",
+                f"name={REVIEW_CHECK_NAME}",
+                "-f",
+                f"head_sha={sha}",
+                "-f",
+                f"status={IN_PROGRESS}",
+                "--jq",
+                ".id",
+            ],
+            timeout=60,
+        )
+        if rc != 0:
+            # A missing `checks: write` on the App installation lands here; name the
+            # permission once you read the log rather than leaving a bare 403.
+            log.warning(
+                "[pr-reviewer] could not open the %s check on %s@%s (needs App permission `Checks: read & write`): %s",
+                REVIEW_CHECK_NAME,
+                repo,
+                sha[:7],
+                err[-200:],
+            )
+            return None
+        try:
+            check_run_id = int(str(out).strip())
+        except (TypeError, ValueError):
+            log.warning(
+                "[pr-reviewer] %s check create on %s@%s returned no id (%r) — cannot conclude it",
+                REVIEW_CHECK_NAME,
+                repo,
+                sha[:7],
+                (out or "")[:80],
+            )
+            return None
+        self.telemetry.emit("review_check", repo=repo, sha=sha, status=IN_PROGRESS, check_run_id=check_run_id)
+        return check_run_id
+
+    async def _conclude_review_check(
+        self, repo: str, check_run_id: int | None, conclusion: str, title: str, summary: str
+    ) -> None:
+        """PATCH the `protoReview` check to completed+conclusion. Degrades, never raises (r7).
+
+        `check_run_id is None` (the open never succeeded) is a no-op — the verdict still
+        posted, which is the job; the check is bookkeeping. A failed PATCH is logged at
+        WARNING and swallowed for the same reason.
+        """
+        if check_run_id is None:
+            return
+        rc, _out, err = await self._run_gh(
+            [
+                "api",
+                f"repos/{repo}/check-runs/{check_run_id}",
+                "-X",
+                "PATCH",
+                "-f",
+                f"status={COMPLETED}",
+                "-f",
+                f"conclusion={conclusion}",
+                "-f",
+                f"output[title]={title}",
+                "-f",
+                f"output[summary]={summary}",
+            ],
+            timeout=60,
+        )
+        if rc != 0:
+            log.warning(
+                "[pr-reviewer] could not conclude the %s check (%s) on %s via id %s: %s",
+                REVIEW_CHECK_NAME,
+                conclusion,
+                repo,
+                check_run_id,
+                err[-200:],
+            )
+            return
+        self.telemetry.emit(
+            "review_check", repo=repo, status=COMPLETED, conclusion=conclusion, check_run_id=check_run_id
+        )
+
+    @staticmethod
+    def _review_check_summary(verdict: str, findings: list[dict] | None) -> str:
+        """The `output.summary` for a concluded check — carries the verdict text (r6)."""
+        n = len([f for f in (findings or []) if isinstance(f, dict)])
+        tail = f" ({n} finding{'s' if n != 1 else ''})" if n else ""
+        if verdict == FAIL:
+            return (
+                f"The QA panel returned **{verdict}** — blocking defects stand against this "
+                f"head{tail}. See the review for details; push a fix to clear it."
+            )
+        return f"The QA panel returned **{verdict}**{tail}. See the review for details."
 
     async def _publish_qa_check(self, repo: str, sha: str, run: CheckRun) -> None:
         """Publish (or update) this head's `QA panel` check run. Degrades, never raises.

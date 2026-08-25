@@ -298,6 +298,64 @@ def test_an_unsigned_summon_is_rejected_like_any_other_delivery(tmp_path):
     assert dispatcher.summons == []
 
 
+# ── re-running the protoReview gate (#95) ────────────────────────────────────
+
+
+def check_run_payload(name: str = "protoReview", action: str = "rerequested", pr: int = 7, login: str = "dev") -> bytes:
+    check_run: dict = {"name": name}
+    if pr:
+        check_run["pull_requests"] = [{"number": pr}]
+    return json.dumps(
+        {
+            "action": action,
+            "repository": {"full_name": "o/r"},
+            "check_run": check_run,
+            "sender": {"login": login},
+        }
+    ).encode()
+
+
+def post_check_run(app, body: bytes):
+    return TestClient(app).post(
+        "/plugins/pr-reviewer/webhook",
+        content=body,
+        headers={**signed(body), "X-GitHub-Event": "check_run"},
+    )
+
+
+def test_rerequesting_the_protoreview_check_reruns_the_panel(tmp_path):
+    """A required check you cannot re-run is a footgun: a red X could only be cleared by
+    pushing a dummy commit. "Re-run" on the gate re-drives the panel (summon posture)."""
+    app, dispatcher, _posted = summon_app(tmp_path)
+    with TestClient(app) as client:  # context manager runs the background task to completion
+        body = check_run_payload()
+        r = client.post(
+            "/plugins/pr-reviewer/webhook", content=body, headers={**signed(body), "X-GitHub-Event": "check_run"}
+        )
+        assert r.json() == {"ok": True, "dispatched": True, "reason": "check-run-rerequest"}
+    assert dispatcher.summons == [("o/r", 7, "dev")]
+
+
+def test_a_non_rerequest_check_run_is_ignored(tmp_path):
+    """Our own `created`/`completed` events (we open and conclude the check) must not
+    loop the panel — only the human-initiated `rerequested` acts."""
+    app, dispatcher, _posted = summon_app(tmp_path)
+    assert post_check_run(app, check_run_payload(action="completed")).json()["reason"] == "not-a-rerequest"
+    assert dispatcher.summons == []
+
+
+def test_a_rerequest_for_another_check_is_ignored(tmp_path):
+    app, dispatcher, _posted = summon_app(tmp_path)
+    assert post_check_run(app, check_run_payload(name="CI")).json()["reason"] == "not-our-check"
+    assert dispatcher.summons == []
+
+
+def test_a_check_run_not_tied_to_a_pr_is_a_no_op(tmp_path):
+    app, dispatcher, _posted = summon_app(tmp_path)
+    assert post_check_run(app, check_run_payload(pr=0)).json()["reason"] == "check-run-no-pr"
+    assert dispatcher.summons == []
+
+
 # ── replay endpoint (in-process A/B runner, issue #20) ───────────────────────
 
 

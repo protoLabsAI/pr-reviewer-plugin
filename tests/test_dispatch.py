@@ -213,10 +213,30 @@ class RoutedGH(FakeGH):
         self.review_author = "qa-bot"
         # Successive (rc, err) results for the verdict POST — for the retry path (#72).
         self.post_results = list(post_results or [])
+        # The dispatch-path `protoReview` check writes (#95), captured SEPARATELY from
+        # `posted`: those are reviews/comments, and a test asserting on `posted[0]` must
+        # not start reading a check write. Only OUR check (name=protoReview / a PATCH to
+        # an id we handed out) is intercepted; the `QA panel` promotion check falls
+        # through to the generic handlers unchanged.
+        self.check_writes: list[dict] = []
+        self._next_check_id = 1000
+        self._review_check_ids: set[int] = set()
 
     async def __call__(self, args, timeout=30):
         self.calls.append(args)
         joined = " ".join(args)
+        if "/check-runs" in joined and "-X" in args:
+            fields = {a.split("=", 1)[0]: a.split("=", 1)[1] for a in args if "=" in a}
+            if "POST" in args and fields.get("name") == "protoReview":
+                cid = self._next_check_id
+                self._next_check_id += 1
+                self._review_check_ids.add(cid)
+                self.check_writes.append({"method": "POST", "url": args[1], "id": cid, **fields})
+                return 0, str(cid), ""  # `--jq .id` yields the bare id
+            tail = args[1].rsplit("/", 1)[-1] if len(args) > 1 else ""
+            if "PATCH" in args and tail.isdigit() and int(tail) in self._review_check_ids:
+                self.check_writes.append({"method": "PATCH", "url": args[1], **fields})
+                return 0, "{}", ""
         if "-X" in args and "PUT" in args and "/dismissals" in joined:
             self.dismissed.append(args[1])
             return 0, "{}", ""
@@ -371,6 +391,151 @@ async def test_failed_panel_step_escalates_and_posts_nothing(tmp_path):
     # D3 holds: no verdict review posted (the exhaustion comment is not a verdict)
     assert all("event" not in p for p in gh.posted)
     assert escalations and "UNREVIEWED" in escalations[0][0]
+
+
+# ── the protoReview check run (#95) ───────────────────────────────────────────
+
+
+def _clean_report() -> str:
+    """A brief + empty findings array — the panel's PASS shape."""
+    return "<!-- brief -->\nAll good.\n<!-- /brief -->\n\n```json\n[]\n```"
+
+
+async def _clean_runner(name, inputs):
+    return {"output": _clean_report(), "failed": []}
+
+
+async def test_dispatch_opens_a_protoreview_check_in_progress(tmp_path):
+    """r1/r9: a panel that proceeds past the gates opens an `in_progress` check keyed to
+    the server-resolved head — the handle branch protection can require."""
+    gh = RoutedGH(pr_facts=facts(), reviews=[])
+    d = make(tmp_path, gh=gh)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")).startswith("reviewed:")
+    creates = [w for w in gh.check_writes if w["method"] == "POST"]
+    assert len(creates) == 1
+    c = creates[0]
+    assert c["url"] == "repos/o/r/check-runs"
+    assert c["name"] == "protoReview" and c["head_sha"] == HEAD and c["status"] == "in_progress"
+
+
+async def test_pass_verdict_concludes_the_check_success(tmp_path):
+    """r2/r6: PASS clears the gate; the summary carries the verdict text, and the PATCH
+    targets the id the create handed back."""
+    gh = RoutedGH(pr_facts=facts(), reviews=[])
+    d = make(tmp_path, gh=gh, runner=_clean_runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "reviewed:PASS"
+    create = next(w for w in gh.check_writes if w["method"] == "POST")
+    patches = [w for w in gh.check_writes if w["method"] == "PATCH"]
+    assert len(patches) == 1
+    p = patches[0]
+    assert p["url"] == f"repos/o/r/check-runs/{create['id']}"
+    assert p["status"] == "completed" and p["conclusion"] == "success"
+    assert "PASS" in p["output[summary]"]
+
+
+async def test_fail_verdict_concludes_the_check_failure(tmp_path):
+    """r3/r6: a FAIL holds the gate red, and the verdict text rides in the summary."""
+    gh = RoutedGH(pr_facts=facts(), reviews=[])  # default REPORT is a confirmed major on x.py
+    d = make(tmp_path, gh=gh)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "reviewed:FAIL"
+    patches = [w for w in gh.check_writes if w["method"] == "PATCH"]
+    assert patches and patches[0]["conclusion"] == "failure"
+    assert patches[0]["status"] == "completed" and "FAIL" in patches[0]["output[summary]"]
+
+
+async def test_exhaustion_concludes_the_check_failure(tmp_path):
+    """r4: THE key closure — an exhausted panel used to leave no signal at all. Now the
+    check goes red and its summary names the exhaustion, while D3 still posts no verdict."""
+    gh = RoutedGH(pr_facts=facts(), reviews=[])
+
+    async def runner(name, inputs):
+        return {"output": "partial", "failed": ["find_crossfile"]}
+
+    d = make(tmp_path, gh=gh, runner=runner, inbox=lambda text, **kw: None)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "error:panel-exhausted"
+    assert len([w for w in gh.check_writes if w["method"] == "POST"]) == 1  # opened
+    patches = [w for w in gh.check_writes if w["method"] == "PATCH"]
+    assert patches and patches[0]["conclusion"] == "failure"
+    assert "exhaust" in (patches[0]["output[title]"] + patches[0]["output[summary]"]).lower()
+    assert all("event" not in p for p in gh.posted)  # D3: still no verdict review
+
+
+async def test_a_dropped_event_opens_no_check(tmp_path):
+    """r5: draft (dropped inside `_review`) and allowlist miss (dropped before any GitHub
+    call) both open no check — a check exists only for panels that actually run."""
+    draft = RoutedGH(pr_facts=facts(draft=True), reviews=[])
+    d = make(tmp_path, gh=draft)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "drop:pr-not-eligible"
+    assert draft.check_writes == []
+
+    unlisted = RoutedGH(pr_facts=facts(), reviews=[])
+    d2 = make(tmp_path, gh=unlisted)
+    assert (await d2.handle_pr_event("evil/repo", 1, HEAD, "opened")) == "drop:unlisted-repo"
+    assert unlisted.check_writes == [] and unlisted.calls == []
+
+
+async def test_a_reaffirm_opens_no_new_check(tmp_path):
+    """An unchanged head with a posted verdict reaffirms without re-spending the panel —
+    and without opening a second check; the head already carries one from its real review."""
+    gh = RoutedGH(pr_facts=facts(), reviews=[review_row(HEAD, "PASS")])
+    d = make(tmp_path, gh=gh)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "synchronize")) == "reaffirmed:PASS"
+    assert gh.check_writes == []
+
+
+async def test_check_create_failure_never_blocks_the_verdict(tmp_path):
+    """r7: a missing `checks: write` (the create 403s) must not cost the review — the
+    verdict posts, and no conclude is attempted against an id we never got."""
+
+    class NoCheckWriteGH(RoutedGH):
+        async def __call__(self, args, timeout=30):
+            joined = " ".join(args)
+            if "/check-runs" in joined and "-X" in args and "POST" in args and "protoReview" in joined:
+                self.calls.append(args)
+                return 1, "", "HTTP 403: Resource not accessible by integration"
+            return await super().__call__(args, timeout)
+
+    gh = NoCheckWriteGH(pr_facts=facts(), reviews=[])
+    d = make(tmp_path, gh=gh)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "reviewed:FAIL"
+    assert gh.reviews_posted and gh.reviews_posted[0]["event"] == "COMMENT"  # shadow FAIL
+    assert [w for w in gh.check_writes if w["method"] == "PATCH"] == []  # nothing to conclude
+
+
+async def test_check_conclude_failure_never_blocks_the_verdict(tmp_path):
+    """r7, the other half: the create succeeds but the conclude PATCH 500s — the verdict
+    already landed (it posts BEFORE the check is concluded), so it is never lost."""
+
+    class PatchFailsGH(RoutedGH):
+        async def __call__(self, args, timeout=30):
+            joined = " ".join(args)
+            if "/check-runs/" in joined and "-X" in args and "PATCH" in args:
+                self.calls.append(args)
+                return 1, "", "HTTP 500"
+            return await super().__call__(args, timeout)
+
+    gh = PatchFailsGH(pr_facts=facts(), reviews=[])
+    d = make(tmp_path, gh=gh, runner=_clean_runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "reviewed:PASS"
+    assert gh.reviews_posted and "event" in gh.reviews_posted[0]
+
+
+async def test_our_review_check_is_not_a_check_we_wait_on(tmp_path):
+    """The deadlock this would otherwise ship with: `protoReview` sits `in_progress`
+    while the panel runs, so counting it among the checks a FAIL gate reads would force
+    every FAIL to post as a comment instead of a block. It must be filtered like `QA
+    panel` is."""
+    from pr_reviewer.dispatch import REVIEW_CHECK_NAME
+
+    gh = RoutedGH(
+        pr_facts=facts(),
+        checks=[
+            {"status": "in_progress", "conclusion": None, "name": REVIEW_CHECK_NAME},
+            {"status": "completed", "conclusion": "success", "name": "CI"},
+        ],
+    )
+    d = make(tmp_path, gh=gh)
+    assert (await d._checks_state("o/r", HEAD)) == "green"
 
 
 # ── a PR GitHub will not accept a review on (issue #78) ──────────────────────
