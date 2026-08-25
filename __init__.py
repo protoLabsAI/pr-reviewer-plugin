@@ -96,22 +96,15 @@ def register(registry) -> None:
             n_tools += 1
 
         if hasattr(registry, "register_surface"):
-            stop_event = asyncio.Event()
-            interval = int(cfg.get("sweep_interval_s") or 180)
-
-            def _start():
-                # Runs in the server's startup hook — the loop exists here.
-                return asyncio.get_running_loop().create_task(sweep_loop(dispatcher, interval, stop_event))
-
-            def _stop():
-                stop_event.set()
-
-            registry.register_surface(_start, _stop, name="pr-reviewer-sweep")
-
             # GitHub App identity (optional): when App credentials are configured,
             # a refresher keeps a fresh installation token in GH_TOKEN/GITHUB_TOKEN
             # (App tokens expire hourly; gh has no App mode). Reviews then post as
             # the App's bot identity — no machine-user PAT.
+            #
+            # Registered BEFORE the sweep so the installation token exists before the
+            # sweep's first repo enumeration runs (issue #99). Registering it after
+            # meant the first enumeration raced the token refresher, failed, and the
+            # first sweep pass reviewed 0 repos for one interval.
             from .app_auth import AppAuthConfig, token_refresh_loop
 
             app_cfg = AppAuthConfig(cfg)
@@ -125,6 +118,18 @@ def register(registry) -> None:
                     auth_stop.set()
 
                 registry.register_surface(_auth_start, _auth_stop, name="pr-reviewer-app-auth")
+
+            stop_event = asyncio.Event()
+            interval = int(cfg.get("sweep_interval_s") or 180)
+
+            def _start():
+                # Runs in the server's startup hook — the loop exists here.
+                return asyncio.get_running_loop().create_task(sweep_loop(dispatcher, interval, stop_event))
+
+            def _stop():
+                stop_event.set()
+
+            registry.register_surface(_start, _stop, name="pr-reviewer-sweep")
         machinery = True
     except Exception:  # noqa: BLE001
         log.exception("[pr-reviewer] registering the reviewer machinery failed")
