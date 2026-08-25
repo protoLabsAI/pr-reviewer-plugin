@@ -3,6 +3,7 @@ reads/writes go through a canned fake `gh`; the workflow runner is a stub."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 
@@ -1569,6 +1570,31 @@ async def test_backfill_still_honours_the_self_authored_rail(tmp_path):
     d = make(tmp_path, cfg={"shadow_mode": False, "promotion_owner": True}, gh=gh)
     assert (await d.backfill_review("o/r", 1, HEAD)) == "drop:self-authored"
     assert gh.posted == []
+
+
+async def test_sweep_backfill_waits_on_an_injected_panel_semaphore(tmp_path):
+    """The sweep shares a process with the webhook, so its backfill panels honour the
+    same cross-PR cap (#96): with the semaphore full, a backfill QUEUES — and says so in
+    telemetry — instead of launching a panel on top of a live burst. When a slot frees it
+    proceeds and posts, proving the bound queues rather than drops."""
+    gh = RoutedGH(pr_facts=facts(), reviews=[])
+    d = make(tmp_path, gh=gh)
+    d.panel_sem = asyncio.Semaphore(0)  # every slot held by (imagined) in-flight webhook panels
+
+    task = asyncio.create_task(d.backfill_review("o/r", 1, HEAD))
+    for _ in range(50):  # give the backfill every chance to run; it must stay parked
+        await asyncio.sleep(0)
+        if task.done():
+            break
+    assert not task.done()  # queued behind the full semaphore
+    assert gh.posted == []  # the panel never started, so nothing was posted yet
+    queued = [e for e in d.telemetry.read_all() if e["event"] == "queued"]
+    assert queued and queued[0]["kind"] == "sweep-backfill"
+
+    d.panel_sem.release()  # a webhook panel finished — the queued backfill gets the slot
+    outcome = await asyncio.wait_for(task, timeout=5)
+    assert outcome.startswith("reviewed:")  # it ran to a verdict
+    assert gh.posted  # …and finally posted it — the dispatch queued, it did not drop
 
 
 async def test_backfill_budget_bounds_one_sweep_pass(tmp_path):

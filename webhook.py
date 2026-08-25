@@ -39,6 +39,29 @@ def build_routers(dispatcher, telemetry, get_secret, run_gh_fn=None):
     public = APIRouter()
     api = APIRouter()
 
+    # The CROSS-PR panel bound (#96). The webhook fires one background panel per eligible
+    # event with no ceiling, so a burst of N PRs launched N panels at once, each fanning
+    # to ~5 finders — a 14-PR burst measured 70 concurrent LLM calls, 7× latency, and 5
+    # panels exhausted mid-run. This caps concurrent panels; excess dispatches QUEUE on the
+    # semaphore rather than drop, so every PR still gets reviewed, just not all at once. The
+    # Dispatcher's chokepoint already stops the SAME PR running twice — this bounds DIFFERENT
+    # PRs. Built here (a webhook-layer concern), then injected into the dispatcher so the
+    # sweep's backfill panels honour the same bound instead of stacking on a live burst.
+    #
+    # Constructed with no running loop (register-time): on Python ≥3.10 asyncio.Semaphore
+    # binds to the loop lazily at first `acquire`, which is inside the async handlers.
+    panel_limit = max(1, int(getattr(dispatcher, "max_concurrent_panels", 3)))
+    _panel_sem = asyncio.Semaphore(panel_limit)
+    dispatcher.panel_sem = _panel_sem
+
+    def _note_if_queued(kind: str, repo: str, pr: int) -> None:
+        """Emit a `queued` event when the semaphore is full and this dispatch must wait —
+        the queue depth the operator sees in the panel stats. Best-effort: the check is
+        racy by nature (a slot may free before `acquire`), and a missed/spurious signal
+        is harmless."""
+        if _panel_sem.locked():
+            telemetry.emit("queued", kind=kind, repo=repo, pr=pr, limit=panel_limit)
+
     @public.post("/webhook")
     async def _webhook(request: Request):
         body = await request.body()
@@ -177,8 +200,11 @@ def build_routers(dispatcher, telemetry, get_secret, run_gh_fn=None):
             log.warning("[pr-reviewer] summon reply failed on %s#%s: %s", repo, pr, err[-200:])
 
     async def _safe_summon(repo: str, pr: int, actor: str) -> None:
+        # A summon is still a panel — bound it by the same cross-PR cap (#96).
         try:
-            outcome = await dispatcher.handle_summon(repo, pr, actor)
+            _note_if_queued("summon", repo, pr)
+            async with _panel_sem:
+                outcome = await dispatcher.handle_summon(repo, pr, actor)
             log.info("[pr-reviewer] summon %s#%s by @%s -> %s", repo, pr, actor, outcome)
             if outcome.startswith("drop:"):
                 await _reply(
@@ -188,8 +214,12 @@ def build_routers(dispatcher, telemetry, get_secret, run_gh_fn=None):
             log.exception("[pr-reviewer] summon crashed for %s#%s", repo, pr)
 
     async def _safe_handle(repo: str, pr: int, head: str, action: str) -> None:
+        # Hold a panel slot across the dispatch; a burst beyond the cap queues here
+        # rather than launching every panel at once (#96).
         try:
-            outcome = await dispatcher.handle_pr_event(repo, pr, head, action)
+            _note_if_queued("webhook", repo, pr)
+            async with _panel_sem:
+                outcome = await dispatcher.handle_pr_event(repo, pr, head, action)
             log.info("[pr-reviewer] %s#%s @%s (%s) -> %s", repo, pr, head[:7], action, outcome)
         except Exception:  # noqa: BLE001
             log.exception("[pr-reviewer] webhook dispatch crashed for %s#%s", repo, pr)

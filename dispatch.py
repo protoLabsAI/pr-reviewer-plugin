@@ -23,6 +23,7 @@ the deterministic path.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -365,6 +366,12 @@ class Dispatcher:
         self._round_cap: dict[str, float] = {}  # repo#pr -> monotonic timestamp when capped
         self._installation_repos: list[str] = []  # last good App-installation scope
         self._installation_repos_at: float = 0.0
+        # The cross-PR panel cap (#96) is a WEBHOOK-LAYER concern: build_routers sizes an
+        # asyncio.Semaphore from `max_concurrent_panels` and INJECTS it here, so the
+        # sweep's backfill panels queue behind the same bound as webhook dispatches
+        # instead of piling on top of a burst. None ⇒ unbounded (a sweep-only wiring, or
+        # a test that never built the routers); the dispatcher never creates or sizes it.
+        self.panel_sem: asyncio.Semaphore | None = None
 
     # ── config, resolved live ────────────────────────────────────────────────
     #
@@ -496,6 +503,21 @@ class Dispatcher:
             if "backfill_per_pass" in cfg
             else _env_int("PR_REVIEWER_BACKFILL_PER_PASS", 2)
         )
+
+    @property
+    def max_concurrent_panels(self) -> int:
+        """Cross-PR cap on panels running at once, sized so `× 5 finders` stays within
+        one gateway lane (#96). Read here so an operator can retune it live, but the
+        SEMAPHORE lives at the webhook dispatch layer — `build_routers` sizes one from
+        this and injects it as `panel_sem`. Clamped to ≥1: a `Semaphore(0)` would deadlock
+        every dispatch, so zero degrades to serial, never to a stall."""
+        cfg = self.cfg
+        n = (
+            int(cfg["max_concurrent_panels"])
+            if "max_concurrent_panels" in cfg
+            else _env_int("PR_REVIEWER_MAX_CONCURRENT_PANELS", 3)
+        )
+        return max(1, n)
 
     @property
     def regate_enabled(self) -> bool:
@@ -2162,14 +2184,27 @@ class Dispatcher:
 
     async def backfill_review(self, repo: str, pr: int, head: str) -> str:
         """Review a PR the sweep found without a verdict — same path as the edge, so
-        every guard (self-authored, eligibility, cooldown, in-flight) still applies."""
+        every guard (self-authored, eligibility, cooldown, in-flight) still applies.
+
+        The sweep is already bounded to `backfill_per_pass` reviews and runs them
+        serially, but those panels share a process with the webhook's — so a backfill
+        firing during a webhook burst would push total concurrency past the cap. When
+        `build_routers` injected a `panel_sem`, the backfill queues behind the SAME
+        cross-PR bound (#96); with none injected it runs unbounded, as before.
+        """
         decision = self.chokepoint.admit(repo, pr, head)
         if decision != "accept":
             self.telemetry.emit("drop", repo=repo, pr=pr, sha=head, reason=decision, action=BACKFILL_ACTION)
             return f"drop:{decision}"
         self.telemetry.emit("backfill", repo=repo, pr=pr, sha=head)
+        # `locked()` is True exactly when no slot is free, i.e. this panel WILL wait —
+        # the queue-depth signal the operator reads out of the panel stats.
+        if self.panel_sem is not None and self.panel_sem.locked():
+            self.telemetry.emit("queued", kind=BACKFILL_ACTION, repo=repo, pr=pr, sha=head)
+        slot = self.panel_sem if self.panel_sem is not None else contextlib.nullcontext()
         try:
-            return await self._review(repo, pr)
+            async with slot:
+                return await self._review(repo, pr)
         finally:
             self.chokepoint.done(repo, pr)
 
