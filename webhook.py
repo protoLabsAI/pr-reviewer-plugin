@@ -48,6 +48,8 @@ def build_routers(dispatcher, telemetry, get_secret, run_gh_fn=None):
         gh_event = request.headers.get("X-GitHub-Event", "")
         if gh_event == "issue_comment":
             return await _handle_comment(body)
+        if gh_event == "check_run":
+            return await _handle_check_run(body)
         if gh_event != "pull_request":
             telemetry.emit("drop", reason="not-a-pr-event", gh_event=gh_event)
             return {"ok": True, "dispatched": False, "reason": "not-a-pr-event"}
@@ -122,6 +124,40 @@ def build_routers(dispatcher, telemetry, get_secret, run_gh_fn=None):
             return {"ok": True, "dispatched": False, "reason": "summon:refused-not-admin"}
         asyncio.get_running_loop().create_task(_safe_summon(repo, pr, login))
         return {"ok": True, "dispatched": True, "reason": "summon:review"}
+
+    async def _handle_check_run(body: bytes) -> dict:
+        """A `check_run` webhook. We act ONLY on `rerequested` for our own `protoReview`
+        gate — a human clicked "Re-run" on the required check — and re-run the panel, the
+        same force posture as a summon. Making the check a required status is pointless if
+        a red X can only be cleared by pushing a dummy commit; this is how it is re-driven.
+
+        Every other action is ignored, deliberately: our own `created`/`completed` events
+        (we open and conclude the check ourselves) would otherwise loop the panel."""
+        from .dispatch import REVIEW_CHECK_NAME
+
+        try:
+            payload = json.loads(body)
+            if str(payload.get("action") or "") != "rerequested":
+                return {"ok": True, "dispatched": False, "reason": "not-a-rerequest"}
+            check_run = payload["check_run"]
+            if str(check_run.get("name") or "") != REVIEW_CHECK_NAME:
+                return {"ok": True, "dispatched": False, "reason": "not-our-check"}
+            repo = str(payload["repository"]["full_name"])
+            prs = check_run.get("pull_requests") or []
+            pr = int(prs[0]["number"]) if prs else 0
+            # The re-run is user-initiated in the GitHub UI, which already gates on write
+            # access; `sender` is who clicked it, for the telemetry trail.
+            actor = str((payload.get("sender") or {}).get("login") or "check-rerequest")
+        except (KeyError, TypeError, ValueError, IndexError, json.JSONDecodeError):
+            telemetry.emit("drop", reason="malformed-payload", gh_event="check_run")
+            return {"ok": True, "dispatched": False, "reason": "malformed-payload"}
+        if not pr:
+            # A check run is not always tied to a PR (a branch push builds one too) —
+            # there is nothing to re-review.
+            return {"ok": True, "dispatched": False, "reason": "check-run-no-pr"}
+        telemetry.emit("summon", repo=repo, pr=pr, actor=actor, verb="check-rerequest")
+        asyncio.get_running_loop().create_task(_safe_summon(repo, pr, actor))
+        return {"ok": True, "dispatched": True, "reason": "check-run-rerequest"}
 
     async def _handles() -> list[str]:
         """Names this reviewer answers to: the configured handle plus its own login, so

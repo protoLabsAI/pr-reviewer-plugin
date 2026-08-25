@@ -228,6 +228,48 @@ logs a warning naming that permission and the panel otherwise behaves as before.
 check is written only where this agent owns promotion — a *required* check that nobody
 drives would block every merge in that repo forever.
 
+### The `protoReview` check run — verdicts you can require on every merge
+
+`QA panel` above answers *"is this head cleared for merge?"*, and only where this agent
+**owns promotion** — so a shadow deployment publishes nothing, and an **exhausted** panel
+(no verdict) leaves it sitting *in progress*, indistinguishable from a head still under
+review. That is exactly the gap that let **12 PRs merge unreviewed** in one deployment
+(lifetime 29): the verdict was an *advisory* GitHub review, and an exhausted panel that
+posts no review is indistinguishable from an approved one.
+
+**`protoReview`** closes it. It is a check run of a different kind — it tracks the
+**dispatch lifecycle itself**, not the promotion decision:
+
+| Moment | The check |
+|---|---|
+| Panel dispatched (past the drop/skip gates) | ⏳ in progress |
+| `PASS` / `WARN` verdict posted | ✅ success |
+| `FAIL` verdict posted | ❌ failure |
+| **Panel exhausted / crashed** (no verdict) | ❌ failure — *the key new signal* |
+| Verdict produced but the post was refused | ❌ failure (not left dangling) |
+| Dropped (draft, closed, allowlist miss) | *no check — the panel never ran* |
+
+Because the **same review that opens the check also concludes it**, `protoReview` never
+dangles — so, unlike `QA panel`, it is published for **every** panel that runs regardless
+of shadow mode or promotion ownership, and is safe to require everywhere. Its `head_sha`
+is resolved **server-side** from the PR (never the webhook's ref), and the concluding
+`output.summary` carries the verdict text or the exhaustion reason.
+
+**To make it enforce**, add **`protoReview`** to the branch's required status checks
+(ruleset → *Require status checks to pass*). An exhausted panel then leaves a **red X**
+that blocks the merge, instead of the silence a merge would sail straight through — a
+human's PR and projectBoard-plugin's auto-merge (which gates on `mergeStateStatus`) alike.
+
+**Re-running it.** A red `protoReview` is cleared by pushing a fix (a new head re-triggers
+the panel), or by clicking **Re-run** on the check itself — GitHub delivers that as a
+`check_run` *rerequested* event, which re-runs the panel with the same force posture as a
+manual summon. That needs the App subscribed to the **`check_run`** event (like
+`issue_comment` for summons); without it the push path still works.
+
+Requires the App installation to carry **Checks: read & write**. Without it the create
+logs a warning naming that permission and the whole lifecycle no-ops — the review still
+posts as before (bookkeeping must never cost the verdict).
+
 ### What the sweep does (every `sweep_interval_s`, default 180s)
 
 Each open PR in each managed repo is reconciled in this order — cheapest and most
