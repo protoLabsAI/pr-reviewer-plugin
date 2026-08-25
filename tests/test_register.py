@@ -79,4 +79,6 @@ def test_app_auth_surface_registers_only_when_configured(monkeypatch, no_app_env
     monkeypatch.setenv("PROTOREVIEW_APP_PRIVATE_KEY", "PEM")
     reg2 = FakeRegistry({})
     pr_reviewer.register(reg2)
-    assert [s["name"] for s in reg2.surfaces] == ["pr-reviewer-sweep", "pr-reviewer-app-auth"]
+    # app-auth registers BEFORE sweep so the installation token exists before the
+    # sweep's first repo enumeration runs (issue #99).
+    assert [s["name"] for s in reg2.surfaces] == ["pr-reviewer-app-auth", "pr-reviewer-sweep"]
