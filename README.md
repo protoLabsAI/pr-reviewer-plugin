@@ -161,6 +161,60 @@ structural-trigger dispatch, approve-on-green + sweep, and the review eval.
   recall reads it back out of the body, so it can't be removed. A clean pass (`[]`) or a
   prose-only report is left untouched.
 
+## The draft → ready contract — undrafting a PR is the act of shipping it
+
+On a repository this plugin watches, a PR's **draft** state is its merge gate. Read
+this before you mark a PR ready for review.
+
+- **Draft PRs are skipped by the panel.** A PR in the draft state is dropped before
+  the panel runs — the same eligibility gate that skips a closed or a locked
+  conversation (telemetered `pr-not-eligible`, `why=draft`). No review is posted, no
+  verdict is produced, and nothing can promote while the PR stays draft.
+- **Marking a PR ready for review hands it to the QA pipeline.** The draft→ready
+  transition is a review trigger: on a watched, `main`-targeting PR the panel runs,
+  and once it posts a **current, complete PASS** and the promotion guards are all
+  green, approve-on-green posts a formal APPROVE **and arms native GitHub squash
+  auto-merge** (`gh pr merge --auto --squash`). Arming is best-effort and scoped to
+  `main`-targeting PRs (stacked PRs are excluded); a repo with auto-merge disabled
+  simply declines.
+
+So the practical contract is: **undraft a PR only when it is ready to ship, not when
+you merely want eyes on it.** The moment the panel is satisfied, an eligible
+ready-for-review PR with a promoted current PASS lands on its own.
+
+### A PASS does not bypass the guards
+
+Auto-merge is armed only when a clear PASS/WARN verdict clears **every** fail-closed
+guard in `promotion_decision` — approve-on-green is exactly as conservative as the
+panel, and a PASS is not a skeleton key past any of these:
+
+- this agent **owns promotion** for the repo and is **not in shadow mode**;
+- a **clear verdict** (PASS or WARN) exists for the PR's **current head SHA** — a
+  verdict for a superseded head is **stale** and holds (`hold:stale-head`), so a PASS
+  never lands a commit the panel never saw;
+- that verdict has **not already been promoted** (per-head dedup);
+- the pass was **verified** (the verify pass ran) over **complete** coverage (no
+  finder was down) — an incomplete pass is "nobody looked", not "nothing there", and
+  holds;
+- **CI is terminal-green** — checks unknown, pending, or failing all hold; and
+- there are **zero unresolved review threads**.
+
+Every unknown (unreadable checks, unreadable threads, no verdict) falls through to a
+typed hold and the sweep re-evaluates next pass. Even once armed, native GitHub
+auto-merge still waits on branch protection and required status checks (including
+`QA panel` / `protoReview` where required) before it merges — arming it is not
+merging it.
+
+### Holding a PR that is reviewed but must not ship yet
+
+There is no separate "reviewed but held" state today. If a PR is complete and wants
+scrutiny but must **not** land yet — it shares a file with another PR in flight, waits
+on a sibling landing first, a release window, or a coordinated rollout — **keep it in
+draft** (or do not undraft it) until that dependency or sequencing is resolved. A
+draft is skipped by the panel and can never promote, so draft is the safe hold:
+nothing arms auto-merge while the PR stays draft. Undraft only once it is genuinely
+clear to ship.
+
 ## Requirements
 
 - protoAgent ≥ the version carrying the findings `source` field (see the manifest pin).
