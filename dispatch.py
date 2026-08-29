@@ -31,7 +31,7 @@ import re
 import time
 from urllib.parse import quote
 
-from .approve import HOLD_NOT_OWNER, PROMOTE, Observations, promotion_decision
+from .approve import HOLD_NOT_OWNER, HOLD_THREADS_UNRESOLVED, PROMOTE, Observations, promotion_decision
 from .checks import CHECK_NAME, COMPLETED, FAILURE, IN_PROGRESS, SUCCESS, CheckRun, check_for
 from .chokepoint import DISPATCH_ACTIONS, Chokepoint
 from .gh_cli import bad_repo, run_gh
@@ -919,6 +919,42 @@ class Dispatcher:
         from .threads import count_unresolved_threads
 
         return await count_unresolved_threads(self._run_gh, repo, pr)
+
+    async def _panel_owned_unresolved(self, repo: str, pr: int) -> int | None:
+        """How many UNRESOLVED review threads the PANEL itself raised, or None when the
+        threads (or our own identity) cannot be read.
+
+        Server-authoritative and author-based: a thread is the panel's iff its ROOT comment
+        was written by our own bot login. Threads other reviewers opened are external —
+        they hold PROMOTION (fail-closed, via the total count) but are not the panel's
+        findings, so they must not fail or misattribute the `QA panel` check (issue #105).
+
+        None is load-bearing: it means "ownership unknown", which the check maps to a HOLD,
+        never a failure. We never claim a thread as ours on an unreadable identity or an
+        unreadable thread list — the safe direction is to say nothing, not to fail.
+        """
+        viewer = (await self._viewer_login()).removesuffix("[bot]")
+        if not viewer:
+            return None  # we don't know who we are ⇒ cannot claim any thread as the panel's
+        from .threads import fetch_threads
+
+        try:
+            nodes = await fetch_threads(self._run_gh, repo, pr)
+        except Exception:  # noqa: BLE001 — an unreadable thread list is "unknown", never a failure
+            log.exception("[pr-reviewer] thread-ownership fetch failed on %s#%s", repo, pr)
+            return None
+        if nodes is None:
+            return None
+        owned = 0
+        for t in nodes:
+            if not isinstance(t, dict) or t.get("isResolved"):
+                continue
+            comments = (t.get("comments") or {}).get("nodes") or []
+            root = next((c for c in comments if isinstance(c, dict)), None)
+            author = str(((root or {}).get("author") or {}).get("login") or "").strip().lower()
+            if author and author.removesuffix("[bot]") == viewer:
+                owned += 1
+        return owned
 
     async def _existing_threads_block(self, repo: str, pr: int) -> str:
         """The rendered <pr_review_threads> block, or "" (unreadable/none — the
@@ -1895,6 +1931,12 @@ class Dispatcher:
             return HOLD_PROMOTE_BACKOFF
         decision = promotion_decision(obs)
         self.telemetry.emit("promotion", repo=repo, pr=pr, sha=head, decision=decision)
+        # Promotion holds on ANY open thread (fail-closed, above), but the `QA panel` check
+        # speaks only for the PANEL — so a thread another reviewer opened must not fail it
+        # (issue #105). Split the open threads by server-side authorship into the panel's
+        # own vs. everyone else's, and hand the OWN count to the mapping. Read only when the
+        # decision actually turns on threads, so the common paths pay nothing for it.
+        panel_unresolved = await self._panel_owned_unresolved(repo, pr) if decision == HOLD_THREADS_UNRESOLVED else None
         # The gate GitHub can enforce (checks.py). Written from the SAME decision that
         # drives approve-on-green — one judgement, published two ways — and before the
         # early return, so a hold is what the check reports too. It deliberately does not
@@ -1908,6 +1950,7 @@ class Dispatcher:
                 # The latest verdict FOR THIS HEAD — a stale one is not this head's.
                 verdict=(latest["verdict"] if latest and latest["head"] == head else None),
                 unresolved=obs.unresolved_threads,
+                panel_unresolved=panel_unresolved,
             ),
         )
         if decision != PROMOTE:

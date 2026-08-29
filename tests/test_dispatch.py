@@ -187,6 +187,13 @@ def review_row(head, verdict, state="COMMENTED", findings_json="", id=None, comp
     return {"state": state, "body": body, "id": id}
 
 
+def thread_node(author, *, resolved=False):
+    """A review-thread node shaped like the GraphQL fetch returns — a single root comment
+    by `author`. `count_unresolved_threads` reads only `isResolved`; thread OWNERSHIP
+    (issue #105) reads the root comment's author to decide whose thread it is."""
+    return {"isResolved": resolved, "comments": {"nodes": [{"author": {"login": author}, "body": "…"}]}}
+
+
 class RoutedGH(FakeGH):
     def __init__(
         self,
@@ -350,6 +357,70 @@ async def test_unreadable_threads_never_block_the_review(tmp_path):
     d = make(tmp_path, gh=gh, runner=runner)
     assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "reviewed:FAIL"
     assert "existing_threads" not in seen["inputs"]  # recipe default "(none)" applies
+
+
+# ── thread ownership for the QA-panel check (issue #105) ──────────────────────
+
+
+async def test_panel_owned_unresolved_counts_only_our_own_open_threads(tmp_path):
+    """Server-authoritative and author-based: a thread is the panel's iff its ROOT comment
+    is our own bot login. Resolved threads and other reviewers' threads don't count."""
+    gh = RoutedGH(
+        pr_facts=facts(),
+        threads=[
+            thread_node("qa-bot[bot]"),  # ours, open → counts
+            thread_node("coderabbitai[bot]"),  # external → does not
+            thread_node("qa-bot[bot]", resolved=True),  # ours but resolved → does not
+            thread_node("some-human"),  # external → does not
+        ],
+    )
+    d = make(tmp_path, gh=gh)  # RoutedGH's `user` probe resolves our login to qa-bot
+    assert (await d._panel_owned_unresolved("o/r", 1)) == 1
+
+
+async def test_panel_ownership_is_unknown_when_identity_is_unknown(tmp_path):
+    """Without a resolvable identity we cannot claim any thread as ours — None (a HOLD),
+    never a count, so an unread identity can't fail the check on someone else's thread."""
+
+    class NoViewerGH(RoutedGH):
+        async def __call__(self, args, timeout=30):
+            if len(args) > 1 and args[1] == "user":
+                return 1, "", "HTTP 403"
+            return await super().__call__(args, timeout)
+
+    gh = NoViewerGH(pr_facts=facts(), threads=[thread_node("coderabbitai[bot]")])
+    d = make(tmp_path, gh=gh)  # no viewer_login configured, and the probe fails
+    assert (await d._panel_owned_unresolved("o/r", 1)) is None
+
+
+async def test_panel_ownership_is_unknown_when_threads_are_unreadable(tmp_path):
+    """An unreadable thread list is 'unknown', not 'zero of ours' — None, so the check
+    HOLDS rather than either failing or falsely clearing."""
+    gh = RoutedGH(pr_facts=facts(), threads=None)  # the fetch degrades to null nodes
+    d = make(tmp_path, cfg={"viewer_login": "qa-bot[bot]"}, gh=gh)
+    assert (await d._panel_owned_unresolved("o/r", 1)) is None
+
+
+async def test_external_thread_holds_promotion_without_a_panel_failure(tmp_path):
+    """Issue #105 end-to-end: a clean PASS with no panel findings and only ANOTHER
+    reviewer's open thread. Promotion stays fail-closed (no APPROVE posted), but the
+    QA-panel check we publish is NOT a failure and never calls the external thread a panel
+    finding — the verdict and promotion eligibility are kept apart."""
+    gh = RoutedGH(
+        pr_facts=facts(),
+        reviews=[review_row(HEAD, "PASS")],
+        checks=[{"status": "completed", "conclusion": "success", "name": "CI"}],
+        threads=[thread_node("coderabbitai[bot]")],
+    )
+    d = make(tmp_path, cfg={"shadow_mode": False, "promotion_owner": True}, gh=gh)
+    assert (await d.evaluate_promotion("o/r", 1)) == "hold:threads-unresolved"
+    assert gh.reviews_posted == []  # fail-closed: the external thread holds promotion
+    qa_writes = [p for p in gh.posted if "check-runs" in p.get("url", "")]
+    assert qa_writes, "the QA-panel check should still be published"
+    qa = qa_writes[-1]
+    assert qa.get("conclusion") == "success"  # the panel is clear — not a red X
+    assert "finding" not in qa.get("output[title]", "").lower()  # not called a panel finding
+    assert "held" in qa.get("output[summary]", "").lower()  # attributed as a promotion hold
 
 
 # ── in-diff confinement ───────────────────────────────────────────────────────
