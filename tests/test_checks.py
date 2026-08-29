@@ -24,7 +24,7 @@ from pr_reviewer.approve import (
 )
 from pr_reviewer.checks import CHECK_NAME, check_for
 
-from tests.test_dispatch import HEAD, RoutedGH, facts, make, review_row
+from tests.test_dispatch import HEAD, RoutedGH, facts, make, review_row, thread_node
 
 
 class ChecksGH(RoutedGH):
@@ -69,13 +69,33 @@ def test_a_cleared_head_is_a_green_check():
         assert (run.status, run.conclusion) == ("completed", "success")
 
 
-def test_unresolved_findings_fail_the_check_and_say_how_many():
-    """The WARN gate. The verdict stays non-blocking — what blocks is feedback nobody
-    addressed, which is the thing a merge would bury."""
-    run = check_for(HOLD_THREADS_UNRESOLVED, verdict="WARN", unresolved=2)
+def test_panel_owned_unresolved_findings_fail_the_check_and_say_how_many():
+    """The WARN gate — scoped to the panel's OWN threads. The verdict stays non-blocking;
+    what blocks is the panel's feedback nobody addressed. Reported by the panel-owned
+    count, so an external thread never inflates or mislabels the number (issue #105)."""
+    run = check_for(HOLD_THREADS_UNRESOLVED, verdict="WARN", unresolved=5, panel_unresolved=2)
     assert (run.status, run.conclusion) == ("completed", "failure")
-    assert "2 unresolved review threads" in run.title
-    assert "1 unresolved review thread" in check_for(HOLD_THREADS_UNRESOLVED, unresolved=1).title
+    assert "2 unresolved review threads" in run.title  # the panel's 2, not the total 5
+    assert "1 unresolved review thread" in check_for(HOLD_THREADS_UNRESOLVED, unresolved=1, panel_unresolved=1).title
+
+
+def test_an_external_thread_hold_does_not_fail_the_check():
+    """PASS/clear + only OTHER reviewers' threads open: promotion is held (elsewhere), but
+    the panel raised none of those threads. The check stays green and names the hold
+    external — it never converts an empty PASS into a panel failure (issue #105)."""
+    run = check_for(HOLD_THREADS_UNRESOLVED, verdict="PASS", unresolved=1, panel_unresolved=0)
+    assert (run.status, run.conclusion) == ("completed", "success")
+    assert "finding" not in run.title.lower()  # never called a panel finding
+    # The message distinguishes the (clear) verdict from the (held) promotion eligibility.
+    summary = run.summary.lower()
+    assert "clear" in summary and "held" in summary and "promotion hold" in summary
+
+
+def test_unreadable_thread_ownership_holds_rather_than_fails():
+    """When we can't read WHO owns the open threads, we can neither claim nor disclaim them
+    as the panel's — so the check holds in progress, never a red X on our own read outage."""
+    run = check_for(HOLD_THREADS_UNRESOLVED, unresolved=2, panel_unresolved=None)
+    assert (run.status, run.conclusion) == ("in_progress", None)
 
 
 def test_a_standing_fail_fails_the_check_but_silence_does_not():
@@ -149,18 +169,40 @@ async def test_promotion_publishes_a_green_check_for_the_head(tmp_path):
     assert write["status"] == "completed" and write["conclusion"] == "success"
 
 
-async def test_unresolved_threads_publish_a_failing_check(tmp_path):
-    """The end-to-end shape of "address the findings before you merge"."""
+async def test_panel_owned_unresolved_thread_publishes_a_failing_check(tmp_path):
+    """The end-to-end shape of "address the panel's findings before you merge": a thread
+    the panel itself raised (root comment by our bot login) still fails the check."""
     gh = ChecksGH(
         pr_facts=facts(),
         reviews=[review_row(HEAD, "WARN")],
         checks=GREEN,
-        threads=[{"isResolved": False}],
+        threads=[thread_node("qa-bot[bot]")],  # ours
     )
     d = owned(tmp_path, gh)
     assert (await d.evaluate_promotion("o/r", 1)) == "hold:threads-unresolved"
     assert gh.writes[0]["conclusion"] == "failure"
     assert gh.reviews_posted == []  # held: no approval, and the check says why
+
+
+async def test_an_external_unresolved_thread_does_not_fail_the_check(tmp_path):
+    """Issue #105: a clean PASS with no panel findings must not publish a FAILING QA-panel
+    check merely because an unrelated reviewer has an open thread — nor call it the panel's.
+    Promotion stays fail-closed on the open thread; the check reflects the clear verdict."""
+    gh = ChecksGH(
+        pr_facts=facts(),
+        reviews=[review_row(HEAD, "PASS")],
+        checks=GREEN,
+        threads=[thread_node("coderabbitai[bot]")],  # someone else's
+    )
+    d = owned(tmp_path, gh)
+    # Promotion stays fail-closed while any thread is open — the external thread still holds.
+    assert (await d.evaluate_promotion("o/r", 1)) == "hold:threads-unresolved"
+    assert gh.reviews_posted == []  # not approved — external thread holds promotion
+    # ...but the QA-panel check does NOT fail, and does not call the thread a panel finding.
+    write = gh.writes[0]
+    assert write["conclusion"] == "success"
+    assert "finding" not in write["output[title]"].lower()
+    assert "held" in write["output[summary]"].lower()
 
 
 async def test_an_unchanged_check_is_not_rewritten(tmp_path):
