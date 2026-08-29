@@ -45,7 +45,6 @@ from .rounds import (
     panel_rounds,
     parse_dispositions,
     render_degraded_note,
-    render_diff_marker,
     render_held_note,
     render_notes_section,
     render_prior_requests,
@@ -54,7 +53,7 @@ from .rounds import (
     unaccounted_priors,
     unexplained_clearance,
 )
-from .telemetry import REAFFIRM, REAFFIRM_DIFF, REAFFIRM_HEAD, REAFFIRM_MISS, Telemetry
+from .telemetry import REAFFIRM_DIFF, REAFFIRM_HEAD, REAFFIRM_MISS, Telemetry
 from .trigger import structural_trigger
 from .verdicts import (
     FAIL,
@@ -750,71 +749,79 @@ class Dispatcher:
         )
         return [line.strip() for line in out.splitlines() if line.strip()] if rc == 0 else []
 
-    async def _pr_diff_id(self, repo: str, pr: int) -> str | None:
-        """The identity of the PR's current review-relevant base↔head diff, or None (issue #91).
+    async def _commit_tree(self, repo: str, ref: str) -> str | None:
+        """The Git tree SHA of `ref`'s commit — one Merkle root over the WHOLE tree, or None.
 
-        Reads the PR's own three-dot file diff server-side — path, status, rename source,
-        resulting blob, and unified patch per changed file — and folds it deterministically
-        (`diff_identity`). This is the change a reviewer sees, so it is stable across a
-        rebase, a reworded commit, or a moved stacked base that left the net change intact,
-        and it differs the instant the PR's content does. `gh` resolves the refs; the model
-        never supplies one. One JSON object per line so a PR over 30 files still hashes its
-        WHOLE diff (the #75 pagination posture), never a silently-short prefix.
-
-        Fails CLOSED: a non-zero rc, a partial/unparseable page, an empty file set, or any
-        file whose patch GitHub omitted all fold to None (via the read helpers and
-        `diff_identity`), and the reaffirm short-circuit then declines and the normal review
-        runs. This only decides whether redundant panel work can be skipped — it posts
-        nothing and never weakens the SHA-keyed stale-head protections.
+        Read PINNED to the SHA the caller passes (`gh` resolves it; the model never supplies
+        a ref, ADR 0078). Being a single hash over the entire tree, it is immune to the
+        3,000-file `/pulls/{n}/files` truncation the changed-file diff suffers — a change in
+        a file past that cap still moves the tree root. Fails CLOSED: non-zero rc or an empty
+        read ⇒ None.
         """
-        rc, out, _err = await self._run_gh(
-            [
-                "api",
-                f"repos/{repo}/pulls/{pr}/files",
-                "--paginate",
-                "--jq",
-                ".[] | {filename: .filename, status: .status, sha: .sha, "
-                "previous_filename: .previous_filename, patch: .patch}",
-            ],
-        )
-        if rc != 0:
+        rc, out, _err = await self._run_gh(["api", f"repos/{repo}/commits/{ref}", "--jq", ".commit.tree.sha"])
+        tree = out.strip() if rc == 0 else ""
+        return tree or None
+
+    async def _merge_base_tree(self, repo: str, base: str, head: str) -> str | None:
+        """The tree SHA of the base↔head merge base — the left endpoint of the three-dot
+        diff, or None. Derived server-side from the PINNED head SHA, so a push landing after
+        the head was resolved cannot move it. Fails CLOSED like `_commit_tree`.
+        """
+        if not base or not head:
             return None
-        rows = gh_json_rows(out)
-        if rows is None:
-            return None  # a partial read is never a proven byte-identical diff (#75)
-        return diff_identity(rows)
+        rc, out, _err = await self._run_gh(
+            ["api", f"repos/{repo}/compare/{base}...{head}", "--jq", ".merge_base_commit.commit.tree.sha"]
+        )
+        tree = out.strip() if rc == 0 else ""
+        return tree or None
+
+    async def _pr_diff_id(self, repo: str, base: str, head: str) -> str | None:
+        """Identity of the PR's current review-relevant base↔head diff, or None (issue #91).
+
+        Both endpoints of the three-dot diff are read as Git tree SHAs, PINNED to the
+        resolved head — the head tree by its SHA, the merge-base tree derived from that same
+        SHA — and folded by `diff_identity`. The identity is stable across a rebase, a
+        reworded commit, or a moved-but-identical base (the head SHA changes, the reviewed
+        content does not), and it moves the instant any reviewed byte does — INCLUDING a
+        dependency the rebase pulled in through the base, which a changed-file-only hash
+        could not see (the correctness gap the earlier attempt shipped).
+
+        Fails CLOSED: either tree unreadable ⇒ None (via the helpers and `diff_identity`),
+        so the reaffirm short-circuit declines and the normal review runs. It posts nothing
+        and never relaxes the SHA-keyed stale-head protections — it only decides whether a
+        redundant panel can be skipped.
+        """
+        head_tree = await self._commit_tree(repo, head)
+        if head_tree is None:
+            return None
+        merge_base_tree = await self._merge_base_tree(repo, base, head)
+        return diff_identity(merge_base_tree, head_tree)
 
     def _reaffirm_by_diff(self, repo: str, pr: int, head: str, prior: dict, current_id: str | None) -> str | None:
-        """Reaffirm `prior`'s verdict when the PR's current diff (`current_id`) is byte-identical
-        to what that round reviewed, though the head SHA changed — a rebase, a reworded commit,
-        or a moved stacked base (issue #91). Returns 'reaffirmed:<verdict>' or None to fall
-        through to a fresh panel.
+        """Reuse `prior`'s verdict when the PR's current diff (`current_id`) is byte-identical
+        to what that round reviewed, even though the head SHA changed — a rebase, a reworded
+        commit, or a moved-but-identical base (issue #91). Returns ``reaffirmed:<verdict>`` or
+        None to fall through to a fresh panel.
 
-        A pure decision over ids already read by the caller, so it never issues a second file
-        read. Fails CLOSED in every uncertain direction: the prior round recorded no diff id
-        (an older body), the current diff could not be read, or the two differ ⇒ None, and the
-        normal review runs. It posts nothing, promotes nothing, and opens no check for the new
-        head — the optimization only suppresses a redundant panel when the review-relevant diff
-        provably did not change; the SHA-based stale-head protections are untouched. The reuse
-        is recorded in telemetry, and so are the near-misses, so a reuse that stops is not silent.
+        A PURE decision over ids the caller already read — it issues no GitHub call. Fails
+        CLOSED in every uncertain direction, each telemetered so a reuse that stops is never
+        silent: the current diff was unreadable, the prior round stored no identity (an older
+        body), or the two differ ⇒ None and the normal review runs. It posts nothing, promotes
+        nothing, and opens no check for the new head; the SHA-based stale-head and promotion
+        rules are untouched. Only a proven-identical diff suppresses the redundant panel.
         """
-        prior_id = prior.get("diff_id")
-        if not prior_id:
-            return None  # a round without a stored identity — sameness cannot be proven
         if current_id is None:
             self.telemetry.emit(REAFFIRM_MISS, repo=repo, pr=pr, sha=head, reason="diff-unreadable")
+            return None
+        prior_id = prior.get("diff_id")
+        if not prior_id:
+            self.telemetry.emit(REAFFIRM_MISS, repo=repo, pr=pr, sha=head, reason="prior-has-no-diff-id")
             return None
         if current_id != prior_id:
             self.telemetry.emit(REAFFIRM_MISS, repo=repo, pr=pr, sha=head, reason="diff-changed")
             return None
         self.telemetry.emit(
-            REAFFIRM,
-            repo=repo,
-            pr=pr,
-            sha=head,
-            verdict=prior["verdict"],
-            basis=REAFFIRM_DIFF,
-            prior_head=prior["head"],
+            REAFFIRM_DIFF, repo=repo, pr=pr, sha=head, prior_head=prior.get("head"), verdict=prior.get("verdict")
         )
         return f"reaffirmed:{prior['verdict']}"
 
@@ -1076,11 +1083,10 @@ class Dispatcher:
         """An operator asked for a review (issue #28). Same panel, two differences.
 
         A summon bypasses the COOLDOWN (that exists to eat webhook bursts; a human who
-        typed a command is not a burst) and BOTH reaffirm short-circuits (an unchanged head,
-        or a new head whose diff is byte-identical to the last reviewed round, normally
-        reaffirms without re-spending the panel — but `@vera review` is precisely the "I
-        think you got this wrong" case, and reaffirming either way would answer the question
-        with the answer under dispute). `force=True` carries that bypass into `_review`.
+        typed a command is not a burst) and the REAFFIRM short-circuit (an unchanged head
+        with a posted verdict normally reaffirms without re-spending the panel — but
+        `@vera review` on an unchanged head is precisely the "I think you got this wrong"
+        case, and reaffirming it would answer the question with the answer under dispute).
 
         Everything else is unchanged: allowlist, eligibility, self-authored, in-flight,
         confinement, grounding, fail-closed exhaustion.
@@ -1187,17 +1193,19 @@ class Dispatcher:
         current = next((r for r in reversed(history) if r["head"] == head), None)
         if current and not force:  # `force` = an operator summon disputing this verdict
             # Unchanged head with a posted verdict — reaffirm, don't re-spend the panel.
-            self.telemetry.emit(REAFFIRM, repo=repo, pr=pr, sha=head, verdict=current["verdict"], basis=REAFFIRM_HEAD)
+            self.telemetry.emit(REAFFIRM_HEAD, repo=repo, pr=pr, sha=head, verdict=current["verdict"])
             return f"reaffirmed:{current['verdict']}"
-        # The PR's review-relevant diff identity for THIS head (issue #91). Computed once:
-        # it is persisted with this round's verdict below (so a later rebase can reaffirm
-        # against it), and — unless this is a forced summon — compared NOW against the last
-        # round to skip a redundant panel when a rebase/reword left the diff byte-identical.
-        # A summon deliberately re-runs the panel even on an identical diff (that is the "I
-        # think you got this wrong" case), so it never reaffirms; it still records an id so
-        # the fresh verdict it posts remains reaffirmable.
-        diff_id = await self._pr_diff_id(repo, pr)
-        if not force and history:
+        # The identity of the base↔head content this event would have the panel review —
+        # read ONCE, pinned to the resolved head SHA (issue #91). It serves two ends: the
+        # byte-identical-diff reaffirm just below, and the marker stamp further down, so a
+        # LATER rebase can reaffirm against THIS round. A summon still computes it for the
+        # stamp but never reuses a verdict from it — `force` means the operator is disputing.
+        diff_id = await self._pr_diff_id(repo, str(facts.get("base_ref") or ""), head)
+        if history and not force:
+            # A new head SHA whose base↔head diff is byte-identical to the most recent round
+            # reaffirms that verdict without re-spending the panel — a rebase, a reworded
+            # commit, or a moved-but-identical base. Fails closed to a fresh review when the
+            # identity is unreadable, absent on the prior round, or different.
             reaffirmed = self._reaffirm_by_diff(repo, pr, head, history[-1], diff_id)
             if reaffirmed is not None:
                 return reaffirmed
@@ -1470,10 +1478,8 @@ class Dispatcher:
             # normal; empty over real findings means the verdict is ungrounded, and the
             # promotion gate must not auto-approve it (mirrors `complete` one step up).
             verified=verification_ran(str(steps_out.get("verify") or ""), reported),
-            # The diff this round reviewed, stashed in the body so a later rebase whose
-            # diff is byte-identical can reaffirm this verdict without re-running the panel
-            # (issue #91). Read at dispatch, so it is the PINNED head's diff — the one the
-            # marker names — not whatever the PR advanced to while the panel ran.
+            # Stamp the reviewed base↔head diff identity into the marker (issue #91) so a
+            # later rebased/reworded head with a byte-identical diff reaffirms this verdict.
             diff_id=diff_id,
         )
         self.telemetry.emit(
@@ -1645,12 +1651,8 @@ class Dispatcher:
             complete=complete,
             verified=verified,
             stale_note=stale_note,
+            diff_id=diff_id or "",
         )
-        # Persist the reviewed diff's identity as a hidden trailing marker (issue #91), so a
-        # future push whose diff is byte-identical reaffirms this verdict instead of re-running
-        # the panel. Appended AFTER the body — never woven into the verdict marker — so it is
-        # the last such marker and `diff_identity_of` reads ours, not one a claim echoed.
-        body += render_diff_marker(diff_id)
         event = "COMMENT"
         if not self.shadow and verdict == FAIL:
             # A blocking verdict only against terminal CI (#863) — else comment now;
@@ -2325,18 +2327,6 @@ class Dispatcher:
             return None
         if any(r["head"] == head for r in ours):
             return None  # a verdict for the CURRENT head exists — nothing to backfill
-        # A NEW head with no verdict is normally backfilled — but if it is a rebase/reword
-        # whose review-relevant diff is byte-identical to the last reviewed round, the panel
-        # would only reconfirm the same verdict (issue #91). Decline, so the sweep does NOT
-        # re-spend it every tick (the loop a webhook-side reaffirm would otherwise feed) and
-        # does not starve genuine backfills. Nothing is posted for the new head: promotion
-        # stays SHA-keyed and only fires on a verdict FOR the head, so this never merges an
-        # unreviewed head — it just stops paying for a panel that cannot change the answer.
-        history = panel_rounds(ours)
-        if history and history[-1].get("diff_id"):
-            reaffirmed = self._reaffirm_by_diff(repo, pr, head, history[-1], await self._pr_diff_id(repo, pr))
-            if reaffirmed is not None:
-                return None
         return head
 
     async def backfill_review(self, repo: str, pr: int, head: str) -> str:

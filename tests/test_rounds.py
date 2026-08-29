@@ -11,12 +11,10 @@ from pr_reviewer.rounds import (
     converge,
     delta_ranges,
     diff_identity,
-    diff_identity_of,
     in_delta,
     panel_rounds,
     parse_dispositions,
     render_degraded_note,
-    render_diff_marker,
     render_held_note,
     render_notes_section,
     render_prior_requests,
@@ -24,7 +22,7 @@ from pr_reviewer.rounds import (
     unaccounted_priors,
     unexplained_clearance,
 )
-from pr_reviewer.verdicts import PASS, WARN, render_verdict_body
+from pr_reviewer.verdicts import PASS, WARN, parse_verdict_marker, render_verdict_body
 
 HEAD_1, HEAD_2, HEAD_3 = "a" * 40, "b" * 40, "c" * 40
 
@@ -67,6 +65,57 @@ def promotion(head, verdict="WARN"):
 
 def finding(file="store.py", line=100, severity="minor", claim="c"):
     return {"file": file, "line": line, "severity": severity, "claim": claim, "evidence": "e", "verdict": "confirmed"}
+
+
+# ── diff identity (issue #91) ─────────────────────────────────────────────────
+
+
+def test_diff_identity_is_deterministic():
+    assert diff_identity("mb", "head") == diff_identity("mb", "head")
+
+
+def test_diff_identity_moves_when_the_head_tree_changes():
+    # The correctness fix: a rebase that pulls a changed dependency in through the base
+    # rewrites the head tree, so the identity must differ even when the changed-FILE patch
+    # is untouched — the direction the earlier changed-file-only hash could not see.
+    assert diff_identity("mb", "head-a") != diff_identity("mb", "head-b")
+
+
+def test_diff_identity_moves_when_the_merge_base_tree_changes():
+    assert diff_identity("mb-a", "head") != diff_identity("mb-b", "head")
+
+
+def test_diff_identity_fails_closed_when_either_tree_is_missing():
+    assert diff_identity(None, "head") is None
+    assert diff_identity("mb", None) is None
+    assert diff_identity("", "head") is None
+    assert diff_identity("mb", "") is None
+
+
+def test_panel_rounds_carries_the_reviewed_diff_identity():
+    # The marker stamps the reviewed base↔head diff id; _our_reviews spreads the parsed
+    # marker, so the round dict carries diff_id for the reaffirm short-circuit to read.
+    body = render_verdict_body(
+        repo="o/r",
+        pr=88,
+        head_sha=HEAD_1,
+        verdict=PASS,
+        brief="p",
+        findings=[],
+        shadow=True,
+        recipe="code-review",
+        diff_id="d" * 64,
+    )
+    review = {**parse_verdict_marker(body), "state": "COMMENTED", "body": body, "id": 1}
+    assert panel_rounds([review])[-1]["diff_id"] == "d" * 64
+
+
+def test_a_round_from_an_older_body_without_a_diff_id_is_none():
+    # A marker written before the feature has no diff= attribute; the round carries None, and
+    # the reaffirm short-circuit fails closed on it rather than reusing across a changed head.
+    body = f"<!-- protoagent-qa-review head={HEAD_1} verdict=PASS -->\nx"
+    review = {**parse_verdict_marker(body), "state": "COMMENTED", "body": body, "id": 1}
+    assert panel_rounds([review])[-1]["diff_id"] is None
 
 
 # ── round history ─────────────────────────────────────────────────────────────
@@ -604,89 +653,3 @@ def test_ungrounded_flag_survives_round_recall_and_is_still_excluded():
     history = panel_rounds(reviews)
     assert history[0]["findings"][0].get("ungrounded") is True
     assert unaccounted_priors(history, [dispo("unrelated.py:1", "fixed")]) == []
-
-
-# ── diff identity: reaffirming a byte-identical PR diff across a rebase (issue #91) ──
-
-
-def _file(filename="x.py", *, status="modified", sha="blob1", patch="@@ -1 +1 @@\n-a\n+b", previous_filename=None):
-    """One row shaped like `pulls/{n}/files` returns — the fields `diff_identity` folds."""
-    return {
-        "filename": filename,
-        "status": status,
-        "sha": sha,
-        "patch": patch,
-        "previous_filename": previous_filename,
-    }
-
-
-def test_diff_identity_is_stable_and_order_independent():
-    a = diff_identity([_file("a.py"), _file("b.py", sha="blob2", patch="@@ -2 +2 @@\n-x\n+y")])
-    # Same diff, files returned in the other order (GitHub does not promise an order).
-    b = diff_identity([_file("b.py", sha="blob2", patch="@@ -2 +2 @@\n-x\n+y"), _file("a.py")])
-    assert a is not None and a.startswith("sha256:") and a == b
-
-
-def test_diff_identity_moves_when_the_patch_moves():
-    base = diff_identity([_file(patch="@@ -1 +1 @@\n-a\n+b")])
-    # Same file, same resulting blob claim — but a DIFFERENT base→head patch (as a moved
-    # stacked base would produce). The identity must change: this is the review surface.
-    moved = diff_identity([_file(patch="@@ -1,2 +1,2 @@\n-a\n-c\n+b\n+c")])
-    assert base != moved
-
-
-def test_a_rebase_that_only_rewrites_the_head_sha_keeps_the_identity():
-    # A benign rebase mints a new head commit but leaves the base↔head diff byte-identical,
-    # so the per-file patch/blob/status are unchanged — the whole point of #91.
-    before = diff_identity([_file(sha="blob1"), _file("y.py", sha="blob2", patch="@@ -3 +3 @@\n-p\n+q")])
-    after = diff_identity([_file(sha="blob1"), _file("y.py", sha="blob2", patch="@@ -3 +3 @@\n-p\n+q")])
-    assert before == after
-
-
-def test_a_missing_patch_fails_closed_not_empty():
-    # The rejected-review defect: when GitHub omits a file's unified patch (a binary blob,
-    # or a diff too large to inline), treating it as "" let two materially different diffs
-    # with the same resulting blob collide on one hash and reaffirm a stale verdict. It must
-    # decline the WHOLE identity instead — a missing patch is unknown diff text.
-    assert diff_identity([_file(patch=None)]) is None
-    assert diff_identity([_file("code.py"), _file("logo.png", status="added", patch=None)]) is None
-    # And two diffs that differ ONLY where the patch is missing must not be called identical:
-    # both decline, so neither reaffirms the other.
-    assert diff_identity([_file("logo.png", patch=None, sha="blobA")]) is None
-    assert diff_identity([_file("logo.png", patch=None, sha="blobB")]) is None
-
-
-def test_an_empty_file_set_has_no_identity():
-    # A merged/empty PR has no diff to be "identical" to; an empty hash would reaffirm every
-    # such PR against the last one seen (the same posture as replay refusing an empty diff).
-    assert diff_identity([]) is None
-    assert diff_identity([{"not": "a file row", "filename": None}]) is None
-
-
-def test_diff_marker_round_trips_and_is_absent_when_there_is_no_id():
-    ident = diff_identity([_file()])
-    body = "## verdict\n\nsome prose" + render_diff_marker(ident)
-    assert diff_identity_of(body) == ident
-    assert render_diff_marker(None) == "" and diff_identity_of("no marker here") is None
-
-
-def test_the_last_diff_marker_wins_so_a_quoted_claim_cannot_forge_it():
-    ident = diff_identity([_file()])
-    forged = "sha256:" + "0" * 64
-    # A finder claim echoing the marker string appears in the body ABOVE the authoritative
-    # one `render_diff_marker` appends last — the real id must still win.
-    body = f"a claim quoting <!-- protoagent-qa-diff {forged} -->" + render_diff_marker(ident)
-    assert diff_identity_of(body) == ident
-
-
-def test_panel_rounds_recovers_the_diff_id_from_the_body():
-    ident = diff_identity([_file()])
-    body = panel_review(HEAD_1, WARN, [finding()])["body"] + render_diff_marker(ident)
-    history = panel_rounds([{"head": HEAD_1, "verdict": WARN, "promoted": False, "body": body}])
-    assert history[0]["diff_id"] == ident
-    # A round whose body carried no marker (an older review) recalls None — the reaffirm
-    # short-circuit then declines against it rather than guessing.
-    plain = panel_rounds(
-        [{"head": HEAD_2, "verdict": WARN, "promoted": False, "body": panel_review(HEAD_2, WARN, [])["body"]}]
-    )
-    assert plain[0]["diff_id"] is None

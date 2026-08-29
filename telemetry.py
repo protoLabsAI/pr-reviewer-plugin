@@ -18,17 +18,14 @@ from pathlib import Path
 
 log = logging.getLogger("protoagent.plugins.pr_reviewer")
 
-# The reaffirm short-circuit (issue #91) and its two bases. A `REAFFIRM` event says the
-# panel was NOT re-spent because the current head is already-reviewed: `REAFFIRM_HEAD` when
-# the head SHA itself is unchanged, `REAFFIRM_DIFF` when a NEW head (a rebase, a reworded
-# commit, a moved stacked base) carries a byte-identical review-relevant diff. `REAFFIRM_MISS`
-# is a NEAR-miss — a diff that could not be read, or that genuinely changed — recorded so a
-# reuse that STOPS is visible in telemetry rather than silent, and the review that followed
-# can be told apart from one that reaffirmed.
-REAFFIRM = "reaffirm"
-REAFFIRM_MISS = "reaffirm_miss"
-REAFFIRM_HEAD = "head"
-REAFFIRM_DIFF = "diff"
+# Reaffirm event names (issue #91): a verdict REUSED without re-spending the panel, plus
+# the near-misses where a reuse was considered and declined. Named here rather than inlined
+# as string literals in the dispatcher so the eval reads one vocabulary for "the panel did
+# not run because the reviewed content had not changed." REAFFIRM_HEAD keeps the original
+# "reaffirm" name so existing telemetry and dashboards are unbroken.
+REAFFIRM_HEAD = "reaffirm"  # the exact same head SHA already carries this verdict
+REAFFIRM_DIFF = "reaffirm-diff"  # head SHA changed, but the base↔head diff is byte-identical
+REAFFIRM_MISS = "reaffirm-miss"  # a diff reaffirm was considered and declined (fail-closed)
 
 
 class Telemetry:

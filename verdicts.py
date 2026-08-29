@@ -400,6 +400,7 @@ def render_verdict_body(
     complete: bool = True,
     verified: bool = True,
     stale_note: str = "",
+    diff_id: str = "",
 ) -> str:
     """The comment body, ASSEMBLED — marker line (machine), header (human), the brief,
     the dispositions table, the findings table + machine-readable array, then the
@@ -440,11 +441,19 @@ def render_verdict_body(
     # Both withhold auto-approve for the same reason — a clean verdict nobody checked is
     # not a clean verdict. Emitted only when true, so a normal marker is unchanged and an
     # older one parses as verified by default.
+    # `diff=<id>` records the identity of the base↔head content this round reviewed
+    # (issue #91). A later event whose PR diff hashes to the same id is byte-identical to
+    # what this verdict already judged — even across a rebased/reworded head SHA — so it
+    # reaffirms rather than re-spends the panel. A tolerated trailing attribute, so an
+    # older marker (no `diff=`) simply parses as "no stored identity" and reaffirm fails
+    # closed for it. Emitted only when known, so a normal marker is otherwise unchanged.
     marker = f"<!-- protoagent-qa-review head={head_sha} verdict={verdict} promoted=false"
     if not complete:
         marker += " complete=false"
     if not verified:
         marker += " verified=false"
+    if diff_id:
+        marker += f" diff={diff_id}"
     marker += " -->"
     sections = [
         f"{marker}\n## QA panel review — **{verdict}**\n_{recipe} · head `{head_sha[:12]}` · {mode}_",
@@ -467,7 +476,8 @@ def render_verdict_body(
 
 
 def parse_verdict_marker(body: str) -> dict | None:
-    """{'head', 'verdict', 'promoted'} from a posted body, or None if it isn't ours."""
+    """{'head', 'verdict', 'promoted', 'complete', 'verified', 'diff_id'} from a posted
+    body, or None if it isn't ours."""
     m = _MARKER_RE.search(body or "")
     if not m:
         return None
@@ -476,12 +486,17 @@ def parse_verdict_marker(body: str) -> dict | None:
     # a plain review IS complete) — only an explicit `complete=false` withholds promotion.
     complete = "complete=false" not in m.group(0)
     verified = "verified=false" not in m.group(0)
+    # `diff=<id>` is the base↔head diff identity this round reviewed (issue #91). Absent on
+    # any marker written before the feature ⇒ None ⇒ the reaffirm short-circuit fails closed
+    # and the normal review runs.
+    diff_m = re.search(r"\bdiff=([0-9a-f]+)", m.group(0))
     return {
         "head": m.group("head"),
         "verdict": m.group("verdict"),
         "promoted": m.group("promoted") == "true",
         "complete": complete,
         "verified": verified,
+        "diff_id": diff_m.group(1) if diff_m else None,
     }
 
 
