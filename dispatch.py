@@ -41,9 +41,11 @@ from .rounds import (
     DEFAULT_CONVERGENCE_ROUNDS,
     converge,
     delta_ranges,
+    diff_identity,
     panel_rounds,
     parse_dispositions,
     render_degraded_note,
+    render_diff_marker,
     render_held_note,
     render_notes_section,
     render_prior_requests,
@@ -52,7 +54,7 @@ from .rounds import (
     unaccounted_priors,
     unexplained_clearance,
 )
-from .telemetry import Telemetry
+from .telemetry import REAFFIRM, REAFFIRM_DIFF, REAFFIRM_HEAD, REAFFIRM_MISS, Telemetry
 from .trigger import structural_trigger
 from .verdicts import (
     FAIL,
@@ -748,6 +750,74 @@ class Dispatcher:
         )
         return [line.strip() for line in out.splitlines() if line.strip()] if rc == 0 else []
 
+    async def _pr_diff_id(self, repo: str, pr: int) -> str | None:
+        """The identity of the PR's current review-relevant base↔head diff, or None (issue #91).
+
+        Reads the PR's own three-dot file diff server-side — path, status, rename source,
+        resulting blob, and unified patch per changed file — and folds it deterministically
+        (`diff_identity`). This is the change a reviewer sees, so it is stable across a
+        rebase, a reworded commit, or a moved stacked base that left the net change intact,
+        and it differs the instant the PR's content does. `gh` resolves the refs; the model
+        never supplies one. One JSON object per line so a PR over 30 files still hashes its
+        WHOLE diff (the #75 pagination posture), never a silently-short prefix.
+
+        Fails CLOSED: a non-zero rc, a partial/unparseable page, an empty file set, or any
+        file whose patch GitHub omitted all fold to None (via the read helpers and
+        `diff_identity`), and the reaffirm short-circuit then declines and the normal review
+        runs. This only decides whether redundant panel work can be skipped — it posts
+        nothing and never weakens the SHA-keyed stale-head protections.
+        """
+        rc, out, _err = await self._run_gh(
+            [
+                "api",
+                f"repos/{repo}/pulls/{pr}/files",
+                "--paginate",
+                "--jq",
+                ".[] | {filename: .filename, status: .status, sha: .sha, "
+                "previous_filename: .previous_filename, patch: .patch}",
+            ],
+        )
+        if rc != 0:
+            return None
+        rows = gh_json_rows(out)
+        if rows is None:
+            return None  # a partial read is never a proven byte-identical diff (#75)
+        return diff_identity(rows)
+
+    def _reaffirm_by_diff(self, repo: str, pr: int, head: str, prior: dict, current_id: str | None) -> str | None:
+        """Reaffirm `prior`'s verdict when the PR's current diff (`current_id`) is byte-identical
+        to what that round reviewed, though the head SHA changed — a rebase, a reworded commit,
+        or a moved stacked base (issue #91). Returns 'reaffirmed:<verdict>' or None to fall
+        through to a fresh panel.
+
+        A pure decision over ids already read by the caller, so it never issues a second file
+        read. Fails CLOSED in every uncertain direction: the prior round recorded no diff id
+        (an older body), the current diff could not be read, or the two differ ⇒ None, and the
+        normal review runs. It posts nothing, promotes nothing, and opens no check for the new
+        head — the optimization only suppresses a redundant panel when the review-relevant diff
+        provably did not change; the SHA-based stale-head protections are untouched. The reuse
+        is recorded in telemetry, and so are the near-misses, so a reuse that stops is not silent.
+        """
+        prior_id = prior.get("diff_id")
+        if not prior_id:
+            return None  # a round without a stored identity — sameness cannot be proven
+        if current_id is None:
+            self.telemetry.emit(REAFFIRM_MISS, repo=repo, pr=pr, sha=head, reason="diff-unreadable")
+            return None
+        if current_id != prior_id:
+            self.telemetry.emit(REAFFIRM_MISS, repo=repo, pr=pr, sha=head, reason="diff-changed")
+            return None
+        self.telemetry.emit(
+            REAFFIRM,
+            repo=repo,
+            pr=pr,
+            sha=head,
+            verdict=prior["verdict"],
+            basis=REAFFIRM_DIFF,
+            prior_head=prior["head"],
+        )
+        return f"reaffirmed:{prior['verdict']}"
+
     async def _our_reviews(self, repo: str, pr: int) -> list[dict] | None:
         """Our posted reviews (marker-bearing), oldest→newest: [{head, verdict, promoted, state, body, id}].
 
@@ -1006,10 +1076,11 @@ class Dispatcher:
         """An operator asked for a review (issue #28). Same panel, two differences.
 
         A summon bypasses the COOLDOWN (that exists to eat webhook bursts; a human who
-        typed a command is not a burst) and the REAFFIRM short-circuit (an unchanged head
-        with a posted verdict normally reaffirms without re-spending the panel — but
-        `@vera review` on an unchanged head is precisely the "I think you got this wrong"
-        case, and reaffirming it would answer the question with the answer under dispute).
+        typed a command is not a burst) and BOTH reaffirm short-circuits (an unchanged head,
+        or a new head whose diff is byte-identical to the last reviewed round, normally
+        reaffirms without re-spending the panel — but `@vera review` is precisely the "I
+        think you got this wrong" case, and reaffirming either way would answer the question
+        with the answer under dispute). `force=True` carries that bypass into `_review`.
 
         Everything else is unchanged: allowlist, eligibility, self-authored, in-flight,
         confinement, grounding, fail-closed exhaustion.
@@ -1116,8 +1187,20 @@ class Dispatcher:
         current = next((r for r in reversed(history) if r["head"] == head), None)
         if current and not force:  # `force` = an operator summon disputing this verdict
             # Unchanged head with a posted verdict — reaffirm, don't re-spend the panel.
-            self.telemetry.emit("reaffirm", repo=repo, pr=pr, sha=head, verdict=current["verdict"])
+            self.telemetry.emit(REAFFIRM, repo=repo, pr=pr, sha=head, verdict=current["verdict"], basis=REAFFIRM_HEAD)
             return f"reaffirmed:{current['verdict']}"
+        # The PR's review-relevant diff identity for THIS head (issue #91). Computed once:
+        # it is persisted with this round's verdict below (so a later rebase can reaffirm
+        # against it), and — unless this is a forced summon — compared NOW against the last
+        # round to skip a redundant panel when a rebase/reword left the diff byte-identical.
+        # A summon deliberately re-runs the panel even on an identical diff (that is the "I
+        # think you got this wrong" case), so it never reaffirms; it still records an id so
+        # the fresh verdict it posts remains reaffirmable.
+        diff_id = await self._pr_diff_id(repo, pr)
+        if not force and history:
+            reaffirmed = self._reaffirm_by_diff(repo, pr, head, history[-1], diff_id)
+            if reaffirmed is not None:
+                return reaffirmed
         prior = history[-1] if history else None
         round_number = len(history) + 1
         # Max-rounds cap: arm on the first push-triggered review that exceeds the limit so
@@ -1387,6 +1470,11 @@ class Dispatcher:
             # normal; empty over real findings means the verdict is ungrounded, and the
             # promotion gate must not auto-approve it (mirrors `complete` one step up).
             verified=verification_ran(str(steps_out.get("verify") or ""), reported),
+            # The diff this round reviewed, stashed in the body so a later rebase whose
+            # diff is byte-identical can reaffirm this verdict without re-running the panel
+            # (issue #91). Read at dispatch, so it is the PINNED head's diff — the one the
+            # marker names — not whatever the PR advanced to while the panel ran.
+            diff_id=diff_id,
         )
         self.telemetry.emit(
             "reviewed",
@@ -1534,6 +1622,7 @@ class Dispatcher:
         complete: bool = True,
         review_check_id: int | None = None,
         verified: bool = True,
+        diff_id: str | None = None,
     ) -> bool:
         # Immediately before posting — the last moment a mid-round push can be caught.
         # The marker keeps the PINNED head on purpose: the round ran against it, and
@@ -1557,6 +1646,11 @@ class Dispatcher:
             verified=verified,
             stale_note=stale_note,
         )
+        # Persist the reviewed diff's identity as a hidden trailing marker (issue #91), so a
+        # future push whose diff is byte-identical reaffirms this verdict instead of re-running
+        # the panel. Appended AFTER the body — never woven into the verdict marker — so it is
+        # the last such marker and `diff_identity_of` reads ours, not one a claim echoed.
+        body += render_diff_marker(diff_id)
         event = "COMMENT"
         if not self.shadow and verdict == FAIL:
             # A blocking verdict only against terminal CI (#863) — else comment now;
@@ -2231,6 +2325,18 @@ class Dispatcher:
             return None
         if any(r["head"] == head for r in ours):
             return None  # a verdict for the CURRENT head exists — nothing to backfill
+        # A NEW head with no verdict is normally backfilled — but if it is a rebase/reword
+        # whose review-relevant diff is byte-identical to the last reviewed round, the panel
+        # would only reconfirm the same verdict (issue #91). Decline, so the sweep does NOT
+        # re-spend it every tick (the loop a webhook-side reaffirm would otherwise feed) and
+        # does not starve genuine backfills. Nothing is posted for the new head: promotion
+        # stays SHA-keyed and only fires on a verdict FOR the head, so this never merges an
+        # unreviewed head — it just stops paying for a panel that cannot change the answer.
+        history = panel_rounds(ours)
+        if history and history[-1].get("diff_id"):
+            reaffirmed = self._reaffirm_by_diff(repo, pr, head, history[-1], await self._pr_diff_id(repo, pr))
+            if reaffirmed is not None:
+                return None
         return head
 
     async def backfill_review(self, repo: str, pr: int, head: str) -> str:

@@ -32,6 +32,7 @@ introduced is still a defect — see #88 rounds 4 and 7).
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 
@@ -101,8 +102,101 @@ def panel_rounds(reviews: list[dict]) -> list[dict]:
             # Carried from the marker so the promotion gate can refuse a clean verdict
             # that was produced over incomplete coverage (#49). Absent ⇒ complete.
             "complete": bool(review.get("complete", True)),
+            # The review-relevant diff this round reviewed, recovered from the body's
+            # own hidden marker (issue #91). Absent ⇒ None, and the reaffirm-by-diff
+            # short-circuit then declines against this round — sameness can't be proven
+            # for a round that never recorded its diff.
+            "diff_id": diff_identity_of(str(review.get("body") or "")),
         }
     return list(by_head.values())
+
+
+# The PR's review-relevant diff, folded to a stable id and stashed in the posted body so a
+# later push can ask "is this the same change I already reviewed?" without re-running the
+# panel (issue #91). A rebase, a reworded commit, or a moved stacked base all mint a fresh
+# head SHA while leaving the base↔head diff byte-identical; the head SHA cannot tell those
+# apart from a real edit, but the diff itself can.
+_DIFF_MARKER_RE = re.compile(r"<!--\s*protoagent-qa-diff\s+(sha256:[0-9a-f]{64})\s*-->")
+
+
+def diff_identity(files: list[dict]) -> str | None:
+    """A deterministic id for the PR's review-relevant base↔head diff, or None when it
+    cannot be computed faithfully (issue #91).
+
+    Folds the per-file three-dot diff GitHub returns from `pulls/{n}/files` — path,
+    status, rename source, resulting blob, and the unified `patch` — into one SHA-256.
+    The `patch` is the base→head change ITSELF, so this id is invariant to a rebase, a
+    reworded commit, or a moved stacked base that leaves the net change intact, and it
+    moves the instant the change does. It deliberately folds in NO head/base SHA: those
+    are exactly what a benign rebase alters, and the whole point is to see through them.
+
+    Fails CLOSED — returns None — the moment sameness cannot be proven:
+
+      - an empty file set. A merged/empty PR has no diff to be "identical" to, and an
+        empty hash would reaffirm every such PR against the last one seen.
+      - ANY changed file whose `patch` GitHub omitted — a binary blob, or a diff too
+        large to inline. A missing patch is UNKNOWN diff text: folding it in as an empty
+        string would let two materially different diffs (e.g. the same head blob reached
+        from a different base after a rebase) collide on one hash and reaffirm a stale
+        verdict without re-running the panel. That head-context defect is precisely what
+        this refuses to guess at — the blob `sha` alone is not the review-relevant diff.
+
+    A missing patch declines the WHOLE identity, not just that file, so the caller runs a
+    normal review. Deterministic across reads: rows are sorted, since GitHub's file order
+    is not contractually stable across pages.
+    """
+    if not files:
+        return None
+    parts: list[str] = []
+    for entry in files:
+        if not isinstance(entry, dict):
+            return None  # an unparseable row — cannot prove anything about the diff
+        filename = str(entry.get("filename") or "").strip()
+        if not filename:
+            return None
+        patch = entry.get("patch")
+        if not isinstance(patch, str):
+            # No unified patch ⇒ unknown diff text ⇒ decline (never treat as empty). See
+            # the docstring: this is the head-context defect the byte-identical check must
+            # not fall into.
+            return None
+        parts.append(
+            "\x00".join(
+                [
+                    filename,
+                    str(entry.get("status") or ""),
+                    str(entry.get("previous_filename") or ""),  # rename/copy source
+                    str(entry.get("sha") or ""),  # resulting blob, redundant-but-discriminating
+                    patch,
+                ]
+            )
+        )
+    parts.sort()
+    digest = hashlib.sha256("\x1e".join(parts).encode("utf-8", "surrogatepass")).hexdigest()
+    return f"sha256:{digest}"
+
+
+def render_diff_marker(diff_id: str | None) -> str:
+    """The hidden marker that persists a round's diff identity in its posted body, so
+    `panel_rounds` can recall it next push (issue #91). Empty when there is no id to
+    record (an unreadable diff), so the round simply carries none and cannot be reaffirmed
+    against — the fail-closed direction."""
+    if not diff_id:
+        return ""
+    return f"\n\n<!-- protoagent-qa-diff {diff_id} -->"
+
+
+def diff_identity_of(body: str) -> str | None:
+    """Recover the diff identity a posted body recorded, or None if it carried none.
+
+    Takes the LAST marker in the body, never the first: finder claims quote untrusted PR
+    text into the findings block, so a PR author who writes the marker string into their
+    code could get it echoed into a claim above the real one. `render_diff_marker` appends
+    the authoritative id as the final line of the body, so the last match is always ours —
+    the same last-wins discipline `extract_findings_json` uses for the same reason.
+    """
+    matches = _DIFF_MARKER_RE.findall(body or "")
+    return matches[-1] if matches else None
 
 
 def render_prior_requests(rounds: list[dict]) -> str:
