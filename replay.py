@@ -260,7 +260,15 @@ async def _finding_sources(run_gh, repo: str, pr: int, head: str, findings: list
         )
         blob = ""
         read_ok = False
-        if rc == 0 and out.strip():
+        # In lockstep with `Dispatcher._finding_sources`: `rc == 0` is a SUCCESSFUL read —
+        # INCLUDING a zero-byte file, whose `.content` is the empty string (`out.strip() ==
+        # ""`). Gating on non-empty output would misclassify that empty-but-real file as
+        # UNREADABLE and PRESERVE an ungrounded blocker/major instead of downgrading a quote
+        # genuinely absent from a file we DID read (issue #109 regression). `null` is the one
+        # empty-ish payload that is NOT readable source — `.content` is absent (a directory or
+        # submodule, or an over-size file the contents API omits) — so it stays UNREADABLE and
+        # the finding's severity is preserved.
+        if rc == 0 and out.strip() != "null":
             try:
                 blob = base64.b64decode(out.strip()).decode("utf-8", errors="replace")
                 read_ok = True
