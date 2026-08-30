@@ -907,6 +907,11 @@ class Dispatcher:
         that was never read, and grounding must treat that as could-not-verify (issue #109),
         never as fabricated evidence that lifts the gate.
 
+        SUCCESS is keyed off ``rc == 0``, not off non-empty output: a zero-byte file at the
+        head reads back as empty ``.content`` (``out.strip() == ""``) yet is a genuine,
+        successful read of an empty file — its (empty) blob still grounds a fabricated quote
+        as absent and downgrades it, so it must NOT be mistaken for an unreadable source.
+
         The read is PINNED to the immutable head SHA (``ref=<head>``, resolved server-side —
         never a model ref, ADR 0078) against the correct repository over the authenticated
         ``gh`` client. A force-push mid-review can only 404 the orphaned SHA (⇒ UNREADABLE),
@@ -936,7 +941,15 @@ class Dispatcher:
             )
             blob = ""
             read_ok = False
-            if rc == 0 and out.strip():
+            # ``rc == 0`` is a SUCCESSFUL read — INCLUDING a zero-byte file, whose ``.content``
+            # is the empty string (so ``out.strip() == ""``). Gating ``read_ok`` on non-empty
+            # output would misclassify that empty-but-real file as UNREADABLE and PRESERVE an
+            # ungrounded blocker/major's gating verdict instead of downgrading a quote that is
+            # genuinely absent from a file we DID read (issue #109 regression). ``null`` is the
+            # one empty-ish payload that is NOT readable source: ``.content`` is absent (a
+            # directory or submodule, or an over-size file the contents API omits), so it stays
+            # unreadable and the finding's severity is preserved.
+            if rc == 0 and out.strip() != "null":
                 try:
                     blob = base64.b64decode(out.strip()).decode("utf-8", errors="replace")
                     read_ok = True

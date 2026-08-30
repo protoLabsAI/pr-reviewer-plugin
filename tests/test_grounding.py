@@ -238,6 +238,19 @@ def test_a_none_source_still_fails_open_silently():
     assert out[0]["verdict"] == "confirmed"
 
 
+def test_an_empty_string_source_is_a_real_read_and_downgrades():
+    # A zero-byte file at the head reads back as the empty STRING — a genuine, successful
+    # read of an empty file, NOT `None` (no source) and NOT `UNREADABLE` (fetch failure).
+    # Any quote is trivially absent from empty content, so a fabricated finding downgrades:
+    # the dispatcher must classify a zero-byte read as `""`, never as UNREADABLE (issue #109).
+    grounded, missing = ground_finding(FABRICATED, "")
+    assert grounded is False and missing  # empty content ⇒ the quote is absent
+    out, downgraded, unreadable = apply_grounding([FABRICATED], {FABRICATED["file"]: ""})
+    assert len(downgraded) == 1 and unreadable == []  # the fabricated-quote path, not could-not-verify
+    assert out[0]["verdict"] == "uncertain"
+    assert out[0].get("source_unavailable") is not True
+
+
 # ── prose must never be mistaken for a code quote ────────────────────────────
 
 

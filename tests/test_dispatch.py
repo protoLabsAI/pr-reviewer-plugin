@@ -2256,6 +2256,50 @@ async def test_a_successful_read_with_a_patch_still_downgrades_an_absent_quote(t
     assert "could NOT be evidence-checked" not in body  # distinct from the unreadable state
 
 
+async def test_a_zero_byte_head_file_is_a_successful_read_and_downgrades(tmp_path):
+    # The review-flagged regression: a zero-byte file at the head reads back as empty
+    # `.content` (`rc == 0`, `out.strip() == ""`). Gating the read on non-empty output would
+    # misclassify that real, empty file as UNREADABLE and PRESERVE the fabricated blocker's
+    # gating verdict. An empty file was READ — its quote is genuinely absent, so the blocker
+    # must DOWNGRADE, not stand as source-unavailable.
+    gh = HeadReadGH(source="", patch="", pr_facts=facts(), reviews=[])
+    runner, _seen = capturing_runner(FABRICATED_REPORT)
+    d = make(tmp_path, cfg={"shadow_mode": False}, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "reviewed:WARN"  # downgraded
+    body = gh.reviews_posted[0]["body"]
+    assert gh.posted[0]["event"] == "COMMENT"  # not REQUEST_CHANGES — the gate is lifted
+    assert "downgraded to **uncertain**" in body
+    assert "could NOT be evidence-checked" not in body  # NOT the unreadable/could-not-verify state
+
+
+async def test_finding_sources_splits_empty_read_from_null_content(tmp_path):
+    # Unit-level proof of the two `rc == 0` branches the review flagged:
+    #   * empty `.content` (a zero-byte file) is a SUCCESSFUL read → `combined` is a real
+    #     string haystack (blob + patch), so grounding can still prove a quote absent;
+    #   * `.content == null` (a submodule, or an over-size file the contents API omits) is
+    #     NOT readable source → the `UNREADABLE` sentinel, which preserves severity.
+    from pr_reviewer.grounding import UNREADABLE
+
+    class TwoFileGH:
+        async def __call__(self, args, timeout=30):
+            joined = " ".join(args)
+            if "/pulls/" in joined and "/files" in joined:
+                return 0, json.dumps([{"f": "empty.py", "p": "patchE"}, {"f": "sub", "p": "patchS"}]), ""
+            if "/contents/empty.py" in joined:
+                return 0, "", ""  # zero-byte file: rc == 0 with empty base64 content
+            if "/contents/sub" in joined:
+                return 0, "null", ""  # `.content` absent — not a readable file
+            return 1, "", "unexpected call"
+
+    d = make(tmp_path, gh=TwoFileGH())
+    sources = await d._finding_sources("o/r", 1, HEAD, [{"file": "empty.py"}, {"file": "sub"}])
+    blob_e, combined_e = sources["empty.py"]
+    assert blob_e == ""  # the file really is empty…
+    assert isinstance(combined_e, str) and combined_e.endswith("patchE")  # …but the read SUCCEEDED
+    _blob_s, combined_s = sources["sub"]
+    assert combined_s is UNREADABLE  # `null` content cannot ground anything — fail closed
+
+
 # ── unaccounted priors hold the block at any verdict (issue #26) ─────────────
 
 
