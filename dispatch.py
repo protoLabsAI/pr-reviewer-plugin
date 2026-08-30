@@ -35,7 +35,13 @@ from .approve import HOLD_NOT_OWNER, HOLD_THREADS_UNRESOLVED, PROMOTE, Observati
 from .checks import CHECK_NAME, COMPLETED, FAILURE, IN_PROGRESS, SUCCESS, CheckRun, check_for
 from .chokepoint import DISPATCH_ACTIONS, Chokepoint
 from .gh_cli import bad_repo, run_gh
-from .grounding import apply_grounding, correct_line_numbers, render_grounding_footnote
+from .grounding import (
+    UNREADABLE,
+    apply_grounding,
+    correct_line_numbers,
+    render_grounding_footnote,
+    render_unreadable_footnote,
+)
 from .protopatch import UNAVAILABLE_PREFIX
 from .rounds import (
     DEFAULT_CONVERGENCE_ROUNDS,
@@ -890,15 +896,27 @@ class Dispatcher:
 
     async def _finding_sources(
         self, repo: str, pr: int, head: str, findings: list[dict]
-    ) -> dict[str, tuple[str, str | None]]:
+    ) -> dict[str, tuple[str, str | object | None]]:
         """{file: (blob, combined)} for the files the findings cite.
 
         ``blob`` is the raw file at the reviewed head — used for line-number correction.
-        ``combined`` is ``blob + patch`` — used for grounding existence checks (a
-        removed-behaviour finding legitimately quotes code the head no longer has).
-        An unreadable file gives ``("", None)`` — fail open, never downgrade on a
-        failed read (the ``confine_findings`` posture).
+        ``combined`` is ``blob + patch`` when the head read SUCCEEDS — used for grounding
+        existence checks (a removed-behaviour finding legitimately quotes code the head no
+        longer has). When the head file cannot be read, ``combined`` is the ``UNREADABLE``
+        sentinel — NOT a patch-only haystack: absence cannot be established against a source
+        that was never read, and grounding must treat that as could-not-verify (issue #109),
+        never as fabricated evidence that lifts the gate.
+
+        The read is PINNED to the immutable head SHA (``ref=<head>``, resolved server-side —
+        never a model ref, ADR 0078) against the correct repository over the authenticated
+        ``gh`` client. A force-push mid-review can only 404 the orphaned SHA (⇒ UNREADABLE),
+        never silently resolve a DIFFERENT head, because we never fall back to the movable
+        branch tip (a bare ``contents/{file}``) — a read of another head is not evidence
+        about this one (acceptance r1/r6). Path and ref are URL-encoded so a filename with a
+        space or a ref with a slash cannot 404 by malformed request.
         """
+        import base64
+
         patches: dict[str, str] = {}
         rc, out, _err = await self._run_gh(
             ["api", f"repos/{repo}/pulls/{pr}/files", "--paginate", "--jq", ".[] | {f: .filename, p: .patch}"]
@@ -910,19 +928,24 @@ class Dispatcher:
             for row in gh_json_rows(out) or []:
                 if isinstance(row, dict) and row.get("f"):
                     patches[str(row["f"])] = str(row.get("p") or "")
-        sources: dict[str, tuple[str, str | None]] = {}
+        sources: dict[str, tuple[str, str | object | None]] = {}
         for file in {str(f.get("file") or "") for f in findings if f.get("file")}:
-            rc, out, _err = await self._run_gh(["api", f"repos/{repo}/contents/{file}?ref={head}", "--jq", ".content"])
+            ref = quote(head, safe="")
+            rc, out, _err = await self._run_gh(
+                ["api", f"repos/{repo}/contents/{quote(file, safe='/')}?ref={ref}", "--jq", ".content"]
+            )
             blob = ""
+            read_ok = False
             if rc == 0 and out.strip():
                 try:
-                    import base64
-
                     blob = base64.b64decode(out.strip()).decode("utf-8", errors="replace")
+                    read_ok = True
                 except Exception:  # noqa: BLE001 — an undecodable blob is a failed read
                     blob = ""
-            patch = patches.get(file, "")
-            combined = f"{blob}\n{patch}" if (blob or patch) else None
+            # A successful read grounds against blob + patch; a failed read is UNREADABLE,
+            # so a finding quoting real head code is preserved, not downgraded, and the
+            # report says the source was unavailable rather than claiming absence.
+            combined: str | object = f"{blob}\n{patches.get(file, '')}" if read_ok else UNREADABLE
             sources[file] = (blob, combined)
         return sources
 
@@ -1371,18 +1394,24 @@ class Dispatcher:
         # it doesn't reconsider a verdict, it corrects the findings the verdict is
         # computed from. A finding quoting code that isn't at the reviewed head is
         # annotated `uncertain`, which verdict_for already refuses to turn into a FAIL.
-        grounded_findings, ungrounded = [], []
+        grounded_findings, ungrounded, unreadable = [], [], []
         grounding_checked = 0
         if self.grounding_enabled and findings:
             raw = await self._finding_sources(repo, pr, head, findings)
             blobs = {f: v[0] for f, v in raw.items()}
             grounding_sources = {f: v[1] for f, v in raw.items()}
-            grounded_findings, ungrounded = apply_grounding(findings, grounding_sources)
+            grounded_findings, ungrounded, unreadable = apply_grounding(findings, grounding_sources)
             grounding_checked = len(findings)
             findings = grounded_findings
             findings = correct_line_numbers(findings, blobs)
         if ungrounded:
             self.telemetry.emit("ungrounded", repo=repo, pr=pr, sha=head, round=round_number, downgraded=ungrounded)
+        if unreadable:
+            # A failed head read is a DEGRADATION, not a downgrade — surfaced so a
+            # could-not-verify pass is never mistaken for a clean one (issue #109).
+            self.telemetry.emit(
+                "source_unavailable", repo=repo, pr=pr, sha=head, round=round_number, findings=unreadable
+            )
         verdict = verdict_for(findings)
         # Convergence (issue #23) sits AFTER the pure mapping, never inside it: ADR
         # 0078 C's rule is that findings decide the verdict, and that still holds —
@@ -1423,7 +1452,9 @@ class Dispatcher:
         dropped_finding = (
             unexplained_clearance(history, verdict, findings) if (self.hold_unexplained and not dispositions) else None
         )
-        trailer = render_notes_section(notes) + render_grounding_footnote(ungrounded)
+        trailer = (
+            render_notes_section(notes) + render_grounding_footnote(ungrounded) + render_unreadable_footnote(unreadable)
+        )
         if degraded:
             trailer += render_degraded_note(degraded)
         if unaccounted:
@@ -1506,6 +1537,7 @@ class Dispatcher:
             report_truncated=truncated or None,
             grounding_checked=grounding_checked,
             grounding_downgraded=len(ungrounded),
+            grounding_unreadable=len(unreadable),
             dispositions=len(dispositions),
             unaccounted=len(unaccounted),
             latency_s=round(elapsed, 1),

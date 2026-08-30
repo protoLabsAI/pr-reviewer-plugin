@@ -358,15 +358,24 @@ steps:
       finding, the other is you learning nothing. Downgrading on a failed read
       silently lifts the gate on a defect that is still there.
 
-      When a read fails at head SHA "{{inputs.head_sha}}":
+      Always read the cited file PINNED to head SHA "{{inputs.head_sha}}" — the
+      immutable commit under review, passed as `ref=` on github_read_file. When
+      that read fails at head SHA "{{inputs.head_sha}}":
 
-      1. **Retry without a ref** (the branch's current tip). A PR that is rebased
-         or force-pushed mid-review orphans the SHA this round pinned, and the
-         404 is about the ref, not the code.
-      2. If that also fails, **leave the finding exactly as it was** — same
-         severity, same disposition. Do NOT mark it `uncertain`, do not
-         de-escalate major→minor, and say plainly in your note that the file was
-         unreadable and the prior verdict stands unchanged.
+      1. **Do NOT re-read the file at the branch tip** (a bare read with no
+         `ref=`) and treat what you get back as this head. A rebase or force-push
+         mid-review orphans the pinned SHA, and the branch tip is then a DIFFERENT
+         head with possibly different code — grounding or refuting a finding
+         against it silently attributes a read to a head the panel never reviewed.
+         A read of another ref is not evidence about this one.
+      2. **Leave the finding exactly as it was** — same severity, same
+         disposition. Do NOT mark it `uncertain`, do not de-escalate major→minor.
+         Label it plainly as **source unavailable**: say in your note that the
+         cited file could not be read at this head, so the finding was neither
+         confirmed nor refuted on its merits and its prior verdict stands
+         unchanged. Source-unavailable is its OWN state — never write it up as
+         refuted, or as uncertain-on-the-merits, which would claim you learned
+         something you did not.
 
       Stale line anchors are the same trap wearing a different hat: when the head
       has moved, a finding's line number may no longer point at its code. Locate

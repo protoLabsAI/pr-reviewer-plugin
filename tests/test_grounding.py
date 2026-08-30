@@ -7,11 +7,13 @@ finding that quotes real code and reasons wrongly about it."""
 from __future__ import annotations
 
 from pr_reviewer.grounding import (
+    UNREADABLE,
     apply_grounding,
     correct_line_numbers,
     ground_finding,
     quoted_snippets,
     render_grounding_footnote,
+    render_unreadable_footnote,
 )
 from pr_reviewer.verdicts import FAIL, WARN, verdict_for
 
@@ -51,8 +53,8 @@ def test_the_2138_fabrication_is_downgraded():
 def test_a_downgraded_blocker_can_no_longer_fail_the_verdict():
     # The whole point: verdict_for maps an `uncertain` blocker/major to WARN, not FAIL.
     assert verdict_for([FABRICATED]) == FAIL
-    out, downgraded = apply_grounding([FABRICATED], {FABRICATED["file"]: WRITABLE_DIR_SRC})
-    assert len(downgraded) == 1
+    out, downgraded, unreadable = apply_grounding([FABRICATED], {FABRICATED["file"]: WRITABLE_DIR_SRC})
+    assert len(downgraded) == 1 and unreadable == []
     assert verdict_for(out) == WARN
     assert out[0]["verdict"] == "uncertain"
     assert "not found at the reviewed head" in out[0]["note"]
@@ -61,7 +63,7 @@ def test_a_downgraded_blocker_can_no_longer_fail_the_verdict():
 def test_a_downgraded_finding_is_marked_ungrounded():
     # The marker must be persisted in the findings JSON so it survives round recall
     # and unaccounted_priors can exclude it from the prior-finding ledger.
-    out, _ = apply_grounding([FABRICATED], {FABRICATED["file"]: WRITABLE_DIR_SRC})
+    out, _, _ = apply_grounding([FABRICATED], {FABRICATED["file"]: WRITABLE_DIR_SRC})
     assert out[0].get("ungrounded") is True
 
 
@@ -72,12 +74,12 @@ def test_a_grounded_finding_is_not_marked_ungrounded():
         "claim": "The guard `writable = Path(configured).expanduser()` runs only in one branch.",
         "evidence": 'It sits under `if configured and not str(configured).startswith("/sandbox"):`',
     }
-    out, _ = apply_grounding([real], {real["file"]: WRITABLE_DIR_SRC})
+    out, _, _ = apply_grounding([real], {real["file"]: WRITABLE_DIR_SRC})
     assert not out[0].get("ungrounded")
 
 
 def test_nothing_is_ever_dropped():
-    out, _ = apply_grounding([FABRICATED], {FABRICATED["file"]: WRITABLE_DIR_SRC})
+    out, _, _ = apply_grounding([FABRICATED], {FABRICATED["file"]: WRITABLE_DIR_SRC})
     assert len(out) == 1  # still posts, still readable, still a human's call
     assert out[0]["claim"] == FABRICATED["claim"]
 
@@ -175,11 +177,65 @@ def test_whitespace_and_diff_markers_do_not_decide_groundedness():
 
 
 def test_footnote_names_the_missing_quote():
-    _out, downgraded = apply_grounding([FABRICATED], {FABRICATED["file"]: WRITABLE_DIR_SRC})
+    _out, downgraded, _ = apply_grounding([FABRICATED], {FABRICATED["file"]: WRITABLE_DIR_SRC})
     note = render_grounding_footnote(downgraded)
     assert "downgraded to **uncertain**" in note
     assert "Path(str(configured))" in note
     assert render_grounding_footnote([]) == ""
+
+
+# ── unreadable source is could-not-verify, NOT quote-absent (issue #109) ──────
+#
+# A fetch failure at the reviewed head (`UNREADABLE`) must never be treated as the
+# fabricated-quote downgrade: the panel learned nothing, so the finding's severity and
+# verdict stand — only its visibility changes. This is the fail-open→fail-closed conflation
+# that de-escalated two byte-for-byte-present majors on a rebased PR (protoAgent#2296).
+
+
+def test_an_unreadable_source_preserves_severity_and_verdict():
+    out, downgraded, unreadable = apply_grounding([FABRICATED], {FABRICATED["file"]: UNREADABLE})
+    assert downgraded == []  # NOT a fabricated-quote downgrade
+    assert len(unreadable) == 1 and unreadable[0]["file"] == FABRICATED["file"]
+    # severity and verdict untouched — the blocker still gates
+    assert out[0]["severity"] == "blocker"
+    assert out[0]["verdict"] == "confirmed"
+    assert out[0].get("ungrounded") is not True
+    assert verdict_for(out) == FAIL
+
+
+def test_an_unreadable_finding_is_marked_source_unavailable_not_ungrounded():
+    out, _, _ = apply_grounding([FABRICATED], {FABRICATED["file"]: UNREADABLE})
+    assert out[0].get("source_unavailable") is True
+    assert out[0].get("ungrounded") is not True
+    assert "source unavailable at the reviewed head" in out[0]["note"]
+
+
+def test_unreadable_is_distinct_from_a_read_that_shows_the_quote_absent():
+    # Same finding, same file: a SUCCESSFUL read where the quote is absent downgrades;
+    # an UNREADABLE source does not. The two dispositions must never collapse.
+    absent_out, absent_down, absent_unread = apply_grounding([FABRICATED], {FABRICATED["file"]: WRITABLE_DIR_SRC})
+    unread_out, unread_down, unread_unread = apply_grounding([FABRICATED], {FABRICATED["file"]: UNREADABLE})
+    assert absent_out[0]["verdict"] == "uncertain" and len(absent_down) == 1 and absent_unread == []
+    assert unread_out[0]["verdict"] == "confirmed" and unread_down == [] and len(unread_unread) == 1
+
+
+def test_unreadable_footnote_names_the_state_without_claiming_a_verdict():
+    _out, _down, unreadable = apply_grounding([FABRICATED], {FABRICATED["file"]: UNREADABLE})
+    note = render_unreadable_footnote(unreadable)
+    assert "could NOT be evidence-checked" in note
+    assert "severity is UNCHANGED" in note
+    assert "neither confirmed nor refuted" in note
+    assert "uncertain" not in note.lower() and "refuted" in note  # not claimed uncertain-on-merits
+    assert render_unreadable_footnote([]) == ""
+
+
+def test_a_none_source_still_fails_open_silently():
+    # `None` is "no source to check", NOT a fetch failure: it fails open with no
+    # annotation (a finding whose file was never cited/read), distinct from UNREADABLE.
+    out, downgraded, unreadable = apply_grounding([FABRICATED], {FABRICATED["file"]: None})
+    assert downgraded == [] and unreadable == []
+    assert not out[0].get("source_unavailable") and not out[0].get("ungrounded")
+    assert out[0]["verdict"] == "confirmed"
 
 
 # ── prose must never be mistaken for a code quote ────────────────────────────

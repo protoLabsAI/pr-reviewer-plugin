@@ -213,7 +213,12 @@ def quoted_snippets(finding: dict) -> list[str]:
 def ground_finding(finding: dict, source: str | None) -> tuple[bool, list[str]]:
     """(grounded?, quotes that were absent). `source` should be the file at the reviewed
     head PLUS the PR's patch for it — a removed-behaviour finding legitimately quotes
-    code the head no longer has, and must not be downgraded for being right."""
+    code the head no longer has, and must not be downgraded for being right.
+
+    `source` is text that was ACTUALLY READ (or `None` for "no source to check"). A FETCH
+    FAILURE is a different animal — see `UNREADABLE`; `apply_grounding` handles it, and this
+    function must never be handed the sentinel, because "quote absent from a file I read"
+    and "I could not read the file" are opposite facts (issue #109)."""
     quotes = quoted_snippets(finding)
     if source is None or not quotes:
         return True, []  # nothing to check against, or nothing checkable — fail open
@@ -226,21 +231,57 @@ def ground_finding(finding: dict, source: str | None) -> tuple[bool, list[str]]:
 
 UNGROUNDED_NOTE = "evidence not found at the reviewed head — downgraded to uncertain, cannot gate a merge (issue #25)"
 
+# The reviewed head file could not be READ (a fetch failure — a 404 on an orphaned SHA
+# after a force-push, a network error, an undecodable blob), as distinct from `None` (no
+# source to check against) and from a successfully-read string. A fetch failure is NOT
+# evidence: absence cannot be established against a source that was never read, so it must
+# never masquerade as a fabricated quote (issue #109). `_finding_sources` passes this for a
+# failed head read INSTEAD of a patch-only haystack — grounding a head-context quote against
+# the patch alone would falsely downgrade a real finding for code the panel never saw.
+UNREADABLE = object()
 
-def apply_grounding(findings: list[dict], sources: dict[str, str | None]) -> tuple[list[dict], list[dict]]:
-    """(findings, downgraded). Every finding whose quoted code is absent from its file at
-    the reviewed head is annotated `verdict: uncertain` — which `verdict_for` already
-    refuses to turn into a FAIL — and carries a note saying why.
+SOURCE_UNAVAILABLE_NOTE = (
+    "source unavailable at the reviewed head — could NOT verify; severity unchanged, the "
+    "finding was neither confirmed nor refuted on its merits (issue #109)"
+)
+
+
+def apply_grounding(
+    findings: list[dict], sources: dict[str, str | object | None]
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """(findings, downgraded, unreadable). Three dispositions, kept deliberately distinct:
+
+    * quoted code ABSENT from a file that WAS read → annotated `verdict: uncertain` +
+      `ungrounded` (the fabricated-quote downgrade `verdict_for` refuses to turn into a
+      FAIL, issue #25), and listed in `downgraded`;
+    * the file could NOT be read at the reviewed head (`sources[file] is UNREADABLE`) →
+      severity and verdict left UNTOUCHED, annotated `source_unavailable` and listed in
+      `unreadable` so the report can say the finding was neither confirmed nor refuted on
+      its merits (issue #109) — a failed read must never lift a gate the panel earned;
+    * anything else → left exactly as it is.
 
     Findings are never removed. The report's own JSON still shows them and the posted body
-    footnotes the downgrade, so a human can always overrule the machine: the failure mode
-    this guards against is a fabrication that BLOCKS, not a fabrication that is visible.
+    footnotes BOTH the downgrade and the could-not-verify state, so a human can always
+    overrule the machine. The failure mode guarded against is a fabrication that BLOCKS and,
+    now, a fetch failure that silently UNBLOCKS.
     """
     out: list[dict] = []
     downgraded: list[dict] = []
+    unreadable: list[dict] = []
     for finding in findings:
         file = str(finding.get("file") or "")
-        grounded, missing = ground_finding(finding, sources.get(file))
+        source = sources.get(file)
+        if source is UNREADABLE:
+            # Fetch failure, NOT quote-absent: we learned nothing, so we change nothing but
+            # the visibility. Severity and verdict stand; only the note is added.
+            annotated = dict(finding)
+            annotated["source_unavailable"] = True
+            note = str(annotated.get("note") or "").strip()
+            annotated["note"] = f"{note} — {SOURCE_UNAVAILABLE_NOTE}" if note else SOURCE_UNAVAILABLE_NOTE
+            out.append(annotated)
+            unreadable.append({"file": file, "severity": str(finding.get("severity") or "")})
+            continue
+        grounded, missing = ground_finding(finding, source)
         if grounded:
             out.append(finding)
             continue
@@ -251,7 +292,7 @@ def apply_grounding(findings: list[dict], sources: dict[str, str | None]) -> tup
         annotated["note"] = f"{note} — {UNGROUNDED_NOTE}" if note else UNGROUNDED_NOTE
         out.append(annotated)
         downgraded.append({"file": file, "severity": str(finding.get("severity") or ""), "missing": missing[:3]})
-    return out, downgraded
+    return out, downgraded, unreadable
 
 
 def correct_line_numbers(findings: list[dict], blobs: dict[str, str]) -> list[dict]:
@@ -304,4 +345,24 @@ def render_grounding_footnote(downgraded: list[dict]) -> str:
         f"\n\n---\n_{len(downgraded)} finding(s) downgraded to **uncertain**: the code they quote as evidence "
         f"does not appear in the file at the reviewed head, nor in this PR's patch for it. A finding that "
         f"cannot be grounded does not gate a merge (issue #25) — it still stands for a human to judge._\n{lines}"
+    )
+
+
+def render_unreadable_footnote(unreadable: list[dict]) -> str:
+    """The posted-body note for findings whose cited file could not be READ at the reviewed
+    head. A failed read is not absent evidence: the severity is UNCHANGED and the finding is
+    neither refuted nor uncertain-on-its-merits — it simply could not be checked (issue #109).
+    The note says exactly that, so the verdict never silently over- or under-claims what the
+    grounding pass actually learned."""
+    if not unreadable:
+        return ""
+    lines = "\n".join(
+        f"- `{d['file'] or '(no file)'}` ({d['severity'] or '?'}) — file could not be read at this head"
+        for d in unreadable
+    )
+    return (
+        f"\n\n---\n_{len(unreadable)} finding(s) could NOT be evidence-checked: the file each cites could not "
+        f"be read at the reviewed head. This is a failed READ, not absent evidence — the severity is UNCHANGED "
+        f"and the finding was neither confirmed nor refuted on its merits (issue #109). A human should confirm "
+        f"it against the PR head._\n{lines}"
     )
