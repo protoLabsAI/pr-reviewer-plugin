@@ -32,6 +32,7 @@ introduced is still a defect — see #88 rounds 4 and 7).
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 
@@ -54,6 +55,33 @@ _CLOSING_TAG_RE = re.compile(r"</\s*(" + "|".join(_WRAPPER_TAGS) + r")\s*>", re.
 _HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@", re.MULTILINE)
 
 _RELIEVABLE = ("minor", "nit")
+
+
+def diff_identity(merge_base_tree: str | None, head_tree: str | None) -> str | None:
+    """Deterministic identity of a PR's review-relevant base↔head comparison, or None.
+
+    A three-dot PR diff is a pure function of exactly two trees — the merge-base tree and
+    the head tree — so the identity folds BOTH Git Merkle roots, NOT the changed-file
+    patch list. That distinction is the whole correctness of reaffirming a verdict across
+    a changed head SHA (issue #91):
+
+      - It captures the WHOLE reviewed head context. A rebase that pulls a changed
+        dependency in through the base rewrites the head tree, so the identity moves with
+        it. The earlier changed-file-only hash missed exactly this — it reaffirmed a
+        verdict produced against the old base even though the code at head had changed.
+      - It is not bounded by GitHub's 3,000-file `/pulls/{n}/files` cap. A tree SHA is one
+        hash over the entire tree however large, so a change in a file past that cap can
+        never be silently omitted from the identity.
+      - It is content-addressed, so it is STABLE across a reworded commit or a
+        moved-but-identical-content base (same bytes ⇒ same tree root, new commit SHA) —
+        which is the case this optimization exists to reuse.
+
+    Fails CLOSED: either tree missing (an unreadable or ambiguous read) ⇒ None, and the
+    caller declines to reaffirm and runs the normal review.
+    """
+    if not merge_base_tree or not head_tree:
+        return None
+    return hashlib.sha256(f"{merge_base_tree}\n{head_tree}".encode()).hexdigest()
 
 
 def _escape(text: str) -> str:
@@ -101,6 +129,10 @@ def panel_rounds(reviews: list[dict]) -> list[dict]:
             # Carried from the marker so the promotion gate can refuse a clean verdict
             # that was produced over incomplete coverage (#49). Absent ⇒ complete.
             "complete": bool(review.get("complete", True)),
+            # The base↔head diff identity this round reviewed (issue #91), so a later
+            # rebased head with a byte-identical diff can reaffirm this verdict without
+            # re-spending the panel. Absent (older bodies) ⇒ None ⇒ reaffirm fails closed.
+            "diff_id": review.get("diff_id") or None,
         }
     return list(by_head.values())
 

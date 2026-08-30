@@ -161,7 +161,14 @@ def test_body_marker_roundtrip():
         recipe="code-review",
     )
     marker = parse_verdict_marker(body)
-    assert marker == {"head": "a" * 40, "verdict": WARN, "promoted": False, "complete": True, "verified": True}
+    assert marker == {
+        "head": "a" * 40,
+        "verdict": WARN,
+        "promoted": False,
+        "complete": True,
+        "verified": True,
+        "diff_id": None,
+    }
     assert "shadow" in body and "QA panel review" in body
 
 
@@ -229,13 +236,56 @@ def test_a_marker_with_trailing_attributes_still_parses():
     # every sweep tick. 20+ duplicate APPROVE reviews before it was caught.
     body = "<!-- protoagent-qa-review head=abc1234 verdict=WARN promoted=true findings=1 -->\nPromoting..."
     m = parse_verdict_marker(body)
-    assert m == {"head": "abc1234", "verdict": "WARN", "promoted": True, "complete": True, "verified": True}
+    assert m == {
+        "head": "abc1234",
+        "verdict": "WARN",
+        "promoted": True,
+        "complete": True,
+        "verified": True,
+        "diff_id": None,
+    }
 
 
 def test_unknown_future_attributes_do_not_break_the_marker():
     body = "<!-- protoagent-qa-review head=abc1234 verdict=PASS promoted=false findings=0 mode=shadow x=1 -->"
     m = parse_verdict_marker(body)
     assert m and m["head"] == "abc1234" and m["verdict"] == "PASS" and m["promoted"] is False
+
+
+def test_the_reviewed_diff_identity_round_trips_through_the_marker():
+    # issue #91: the reviewed base↔head diff id is stamped into the marker and read back, so
+    # a later rebased head with a byte-identical diff can reaffirm this verdict.
+    did = "f" * 64
+    body = render_verdict_body(
+        repo="o/r",
+        pr=7,
+        head_sha="a" * 40,
+        verdict=PASS,
+        brief="prose",
+        findings=[],
+        shadow=True,
+        recipe="code-review",
+        diff_id=did,
+    )
+    assert f"diff={did}" in body
+    assert parse_verdict_marker(body)["diff_id"] == did
+
+
+def test_a_marker_without_a_diff_attribute_reads_none():
+    # An older body (or a review that could not read its diff) carries no diff= — the round
+    # then has no stored identity and the reaffirm short-circuit fails closed on it.
+    body = render_verdict_body(
+        repo="o/r",
+        pr=7,
+        head_sha="a" * 40,
+        verdict=PASS,
+        brief="prose",
+        findings=[],
+        shadow=True,
+        recipe="code-review",
+    )
+    assert "diff=" not in body
+    assert parse_verdict_marker(body)["diff_id"] is None
 
 
 def test_incomplete_marker_records_and_parses_complete_false():
@@ -456,6 +506,7 @@ def test_the_stale_header_rides_the_body_and_the_demotion_survives_recall():
         "promoted": False,
         "complete": True,
         "verified": True,
+        "diff_id": None,
     }
 
 

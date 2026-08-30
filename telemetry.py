@@ -18,6 +18,15 @@ from pathlib import Path
 
 log = logging.getLogger("protoagent.plugins.pr_reviewer")
 
+# Reaffirm event names (issue #91): a verdict REUSED without re-spending the panel, plus
+# the near-misses where a reuse was considered and declined. Named here rather than inlined
+# as string literals in the dispatcher so the eval reads one vocabulary for "the panel did
+# not run because the reviewed content had not changed." REAFFIRM_HEAD keeps the original
+# "reaffirm" name so existing telemetry and dashboards are unbroken.
+REAFFIRM_HEAD = "reaffirm"  # the exact same head SHA already carries this verdict
+REAFFIRM_DIFF = "reaffirm-diff"  # head SHA changed, but the base↔head diff is byte-identical
+REAFFIRM_MISS = "reaffirm-miss"  # a diff reaffirm was considered and declined (fail-closed)
+
 
 class Telemetry:
     def __init__(self, root: str | Path):

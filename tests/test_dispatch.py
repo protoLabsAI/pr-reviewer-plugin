@@ -172,7 +172,7 @@ async def test_self_authored_pr_drops(tmp_path):
 # ── recall: reaffirm + delta ──────────────────────────────────────────────────
 
 
-def review_row(head, verdict, state="COMMENTED", findings_json="", id=None, complete=True):
+def review_row(head, verdict, state="COMMENTED", findings_json="", id=None, complete=True, diff_id=""):
     body = render_verdict_body(
         repo="o/r",
         pr=1,
@@ -183,6 +183,7 @@ def review_row(head, verdict, state="COMMENTED", findings_json="", id=None, comp
         shadow=True,
         recipe="code-review",
         complete=complete,
+        diff_id=diff_id,
     )
     return {"state": state, "body": body, "id": id}
 
@@ -317,6 +318,156 @@ async def test_advanced_head_runs_a_delta_review_with_prior_findings(tmp_path):
     out = await d.handle_pr_event("o/r", 1, HEAD, "synchronize")
     assert out == "reviewed:FAIL"
     assert "old" in seen["inputs"]["prior_findings"]
+
+
+# ── reaffirm across a changed head with a byte-identical diff (issue #91) ──────
+
+
+class DiffIdGH(RoutedGH):
+    """Serves the pinned tree-SHA reads the diff-identity uses (issue #91): a head-commit
+    tree per head SHA, and the merge-base tree of a base↔head compare. Everything else is
+    RoutedGH. The fake pre-applies the `--jq`, same discipline as `pr_facts`/`files`, and
+    routes on the jq so it never shadows the `/commits/{sha}/check-runs` or delta-`/compare/`
+    reads that share those URL prefixes."""
+
+    def __init__(self, *, head_trees=None, merge_base_tree="mb0", **kw):
+        super().__init__(**kw)
+        # {head_sha: tree_sha}; an absent head serves "" → the read fails closed to None.
+        self.head_trees = head_trees or {}
+        self.merge_base_tree = merge_base_tree
+
+    async def __call__(self, args, timeout=30):
+        joined = " ".join(args)
+        if "merge_base_commit.commit.tree.sha" in joined:  # _merge_base_tree
+            self.calls.append(args)
+            return 0, self.merge_base_tree, ""
+        if ".commit.tree.sha" in joined and "/commits/" in joined:  # _commit_tree
+            self.calls.append(args)
+            ref = args[1].rsplit("/", 1)[-1]
+            return 0, self.head_trees.get(ref, ""), ""
+        return await super().__call__(args, timeout)
+
+
+def _no_panel_runner(ran):
+    async def runner(name, inputs):
+        ran.append(name)
+        return {"output": REPORT, "failed": []}
+
+    return runner
+
+
+async def test_a_rebased_head_with_a_byte_identical_diff_reaffirms(tmp_path):
+    """A new head SHA (rebase / reworded commit / moved-but-identical base) whose base↔head
+    tree pair is byte-identical to the last round reaffirms that verdict — no panel, no
+    duplicate review, no check for the new head (acceptance r1, r5)."""
+    from pr_reviewer.rounds import diff_identity
+
+    did = diff_identity("mbA", "treeA")
+    gh = DiffIdGH(
+        pr_facts=facts(),  # head=HEAD
+        reviews=[review_row(OLD_HEAD, "PASS", diff_id=did)],
+        head_trees={OLD_HEAD: "treeA", HEAD: "treeA"},  # same tree content, new head SHA
+        merge_base_tree="mbA",
+    )
+    ran: list[str] = []
+    d = make(tmp_path, gh=gh, runner=_no_panel_runner(ran))
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "synchronize")) == "reaffirmed:PASS"
+    assert ran == []  # the panel never ran
+    assert gh.posted == []  # nothing posted — no duplicate panel review, no promotion
+    assert gh.check_writes == []  # and no check opened/concluded for the new head
+
+
+async def test_a_material_diff_change_runs_a_new_panel(tmp_path):
+    """The head tree differs — e.g. a rebase pulled a changed dependency in through the
+    base, the exact case the changed-file-only identity missed. The identity differs, so
+    the panel runs rather than reaffirming a stale verdict (acceptance r2)."""
+    from pr_reviewer.rounds import diff_identity
+
+    did_old = diff_identity("mbA", "treeA")
+    gh = DiffIdGH(
+        pr_facts=facts(),
+        reviews=[review_row(OLD_HEAD, "PASS", diff_id=did_old)],
+        head_trees={OLD_HEAD: "treeA", HEAD: "treeB"},  # reviewed content changed
+        merge_base_tree="mbA",
+    )
+    ran: list[str] = []
+    d = make(tmp_path, gh=gh, runner=_no_panel_runner(ran))
+    out = await d.handle_pr_event("o/r", 1, HEAD, "synchronize")
+    assert out == "reviewed:FAIL"  # the panel ran and posted its own verdict
+    assert len(ran) == 1
+
+
+async def test_an_unreadable_diff_identity_does_not_reaffirm(tmp_path):
+    """The current head's tree cannot be read, so the identity is unknown. Fail closed —
+    run the panel rather than reuse a prior verdict (acceptance r3)."""
+    from pr_reviewer.rounds import diff_identity
+
+    did_old = diff_identity("mbA", "treeA")
+    gh = DiffIdGH(
+        pr_facts=facts(),
+        reviews=[review_row(OLD_HEAD, "PASS", diff_id=did_old)],
+        head_trees={},  # HEAD's tree read returns "" → identity unreadable
+        merge_base_tree="mbA",
+    )
+    ran: list[str] = []
+    d = make(tmp_path, gh=gh, runner=_no_panel_runner(ran))
+    out = await d.handle_pr_event("o/r", 1, HEAD, "synchronize")
+    assert out == "reviewed:FAIL"
+    assert len(ran) == 1
+
+
+async def test_a_prior_round_without_a_stored_identity_does_not_reaffirm(tmp_path):
+    """An older marker carries no `diff=` id, so sameness cannot be proven even when the
+    current diff reads fine. Fail closed to a fresh panel (acceptance r3)."""
+    gh = DiffIdGH(
+        pr_facts=facts(),
+        reviews=[review_row(OLD_HEAD, "PASS")],  # no diff_id on the prior round
+        head_trees={OLD_HEAD: "treeA", HEAD: "treeA"},
+        merge_base_tree="mbA",
+    )
+    ran: list[str] = []
+    d = make(tmp_path, gh=gh, runner=_no_panel_runner(ran))
+    out = await d.handle_pr_event("o/r", 1, HEAD, "synchronize")
+    assert out == "reviewed:FAIL"
+    assert len(ran) == 1
+
+
+async def test_a_summon_bypasses_the_diff_reaffirm_and_runs_a_fresh_panel(tmp_path):
+    """`@vera review` is 'I think you got this wrong' — it forces a fresh panel even when
+    the diff is byte-identical to a reaffirmable round (acceptance r4)."""
+    from pr_reviewer.rounds import diff_identity
+
+    did = diff_identity("mbA", "treeA")
+    gh = DiffIdGH(
+        pr_facts=facts(),
+        reviews=[review_row(OLD_HEAD, "PASS", diff_id=did)],
+        head_trees={OLD_HEAD: "treeA", HEAD: "treeA"},  # byte-identical diff
+        merge_base_tree="mbA",
+    )
+    ran: list[str] = []
+    d = make(tmp_path, gh=gh, runner=_no_panel_runner(ran))
+    out = await d.handle_summon("o/r", 1, "operator")
+    assert out == "reviewed:FAIL"  # a fresh panel, despite the identical diff
+    assert len(ran) == 1
+
+
+async def test_a_posted_verdict_stamps_its_diff_identity_for_a_later_rebase(tmp_path):
+    """The posted verdict's marker carries the reviewed diff id, so a LATER rebased head can
+    reaffirm against this round. Closes the loop the reaffirm read depends on."""
+    from pr_reviewer.rounds import diff_identity
+
+    gh = DiffIdGH(
+        pr_facts=facts(),
+        reviews=[],  # first review of this PR — the panel runs and posts
+        head_trees={HEAD: "treeA"},
+        merge_base_tree="mbA",
+    )
+    ran: list[str] = []
+    d = make(tmp_path, gh=gh, runner=_no_panel_runner(ran))
+    out = await d.handle_pr_event("o/r", 1, HEAD, "opened")
+    assert out == "reviewed:FAIL" and len(ran) == 1
+    review_post = gh.reviews_posted[0]
+    assert f"diff={diff_identity('mbA', 'treeA')}" in review_post["body"]
 
 
 # ── existing-threads context ──────────────────────────────────────────────────

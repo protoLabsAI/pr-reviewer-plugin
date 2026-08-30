@@ -10,6 +10,7 @@ import json
 from pr_reviewer.rounds import (
     converge,
     delta_ranges,
+    diff_identity,
     in_delta,
     panel_rounds,
     parse_dispositions,
@@ -21,7 +22,7 @@ from pr_reviewer.rounds import (
     unaccounted_priors,
     unexplained_clearance,
 )
-from pr_reviewer.verdicts import PASS, WARN, render_verdict_body
+from pr_reviewer.verdicts import PASS, WARN, parse_verdict_marker, render_verdict_body
 
 HEAD_1, HEAD_2, HEAD_3 = "a" * 40, "b" * 40, "c" * 40
 
@@ -64,6 +65,57 @@ def promotion(head, verdict="WARN"):
 
 def finding(file="store.py", line=100, severity="minor", claim="c"):
     return {"file": file, "line": line, "severity": severity, "claim": claim, "evidence": "e", "verdict": "confirmed"}
+
+
+# ── diff identity (issue #91) ─────────────────────────────────────────────────
+
+
+def test_diff_identity_is_deterministic():
+    assert diff_identity("mb", "head") == diff_identity("mb", "head")
+
+
+def test_diff_identity_moves_when_the_head_tree_changes():
+    # The correctness fix: a rebase that pulls a changed dependency in through the base
+    # rewrites the head tree, so the identity must differ even when the changed-FILE patch
+    # is untouched — the direction the earlier changed-file-only hash could not see.
+    assert diff_identity("mb", "head-a") != diff_identity("mb", "head-b")
+
+
+def test_diff_identity_moves_when_the_merge_base_tree_changes():
+    assert diff_identity("mb-a", "head") != diff_identity("mb-b", "head")
+
+
+def test_diff_identity_fails_closed_when_either_tree_is_missing():
+    assert diff_identity(None, "head") is None
+    assert diff_identity("mb", None) is None
+    assert diff_identity("", "head") is None
+    assert diff_identity("mb", "") is None
+
+
+def test_panel_rounds_carries_the_reviewed_diff_identity():
+    # The marker stamps the reviewed base↔head diff id; _our_reviews spreads the parsed
+    # marker, so the round dict carries diff_id for the reaffirm short-circuit to read.
+    body = render_verdict_body(
+        repo="o/r",
+        pr=88,
+        head_sha=HEAD_1,
+        verdict=PASS,
+        brief="p",
+        findings=[],
+        shadow=True,
+        recipe="code-review",
+        diff_id="d" * 64,
+    )
+    review = {**parse_verdict_marker(body), "state": "COMMENTED", "body": body, "id": 1}
+    assert panel_rounds([review])[-1]["diff_id"] == "d" * 64
+
+
+def test_a_round_from_an_older_body_without_a_diff_id_is_none():
+    # A marker written before the feature has no diff= attribute; the round carries None, and
+    # the reaffirm short-circuit fails closed on it rather than reusing across a changed head.
+    body = f"<!-- protoagent-qa-review head={HEAD_1} verdict=PASS -->\nx"
+    review = {**parse_verdict_marker(body), "state": "COMMENTED", "body": body, "id": 1}
+    assert panel_rounds([review])[-1]["diff_id"] is None
 
 
 # ── round history ─────────────────────────────────────────────────────────────
