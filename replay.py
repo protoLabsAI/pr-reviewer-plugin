@@ -256,21 +256,36 @@ async def _finding_sources(run_gh, repo: str, pr: int, head: str, findings: list
     for file in {str(f.get("file") or "") for f in findings if f.get("file")}:
         ref = quote(head, safe="")
         rc, out, _e = await run_gh(
-            ["api", f"repos/{repo}/contents/{quote(file, safe='/')}?ref={ref}", "--jq", ".content"]
+            [
+                "api",
+                f"repos/{repo}/contents/{quote(file, safe='/')}?ref={ref}",
+                "--jq",
+                '(.encoding // "") + "\\u0000" + (.content // "")',
+            ]
         )
         blob = ""
         read_ok = False
-        # In lockstep with `Dispatcher._finding_sources`: `rc == 0` is a SUCCESSFUL read —
-        # INCLUDING a zero-byte file, whose `.content` is the empty string (`out.strip() ==
-        # ""`). Gating on non-empty output would misclassify that empty-but-real file as
-        # UNREADABLE and PRESERVE an ungrounded blocker/major instead of downgrading a quote
-        # genuinely absent from a file we DID read (issue #109 regression). `null` is the one
-        # empty-ish payload that is NOT readable source — `.content` is absent (a directory or
-        # submodule, or an over-size file the contents API omits) — so it stays UNREADABLE and
-        # the finding's severity is preserved.
-        if rc == 0 and out.strip() != "null":
+        # ``rc == 0`` is a SUCCESSFUL read — INCLUDING a zero-byte file, whose ``.content``
+        # is the empty string. Gating ``read_ok`` on non-empty output would misclassify
+        # that empty-but-real file as UNREADABLE and PRESERVE an ungrounded blocker/major
+        # instead of downgrading a quote genuinely absent from a file we DID read (the
+        # issue #109 regression this guard exists for).
+        #
+        # But an empty ``.content`` is NOT always an empty file. GitHub's Contents API
+        # returns ``content: ""`` with ``encoding: "none"`` for a file between 1 and
+        # 100 MB — the content is OMITTED, not absent. Reading that as a zero-byte file
+        # marked it read_ok and let a real finding in an oversized file be downgraded for
+        # "missing" evidence that was never fetched — the exact failure #109 is about,
+        # wearing a different hat.
+        #
+        # ``encoding`` is what separates them: ``base64`` is a real read (including a
+        # genuinely empty file), anything else — ``none`` for oversized, or an absent
+        # object for a directory / submodule / 404 — is UNREADABLE, so the finding's
+        # severity is preserved and the report says the source was unavailable.
+        encoding, _, payload = out.partition("\x00")
+        if rc == 0 and encoding.strip() == "base64":
             try:
-                blob = base64.b64decode(out.strip()).decode("utf-8", errors="replace")
+                blob = base64.b64decode(payload.strip()).decode("utf-8", errors="replace")
                 read_ok = True
             except Exception:  # noqa: BLE001 — an undecodable blob is a failed read
                 blob = ""

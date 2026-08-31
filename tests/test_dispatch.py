@@ -277,7 +277,7 @@ class RoutedGH(FakeGH):
             # The jq selects the reviewThreads CONNECTION now (nodes + pageInfo), so the
             # fake serves one complete page rather than a bare node list.
             if self.threads is None:
-                return 0, "null", ""
+                return 0, "\x00", ""
             page = {"pageInfo": {"hasNextPage": False, "endCursor": ""}, "nodes": self.threads}
             return 0, json.dumps(page), ""
         if "graphql" in joined:
@@ -2136,7 +2136,7 @@ class GroundingGH(RoutedGH):
         if "/contents/" in joined:
             if self.source is None:
                 return 1, "", "404"
-            return 0, base64.b64encode(self.source.encode()).decode(), ""
+            return 0, "base64\x00" + base64.b64encode(self.source.encode()).decode(), ""
         if "/files" in joined and "--jq" in joined and ".patch" in joined:
             return 0, json.dumps([{"f": "x.py", "p": ""}]), ""
         return await super().__call__(args, timeout=timeout)
@@ -2203,7 +2203,7 @@ class HeadReadGH(RoutedGH):
             self.contents_calls.append(args[1] if len(args) > 1 else "")
             if self.source is None:
                 return 1, "", "404 Not Found"  # orphaned SHA / transient / wrong ref
-            return 0, base64.b64encode(self.source.encode()).decode(), ""
+            return 0, "base64\x00" + base64.b64encode(self.source.encode()).decode(), ""
         if "/files" in joined and "--jq" in joined and ".patch" in joined:
             return 0, json.dumps([{"f": "x.py", "p": self.patch}]), ""
         return await super().__call__(args, timeout=timeout)
@@ -2272,11 +2272,32 @@ async def test_a_zero_byte_head_file_is_a_successful_read_and_downgrades(tmp_pat
     assert "could NOT be evidence-checked" not in body  # NOT the unreadable/could-not-verify state
 
 
+async def test_finding_sources_treats_an_oversized_file_as_unreadable(tmp_path):
+    """GitHub returns `content: ""` with `encoding: "none"` for a 1–100 MB file — OMITTED,
+    not empty. Treating it as a zero-byte read marked it read_ok, so a real finding in an
+    oversized file was downgraded for evidence that was never fetched. `encoding` is the
+    only field that separates an omitted file from a genuinely empty one."""
+    from pr_reviewer.grounding import UNREADABLE
+
+    class BigFileGH:
+        async def __call__(self, args, timeout=30):
+            joined = " ".join(args)
+            if "/pulls/" in joined and "/files" in joined:
+                return 0, json.dumps([{"filename": "big.bin", "patch": "patchB"}]), ""
+            if "/contents/big.bin" in joined:
+                return 0, "none\x00", ""  # 1–100 MB: encoding none, content omitted
+            return 1, "", "unexpected call"
+
+    d = make(tmp_path, gh=BigFileGH())
+    sources = await d._finding_sources("o/r", 1, HEAD, [{"file": "big.bin"}])
+    assert sources["big.bin"][1] is UNREADABLE  # severity preserved — never a silent downgrade
+
+
 async def test_finding_sources_splits_empty_read_from_null_content(tmp_path):
     # Unit-level proof of the two `rc == 0` branches the review flagged:
     #   * empty `.content` (a zero-byte file) is a SUCCESSFUL read → `combined` is a real
     #     string haystack (blob + patch), so grounding can still prove a quote absent;
-    #   * `.content == null` (a submodule, or an over-size file the contents API omits) is
+    #   * an absent object (a submodule / directory) is
     #     NOT readable source → the `UNREADABLE` sentinel, which preserves severity.
     from pr_reviewer.grounding import UNREADABLE
 
@@ -2286,9 +2307,9 @@ async def test_finding_sources_splits_empty_read_from_null_content(tmp_path):
             if "/pulls/" in joined and "/files" in joined:
                 return 0, json.dumps([{"f": "empty.py", "p": "patchE"}, {"f": "sub", "p": "patchS"}]), ""
             if "/contents/empty.py" in joined:
-                return 0, "", ""  # zero-byte file: rc == 0 with empty base64 content
+                return 0, "base64\x00", ""  # zero-byte file: base64 encoding, empty content
             if "/contents/sub" in joined:
-                return 0, "null", ""  # `.content` absent — not a readable file
+                return 0, "\x00", ""  # `.content` absent — not a readable file
             return 1, "", "unexpected call"
 
     d = make(tmp_path, gh=TwoFileGH())

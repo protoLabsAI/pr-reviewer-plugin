@@ -39,7 +39,9 @@ class ReplayGH:
         if "/contents/" in j:
             import base64
 
-            return (0, base64.b64encode(self.blob.encode()).decode(), "") if self.blob else (1, "", "404")
+            return (
+                (0, "base64\x00" + base64.b64encode(self.blob.encode()).decode(), "") if self.blob else (1, "", "404")
+            )
         if "/compare/" in j:
             return (0, json.dumps(self.compare), "") if self.compare is not None else (1, "", "404")
         if "/files" in j and ".patch" in j:
@@ -325,7 +327,7 @@ async def test_finding_sources_splits_a_zero_byte_read_from_null_content_in_repl
     # Unit-level proof of the two `rc == 0` branches, in lockstep with the dispatcher:
     #   * empty `.content` (a zero-byte file) is a SUCCESSFUL read → a real string haystack
     #     (blob + patch), so grounding can still prove a quote absent;
-    #   * `.content == null` (a submodule / over-size file the contents API omits) is NOT
+    #   * an absent object (a submodule / directory) is NOT
     #     readable source → the `UNREADABLE` sentinel, which preserves severity.
     from pr_reviewer.grounding import UNREADABLE
     from pr_reviewer.replay import _finding_sources
@@ -336,23 +338,24 @@ async def test_finding_sources_splits_a_zero_byte_read_from_null_content_in_repl
             if "/pulls/" in j and "/files" in j:
                 return 0, json.dumps([{"f": "empty.py", "p": "patchE"}, {"f": "sub", "p": "patchS"}]), ""
             if "/contents/empty.py" in j:
-                return 0, "", ""  # zero-byte file: rc == 0 with empty base64 content
+                return 0, "base64\x00", ""  # zero-byte file: base64 encoding, empty content
             if "/contents/sub" in j:
-                return 0, "null", ""  # `.content` absent — not a readable file
+                return 0, "\x00", ""  # `.content` absent — not a readable file
             return 1, "", "unexpected call"
 
     sources = await _finding_sources(TwoFileGH(), "o/r", 1, HEAD40, [{"file": "empty.py"}, {"file": "sub"}])
     assert isinstance(sources["empty.py"], str) and sources["empty.py"].endswith("patchE")  # read SUCCEEDED
-    assert sources["sub"] is UNREADABLE  # `null` content cannot ground anything — fail closed
+    assert sources["sub"] is UNREADABLE  # no base64 encoding ⇒ cannot ground anything — fail closed
 
 
 async def test_a_zero_byte_head_file_downgrades_a_fabricated_quote_in_replay():
-    # The review-flagged regression: a zero-byte file at the head reads back as empty
-    # `.content` (`rc == 0`, `out.strip() == ""`). The OLD `if rc == 0 and out.strip():`
-    # gate misclassified that real, empty file as UNREADABLE and PRESERVED the fabricated
-    # major. An empty file WAS read — its quote is genuinely absent, so the major must
-    # DOWNGRADE to uncertain (WARN), not stand as source-unavailable.
-    gh = ContentsGH(contents=(0, ""))  # zero-byte head file: successful empty read
+    # The review-flagged regression: a zero-byte file at the head reads back with
+    # `encoding: base64` and an EMPTY `.content`. An earlier gate misclassified that real,
+    # empty file as UNREADABLE and PRESERVED the fabricated major. An empty file WAS read —
+    # its quote is genuinely absent, so the major must DOWNGRADE to uncertain (WARN), not
+    # stand as source-unavailable. Contrast the oversized case below, where the content is
+    # OMITTED rather than empty and the finding must be preserved.
+    gh = ContentsGH(contents=(0, "base64\x00"))  # zero-byte head file: base64 encoding, empty content
     out = await replay_review(
         {"repo": "o/r", "pr": 1, "head": HEAD40},
         run_gh=gh,
@@ -395,3 +398,21 @@ async def test_the_replay_head_read_is_pinned_to_the_immutable_head_sha():
     assert reads, "the head file was never read"
     assert all(f"?ref={HEAD40}" in r for r in reads)  # pinned to the head SHA
     assert not any(r.rstrip().endswith("/contents/x.py") for r in reads)  # never a bare, movable ref
+
+
+async def test_an_oversized_head_file_is_unreadable_not_an_empty_read_in_replay():
+    """GitHub's Contents API returns `content: ""` with `encoding: "none"` for a file
+    between 1 and 100 MB — the content is OMITTED, not absent. Reading that as a
+    zero-byte file marked it read_ok and let a real finding in an oversized file be
+    downgraded for "missing" evidence that was never fetched: the exact failure #109 is
+    about, wearing a different hat. `encoding` is what separates the two."""
+    gh = ContentsGH(contents=(0, "none\x00"))  # 1–100 MB file: content omitted by the API
+    out = await replay_review(
+        {"repo": "o/r", "pr": 1, "head": HEAD40},
+        run_gh=gh,
+        runner=_runner(f"b\n```json\n{_fab_major()}\n```"),
+        parse_findings=_parse,
+    )
+    assert out["telemetry"]["grounding_downgraded"] == 0  # nothing was read, so nothing is "absent"
+    assert out["telemetry"]["grounding_unreadable"] == 1  # counted as a fetch failure, correctly
+    assert out["verdict"] == "FAIL"  # severity PRESERVED — fail closed on unread evidence
