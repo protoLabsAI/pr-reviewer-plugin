@@ -113,20 +113,33 @@ def test_the_panel_declares_its_own_fan_out_width():
 
 
 def test_a_failed_read_must_not_downgrade_a_finding():
-    """protoAgent#2296: on a PR rebased mid-review the verifier hit a file-fetch 404,
-    could not re-read the blob, and honestly marked still-present majors `uncertain` —
-    which de-escalated them (major→minor) and dropped the verdict, lifting the gate on
-    two real defects that were byte-for-byte still in the file.
+    """protoAgent#2296 / issue #109: on a PR rebased mid-review the verifier hit a
+    file-fetch 404, could not re-read the blob, and honestly marked still-present majors
+    `uncertain` — which de-escalated them (major→minor) and dropped the verdict, lifting
+    the gate on two real defects that were byte-for-byte still in the file.
 
     The prior prompt conflated 'I read the file and the quote wasn't there' (a weak
     finding) with 'I could not read the file' (learning nothing). Only the first earns
     a downgrade."""
     p = STEPS["verify"]["prompt"]
     assert "A failed READ is not evidence" in p
-    # It must say what to do, not just what not to do: retry refless, then hold.
-    assert "Retry without a ref" in p
-    assert "leave the finding exactly as it was" in p
+    # It must say what to do: hold the finding as-is, and name the distinct state.
+    assert "Leave the finding exactly as it was" in p
     assert "de-escalate" in p
+    assert "source unavailable" in p.lower()  # its own state — not refuted, not uncertain
+    # Fail closed on head movement (r6): NEVER re-read the branch tip and attribute that
+    # read to this head — a rebase/force-push makes the tip a different head.
+    assert "Do NOT re-read the file at the branch tip" in p
+    assert "Retry without a ref" not in p  # the old movable-ref retry is gone
     # Stale anchors are the same failure wearing a different hat (the issue's line
     # 176/287-vs-257/259/376 observation).
     assert "line number" in p and "re-anchor" in p
+
+
+def test_verifier_pins_head_reads_and_names_source_unavailable_as_its_own_state():
+    """r5/r6: the verifier reads PINNED to the immutable head SHA and reports an
+    unreadable source as its own disposition, never as refuted or uncertain-on-merits."""
+    p = STEPS["verify"]["prompt"]
+    assert 'PINNED to head SHA "{{inputs.head_sha}}"' in p
+    assert "confirmed nor refuted on its merits" in p
+    assert "not evidence about this one" in p  # a read of another ref proves nothing here

@@ -40,8 +40,9 @@ from __future__ import annotations
 
 import json
 import re
+from urllib.parse import quote
 
-from .grounding import apply_grounding
+from .grounding import UNREADABLE, apply_grounding
 from .rounds import converge, delta_ranges, parse_dispositions, unaccounted_priors
 from .verdicts import confine_findings, extract_findings_json, verdict_for
 
@@ -138,6 +139,7 @@ async def replay_review(
                 "confined": 0,
                 "grounding_checked": 0,
                 "grounding_downgraded": 0,
+                "grounding_unreadable": 0,
                 "converge_reason": "",
                 "converge_notes": 0,
                 "dispositions": 0,
@@ -159,9 +161,10 @@ async def replay_review(
 
     grounding_checked = 0
     ungrounded: list[dict] = []
+    unreadable: list[dict] = []
     if findings:
         sources = await _finding_sources(run_gh, repo, pr, head, findings)
-        findings, ungrounded = apply_grounding(findings, sources)
+        findings, ungrounded, unreadable = apply_grounding(findings, sources)
         grounding_checked = len(findings)
 
     verdict = verdict_for(findings)
@@ -199,6 +202,7 @@ async def replay_review(
             "confined": len(confined),
             "grounding_checked": grounding_checked,
             "grounding_downgraded": len(ungrounded),
+            "grounding_unreadable": len(unreadable),
             "converge_reason": converge_reason,
             "converge_notes": len(notes),
             "dispositions": len(dispositions),
@@ -231,6 +235,12 @@ async def _pr_is_merged(run_gh, repo: str, pr: int) -> bool:
 
 
 async def _finding_sources(run_gh, repo: str, pr: int, head: str, findings: list[dict]) -> dict:
+    """Kept in lockstep with `Dispatcher._finding_sources` (issue #109): the head read is
+    PINNED to the immutable head SHA (path/ref URL-encoded), and a FAILED read yields the
+    `UNREADABLE` sentinel — never a patch-only haystack, which would ground a head-context
+    quote against the patch alone and downgrade a real finding for code never actually read."""
+    import base64
+
     patches: dict[str, str] = {}
     rc, out, _e = await run_gh(
         ["api", f"repos/{repo}/pulls/{pr}/files", "--paginate", "--jq", "[.[] | {f: .filename, p: .patch}]"]
@@ -242,19 +252,44 @@ async def _finding_sources(run_gh, repo: str, pr: int, head: str, findings: list
                     patches[str(r["f"])] = str(r.get("p") or "")
         except json.JSONDecodeError:
             pass
-    sources: dict[str, str | None] = {}
+    sources: dict[str, str | object | None] = {}
     for file in {str(f.get("file") or "") for f in findings if f.get("file")}:
-        rc, out, _e = await run_gh(["api", f"repos/{repo}/contents/{file}?ref={head}", "--jq", ".content"])
+        ref = quote(head, safe="")
+        rc, out, _e = await run_gh(
+            [
+                "api",
+                f"repos/{repo}/contents/{quote(file, safe='/')}?ref={ref}",
+                "--jq",
+                '(.encoding // "") + "\\u0000" + (.content // "")',
+            ]
+        )
         blob = ""
-        if rc == 0 and out.strip():
+        read_ok = False
+        # ``rc == 0`` is a SUCCESSFUL read — INCLUDING a zero-byte file, whose ``.content``
+        # is the empty string. Gating ``read_ok`` on non-empty output would misclassify
+        # that empty-but-real file as UNREADABLE and PRESERVE an ungrounded blocker/major
+        # instead of downgrading a quote genuinely absent from a file we DID read (the
+        # issue #109 regression this guard exists for).
+        #
+        # But an empty ``.content`` is NOT always an empty file. GitHub's Contents API
+        # returns ``content: ""`` with ``encoding: "none"`` for a file between 1 and
+        # 100 MB — the content is OMITTED, not absent. Reading that as a zero-byte file
+        # marked it read_ok and let a real finding in an oversized file be downgraded for
+        # "missing" evidence that was never fetched — the exact failure #109 is about,
+        # wearing a different hat.
+        #
+        # ``encoding`` is what separates them: ``base64`` is a real read (including a
+        # genuinely empty file), anything else — ``none`` for oversized, or an absent
+        # object for a directory / submodule / 404 — is UNREADABLE, so the finding's
+        # severity is preserved and the report says the source was unavailable.
+        encoding, _, payload = out.partition("\x00")
+        if rc == 0 and encoding.strip() == "base64":
             try:
-                import base64
-
-                blob = base64.b64decode(out.strip()).decode("utf-8", errors="replace")
-            except Exception:  # noqa: BLE001
+                blob = base64.b64decode(payload.strip()).decode("utf-8", errors="replace")
+                read_ok = True
+            except Exception:  # noqa: BLE001 — an undecodable blob is a failed read
                 blob = ""
-        patch = patches.get(file, "")
-        sources[file] = f"{blob}\n{patch}" if (blob or patch) else None
+        sources[file] = f"{blob}\n{patches.get(file, '')}" if read_ok else UNREADABLE
     return sources
 
 

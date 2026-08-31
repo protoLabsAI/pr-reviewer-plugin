@@ -39,7 +39,9 @@ class ReplayGH:
         if "/contents/" in j:
             import base64
 
-            return (0, base64.b64encode(self.blob.encode()).decode(), "") if self.blob else (1, "", "404")
+            return (
+                (0, "base64\x00" + base64.b64encode(self.blob.encode()).decode(), "") if self.blob else (1, "", "404")
+            )
         if "/compare/" in j:
             return (0, json.dumps(self.compare), "") if self.compare is not None else (1, "", "404")
         if "/files" in j and ".patch" in j:
@@ -273,3 +275,144 @@ async def test_include_raw_adds_the_report_text_for_faithfulness_debugging():
     on = await replay_review(row, run_gh=gh, runner=_runner(CLEAN_REPORT), parse_findings=_parse, include_raw=True)
     assert "raw_report" not in off  # large; off by default
     assert on["raw_report"] == CLEAN_REPORT  # the exact panel text, to tell found-then-lost from never-found
+
+
+# ── issue #109: replay's head-read splits a zero-byte SUCCESS from an UNREADABLE fetch ──
+
+
+HEAD40 = "a" * 40
+
+
+def _fab_major(file="x.py"):
+    """A fabricated-quote major: the quoted line does NOT appear in the (empty) head file."""
+    return json.dumps(
+        [
+            {
+                "file": file,
+                "line": 3,
+                "severity": "major",
+                "claim": "constructs `writable = Path(str(configured))`, dropping expanduser",
+                "evidence": "the diff moves `writable = Path(str(configured))` in unchanged",
+            }
+        ]
+    )
+
+
+class ContentsGH:
+    """Read-only fake that returns a chosen (rc, out) for the head contents read and
+    records every call, so a test can assert the read is PINNED to the head SHA and never
+    falls back to a movable/bare ref (issue #109, r2/r6)."""
+
+    def __init__(self, *, contents, files="x.py\n", patches=None):
+        self.contents = contents  # (rc, out) for the /contents/ read
+        self.files = files
+        self.patches = patches if patches is not None else [{"f": "x.py", "p": ""}]
+        self.calls: list[list[str]] = []
+
+    async def __call__(self, args, timeout=30):
+        self.calls.append(args)
+        j = " ".join(args)
+        assert "-X" not in args, "replay must never write to GitHub"
+        if "/contents/" in j:
+            rc, out = self.contents
+            return rc, out, ""
+        if "/files" in j and ".patch" in j:
+            return 0, json.dumps(self.patches), ""
+        if "/files" in j:
+            return 0, self.files, ""
+        return 0, "", ""
+
+
+async def test_finding_sources_splits_a_zero_byte_read_from_null_content_in_replay():
+    # Unit-level proof of the two `rc == 0` branches, in lockstep with the dispatcher:
+    #   * empty `.content` (a zero-byte file) is a SUCCESSFUL read → a real string haystack
+    #     (blob + patch), so grounding can still prove a quote absent;
+    #   * an absent object (a submodule / directory) is NOT
+    #     readable source → the `UNREADABLE` sentinel, which preserves severity.
+    from pr_reviewer.grounding import UNREADABLE
+    from pr_reviewer.replay import _finding_sources
+
+    class TwoFileGH:
+        async def __call__(self, args, timeout=30):
+            j = " ".join(args)
+            if "/pulls/" in j and "/files" in j:
+                return 0, json.dumps([{"f": "empty.py", "p": "patchE"}, {"f": "sub", "p": "patchS"}]), ""
+            if "/contents/empty.py" in j:
+                return 0, "base64\x00", ""  # zero-byte file: base64 encoding, empty content
+            if "/contents/sub" in j:
+                return 0, "\x00", ""  # `.content` absent — not a readable file
+            return 1, "", "unexpected call"
+
+    sources = await _finding_sources(TwoFileGH(), "o/r", 1, HEAD40, [{"file": "empty.py"}, {"file": "sub"}])
+    assert isinstance(sources["empty.py"], str) and sources["empty.py"].endswith("patchE")  # read SUCCEEDED
+    assert sources["sub"] is UNREADABLE  # no base64 encoding ⇒ cannot ground anything — fail closed
+
+
+async def test_a_zero_byte_head_file_downgrades_a_fabricated_quote_in_replay():
+    # The review-flagged regression: a zero-byte file at the head reads back with
+    # `encoding: base64` and an EMPTY `.content`. An earlier gate misclassified that real,
+    # empty file as UNREADABLE and PRESERVED the fabricated major. An empty file WAS read —
+    # its quote is genuinely absent, so the major must DOWNGRADE to uncertain (WARN), not
+    # stand as source-unavailable. Contrast the oversized case below, where the content is
+    # OMITTED rather than empty and the finding must be preserved.
+    gh = ContentsGH(contents=(0, "base64\x00"))  # zero-byte head file: base64 encoding, empty content
+    out = await replay_review(
+        {"repo": "o/r", "pr": 1, "head": HEAD40},
+        run_gh=gh,
+        runner=_runner(f"b\n```json\n{_fab_major()}\n```"),
+        parse_findings=_parse,
+    )
+    assert out["telemetry"]["grounding_downgraded"] == 1  # the empty read grounded the fabrication as absent
+    assert out["telemetry"]["grounding_unreadable"] == 0  # NOT conflated with a fetch failure
+    assert out["verdict"] == "WARN"  # a downgraded major can't FAIL
+
+
+async def test_a_404_head_read_preserves_the_finding_as_unreadable_not_downgraded_in_replay():
+    # The distinct fail-closed state: a genuine fetch failure (a 404 on the orphaned SHA
+    # after a force-push) is `rc != 0` → UNREADABLE. The major is neither confirmed nor
+    # downgraded — its severity STANDS, so the verdict fails closed (FAIL), and the read is
+    # counted `grounding_unreadable`, not `grounding_downgraded`.
+    gh = ContentsGH(contents=(1, ""))  # orphaned SHA after force-push
+    out = await replay_review(
+        {"repo": "o/r", "pr": 1, "head": HEAD40},
+        run_gh=gh,
+        runner=_runner(f"b\n```json\n{_fab_major()}\n```"),
+        parse_findings=_parse,
+    )
+    assert out["telemetry"]["grounding_unreadable"] == 1  # could-not-verify, distinct from absence
+    assert out["telemetry"]["grounding_downgraded"] == 0  # severity untouched — no fail-open downgrade
+    assert out["verdict"] == "FAIL"  # a major we could not check still gates
+
+
+async def test_the_replay_head_read_is_pinned_to_the_immutable_head_sha():
+    # r2/r6: the contents read targets `?ref=<head>` (the immutable SHA), never a bare
+    # `contents/{file}` movable-branch-tip fallback that could resolve a DIFFERENT head.
+    gh = ContentsGH(contents=(0, ""))
+    await replay_review(
+        {"repo": "o/r", "pr": 1, "head": HEAD40},
+        run_gh=gh,
+        runner=_runner(f"b\n```json\n{_fab_major()}\n```"),
+        parse_findings=_parse,
+    )
+    reads = [" ".join(c) for c in gh.calls if "/contents/" in " ".join(c)]
+    assert reads, "the head file was never read"
+    assert all(f"?ref={HEAD40}" in r for r in reads)  # pinned to the head SHA
+    assert not any(r.rstrip().endswith("/contents/x.py") for r in reads)  # never a bare, movable ref
+
+
+async def test_an_oversized_head_file_is_unreadable_not_an_empty_read_in_replay():
+    """GitHub's Contents API returns `content: ""` with `encoding: "none"` for a file
+    between 1 and 100 MB — the content is OMITTED, not absent. Reading that as a
+    zero-byte file marked it read_ok and let a real finding in an oversized file be
+    downgraded for "missing" evidence that was never fetched: the exact failure #109 is
+    about, wearing a different hat. `encoding` is what separates the two."""
+    gh = ContentsGH(contents=(0, "none\x00"))  # 1–100 MB file: content omitted by the API
+    out = await replay_review(
+        {"repo": "o/r", "pr": 1, "head": HEAD40},
+        run_gh=gh,
+        runner=_runner(f"b\n```json\n{_fab_major()}\n```"),
+        parse_findings=_parse,
+    )
+    assert out["telemetry"]["grounding_downgraded"] == 0  # nothing was read, so nothing is "absent"
+    assert out["telemetry"]["grounding_unreadable"] == 1  # counted as a fetch failure, correctly
+    assert out["verdict"] == "FAIL"  # severity PRESERVED — fail closed on unread evidence

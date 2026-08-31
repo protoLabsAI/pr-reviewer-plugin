@@ -277,7 +277,7 @@ class RoutedGH(FakeGH):
             # The jq selects the reviewThreads CONNECTION now (nodes + pageInfo), so the
             # fake serves one complete page rather than a bare node list.
             if self.threads is None:
-                return 0, "null", ""
+                return 0, "\x00", ""
             page = {"pageInfo": {"hasNextPage": False, "endCursor": ""}, "nodes": self.threads}
             return 0, json.dumps(page), ""
         if "graphql" in joined:
@@ -2136,7 +2136,7 @@ class GroundingGH(RoutedGH):
         if "/contents/" in joined:
             if self.source is None:
                 return 1, "", "404"
-            return 0, base64.b64encode(self.source.encode()).decode(), ""
+            return 0, "base64\x00" + base64.b64encode(self.source.encode()).decode(), ""
         if "/files" in joined and "--jq" in joined and ".patch" in joined:
             return 0, json.dumps([{"f": "x.py", "p": ""}]), ""
         return await super().__call__(args, timeout=timeout)
@@ -2181,6 +2181,144 @@ def test_grounding_env_fallback_and_default(monkeypatch, tmp_path):
     assert Dispatcher({}, Telemetry(tmp_path)).grounding_enabled is True
     monkeypatch.setenv("PR_REVIEWER_EVIDENCE_GROUNDING", "false")
     assert Dispatcher({}, Telemetry(tmp_path)).grounding_enabled is False
+
+
+# ── PR-head file grounding: reliable reads, fail closed on unreadable (issue #109) ──
+
+
+class HeadReadGH(RoutedGH):
+    """Grounding fake with an independently-controllable head-file read and PR patch, so a
+    404 on the head read can be reproduced WHILE a patch IS present — the exact #109 path,
+    which `GroundingGH` (patch always empty) cannot express."""
+
+    def __init__(self, *, source: str | None, patch: str = "", **kw):
+        super().__init__(**kw)
+        self.source = source
+        self.patch = patch
+        self.contents_calls: list[str] = []  # the `?ref=` string on every head read
+
+    async def __call__(self, args, timeout=30):
+        joined = " ".join(args)
+        if "/contents/" in joined:
+            self.contents_calls.append(args[1] if len(args) > 1 else "")
+            if self.source is None:
+                return 1, "", "404 Not Found"  # orphaned SHA / transient / wrong ref
+            return 0, "base64\x00" + base64.b64encode(self.source.encode()).decode(), ""
+        if "/files" in joined and "--jq" in joined and ".patch" in joined:
+            return 0, json.dumps([{"f": "x.py", "p": self.patch}]), ""
+        return await super().__call__(args, timeout=timeout)
+
+
+# A patch that is genuinely present but does NOT contain the finding's quoted code — the
+# quote lives in unchanged head context, exactly the case the head read (not the patch) must
+# supply. Grounding this against the patch alone would find the quote "absent" and downgrade.
+_UNRELATED_PATCH = "@@ -1,2 +1,3 @@\n a\n+unrelated = True\n b\n"
+_TERMINAL_CHECKS = [{"status": "completed", "conclusion": "failure"}]  # so a FAIL can arm REQUEST_CHANGES
+
+
+async def test_the_head_read_is_pinned_to_the_immutable_head_sha(tmp_path):
+    # r1/r6: the contextual read targets `ref=<head SHA>`, never a bare path (which would
+    # resolve the movable default branch / current tip and mis-ground against a wrong head).
+    gh = HeadReadGH(source=SRC_WITH_EXPANDUSER, patch="", pr_facts=facts(), reviews=[])
+    runner, _seen = capturing_runner(FABRICATED_REPORT)
+    d = make(tmp_path, cfg={"shadow_mode": False}, gh=gh, runner=runner)
+    await d.handle_pr_event("o/r", 1, HEAD, "opened")
+    assert gh.contents_calls, "the verifier's contextual read never ran"
+    assert all(f"ref={HEAD}" in c for c in gh.contents_calls)  # pinned to the reviewed head
+    assert not any(c.split("?")[0].endswith("/contents/x.py") and "ref=" not in c for c in gh.contents_calls)
+
+
+async def test_a_head_404_with_a_patch_present_does_not_downgrade(tmp_path):
+    # THE #109 bug: the head read 404s (orphaned SHA / transient), but the PR patch IS
+    # present. The old path grounded the blocker against the patch alone, found its quote
+    # absent, and downgraded a real blocker to uncertain (a fail-open→fail-closed flip). A
+    # failed READ is not absent evidence — we learned nothing, so the blocker must STAND.
+    gh = HeadReadGH(source=None, patch=_UNRELATED_PATCH, pr_facts=facts(), reviews=[], checks=_TERMINAL_CHECKS)
+    runner, _seen = capturing_runner(FABRICATED_REPORT)
+    d = make(tmp_path, cfg={"shadow_mode": False}, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "reviewed:FAIL"  # NOT downgraded
+    body = gh.reviews_posted[0]["body"]
+    assert gh.posted[0]["event"] == "REQUEST_CHANGES"  # the blocker still gates the merge
+    assert "could NOT be evidence-checked" in body  # source-unavailable is surfaced (r5)
+    assert "downgraded to **uncertain**" not in body  # and NOT the fabricated-quote downgrade
+
+
+async def test_a_successful_read_with_a_patch_still_downgrades_an_absent_quote(tmp_path):
+    # r3, the contrast to the test above: SAME finding, SAME (unrelated) patch, but the head
+    # read SUCCEEDS and the file genuinely lacks the quoted construction. A read that shows
+    # the quote absent keeps the fabricated-evidence downgrade — this half must not regress.
+    gh = HeadReadGH(source=SRC_WITH_EXPANDUSER, patch=_UNRELATED_PATCH, pr_facts=facts(), reviews=[])
+    runner, _seen = capturing_runner(FABRICATED_REPORT)
+    d = make(tmp_path, cfg={"shadow_mode": False}, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "reviewed:WARN"  # downgraded
+    body = gh.reviews_posted[0]["body"]
+    assert "downgraded to **uncertain**" in body
+    assert "could NOT be evidence-checked" not in body  # distinct from the unreadable state
+
+
+async def test_a_zero_byte_head_file_is_a_successful_read_and_downgrades(tmp_path):
+    # The review-flagged regression: a zero-byte file at the head reads back as empty
+    # `.content` (`rc == 0`, `out.strip() == ""`). Gating the read on non-empty output would
+    # misclassify that real, empty file as UNREADABLE and PRESERVE the fabricated blocker's
+    # gating verdict. An empty file was READ — its quote is genuinely absent, so the blocker
+    # must DOWNGRADE, not stand as source-unavailable.
+    gh = HeadReadGH(source="", patch="", pr_facts=facts(), reviews=[])
+    runner, _seen = capturing_runner(FABRICATED_REPORT)
+    d = make(tmp_path, cfg={"shadow_mode": False}, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "reviewed:WARN"  # downgraded
+    body = gh.reviews_posted[0]["body"]
+    assert gh.posted[0]["event"] == "COMMENT"  # not REQUEST_CHANGES — the gate is lifted
+    assert "downgraded to **uncertain**" in body
+    assert "could NOT be evidence-checked" not in body  # NOT the unreadable/could-not-verify state
+
+
+async def test_finding_sources_treats_an_oversized_file_as_unreadable(tmp_path):
+    """GitHub returns `content: ""` with `encoding: "none"` for a 1–100 MB file — OMITTED,
+    not empty. Treating it as a zero-byte read marked it read_ok, so a real finding in an
+    oversized file was downgraded for evidence that was never fetched. `encoding` is the
+    only field that separates an omitted file from a genuinely empty one."""
+    from pr_reviewer.grounding import UNREADABLE
+
+    class BigFileGH:
+        async def __call__(self, args, timeout=30):
+            joined = " ".join(args)
+            if "/pulls/" in joined and "/files" in joined:
+                return 0, json.dumps([{"filename": "big.bin", "patch": "patchB"}]), ""
+            if "/contents/big.bin" in joined:
+                return 0, "none\x00", ""  # 1–100 MB: encoding none, content omitted
+            return 1, "", "unexpected call"
+
+    d = make(tmp_path, gh=BigFileGH())
+    sources = await d._finding_sources("o/r", 1, HEAD, [{"file": "big.bin"}])
+    assert sources["big.bin"][1] is UNREADABLE  # severity preserved — never a silent downgrade
+
+
+async def test_finding_sources_splits_empty_read_from_null_content(tmp_path):
+    # Unit-level proof of the two `rc == 0` branches the review flagged:
+    #   * empty `.content` (a zero-byte file) is a SUCCESSFUL read → `combined` is a real
+    #     string haystack (blob + patch), so grounding can still prove a quote absent;
+    #   * an absent object (a submodule / directory) is
+    #     NOT readable source → the `UNREADABLE` sentinel, which preserves severity.
+    from pr_reviewer.grounding import UNREADABLE
+
+    class TwoFileGH:
+        async def __call__(self, args, timeout=30):
+            joined = " ".join(args)
+            if "/pulls/" in joined and "/files" in joined:
+                return 0, json.dumps([{"f": "empty.py", "p": "patchE"}, {"f": "sub", "p": "patchS"}]), ""
+            if "/contents/empty.py" in joined:
+                return 0, "base64\x00", ""  # zero-byte file: base64 encoding, empty content
+            if "/contents/sub" in joined:
+                return 0, "\x00", ""  # `.content` absent — not a readable file
+            return 1, "", "unexpected call"
+
+    d = make(tmp_path, gh=TwoFileGH())
+    sources = await d._finding_sources("o/r", 1, HEAD, [{"file": "empty.py"}, {"file": "sub"}])
+    blob_e, combined_e = sources["empty.py"]
+    assert blob_e == ""  # the file really is empty…
+    assert isinstance(combined_e, str) and combined_e.endswith("patchE")  # …but the read SUCCEEDED
+    _blob_s, combined_s = sources["sub"]
+    assert combined_s is UNREADABLE  # `null` content cannot ground anything — fail closed
 
 
 # ── unaccounted priors hold the block at any verdict (issue #26) ─────────────
