@@ -2983,3 +2983,105 @@ async def test_an_unmoved_head_posts_the_unchanged_body_with_no_stale_machinery(
     assert "could not be resolved at post time" not in body
     assert not any("/compare/" in " ".join(c) for c in gh.calls)
     assert not [e for e in d.telemetry.read_all() if e.get("event") == "stale_head"]
+
+
+# ── a round can't hold the PR's slot forever (#3431) ─────────────────────────────
+#
+# Only the panel's finders carry a step timeout. A round that hung anywhere else held
+# the PR's chokepoint slot until the process restarted, and the push webhook, the
+# backfill sweep and the operator's `@vera review` all pass that gate — so on #3431 a
+# summon answered "in-flight: nothing ran" for over an hour.
+
+
+class HangOnceGH(RoutedGH):
+    """The first `gh` call never returns — a stuck call OUTSIDE the panel runner."""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.hung = False
+
+    async def __call__(self, args, timeout=30):
+        if not self.hung:
+            self.hung = True
+            await asyncio.Event().wait()
+        return await super().__call__(args, timeout=timeout)
+
+
+async def test_a_hung_round_gives_the_prs_slot_back_so_a_summon_gets_through(tmp_path):
+    escalations: list[str] = []
+    d = make(
+        tmp_path,
+        cfg={"round_timeout": 0.2},
+        gh=HangOnceGH(pr_facts=facts()),
+        inbox=lambda text, **_kw: escalations.append(text),
+    )
+    push = asyncio.create_task(d.handle_pr_event("o/r", 1, HEAD, "opened"))
+    await asyncio.sleep(0.05)
+    # While the round is genuinely live, refusing a second panel is correct.
+    assert (await d.handle_summon("o/r", 1, "operator")) == "drop:in-flight"
+
+    finished, _ = await asyncio.wait({push}, timeout=3)
+    assert finished, "the hung round never ended — the PR's slot stays held until a restart"
+    assert push.result() == "drop:round-timeout"
+    # …and the operator hears about it — a hung reviewer must not be silent.
+    assert any("ran past 0.2s" in e and "UNREVIEWED" in e for e in escalations), escalations
+    assert (await d.handle_summon("o/r", 1, "operator")).startswith("reviewed:")
+
+
+async def test_a_hung_panel_attempt_is_cut_off_and_retried(tmp_path):
+    attempts = []
+
+    async def runner(name, inputs):
+        attempts.append(name)
+        if len(attempts) == 1:
+            await asyncio.Event().wait()  # the unbounded step that never answers
+        return {"output": REPORT, "failed": []}
+
+    d = make(tmp_path, cfg={"panel_attempt_timeout": 0.1}, gh=RoutedGH(pr_facts=facts()), runner=runner)
+    assert (await asyncio.wait_for(d.handle_pr_event("o/r", 1, HEAD, "opened"), 5)) == "reviewed:FAIL"
+    assert len(attempts) == 2
+
+
+async def test_a_panel_that_hangs_every_attempt_says_it_timed_out_not_crashed(tmp_path):
+    escalations: list[str] = []
+
+    async def runner(name, inputs):
+        await asyncio.Event().wait()
+
+    gh = RoutedGH(pr_facts=facts())
+    d = make(
+        tmp_path,
+        cfg={"panel_attempt_timeout": 0.05, "panel_retries": 1},
+        gh=gh,
+        runner=runner,
+        inbox=lambda text, **_kw: escalations.append(text),
+    )
+    assert (await asyncio.wait_for(d.handle_pr_event("o/r", 1, HEAD, "opened"), 5)) == "error:run-timed-out"
+    titles = [w.get("output[title]", "") for w in gh.check_writes]
+    assert any("timed out" in t for t in titles), titles
+    assert escalations and "timed out after 0.05s" in escalations[-1]
+
+
+async def test_a_timeout_from_inside_the_round_is_not_mistaken_for_the_rounds_own(tmp_path):
+    # Only the round's OWN bound expiring is a round timeout; anything else keeps its
+    # original meaning instead of being relabelled and swallowed.
+    d = make(tmp_path, cfg={"round_timeout": 60})
+
+    async def _review(*_a, **_k):
+        raise TimeoutError("some inner call gave up")
+
+    d._review = _review
+    try:
+        await d.handle_pr_event("o/r", 1, HEAD, "opened")
+    except TimeoutError as exc:
+        assert "inner call" in str(exc)
+    else:
+        raise AssertionError("an inner TimeoutError was reported as the round's own timeout")
+
+
+def test_the_slot_ttl_outlasts_every_legitimate_round(tmp_path):
+    # The chokepoint only reclaims a slot whose round can't end: its TTL sits above the
+    # round bound, which sits above every attempt's budget including the retry.
+    d = make(tmp_path, cfg={"panel_attempt_timeout": 1800, "panel_retries": 1})
+    assert d.round_timeout_s >= (d.panel_retries + 1) * d.panel_attempt_timeout_s
+    assert d.chokepoint.in_flight_ttl_s > d.round_timeout_s

@@ -130,6 +130,11 @@ structural-trigger dispatch, approve-on-green + sweep, and the review eval.
     got this wrong" case, and reaffirming would answer with the answer under dispute.
   - **Bypasses the cooldown, not the in-flight guard** — the cooldown eats webhook bursts,
     and a human who typed a command is not a burst; two panels on one PR is still wrong.
+    The guard can't wedge a PR, though: each panel attempt and each round is bounded
+    (`panel_attempt_timeout` / `round_timeout`, below), and a slot still held past the round
+    bound + 10 min is reclaimed as abandoned — logged, and `in_flight_reclaimed` in
+    telemetry. Before that, one hung round answered every `@vera review` with "in-flight"
+    until the process restarted.
   - **Never silent.** Refusals, unknown verbs and drops all reply. `@vera help` lists the
     verbs. `@vera` alone is treated as asking what this thing does.
   - Handle is `summon_handle` (default `vera`) *plus* the reviewer's own login, and it never
@@ -244,6 +249,8 @@ compose env (re-applied every roll) to keep the config volume disposable:
 | `PR_REVIEWER_SHADOW_MODE` | `pr_reviewer.shadow_mode` | `true` | `1/true/yes/on` ⇒ shadow. A present config bool (incl. `false`) wins over the env. |
 | `PR_REVIEWER_PROMOTION_OWNER` | `pr_reviewer.promotion_owner` | `false` | Same tri-state semantics. |
 | `PR_REVIEWER_PANEL_RETRIES` | `pr_reviewer.panel_retries` | `1` | Re-runs of a recipe whose panel reported a failed step, before D3 escalation. `0` restores the old give-up-on-first-failure behaviour. |
+| `PR_REVIEWER_PANEL_ATTEMPT_TIMEOUT` | `pr_reviewer.panel_attempt_timeout` | `1800` | Seconds one panel attempt may run. Only the finders carry a step timeout, so a hung verifier/synthesis step used to hang the round. Past the budget the attempt is cancelled and counts as failed: retried, then concluded on the PR as **"QA panel timed out"**. |
+| `PR_REVIEWER_ROUND_TIMEOUT` | `pr_reviewer.round_timeout` | every attempt + 600 | Backstop for a whole round (every attempt plus the GitHub calls around them). Defaults to `(panel_retries + 1) × panel_attempt_timeout + 600`, so it never cuts a legitimate retry short. |
 | `PR_REVIEWER_BACKFILL_PER_PASS` | `pr_reviewer.backfill_per_pass` | `2` | Reviews the sweep may backfill per pass, across all repos. `0` disables backfill. |
 | `PR_REVIEWER_SUMMON` | `pr_reviewer.summon` | `true` | The comment-command surface (`@vera review` / `pause` / `resume` / `help`) **and** the pause check on the automated path. `false` costs nothing for a repo that never wants comment-driven behaviour. |
 | `PR_REVIEWER_EVIDENCE_GROUNDING` | `pr_reviewer.evidence_grounding` | `true` | A finding whose quoted code appears nowhere in the cited file at the reviewed head (nor in this PR's patch for it) is annotated `uncertain` — it still posts, it just can't carry a FAIL. Fails open on an unreadable blob or unquotable evidence. |

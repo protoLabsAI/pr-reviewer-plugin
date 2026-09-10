@@ -85,6 +85,7 @@ DROP_PAUSED = "paused-by-operator"  # `@vera pause` (issue #28)
 DROP_REVIEWS_UNREADABLE = "reviews-unreadable"  # blind on our own history (issue #71)
 DROP_VIEWER_UNKNOWN = "viewer-unknown"  # blind on our own IDENTITY — can't rule out self-review
 DROP_POST_REFUSED = "post-refused"  # GitHub keeps rejecting this verdict post (issue #78)
+DROP_ROUND_TIMEOUT = "round-timeout"  # a round outlived round_timeout_s and was cancelled
 
 # Our own reviews could not be read this pass (issue #71). Distinct from every other
 # hold because it says nothing about the PR — only that we are blind — and blind is
@@ -362,7 +363,13 @@ class Dispatcher:
         self.summon_enabled = (
             bool(self.cfg["summon"]) if "summon" in self.cfg else _env_bool("PR_REVIEWER_SUMMON", True)
         )
-        self.chokepoint = Chokepoint(cooldown_s=int(self._cfg.get("cooldown_s") or 30))
+        # The TTL sits above the round bound so a slow-but-live round is never raced by a
+        # second panel on the same PR; it only reclaims a slot whose round can't end.
+        self.chokepoint = Chokepoint(
+            cooldown_s=int(self._cfg.get("cooldown_s") or 30),
+            in_flight_ttl_s=self.round_timeout_s + 600,
+            on_reclaim=self._on_in_flight_reclaimed,
+        )
         self._run_gh = run_gh_fn or run_gh
         self._workflow_run = workflow_run  # None → resolve STATE.workflow_run lazily
         self._inbox_add = inbox_add  # None → resolve STATE.inbox_store lazily
@@ -500,6 +507,68 @@ class Dispatcher:
         PR that merges UNREVIEWED."""
         cfg = self.cfg
         return int(cfg["panel_retries"]) if "panel_retries" in cfg else _env_int("PR_REVIEWER_PANEL_RETRIES", 1)
+
+    @property
+    def panel_attempt_timeout_s(self) -> float:
+        """Budget for ONE panel attempt (one `runner(recipe, inputs)` call). Only the
+        finders carry a step timeout; the verifier, synthesis and grounding steps don't,
+        so a hang in any of them used to hang the round — and, holding the PR's
+        in-flight slot, every later review of that PR. Past the budget the attempt is
+        cancelled and counts as a crashed attempt: retried, then concluded as "QA panel
+        crashed" on the PR, visibly. Default 30 min, above the finders' 15."""
+        cfg = self.cfg
+        return (
+            float(cfg["panel_attempt_timeout"])
+            if "panel_attempt_timeout" in cfg
+            else _env_int("PR_REVIEWER_PANEL_ATTEMPT_TIMEOUT", 1800)
+        )
+
+    @property
+    def round_timeout_s(self) -> float:
+        """Backstop for a WHOLE round — every attempt plus the GitHub calls around them —
+        for a hang outside the panel runner. Defaults to every attempt's budget plus ten
+        minutes, so it can never cut a legitimate retry short."""
+        cfg = self.cfg
+        if "round_timeout" in cfg:
+            return float(cfg["round_timeout"])
+        default = (self.panel_retries + 1) * self.panel_attempt_timeout_s + 600
+        return _env_int("PR_REVIEWER_ROUND_TIMEOUT", default)
+
+    def _on_in_flight_reclaimed(self, repo: str, pr: int, held_s: float) -> None:
+        # Past the round bound, a still-held slot means a round that stopped making
+        # progress and never ended — a defect, so make it loud, not just unlocked.
+        log.warning(
+            "[pr-reviewer] %s#%s: reclaimed an in-flight slot held %.0fs — its round never finished",
+            repo,
+            pr,
+            held_s,
+        )
+        self.telemetry.emit("in_flight_reclaimed", repo=repo, pr=pr, held_s=round(held_s))
+
+    async def _bounded_review(self, repo: str, pr: int, **review_kwargs) -> str:
+        """``_review`` under ``round_timeout_s``. The callers hold the chokepoint slot and
+        release it in their ``finally``; bounding the round here is what guarantees they
+        get there."""
+        bound = asyncio.timeout(self.round_timeout_s)
+        try:
+            async with bound:
+                return await self._review(repo, pr, **review_kwargs)
+        except TimeoutError:
+            if not bound.expired():
+                raise  # a TimeoutError from inside the round is not the round's own bound
+            log.warning("[pr-reviewer] %s#%s: round exceeded %gs — cancelled", repo, pr, self.round_timeout_s)
+            self.telemetry.emit("drop", repo=repo, pr=pr, reason=DROP_ROUND_TIMEOUT, timeout_s=self.round_timeout_s)
+            # Tell the operator, not just the log: a round this long means something the
+            # panel depends on has stopped answering, and every later round will likely
+            # hang the same way. The incident this bound came from went unnoticed for
+            # hours precisely because nothing said so.
+            await self._escalate(
+                f"pr-reviewer: a review round on {repo}#{pr} ran past {self.round_timeout_s:g}s and was "
+                f"cancelled — PR is UNREVIEWED. Rounds hanging this long usually mean a dependency "
+                f"of the panel (model gateway, workflow runner) has stopped answering.",
+                dedup_key=f"pr-reviewer-round-timeout:{repo}#{pr}",
+            )
+            return f"drop:{DROP_ROUND_TIMEOUT}"
 
     @property
     def backfill_per_pass(self) -> int:
@@ -1126,7 +1195,7 @@ class Dispatcher:
             self.telemetry.emit("drop", repo=repo, pr=pr, sha=head_sha, reason=decision)
             return f"drop:{decision}"
         try:
-            return await self._review(repo, pr, push_triggered=True)
+            return await self._bounded_review(repo, pr, push_triggered=True)
         finally:
             self.chokepoint.done(repo, pr)
 
@@ -1154,7 +1223,7 @@ class Dispatcher:
         # override the flood guard, and the operator has implicitly acknowledged the cost.
         self._round_cap.pop(f"{repo}#{pr}", None)
         try:
-            return await self._review(repo, pr, force=True)
+            return await self._bounded_review(repo, pr, force=True)
         finally:
             self.chokepoint.done(repo, pr)
 
@@ -1323,27 +1392,39 @@ class Dispatcher:
         failed: list = []
         for attempt in range(1, self.panel_retries + 2):
             last = attempt == self.panel_retries + 1
+            # Bounded: a hung attempt must end as a failed attempt (retried, then reported
+            # on the PR), not hold the round — and with it the PR's slot — forever.
+            attempt_bound = asyncio.timeout(self.panel_attempt_timeout_s)
             try:
-                result = await runner(recipe, inputs)
-            except Exception as exc:  # noqa: BLE001
+                async with attempt_bound:
+                    result = await runner(recipe, inputs)
+            except Exception as exc:  # noqa: BLE001 — the attempt's own TimeoutError included
+                timed_out = isinstance(exc, TimeoutError) and attempt_bound.expired()
+                why = f"timed out after {self.panel_attempt_timeout_s:g}s" if timed_out else type(exc).__name__
                 if not last:
                     self.telemetry.emit(
-                        "panel_retry", repo=repo, pr=pr, sha=head, attempt=attempt, crashed=type(exc).__name__
+                        "panel_retry",
+                        repo=repo,
+                        pr=pr,
+                        sha=head,
+                        attempt=attempt,
+                        crashed="timeout" if timed_out else type(exc).__name__,
                     )
                     continue
                 await self._conclude_review_check(
                     repo,
                     review_check_id,
                     FAILURE,
-                    "QA panel crashed — no verdict",
-                    f"The review run crashed on head `{head[:12]}` ({type(exc).__name__}). "
-                    f"No verdict was posted; push a fix to re-trigger the review.",
+                    "QA panel timed out — no verdict" if timed_out else "QA panel crashed — no verdict",
+                    f"The review run {'timed out' if timed_out else 'crashed'} on head `{head[:12]}` ({why}). "
+                    f"No verdict was posted; push a fix or comment `@vera review` to re-trigger the review.",
                 )
                 await self._escalate(
-                    f"pr-reviewer: review run crashed on {repo}#{pr} ({type(exc).__name__}: {exc}) — PR is UNREVIEWED.",
+                    f"pr-reviewer: review run {'timed out' if timed_out else 'crashed'} on {repo}#{pr} "
+                    f"({why}: {exc}) — PR is UNREVIEWED.",
                     dedup_key=f"pr-reviewer-crash:{repo}#{pr}@{head[:7]}",
                 )
-                return "error:run-crashed"
+                return "error:run-timed-out" if timed_out else "error:run-crashed"
             failed = list(result.get("failed") or [])
             if not failed:
                 break
@@ -2411,7 +2492,7 @@ class Dispatcher:
         slot = self.panel_sem if self.panel_sem is not None else contextlib.nullcontext()
         try:
             async with slot:
-                return await self._review(repo, pr)
+                return await self._bounded_review(repo, pr)
         finally:
             self.chokepoint.done(repo, pr)
 
