@@ -20,12 +20,16 @@ SECRET = "whsec"
 class SpyDispatcher:
     def __init__(self):
         self.events: list[tuple] = []
+        self.promotions: list[tuple] = []
 
     async def handle_pr_event(self, repo, pr, head, action):
         self.events.append((repo, pr, head, action))
         return "reviewed:PASS"
 
     async def evaluate_promotion(self, repo, pr):
+        # Recorded so the thread-resolution tests can assert the gate was actually
+        # re-published, not merely that the request was accepted.
+        self.promotions.append((repo, pr))
         return "hold:not-promotion-owner"
 
 
@@ -357,6 +361,91 @@ def test_a_check_run_not_tied_to_a_pr_is_a_no_op(tmp_path):
     app, dispatcher, _posted = summon_app(tmp_path)
     assert post_check_run(app, check_run_payload(pr=0)).json()["reason"] == "check-run-no-pr"
     assert dispatcher.summons == []
+
+
+# ── resolving a thread must clear the gate it is measured by (issue #111) ────
+
+
+def review_thread_payload(action="resolved", pr=7):
+    return json.dumps(
+        {
+            "action": action,
+            "repository": {"full_name": "o/r"},
+            "pull_request": {"number": pr},
+            "thread": {"id": 1},
+        }
+    ).encode()
+
+
+def post_thread(app, body: bytes):
+    return TestClient(app).post(
+        "/plugins/pr-reviewer/webhook",
+        content=body,
+        headers={**signed(body), "X-GitHub-Event": "pull_request_review_thread"},
+    )
+
+
+def test_resolving_a_thread_republishes_the_gate(tmp_path):
+    """The defect this guards. The `QA panel` check fails with "N unresolved review
+    threads — resolve each thread ... and this clears on the next pass", but nothing
+    subscribed to the event that says a thread WAS resolved, so doing exactly what the
+    check asked left it red until an unrelated push. Live: protoAgent#3415 read FAILURE
+    for ten hours after its threads were dealt with."""
+    app, dispatcher, _posted = summon_app(tmp_path)
+    with TestClient(app) as client:
+        body = review_thread_payload()
+        r = client.post(
+            "/plugins/pr-reviewer/webhook",
+            content=body,
+            headers={**signed(body), "X-GitHub-Event": "pull_request_review_thread"},
+        )
+        assert r.json() == {"ok": True, "dispatched": True, "reason": "thread-resolved"}
+    assert dispatcher.promotions == [("o/r", 7)]
+
+
+def test_reopening_a_thread_also_republishes_the_gate(tmp_path):
+    """The gate must not be one-way. If `unresolved` were ignored, a reopened finding
+    would ride a green check until the next push."""
+    app, dispatcher, _posted = summon_app(tmp_path)
+    with TestClient(app) as client:
+        body = review_thread_payload(action="unresolved")
+        r = client.post(
+            "/plugins/pr-reviewer/webhook",
+            content=body,
+            headers={**signed(body), "X-GitHub-Event": "pull_request_review_thread"},
+        )
+        assert r.json()["reason"] == "thread-unresolved"
+    assert dispatcher.promotions == [("o/r", 7)]
+
+
+def test_a_thread_edit_is_not_a_resolution(tmp_path):
+    app, dispatcher, _posted = summon_app(tmp_path)
+    assert post_thread(app, review_thread_payload(action="edited")).json()["reason"] == "not-a-resolution"
+    assert dispatcher.promotions == []
+
+
+def test_re_evaluating_the_gate_never_spends_a_panel(tmp_path):
+    """`evaluate_promotion` re-reads state and republishes the check with no model call.
+    Routing a thread resolution through the full panel would make every batch-resolve
+    (GitHub sends one event PER THREAD) cost a review."""
+    app, dispatcher, _posted = summon_app(tmp_path)
+    with TestClient(app) as client:
+        body = review_thread_payload()
+        client.post(
+            "/plugins/pr-reviewer/webhook",
+            content=body,
+            headers={**signed(body), "X-GitHub-Event": "pull_request_review_thread"},
+        )
+    assert dispatcher.promotions == [("o/r", 7)]
+    assert dispatcher.summons == []
+    assert dispatcher.events == []
+
+
+def test_a_malformed_thread_payload_is_dropped(tmp_path):
+    app, dispatcher, _posted = summon_app(tmp_path)
+    body = json.dumps({"action": "resolved", "repository": {}}).encode()
+    assert post_thread(app, body).json()["reason"] == "malformed-payload"
+    assert dispatcher.promotions == []
 
 
 # ── replay endpoint (in-process A/B runner, issue #20) ───────────────────────
