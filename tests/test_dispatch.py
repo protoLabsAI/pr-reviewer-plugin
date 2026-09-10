@@ -3008,7 +3008,13 @@ class HangOnceGH(RoutedGH):
 
 
 async def test_a_hung_round_gives_the_prs_slot_back_so_a_summon_gets_through(tmp_path):
-    d = make(tmp_path, cfg={"round_timeout": 0.2}, gh=HangOnceGH(pr_facts=facts()))
+    escalations: list[str] = []
+    d = make(
+        tmp_path,
+        cfg={"round_timeout": 0.2},
+        gh=HangOnceGH(pr_facts=facts()),
+        inbox=lambda text, **_kw: escalations.append(text),
+    )
     push = asyncio.create_task(d.handle_pr_event("o/r", 1, HEAD, "opened"))
     await asyncio.sleep(0.05)
     # While the round is genuinely live, refusing a second panel is correct.
@@ -3017,6 +3023,8 @@ async def test_a_hung_round_gives_the_prs_slot_back_so_a_summon_gets_through(tmp
     finished, _ = await asyncio.wait({push}, timeout=3)
     assert finished, "the hung round never ended — the PR's slot stays held until a restart"
     assert push.result() == "drop:round-timeout"
+    # …and the operator hears about it — a hung reviewer must not be silent.
+    assert any("ran past 0.2s" in e and "UNREVIEWED" in e for e in escalations), escalations
     assert (await d.handle_summon("o/r", 1, "operator")).startswith("reviewed:")
 
 

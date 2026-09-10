@@ -558,6 +558,16 @@ class Dispatcher:
                 raise  # a TimeoutError from inside the round is not the round's own bound
             log.warning("[pr-reviewer] %s#%s: round exceeded %gs — cancelled", repo, pr, self.round_timeout_s)
             self.telemetry.emit("drop", repo=repo, pr=pr, reason=DROP_ROUND_TIMEOUT, timeout_s=self.round_timeout_s)
+            # Tell the operator, not just the log: a round this long means something the
+            # panel depends on has stopped answering, and every later round will likely
+            # hang the same way. The incident this bound came from went unnoticed for
+            # hours precisely because nothing said so.
+            await self._escalate(
+                f"pr-reviewer: a review round on {repo}#{pr} ran past {self.round_timeout_s:g}s and was "
+                f"cancelled — PR is UNREVIEWED. Rounds hanging this long usually mean a dependency "
+                f"of the panel (model gateway, workflow runner) has stopped answering.",
+                dedup_key=f"pr-reviewer-round-timeout:{repo}#{pr}",
+            )
             return f"drop:{DROP_ROUND_TIMEOUT}"
 
     @property
