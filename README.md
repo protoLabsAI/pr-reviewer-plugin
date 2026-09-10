@@ -320,6 +320,17 @@ the panel), or by clicking **Re-run** on the check itself — GitHub delivers th
 manual summon. That needs the App subscribed to the **`check_run`** event (like
 `issue_comment` for summons); without it the push path still works.
 
+**Clearing it by resolving the threads.** When the check reads *"N unresolved review
+threads"*, resolving them re-publishes the gate directly — GitHub delivers that as a
+`pull_request_review_thread` *resolved* event and the handler re-runs `evaluate_promotion`
+(a state re-read and a check publish; no panel, no model call). Re-opening a thread takes
+it back to red the same way.
+
+⚠️ **This needs the App subscribed to the `pull_request_review_thread` event.** Without it
+the check still asks you to resolve the threads and doing so will not clear it — the exact
+contradiction issue #111 was filed for, which cost protoAgent#3415 ten hours of stale red
+and burned board coder attempts against a signal no code change could fix.
+
 Requires the App installation to carry **Checks: read & write**. Without it the create
 logs a warning naming that permission and the whole lifecycle no-ops — the review still
 posts as before (bookkeeping must never cost the verdict).

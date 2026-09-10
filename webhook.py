@@ -73,6 +73,8 @@ def build_routers(dispatcher, telemetry, get_secret, run_gh_fn=None):
             return await _handle_comment(body)
         if gh_event == "check_run":
             return await _handle_check_run(body)
+        if gh_event == "pull_request_review_thread":
+            return await _handle_review_thread(body)
         if gh_event != "pull_request":
             telemetry.emit("drop", reason="not-a-pr-event", gh_event=gh_event)
             return {"ok": True, "dispatched": False, "reason": "not-a-pr-event"}
@@ -147,6 +149,50 @@ def build_routers(dispatcher, telemetry, get_secret, run_gh_fn=None):
             return {"ok": True, "dispatched": False, "reason": "summon:refused-not-admin"}
         asyncio.get_running_loop().create_task(_safe_summon(repo, pr, login))
         return {"ok": True, "dispatched": True, "reason": "summon:review"}
+
+    async def _handle_review_thread(body: bytes) -> dict:
+        """A review thread was resolved or unresolved — re-evaluate promotion so the
+        `QA panel` check reports the CURRENT thread count.
+
+        Without this the check contradicts its own instructions. It fails with "N
+        unresolved review threads — resolve each thread ... and this clears on the next
+        pass", but nothing here subscribed to the event that says a thread WAS resolved,
+        so the only things that produced a next pass were a new push, an `@vera` summon,
+        or a manual re-request. Doing exactly what the check asked left it red. Observed
+        on protoLabsAI/protoAgent#3415: the run read FAILURE for ten hours after the
+        threads were dealt with, and projectBoard-plugin read that stale red as CI failure
+        and burned a coder attempt per tier against it (issue #111).
+
+        `unresolved` is deliberate as well as `resolved`: re-opening a thread must be able
+        to take the check back to red, or the gate is one-way and a reopened finding rides
+        a green check.
+
+        This is NOT a panel — `evaluate_promotion` re-reads state and republishes the
+        check, with no model call — so it does not take the panel semaphore. It is also
+        idempotent, which matters because GitHub delivers one event per thread and a batch
+        resolve fires several at once."""
+        try:
+            payload = json.loads(body)
+            action = str(payload.get("action") or "")
+            if action not in ("resolved", "unresolved"):
+                return {"ok": True, "dispatched": False, "reason": "not-a-resolution"}
+            repo = str(payload["repository"]["full_name"])
+            pr = int(payload["pull_request"]["number"])
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            telemetry.emit("drop", reason="malformed-payload", gh_event="pull_request_review_thread")
+            return {"ok": True, "dispatched": False, "reason": "malformed-payload"}
+        telemetry.emit("thread", repo=repo, pr=pr, action=action)
+        asyncio.get_running_loop().create_task(_safe_reevaluate(repo, pr, action))
+        return {"ok": True, "dispatched": True, "reason": f"thread-{action}"}
+
+    async def _safe_reevaluate(repo: str, pr: int, action: str) -> None:
+        """Republish the gate for one PR. Best-effort: a failure here must never take the
+        webhook down, and the sweep remains the backstop."""
+        try:
+            decision = await dispatcher.evaluate_promotion(repo, pr)
+            log.info("[pr-reviewer] thread %s on %s#%s -> %s", action, repo, pr, decision)
+        except Exception:  # noqa: BLE001 — a re-evaluation must not kill the handler task
+            log.warning("[pr-reviewer] re-evaluate after thread %s failed on %s#%s", action, repo, pr, exc_info=True)
 
     async def _handle_check_run(body: bytes) -> dict:
         """A `check_run` webhook. We act ONLY on `rerequested` for our own `protoReview`
