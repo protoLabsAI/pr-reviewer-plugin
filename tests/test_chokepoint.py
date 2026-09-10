@@ -71,3 +71,32 @@ def test_done_is_idempotent_and_safe_when_never_admitted():
     _clock, now = make_clock()
     cp = Chokepoint(now=now)
     cp.done("o/r", 99)  # no-op, no raise
+
+
+def test_an_abandoned_in_flight_slot_is_reclaimed_after_its_ttl():
+    clock = [1000.0]
+    reclaimed: list[tuple] = []
+    cp = Chokepoint(
+        cooldown_s=0,
+        in_flight_ttl_s=100,
+        on_reclaim=lambda repo, pr, held: reclaimed.append((repo, pr, held)),
+        now=lambda: clock[0],
+    )
+    assert cp.admit("o/r", 1, "a") == "accept"  # a round that will never call done()
+    clock[0] += 99
+    assert cp.admit("o/r", 1, "b") == "in-flight"  # still inside its TTL: live, not abandoned
+    clock[0] += 2
+    assert cp.admit("o/r", 1, "b") == "accept"  # past it: reclaimed, not refused forever
+    assert reclaimed == [("o/r", 1, 101)]
+
+
+def test_a_reclaim_hook_that_raises_never_blocks_the_gate():
+    clock = [0.0]
+
+    def _boom(*_a):
+        raise RuntimeError("telemetry is down")
+
+    cp = Chokepoint(cooldown_s=0, in_flight_ttl_s=1, on_reclaim=_boom, now=lambda: clock[0])
+    assert cp.admit("o/r", 1, "a") == "accept"
+    clock[0] += 5
+    assert cp.admit("o/r", 1, "b") == "accept"
