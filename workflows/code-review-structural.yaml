@@ -121,6 +121,22 @@ steps:
       code this panel has already blessed. A review that never converges costs
       more than the nit it is holding out for.
 
+      ## Status line — required, on its own final line
+
+      A finder that could not actually do its job — every file read you needed
+      404ing or erroring, a tool call failing repeatedly with no working
+      alternative, running low on turns before finishing your pass — must say
+      so. Reviewing blind and reporting zero findings looks IDENTICAL to a
+      clean pass to everything downstream; only you know the difference.
+      After your findings block, end your reply with exactly one of:
+
+      - `FINDER_STATUS: reviewed n=<count>` — you read what this angle needed
+        and completed a real pass (`count` = findings you're reporting; 0 is a
+        normal, honest clean result).
+      - `FINDER_STATUS: blocked reason=<short reason>` — you could not
+        complete a real pass. Say briefly what stopped you (e.g. "file reads
+        404ing", "out of turns before finishing").
+
   - id: find_removed_behavior
     subagent: review-finder
     timeout: 900
@@ -158,6 +174,22 @@ steps:
       code this panel has already blessed. A review that never converges costs
       more than the nit it is holding out for.
 
+      ## Status line — required, on its own final line
+
+      A finder that could not actually do its job — every file read you needed
+      404ing or erroring, a tool call failing repeatedly with no working
+      alternative, running low on turns before finishing your pass — must say
+      so. Reviewing blind and reporting zero findings looks IDENTICAL to a
+      clean pass to everything downstream; only you know the difference.
+      After your findings block, end your reply with exactly one of:
+
+      - `FINDER_STATUS: reviewed n=<count>` — you read what this angle needed
+        and completed a real pass (`count` = findings you're reporting; 0 is a
+        normal, honest clean result).
+      - `FINDER_STATUS: blocked reason=<short reason>` — you could not
+        complete a real pass. Say briefly what stopped you (e.g. "file reads
+        404ing", "out of turns before finishing").
+
   - id: find_crossfile
     subagent: review-finder
     timeout: 900
@@ -168,6 +200,9 @@ steps:
       consumers, config keys renamed on one side only, docs/tests contradicting
       the new behavior. Use github_read_file on the files the diff touches
       indirectly — this angle is exactly the one a hunk-by-hunk read misses.
+      Pass `ref="{{inputs.head_sha}}"` on EVERY such call, including files
+      outside the immediate diff: omitting it silently reads the default
+      branch, which 404s outright for any file this PR adds.
 
       Server-resolved refs (empty when not provided): head SHA
       "{{inputs.head_sha}}", base ref "{{inputs.base_ref}}".
@@ -194,6 +229,22 @@ steps:
       substantially the panel's own doing: prefer silence to a fresh minor on
       code this panel has already blessed. A review that never converges costs
       more than the nit it is holding out for.
+
+      ## Status line — required, on its own final line
+
+      A finder that could not actually do its job — every file read you needed
+      404ing or erroring, a tool call failing repeatedly with no working
+      alternative, running low on turns before finishing your pass — must say
+      so. Reviewing blind and reporting zero findings looks IDENTICAL to a
+      clean pass to everything downstream; only you know the difference.
+      After your findings block, end your reply with exactly one of:
+
+      - `FINDER_STATUS: reviewed n=<count>` — you read what this angle needed
+        and completed a real pass (`count` = findings you're reporting; 0 is a
+        normal, honest clean result).
+      - `FINDER_STATUS: blocked reason=<short reason>` — you could not
+        complete a real pass. Say briefly what stopped you (e.g. "file reads
+        404ing", "out of turns before finishing").
 
   - id: find_conventions
     subagent: review-finder
@@ -237,6 +288,22 @@ steps:
       substantially the panel's own doing: prefer silence to a fresh minor on
       code this panel has already blessed. A review that never converges costs
       more than the nit it is holding out for.
+
+      ## Status line — required, on its own final line
+
+      A finder that could not actually do its job — every file read you needed
+      404ing or erroring, a tool call failing repeatedly with no working
+      alternative, running low on turns before finishing your pass — must say
+      so. Reviewing blind and reporting zero findings looks IDENTICAL to a
+      clean pass to everything downstream; only you know the difference.
+      After your findings block, end your reply with exactly one of:
+
+      - `FINDER_STATUS: reviewed n=<count>` — you read what this angle needed
+        and completed a real pass (`count` = findings you're reporting; 0 is a
+        normal, honest clean result).
+      - `FINDER_STATUS: blocked reason=<short reason>` — you could not
+        complete a real pass. Say briefly what stopped you (e.g. "file reads
+        404ing", "out of turns before finishing").
 
   - id: find_structural
     subagent: structural-finder

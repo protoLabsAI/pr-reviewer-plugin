@@ -14,10 +14,12 @@ from pr_reviewer.verdicts import (
     demote_stale_findings,
     extract_brief,
     extract_findings_json,
+    finder_completed,
     merge_carried_findings,
     parse_verdict_marker,
     render_verdict_body,
     report_hard_stopped,
+    structural_relay_ok,
     verdict_for,
     verification_ran,
 )
@@ -600,3 +602,45 @@ def test_marker_without_the_field_parses_as_verified():
     )
     assert "verified=false" not in body
     assert parse_verdict_marker(body)["verified"] is True
+
+
+# ── finder completeness (issue #117) ───────────────────────────────────────────
+#
+# A finder that hit a wall partway through — every file read 404ing, a crash,
+# exhausting its turn budget — used to look identical to one that reviewed the
+# real code and genuinely found nothing: both emit an empty findings array, and
+# neither trips the engine's own `failed`/`degraded` tracking (that only catches
+# a step the engine itself cut off). protoAgent#3494 posted a clean PASS this way
+# with 4 of 5 lanes blind or broken.
+
+
+def test_a_finder_with_no_status_line_did_not_complete():
+    """An old-format reply, or one truncated before it ever reached the marker."""
+    assert finder_completed("some findings\n```json\n[]\n```\n") is False
+
+
+def test_a_finder_that_declares_reviewed_completed():
+    assert finder_completed("```json\n[]\n```\nFINDER_STATUS: reviewed n=0") is True
+    assert finder_completed("```json\n[...]\n```\nFINDER_STATUS: reviewed n=2") is True
+
+
+def test_a_finder_that_declares_blocked_did_not_complete():
+    """Explicit self-report of failure — even if it also emitted a findings block."""
+    output = "```json\n[]\n```\nFINDER_STATUS: blocked reason=every file read 404ed"
+    assert finder_completed(output) is False
+
+
+def test_structural_relay_with_a_findings_fence_is_ok():
+    assert structural_relay_ok('```json\n[{"source": "protopatch"}]\n```', "PROTOPATCH UNAVAILABLE") is True
+    assert structural_relay_ok("```json\n[]\n```", "PROTOPATCH UNAVAILABLE") is True
+
+
+def test_structural_relay_reporting_unavailable_is_ok():
+    output = "PROTOPATCH UNAVAILABLE — clone failed\n\nGap: structural pass unavailable — clone failed"
+    assert structural_relay_ok(output, "PROTOPATCH UNAVAILABLE") is True
+
+
+def test_structural_relay_with_neither_is_not_ok():
+    """The turn-limit-exhaustion shape: no fence, no Gap line, just a truncated reply."""
+    assert structural_relay_ok("Running protopatch_review on PR #3494...", "PROTOPATCH UNAVAILABLE") is False
+    assert structural_relay_ok("", "PROTOPATCH UNAVAILABLE") is False

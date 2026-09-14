@@ -16,6 +16,7 @@ from pr_reviewer.rounds import (
     parse_dispositions,
     render_degraded_note,
     render_held_note,
+    render_incomplete_note,
     render_notes_section,
     render_prior_requests,
     render_unaccounted_note,
@@ -352,6 +353,19 @@ def test_degraded_note_names_the_skipped_finders():
     assert "`find_crossfile`" in note and "`find_correctness`" in note
     assert "could be missed" in note  # honest about the coverage gap
     assert render_degraded_note([]) == ""  # silent when nothing degraded
+
+
+def test_incomplete_note_names_the_finders_that_did_not_complete():
+    """Distinct wording from render_degraded_note: this is a finder that looked done
+    to the engine (no timeout, no crash) but never proved it, e.g. protoAgent#3494's
+    lanes reading nothing but 404s (issue #117) — must not claim it "hit its time
+    budget", which would misreport what actually happened."""
+    note = render_incomplete_note(["find_removed_behavior", "find_conventions"])
+    assert "did not complete a real pass" in note
+    assert "`find_removed_behavior`" in note and "`find_conventions`" in note
+    assert "hit their time budget" not in note  # that's render_degraded_note's claim
+    assert "not as a clean pass" in note
+    assert render_incomplete_note([]) == ""
 
 
 # ── prior-finding dispositions: #26 in its general form ──────────────────────

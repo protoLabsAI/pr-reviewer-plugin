@@ -347,6 +347,50 @@ def demote_stale_findings(findings: list[dict], ranges: dict[str, list[tuple[int
 NOTHING_TO_VERIFY = "VERIFY_STATUS: nothing-to-verify"
 VERIFY_GAP_PREFIX = "VERIFY_GAP:"
 
+FINDER_REVIEWED = "FINDER_STATUS: reviewed"
+FINDER_BLOCKED_PREFIX = "FINDER_STATUS: blocked"
+
+_FINDINGS_FENCE_RE = re.compile(r"```json\s*\n.*?```", re.DOTALL)
+
+
+def finder_completed(output: str) -> bool:
+    """Did this LLM finder step actually complete a real pass over the code?
+
+    Issue #117: a finder that hits a wall partway through — every file read
+    404ing, an early crash, exhausting its turn budget without a real answer —
+    used to look IDENTICAL to one that looked and genuinely found nothing: both
+    emit an empty findings array, and the engine's own `failed`/`degraded`
+    tracking only catches a step the engine itself cut off (a timeout), not one
+    that ran to a normal-looking finish on garbage input. Every finder's prompt
+    now requires an explicit `FINDER_STATUS: reviewed` marker on completion, so
+    its absence — an old-format reply, a crash mid-response, a truncated
+    turn-limit exit — or an explicit `FINDER_STATUS: blocked` both mean the pass
+    did not happen, the same way `verification_ran` reads the verify step's own
+    status line rather than trusting an empty result at face value.
+    """
+    text = output or ""
+    if FINDER_BLOCKED_PREFIX in text:
+        return False
+    return FINDER_REVIEWED in text
+
+
+def structural_relay_ok(output: str, unavailable_prefix: str) -> bool:
+    """Did the structural finder actually relay a findings block or a proper Gap?
+
+    Its contract (subagents.py) is narrower than the four LLM finders' — call
+    `protopatch_review` once, relay verbatim — so a genuine `PROTOPATCH
+    UNAVAILABLE` Gap is a CLEAN degrade (the panel proceeds on four finders, and
+    `structural_unavailable` already flags it). But a reply that is neither a
+    fenced findings array nor that Gap line — e.g. the relay subagent exhausting
+    its turn budget mid-relay on a large findings payload — is a coverage hole
+    that the exact-prefix check alone let through (issue #117): it isn't the
+    UNAVAILABLE text, so it read as a normal, complete, empty-ish pass.
+    """
+    text = output or ""
+    if unavailable_prefix in text:
+        return True
+    return bool(_FINDINGS_FENCE_RE.search(text))
+
 
 def verification_ran(verify_output: str, findings: list[dict] | None) -> bool:
     """Did the verify pass actually check the findings the panel is reporting?
