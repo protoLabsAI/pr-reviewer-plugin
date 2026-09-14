@@ -202,7 +202,11 @@ steps:
       indirectly — this angle is exactly the one a hunk-by-hunk read misses.
       Pass `ref="{{inputs.head_sha}}"` on EVERY such call, including files
       outside the immediate diff: omitting it silently reads the default
-      branch, which 404s outright for any file this PR adds.
+      branch, which 404s outright for any file this PR adds. **This angle
+      runs the most tool calls of the four** — however many files you read,
+      stop and answer once you have enough evidence rather than chasing every
+      indirect reference; a bounded, honest pass beats an exhaustive one that
+      never reaches its closing status line (below).
 
       Server-resolved refs (empty when not provided): head SHA
       "{{inputs.head_sha}}", base ref "{{inputs.base_ref}}".
@@ -256,7 +260,10 @@ steps:
       contributor docs with github_read_file at the BASE ref below (or the
       default branch when it's empty), never at the PR head — then: naming that
       lies, duplicated logic, dead/debug code left in, missing or weakened
-      tests for changed behavior, secrets or scratch files in the diff.
+      tests for changed behavior, secrets or scratch files in the diff. One
+      doc read is normally enough evidence for this angle — don't chase every
+      linked doc; a bounded, honest pass beats an exhaustive one that never
+      reaches its closing status line (below).
       When the diff touches CI workflows, build/test scripts, or test-runner
       config, check test enforcement specifically: flag any suite that is no
       longer run, skipped, made non-blocking, or conditionally bypassed
