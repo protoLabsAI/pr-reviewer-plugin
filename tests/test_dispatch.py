@@ -1246,7 +1246,7 @@ async def test_all_finders_declaring_reviewed_stays_complete(tmp_path):
                 "find_removed_behavior": clean,
                 "find_crossfile": clean,
                 "find_conventions": clean,
-                "find_structural": '```json\n[]\n```',
+                "find_structural": "```json\n[]\n```",
             },
         }
 

@@ -1506,9 +1506,7 @@ class Dispatcher:
         # of trusting an empty findings array at face value. Steps the engine already
         # cut off at their timeout are skipped here — they're already coverage gaps.
         incomplete_finders = [
-            s
-            for s in LLM_FINDER_STEPS
-            if s not in degraded and not finder_completed(str(steps_out.get(s) or ""))
+            s for s in LLM_FINDER_STEPS if s not in degraded and not finder_completed(str(steps_out.get(s) or ""))
         ]
         complete = not structural_unavailable and not degraded and not incomplete_finders
         output = str(result.get("output") or "")
