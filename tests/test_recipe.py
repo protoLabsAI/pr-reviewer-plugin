@@ -166,3 +166,25 @@ def test_the_status_line_contract_lives_where_the_dispatcher_expects_it():
     assert RECIPE["name"] in STATUS_LINE_RECIPES
     for sid in LLM_FINDER_STEPS:
         assert "FINDER_STATUS: reviewed" in STEPS[sid]["prompt"], sid
+
+
+def test_the_tool_heavy_lanes_get_a_bounded_evidence_reminder():
+    """pr-reviewer-plugin#124: crossfile and conventions are the only two lanes whose
+    angle REQUIRES extra github_read_file calls beyond the initial diff fetch — and
+    live telemetry showed they (never the tool-light correctness/removed_behavior
+    lanes) are the ones that intermittently finish without their closing
+    FINDER_STATUS line. The other two just reason over the given diff in one shot;
+    these two run open-ended tool loops, so the closing-line instruction is furthest
+    (in turns) from wherever it was last seen. A reminder placed right next to the
+    tool-use instruction — not just at the very end of a long prompt — is the fix
+    tried here; it must survive prompt edits."""
+    for sid in ("find_crossfile", "find_conventions"):
+        prompt = STEPS[sid]["prompt"]
+        assert "bounded, honest pass beats an exhaustive one" in prompt, sid
+        # The reminder must sit with the tool-use instruction, not only at the tail —
+        # find it before the last quarter of the prompt.
+        idx = prompt.index("bounded, honest pass beats an exhaustive one")
+        assert idx < len(prompt) * 0.75, f"{sid}: reminder too close to the tail"
+    # The tool-light lanes reason over the given diff directly — no such reminder needed.
+    for sid in ("find_correctness", "find_removed_behavior"):
+        assert "bounded, honest pass beats an exhaustive one" not in STEPS[sid]["prompt"], sid
