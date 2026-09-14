@@ -551,6 +551,25 @@ def render_degraded_note(degraded: list[str]) -> str:
     )
 
 
+def render_incomplete_note(incomplete: list[str]) -> str:
+    """Names the finder(s) that ran but did not complete a real pass this round —
+    a file read failed, a crash cut it off, or it exhausted its turn budget without
+    a real answer (issue #117). Distinct from `render_degraded_note`: that one is the
+    engine cutting a step off at its time budget, a known and bounded coverage gap;
+    this one is a step that looked like it finished — no timeout, no crash the engine
+    saw — but produced nothing trustworthy, which is why it needs its own, blunter
+    wording rather than borrowing "hit their time budget"."""
+    if not incomplete:
+        return ""
+    steps = ", ".join(f"`{s}`" for s in incomplete)
+    return (
+        f"\n\n---\n_{len(incomplete)} panel step(s) did not complete a real pass this "
+        f"round: {steps}. The verdict stands on the remaining angles; treat this as "
+        f"unreviewed from that angle, not as a clean pass — the next push re-runs the "
+        f"full panel._"
+    )
+
+
 def render_notes_section(notes: list[dict]) -> str:
     """The follow-up checklist appended to a converged body — findings the verdict
     stopped carrying, in the form someone can actually act on later."""

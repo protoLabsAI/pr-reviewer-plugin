@@ -52,6 +52,7 @@ from .rounds import (
     parse_dispositions,
     render_degraded_note,
     render_held_note,
+    render_incomplete_note,
     render_notes_section,
     render_prior_requests,
     render_promotion_findings,
@@ -68,10 +69,12 @@ from .verdicts import (
     confine_findings,
     demote_stale_findings,
     extract_brief,
+    finder_completed,
     merge_carried_findings,
     parse_verdict_marker,
     render_verdict_body,
     report_hard_stopped,
+    structural_relay_ok,
     verdict_for,
     verification_ran,
 )
@@ -125,7 +128,22 @@ _TRANSIENT_GH_TEXT = (
     "timed out",
     "connection reset",
     "eof occurred",
+    # A response body that got cut short mid-transfer (connection dropped, proxy
+    # hiccup) fails `gh`'s own JSON decode before we ever see a status line — the
+    # same transient-network family as "connection reset", just caught one layer
+    # up. Without this, `transient_gh_failure` classified it as a hard refusal and
+    # `_post_review_with_retry` gave up on attempt 1 (issue #72's failure class
+    # recurring under a different error shape): 4 verdict-lost events in one day,
+    # one of which (ebay-plugin#3) merged with zero visible reviews because that
+    # repo also lacked a required-review gate.
+    "unexpected end of json input",
 )
+
+# The four LLM review-finder steps in `code-review-structural.yaml` — everything
+# except the non-LLM structural relay, which has its own completeness check
+# (`structural_relay_ok`) since its contract (call a tool once, relay verbatim) is
+# narrower than "review the code and report."
+LLM_FINDER_STEPS = ("find_correctness", "find_removed_behavior", "find_crossfile", "find_conventions")
 
 
 def ineligible_reason(facts: dict | None) -> str | None:
@@ -1476,8 +1494,23 @@ class Dispatcher:
         # `complete=false` so the promotion gate refuses to auto-approve a clean-looking
         # verdict that was produced over code a finder never examined.
         steps_out = result.get("steps") if isinstance(result.get("steps"), dict) else {}
-        structural_unavailable = UNAVAILABLE_PREFIX in str(steps_out.get("find_structural") or "")
-        complete = not structural_unavailable and not degraded
+        structural_out = str(steps_out.get("find_structural") or "")
+        structural_unavailable = UNAVAILABLE_PREFIX in structural_out or (
+            "find_structural" not in degraded and not structural_relay_ok(structural_out, UNAVAILABLE_PREFIX)
+        )
+        # The four LLM finders' own completeness (#117): a finder that ran to a
+        # normal-looking finish on garbage input (every file read 404ing, a crash mid-
+        # response, a turn-limit exit) is invisible to `degraded`/`failed` exactly like
+        # the structural relay case above — it never told the engine anything went
+        # wrong. `finder_completed` reads each finder's required status marker instead
+        # of trusting an empty findings array at face value. Steps the engine already
+        # cut off at their timeout are skipped here — they're already coverage gaps.
+        incomplete_finders = [
+            s
+            for s in LLM_FINDER_STEPS
+            if s not in degraded and not finder_completed(str(steps_out.get(s) or ""))
+        ]
+        complete = not structural_unavailable and not degraded and not incomplete_finders
         output = str(result.get("output") or "")
         # The raw output is read for BLOCKS and never published as text (protoAgent#2439
         # — see verdicts.py). `reported` is what the panel said this round and what the
@@ -1566,6 +1599,8 @@ class Dispatcher:
         )
         if degraded:
             trailer += render_degraded_note(degraded)
+        if incomplete_finders:
+            trailer += render_incomplete_note(incomplete_finders)
         if unaccounted:
             trailer += render_unaccounted_note(unaccounted)
             # Write the recovered majors into the recorded findings, not just the prose
@@ -1653,6 +1688,7 @@ class Dispatcher:
             step_s=timings or None,
             slowest_step=(max(timings, key=timings.get) if timings else None),
             degraded=degraded or None,
+            incomplete_finders=incomplete_finders or None,
             complete=complete,
             structural_unavailable=structural_unavailable or None,
             posted=posted,

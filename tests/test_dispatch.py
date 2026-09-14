@@ -936,6 +936,11 @@ def test_transient_gh_failure_classifies_by_shape():
     assert transient_gh_failure(1, "HTTP 502 Bad Gateway")
     assert transient_gh_failure(1, "You have exceeded a secondary rate limit")
     assert transient_gh_failure(124, "")  # our own timeout kill
+    # A truncated/malformed response body fails gh's own JSON decode before we ever
+    # see a status line — a #72 recurrence with a different error shape (2026-09-13:
+    # 4 verdict-lost events in one day, all "attempts": 1, because this string wasn't
+    # classified as transient and the retry loop never got a second try).
+    assert transient_gh_failure(1, "unexpected end of JSON input")
     # A request GitHub means to refuse — sleeping and re-sending changes nothing.
     assert not transient_gh_failure(1, "HTTP 422: Validation Failed")
     assert not transient_gh_failure(1, "HTTP 404: Not Found")
@@ -1192,6 +1197,65 @@ async def test_a_structural_gateway_failure_stamps_complete_false_on_the_verdict
     out = await d.handle_pr_event("o/r", 1, HEAD, "opened")
     assert out == "reviewed:PASS"
     assert "complete=false" in gh.posted[0]["body"]
+
+
+async def test_a_finder_missing_its_status_line_stamps_complete_false(tmp_path):
+    # protoAgent#3494 (issue #117): removed_behavior and crossfile read nothing but
+    # 404s and reported zero findings anyway — a clean PASS to every existing signal
+    # (no timeout, no crash, no PROTOPATCH UNAVAILABLE). The required FINDER_STATUS
+    # marker is what catches it: two finders here never declare `reviewed`.
+    gh = RoutedGH(pr_facts=facts(changed_files=6, additions=300, deletions=50), files="x.py\nb\nc\nd\ne\nf\n")
+
+    async def runner(name, inputs):
+        return {
+            "output": CLEAN_REPORT,
+            "failed": [],
+            "steps": {
+                "find_correctness": "no issues\n```json\n[]\n```\nFINDER_STATUS: reviewed n=0",
+                "find_removed_behavior": "reading files...\n[404]\n[404]\n[404]\n",
+                "find_crossfile": "reading files...\n[404]\n[404]\n",
+                "find_conventions": "no issues\n```json\n[]\n```\nFINDER_STATUS: reviewed n=0",
+                "find_structural": "PROTOPATCH UNAVAILABLE — clone failed\n\nGap: ...",
+            },
+        }
+
+    d = make(tmp_path, cfg={"shadow_mode": False}, gh=gh, runner=runner)
+    out = await d.handle_pr_event("o/r", 1, HEAD, "opened")
+    assert out == "reviewed:PASS"
+    body = gh.posted[0]["body"]
+    assert "complete=false" in body
+    assert "did not complete a real pass" in body
+    assert "`find_removed_behavior`" in body and "`find_crossfile`" in body
+    # The two that DID declare themselves reviewed must not be swept in with them.
+    assert "`find_correctness`" not in body
+    assert "`find_conventions`" not in body
+
+
+async def test_all_finders_declaring_reviewed_stays_complete(tmp_path):
+    """The status-line requirement must not turn every normal clean pass into a
+    false coverage gap — every finder here plays by the new contract."""
+    gh = RoutedGH(pr_facts=facts(changed_files=6, additions=300, deletions=50), files="x.py\nb\nc\nd\ne\nf\n")
+
+    async def runner(name, inputs):
+        clean = "no issues\n```json\n[]\n```\nFINDER_STATUS: reviewed n=0"
+        return {
+            "output": CLEAN_REPORT,
+            "failed": [],
+            "steps": {
+                "find_correctness": clean,
+                "find_removed_behavior": clean,
+                "find_crossfile": clean,
+                "find_conventions": clean,
+                "find_structural": '```json\n[]\n```',
+            },
+        }
+
+    d = make(tmp_path, cfg={"shadow_mode": False}, gh=gh, runner=runner)
+    out = await d.handle_pr_event("o/r", 1, HEAD, "opened")
+    assert out == "reviewed:PASS"
+    body = gh.posted[0]["body"]
+    assert "complete=false" not in body
+    assert "did not complete a real pass" not in body
 
 
 async def test_promotion_dedups_per_head_via_review_state(tmp_path):

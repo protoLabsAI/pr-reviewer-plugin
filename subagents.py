@@ -46,7 +46,16 @@ code yourself; the engine does. Your entire job:
 Judging the findings is the synthesizer's and verifier's job, not yours — a relay
 that edits its payload corrupts the panel. A clean (empty) result is a good result.""",
         tools=["protopatch_review"],
-        max_turns=4,
+        # 4 was tight enough to exhaust on the observed happy path (call once, relay
+        # once) whenever the engine's findings payload is large enough that relaying it
+        # "verbatim, nothing dropped" needs a continuation turn — protoAgent#3494 hit
+        # this on a 5-file/254-line diff, nowhere near protoPatch's expensive end,
+        # exiting mid-relay with neither a findings fence nor the UNAVAILABLE Gap line
+        # (issue #117; now also caught defensively by `structural_relay_ok`). Raised to
+        # the test suite's own documented ceiling (test_register.py: "a relay, not a
+        # reviewer") rather than past it — still exactly two things, just enough
+        # continuation room to finish relaying a large payload.
+        max_turns=6,
         allow_skill_emission=False,
     )
     return [structural_finder]
