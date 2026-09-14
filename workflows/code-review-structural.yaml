@@ -474,10 +474,16 @@ steps:
       verifier's reply alone cannot tell these apart, and reporting the wrong one
       either cries wolf on every clean PR or hides a real gap:
 
-      - Synthesized findings were EMPTY and the verifier said `nothing-to-verify`:
-        the panel found nothing. Write "no findings were raised, so there was nothing
-        to verify." That is **not** a Gap — do not mention a skipped or empty
-        structural pass, and do not suggest re-running anything.
+      - Synthesized findings were an explicit EMPTY array and the verifier said
+        `nothing-to-verify`: the panel found nothing. Write "no findings were raised,
+        so there was nothing to verify." The empty verify pass is **not** a Gap.
+      - **You cannot see the finder lanes** — only their merged result. So never claim
+        coverage: no "every lane ran", "the structural pass completed", "no coverage
+        gaps". The publisher stamps which lanes actually delivered, from their own
+        outputs, beside your brief — and it contradicts a coverage claim that is wrong.
+      - The synthesized block below carries NO findings array at all (not `[]` —
+        none): the findings were lost before verification. Never call that clean or
+        a pass. Say plainly that this round's findings did not arrive.
       - Findings existed and the verifier returned `annotated n=<count>` covering
         them: normal. Report what verification changed.
       - **Findings existed but the verifier returned no status line, no annotations,

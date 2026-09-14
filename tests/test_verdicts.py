@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 
+from pr_reviewer.protopatch import UNAVAILABLE_PREFIX
 from pr_reviewer.verdicts import (
     FAIL,
     NOTHING_TO_VERIFY,
@@ -11,15 +12,19 @@ from pr_reviewer.verdicts import (
     POSSIBLY_ADDRESSED,
     WARN,
     confine_findings,
+    coverage_gaps,
+    coverage_verdict,
     demote_stale_findings,
     extract_brief,
     extract_findings_json,
     finder_completed,
+    findings_payload_present,
     merge_carried_findings,
     parse_verdict_marker,
     render_verdict_body,
     report_hard_stopped,
     structural_relay_ok,
+    undelivered_stages,
     verdict_for,
     verification_ran,
 )
@@ -644,3 +649,122 @@ def test_structural_relay_with_neither_is_not_ok():
     """The turn-limit-exhaustion shape: no fence, no Gap line, just a truncated reply."""
     assert structural_relay_ok("Running protopatch_review on PR #3494...", "PROTOPATCH UNAVAILABLE") is False
     assert structural_relay_ok("", "PROTOPATCH UNAVAILABLE") is False
+
+
+# ── absent is not empty (#113) ──────────────────────────────────────────────────
+#
+# "The finders ran and found nothing" and "nothing reached this boundary" both parsed
+# as `[]`, so a lost payload rendered as "came back clean" and posted PASS.
+
+HEALTHY = "No issues from this angle.\n\n```json\n[]\n```\nFINDER_STATUS: reviewed n=0"
+
+
+def test_an_explicit_empty_array_is_a_delivered_payload():
+    assert findings_payload_present(HEALTHY) is True
+    assert findings_payload_present('```json\n[{"file": "a.py", "severity": "major", "claim": "x"}]\n```') is True
+    assert findings_payload_present("```\n[]\n```") is True  # an untagged fence is still the contract
+
+
+def test_no_array_at_all_is_not_a_payload():
+    assert findings_payload_present("") is False
+    assert findings_payload_present("Let me read the relevant source files to understand the context.") is False
+    assert (
+        findings_payload_present("[review-synthesizer completed: workflow w:synthesize] -- no output produced.")
+        is False
+    )
+
+
+def test_arrays_that_are_not_findings_are_not_a_payload():
+    assert findings_payload_present('```json\n[{"prior": "a.py:1", "disposition": "fixed", "why": "x"}]\n```') is False
+    assert findings_payload_present("```json\n[404]\n```") is False
+    assert findings_payload_present("```json\n[{broken\n```") is False
+    assert findings_payload_present("the finders returned [] this round") is False  # unfenced prose
+
+
+def test_explicit_empty_arrays_at_every_boundary_deliver():
+    steps = {"find_a": HEALTHY, "find_b": HEALTHY, "synthesize": HEALTHY, "verify": NOTHING_TO_VERIFY}
+    assert undelivered_stages(HEALTHY, steps, [], UNAVAILABLE_PREFIX) == []
+
+
+def test_the_113_shape_is_an_undelivered_synthesis():
+    steps = {"find_a": HEALTHY, "synthesize": "[review-synthesizer completed: w:synthesize] -- no output produced."}
+    assert undelivered_stages(HEALTHY, steps, [], UNAVAILABLE_PREFIX) == ["synthesize"]
+
+
+def test_a_report_without_its_array_is_undelivered_even_with_no_steps():
+    assert undelivered_stages("Brief only, no JSON.", {}, [], UNAVAILABLE_PREFIX) == ["report"]
+    assert undelivered_stages("Brief only, no JSON.", None, None, UNAVAILABLE_PREFIX) == ["report"]
+
+
+def test_one_dead_lane_is_a_gap_but_no_live_lane_is_an_absent_round():
+    one_dead = {"find_a": HEALTHY, "find_b": "Let me read the files.", "synthesize": HEALTHY}
+    assert undelivered_stages(HEALTHY, one_dead, [], UNAVAILABLE_PREFIX) == []
+    # Placeholders are not deliveries: the engine's timeout Gap and the UNAVAILABLE relay
+    # carry a synthetic `[]` for a pass that never happened, and a lane that declares
+    # itself blocked has said its array covers nothing.
+    all_dead = {
+        "find_a": "Let me read the files.",
+        "find_b": "Gap: step 'find_b' exceeded its 900s time budget\n\n```json\n[]\n```",
+        "find_c": "```json\n[]\n```\nFINDER_STATUS: blocked reason=every file read 404ed",
+        "find_structural": f"{UNAVAILABLE_PREFIX} — clone failed\n\nGap: ...\n\n```json\n[]\n```",
+        "synthesize": HEALTHY,
+    }
+    assert undelivered_stages(HEALTHY, all_dead, ["find_b"], UNAVAILABLE_PREFIX) == ["finders"]
+
+
+def test_a_missing_status_line_alone_never_voids_a_lane():
+    """An array without its FINDER_STATUS line is still a delivered array — a coverage gap
+    (#120's incomplete_finders), never an absent round. If a model stops emitting the line,
+    reviews degrade to WARN; they must not all stop producing verdicts."""
+    steps = {"find_a": "No issues.\n\n```json\n[]\n```", "synthesize": HEALTHY}
+    assert undelivered_stages(HEALTHY, steps, [], UNAVAILABLE_PREFIX) == []
+
+
+def test_a_partial_hard_stopped_lane_still_delivered_what_it_found():
+    partial = "[review-finder hard-stopped at max_turns: w:find_a — PARTIAL output; unverified remainder is a Gap]\n\n```json\n[]\n```"
+    assert undelivered_stages(HEALTHY, {"find_a": partial, "synthesize": HEALTHY}, [], UNAVAILABLE_PREFIX) == []
+
+
+# ── a coverage gap caps a clean PASS (#117) ────────────────────────────────────
+
+
+def test_coverage_gaps_fold_the_three_recorded_signals():
+    assert coverage_gaps([], [], False) == {}
+    assert coverage_gaps(["find_crossfile"], ["find_conventions", "find_crossfile"], True) == {
+        "find_crossfile": "hit its time budget",  # the engine's own reason wins
+        "find_conventions": "did not complete a real pass",
+        "find_structural": "structural pass unavailable or cut short",
+    }
+
+
+def test_a_coverage_gap_caps_pass_at_warn_and_never_touches_warn_or_fail():
+    gap = {"find_structural": "structural pass unavailable or cut short"}
+    assert coverage_verdict(PASS, gap) == WARN
+    assert coverage_verdict(PASS, {}) == PASS
+    assert coverage_verdict(PASS, None) == PASS
+    assert coverage_verdict(WARN, gap) == WARN
+    assert coverage_verdict(FAIL, gap) == FAIL
+
+
+def test_a_gapped_round_never_says_it_came_back_clean():
+    body = render_verdict_body(
+        repo="o/r",
+        pr=1,
+        head_sha="a" * 40,
+        verdict=WARN,
+        findings=[],
+        shadow=False,
+        recipe="code-review-structural",
+        brief="No coverage gaps: every lane completed.",
+        complete=False,
+        coverage_gaps=coverage_gaps([], ["find_conventions"], True),
+        lanes=5,
+    )
+    assert "came back clean" not in body
+    assert "not a clean review" in body
+    assert "2 of 5 review lane(s)" in body
+    assert "`find_conventions` (did not complete a real pass)" in body
+    assert "`find_structural` (structural pass unavailable or cut short)" in body
+    assert body.index("Coverage incomplete") < body.index("No coverage gaps")  # the record precedes the brief
+    assert json.loads(extract_findings_json(body)) == []  # recall still reads an explicit []
+    assert parse_verdict_marker(body)["complete"] is False

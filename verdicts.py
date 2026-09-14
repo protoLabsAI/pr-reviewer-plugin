@@ -240,17 +240,25 @@ def render_dispositions_table(rows: list[dict]) -> str:
     return "\n".join(out)
 
 
-def render_findings_block(findings: list[dict]) -> str:
+def render_findings_block(findings: list[dict], *, covered: bool = True) -> str:
     """The findings as a table plus the machine-readable array in a collapsed <details>.
 
     The array is not decoration: `extract_findings_json` reads it back off the posted
     body, which is how prior-round recall and `panel_rounds` reconstruct what a round
     found (ADR 0078 D5 — GitHub is the store). It is emitted even when empty, so a clean
     round records an explicit `[]` rather than an absence the next round has to guess at.
+
+    `covered=False` (a lane did not deliver a full pass, #117) withholds the "came back
+    clean" line: zero findings from part of the panel is not a clean review.
     """
     payload = json.dumps(findings, indent=2)
     collapsed = f"<details>\n<summary>findings JSON (machine-readable)</summary>\n\n```json\n{payload}\n```\n</details>"
     if not findings:
+        if not covered:
+            return (
+                "_No findings from the lanes that ran — coverage was incomplete (see above), so "
+                f"this is not a clean review._\n\n{collapsed}"
+            )
         return f"_No findings — the review came back clean._\n\n{collapsed}"
     return f"### Findings\n\n{render_findings_table(findings)}\n\n{collapsed}"
 
@@ -392,6 +400,138 @@ def structural_relay_ok(output: str, unavailable_prefix: str) -> bool:
     return bool(_FINDINGS_FENCE_RE.search(text))
 
 
+# ── absent is not empty (issue #113) ───────────────────────────────────────────
+# Every panel step is contracted to END with a fenced findings array — `[]` on a clean
+# pass. An explicit `[]` and NO array are different facts: the first is "looked, found
+# nothing", the second is "nothing reached this boundary" — a finder that died after its
+# opening line, a synthesizer that ran out of turns, a report cut off before its JSON.
+# `_parse_findings` reads both as `[]`, so an undelivered payload rendered as "came back
+# clean" and posted PASS beneath a verify note saying the findings may have been lost
+# (#113). This is replay's `looks_truncated` rule, applied at every stage boundary.
+_FENCE_RE = re.compile(r"```(?:json)?\s*\n(.*?)```", re.DOTALL)
+
+# A recipe's review lanes are its `find_*` steps — true of the core four-finder
+# `code-review` recipe and of `code-review-structural` alike.
+FINDER_STEP_PREFIX = "find_"
+
+
+def _finding_shaped(item: object) -> bool:
+    return isinstance(item, dict) and ("claim" in item or "severity" in item)
+
+
+def findings_payload_present(output: str) -> bool:
+    """Did this step deliver a findings array at all? An empty one counts; none does not.
+
+    A fenced JSON array that is empty or holds at least one finding-shaped object. A
+    dispositions block (`prior`/`disposition` rows) is not a findings payload, and nor is
+    a stray `[404]` — a step whose only array is one of those delivered no findings.
+    Fenced only, as the contract (and replay's `looks_truncated`) has it: a bare `[...]`
+    in prose is too easy to hit by accident to count as delivery.
+    """
+    for m in _FENCE_RE.finditer(output or ""):
+        body = m.group(1).strip()
+        if not body.startswith("["):
+            continue
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, list) and (not data or any(_finding_shaped(item) for item in data)):
+            return True
+    return False
+
+
+def _lane_delivered(output: str, timed_out: bool, unavailable_prefix: str) -> bool:
+    """Did this lane hand the synthesizer a findings payload it stands behind? The
+    engine's timeout Gap and the structural relay's UNAVAILABLE Gap both carry a synthetic
+    `[]` for a pass that never happened, and a lane that declares `FINDER_STATUS: blocked`
+    has said its array covers nothing — none of those is a delivery."""
+    if timed_out or FINDER_BLOCKED_PREFIX in output or (unavailable_prefix and unavailable_prefix in output):
+        return False
+    return findings_payload_present(output)
+
+
+def undelivered_stages(
+    output: str, steps: dict | None, degraded: list[str] | None, unavailable_prefix: str
+) -> list[str]:
+    """The stage boundaries at which this round's findings payload never arrived, in
+    pipeline order — empty when every boundary delivered (an explicit `[]` included).
+
+    - `finders`: NO lane delivered a payload — nothing was reviewed at all. One blind or
+      blocked lane among live ones is a coverage gap (WARN, below), not an absent round.
+      A missing FINDER_STATUS line alone never makes a lane undelivered: an array without
+      the line is still an array, and a model that drops the line must not void reviews.
+    - `synthesize`: the merge step emitted no array, so the verifier had nothing to
+      annotate — #113 exactly: "the findings were lost before reaching the verifier".
+    - `report`: the deliverable carries no array; parsing that as `[]` posts a clean PASS.
+
+    Any of these makes the round incomplete: the dispatcher retries it, then concludes
+    with no verdict — it is never rendered as a review that "came back clean". The
+    verify boundary needs no rule here: findings it failed to annotate already surface as
+    unverified (`verification_ran`), and an un-annotated blocker/major already FAILs. A
+    result with no `steps` (an older host) is judged on the report alone.
+    """
+    steps = steps or {}
+    timed_out = {str(s) for s in (degraded or [])}
+    stages: list[str] = []
+    lanes = [str(s) for s in steps if str(s).startswith(FINDER_STEP_PREFIX)]
+    if lanes and not any(_lane_delivered(str(steps.get(s) or ""), s in timed_out, unavailable_prefix) for s in lanes):
+        stages.append("finders")
+    if "synthesize" in steps and not findings_payload_present(str(steps.get("synthesize") or "")):
+        stages.append("synthesize")
+    if not findings_payload_present(output):
+        stages.append("report")
+    return stages
+
+
+# ── coverage gaps cap a clean PASS (issue #117) ─────────────────────────────────
+
+
+def coverage_gaps(
+    degraded: list[str] | None, incomplete_finders: list[str] | None, structural_unavailable: bool
+) -> dict[str, str]:
+    """{lane: why} for every lane that did not deliver a full pass — the three signals
+    the dispatcher already records (`degraded`, `incomplete_finders`,
+    `structural_unavailable`), as the one record the coverage cap and note read."""
+    gaps = {str(s): "hit its time budget" for s in (degraded or [])}
+    for s in incomplete_finders or []:
+        gaps.setdefault(str(s), "did not complete a real pass")
+    if structural_unavailable:
+        gaps.setdefault("find_structural", "structural pass unavailable or cut short")
+    return gaps
+
+
+def coverage_verdict(verdict: str, gaps: dict[str, str] | None) -> str:
+    """Cap a clean PASS at WARN when any lane did not deliver a full pass (#117).
+
+    Deliberately NOT a FAIL or a withheld verdict: a lane gap says the review covered
+    less, not that the code is bad — and the structural lane gaps on most large
+    protoAgent reviews today (#119), so blocking on it would block nearly every merge
+    there. WARN is the tier the gates already read as "non-blocking, look closer", and
+    the coverage note says what to look closer at. Applied by the caller AFTER the pure
+    mapping and every history rule, so `verdict_for` stays a function of findings alone
+    (ADR 0078 C) and convergence can never relieve the cap back to PASS.
+    """
+    return WARN if verdict == PASS and gaps else verdict
+
+
+def render_coverage_note(gaps: dict[str, str] | None, lanes: int = 0) -> str:
+    """The code-authored coverage line. The brief is model-written and cannot see the
+    lanes — on protoAgent#3494 it said the structural pass completed with no coverage
+    gaps while four lanes were blind — so this line, not the brief, is the record."""
+    if not gaps:
+        return ""
+    listed = ", ".join(f"`{sid}` ({why})" for sid, why in gaps.items())
+    of = f" of {lanes}" if lanes >= len(gaps) else ""
+    return (
+        f"**Coverage incomplete — this is not a clean pass.** {len(gaps)}{of} review lane(s) "
+        f"did not complete a full pass this round: {listed}. Findings from the lanes that ran "
+        "stand, but a defect only the missing lanes would catch may be missed, so a PASS is "
+        "capped at WARN. Where the brief below implies full coverage, this line supersedes "
+        "it. The next push re-runs the full panel."
+    )
+
+
 def verification_ran(verify_output: str, findings: list[dict] | None) -> bool:
     """Did the verify pass actually check the findings the panel is reporting?
 
@@ -445,6 +585,8 @@ def render_verdict_body(
     verified: bool = True,
     stale_note: str = "",
     diff_id: str = "",
+    coverage_gaps: dict[str, str] | None = None,
+    lanes: int = 0,
 ) -> str:
     """The comment body, ASSEMBLED — marker line (machine), header (human), the brief,
     the dispositions table, the findings table + machine-readable array, then the
@@ -463,7 +605,11 @@ def render_verdict_body(
     `stale_note` is the stale-head synthesis header (issue #82) — the PR moved while
     the panel ran, or its current head could not be checked. It leads the human-readable
     body: everything below it was verified against the head the MARKER names, and the
-    reader must know that before reading a single finding."""
+    reader must know that before reading a single finding.
+
+    `coverage_gaps` names the lanes that did not deliver a full pass (#117). Its note sits
+    ABOVE the brief for the same reason: the brief cannot see the lanes and has claimed
+    full coverage over blind ones, so the reader meets the code-authored record first."""
     mode = "shadow — comment-only" if shadow else "formal"
     footnote = ""
     if confined:
@@ -506,6 +652,8 @@ def render_verdict_body(
         sections.append(f"> ⚠️ {stale_note}")
     if truncated:
         sections.append("> ⚠️ The report pass was cut off at its turn limit — this round's findings may be incomplete.")
+    if coverage_gaps:
+        sections.append(f"> ⚠️ {render_coverage_note(coverage_gaps, lanes)}")
     if brief:
         sections.append(brief)
     elif not brief_found:
@@ -515,7 +663,7 @@ def render_verdict_body(
         )
     if dispositions:
         sections.append(f"### Prior requests\n\n{render_dispositions_table(dispositions)}")
-    sections.append(render_findings_block(findings))
+    sections.append(render_findings_block(findings, covered=not coverage_gaps))
     return "\n\n".join(s for s in sections if s) + f"{footnote}{notes}"
 
 

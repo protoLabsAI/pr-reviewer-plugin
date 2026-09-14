@@ -143,3 +143,26 @@ def test_verifier_pins_head_reads_and_names_source_unavailable_as_its_own_state(
     assert 'PINNED to head SHA "{{inputs.head_sha}}"' in p
     assert "confirmed nor refuted on its merits" in p
     assert "not evidence about this one" in p  # a read of another ref proves nothing here
+
+
+def test_the_report_cannot_claim_coverage_it_cannot_see():
+    """The report step sees only the merged findings, never the lanes — yet it was told an
+    empty verify pass is "not a Gap" and to not mention a skipped structural pass, and on
+    protoAgent#3494 it duly wrote "no coverage gaps" over four blind lanes (#117). And an
+    ABSENT synthesized array must not be written up as clean (#113)."""
+    prompt = STEPS["report"]["prompt"]
+    assert "You cannot see the finder lanes" in prompt
+    assert "never claim" in prompt and "no coverage" in prompt
+    assert "NO findings array at all" in prompt
+    assert "do not mention a skipped or empty" not in prompt
+
+
+def test_the_status_line_contract_lives_where_the_dispatcher_expects_it():
+    """STATUS_LINE_RECIPES is what the dispatcher uses to decide whether a missing
+    FINDER_STATUS line is a gap. It must name this recipe, and this recipe must ask
+    every LLM finder for the line — else a healthy finder reads as incomplete."""
+    from pr_reviewer.dispatch import LLM_FINDER_STEPS, STATUS_LINE_RECIPES
+
+    assert RECIPE["name"] in STATUS_LINE_RECIPES
+    for sid in LLM_FINDER_STEPS:
+        assert "FINDER_STATUS: reviewed" in STEPS[sid]["prompt"], sid
