@@ -42,7 +42,9 @@ def test_structural_finder_is_a_thin_relay():
     pr_reviewer.register(reg)
     finder = reg.subagents[0]
     assert finder.tools == ["protopatch_review"]
-    assert finder.max_turns <= 6  # a relay, not a reviewer
+    # A relay, not a reviewer — but the budget is host graph SUPER-STEPS, not model
+    # turns; the floor is pinned by tests/test_structural_budget.py (#119).
+    assert finder.max_turns <= 12
     assert finder.allow_skill_emission is False
     prompt = finder.system_prompt
     assert "EXACTLY ONCE" in prompt and "Gap" in prompt

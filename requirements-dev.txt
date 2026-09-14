@@ -6,3 +6,4 @@ ruff>=0.6
 fastapi>=0.115
 httpx>=0.27
 cryptography>=42
+langchain>=1.0,<2     # test-only: drives the real create_agent/langgraph step accounting (tests/test_structural_budget.py, #119)
