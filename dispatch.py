@@ -64,9 +64,12 @@ from .telemetry import REAFFIRM_DIFF, REAFFIRM_HEAD, REAFFIRM_MISS, Telemetry
 from .trigger import structural_trigger
 from .verdicts import (
     FAIL,
+    FINDER_STEP_PREFIX,
     PASS,
     WARN,
     confine_findings,
+    coverage_gaps,
+    coverage_verdict,
     demote_stale_findings,
     extract_brief,
     finder_completed,
@@ -75,6 +78,7 @@ from .verdicts import (
     render_verdict_body,
     report_hard_stopped,
     structural_relay_ok,
+    undelivered_stages,
     verdict_for,
     verification_ran,
 )
@@ -144,6 +148,12 @@ _TRANSIENT_GH_TEXT = (
 # (`structural_relay_ok`) since its contract (call a tool once, relay verbatim) is
 # narrower than "review the code and report."
 LLM_FINDER_STEPS = ("find_correctness", "find_removed_behavior", "find_crossfile", "find_conventions")
+
+# Recipes whose finder prompts REQUIRE the `FINDER_STATUS` line (`finder_completed`). The
+# small-diff `code-review` recipe lives in protoAgent and asks for no such line, so its
+# finders are judged by what they delivered alone — reading a line nobody asked for as
+# missing marked every small-diff review incomplete.
+STATUS_LINE_RECIPES = frozenset({"code-review-structural"})
 
 
 def ineligible_reason(facts: dict | None) -> str | None:
@@ -1408,6 +1418,13 @@ class Dispatcher:
         # draw against whatever starved the failed step.
         result: dict = {}
         failed: list = []
+        # Stage boundaries whose findings payload never arrived (#113). An ABSENT array is
+        # not an empty one, and parsing it as `[]` is what posted a clean PASS beneath a
+        # verify note saying the findings may have been lost. It is handled like a failed
+        # step: this loop is the natural retry point (a rerun is a fresh draw against
+        # whatever starved the stage), and a round that still delivers nothing ends with
+        # NO verdict below — never one that reads as clean.
+        undelivered: list[str] = []
         for attempt in range(1, self.panel_retries + 2):
             last = attempt == self.panel_retries + 1
             # Bounded: a hung attempt must end as a failed attempt (retried, then reported
@@ -1444,10 +1461,19 @@ class Dispatcher:
                 )
                 return "error:run-timed-out" if timed_out else "error:run-crashed"
             failed = list(result.get("failed") or [])
-            if not failed:
+            steps_now = result.get("steps") if isinstance(result.get("steps"), dict) else {}
+            undelivered = (
+                []
+                if failed
+                else undelivered_stages(
+                    str(result.get("output") or ""), steps_now, result.get("degraded"), UNAVAILABLE_PREFIX
+                )
+            )
+            if not failed and not undelivered:
                 break
             if not last:
-                self.telemetry.emit("panel_retry", repo=repo, pr=pr, sha=head, attempt=attempt, failed=failed)
+                retry_why = {"failed": failed} if failed else {"undelivered": undelivered}
+                self.telemetry.emit("panel_retry", repo=repo, pr=pr, sha=head, attempt=attempt, **retry_why)
         if failed:
             # Retries spent: D3's other branch. No verdict, operator escalation — and
             # the sweep's backfill will try again on a later pass (issue #17), so an
@@ -1475,6 +1501,35 @@ class Dispatcher:
                 "exhaustion", repo=repo, pr=pr, sha=head, failed=failed, attempts=self.panel_retries + 1
             )
             return "error:panel-exhausted"
+        if undelivered:
+            # Absent ≠ empty (#113): the panel ran, but a stage boundary delivered NO findings
+            # array on every attempt. That is the exhaustion outcome, not a verdict: nothing is
+            # posted, the protoReview check goes red, the operator is told, and the sweep's
+            # backfill retries the head later (it has no verdict). Telemetered as an
+            # exhaustion so the eval's unreviewed-PR count sees it; `undelivered` says why.
+            stages = ", ".join(undelivered)
+            attempts = self.panel_retries + 1
+            await self._conclude_review_check(
+                repo,
+                review_check_id,
+                FAILURE,
+                "QA panel incomplete — no verdict",
+                f"The review panel ran on head `{head[:12]}` but delivered no findings payload at "
+                f"stage(s) {stages} after {attempts} attempt(s). An absent payload is not a clean "
+                f"result, so no verdict was posted; push a fix or comment `@vera review` to re-trigger the review.",
+            )
+            await self._escalate(
+                f"pr-reviewer: panel delivered no findings payload ({stages}) on {repo}#{pr} "
+                f"after {attempts} attempt(s) — no verdict posted; PR is UNREVIEWED.",
+                dedup_key=f"pr-reviewer-incomplete:{repo}#{pr}@{head[:7]}",
+                repo=repo,
+                pr=pr,
+                head_sha=head,
+            )
+            self.telemetry.emit(
+                "exhaustion", repo=repo, pr=pr, sha=head, failed=[], undelivered=undelivered, attempts=attempts
+            )
+            return "error:panel-incomplete"
 
         # Per-step timings (protoAgent's engine, additive — {} on an older host). The
         # panel's cost is nine LLM steps and a single `latency_s` cannot say which one to
@@ -1495,8 +1550,15 @@ class Dispatcher:
         # verdict that was produced over code a finder never examined.
         steps_out = result.get("steps") if isinstance(result.get("steps"), dict) else {}
         structural_out = str(steps_out.get("find_structural") or "")
-        structural_unavailable = UNAVAILABLE_PREFIX in structural_out or (
-            "find_structural" not in degraded and not structural_relay_ok(structural_out, UNAVAILABLE_PREFIX)
+        # Judge only the lanes this recipe actually ran, against the contract it actually
+        # gave them. The small-diff `code-review` recipe has no structural seat and never
+        # asks its finders for a FINDER_STATUS line, so reading those absences as gaps
+        # marked EVERY small-diff review incomplete — all four finders "did not complete",
+        # structural "unavailable" — which held its promotion and would cap it at WARN
+        # below. A result with no `steps` at all (an older host) says nothing either way.
+        structural_unavailable = "find_structural" in steps_out and (
+            UNAVAILABLE_PREFIX in structural_out
+            or ("find_structural" not in degraded and not structural_relay_ok(structural_out, UNAVAILABLE_PREFIX))
         )
         # The four LLM finders' own completeness (#117): a finder that ran to a
         # normal-looking finish on garbage input (every file read 404ing, a crash mid-
@@ -1506,9 +1568,17 @@ class Dispatcher:
         # of trusting an empty findings array at face value. Steps the engine already
         # cut off at their timeout are skipped here — they're already coverage gaps.
         incomplete_finders = [
-            s for s in LLM_FINDER_STEPS if s not in degraded and not finder_completed(str(steps_out.get(s) or ""))
+            s
+            for s in LLM_FINDER_STEPS
+            if recipe in STATUS_LINE_RECIPES
+            and s in steps_out
+            and s not in degraded
+            and not finder_completed(str(steps_out.get(s) or ""))
         ]
         complete = not structural_unavailable and not degraded and not incomplete_finders
+        # The same three signals as one record, for the coverage cap and note below (#117).
+        gaps = coverage_gaps(degraded, incomplete_finders, structural_unavailable)
+        lanes = len({str(s) for s in (*steps_out, *degraded) if str(s).startswith(FINDER_STEP_PREFIX)})
         output = str(result.get("output") or "")
         # The raw output is read for BLOCKS and never published as text (protoAgent#2439
         # — see verdicts.py). `reported` is what the panel said this round and what the
@@ -1592,6 +1662,13 @@ class Dispatcher:
         dropped_finding = (
             unexplained_clearance(history, verdict, findings) if (self.hold_unexplained and not dispositions) else None
         )
+        # The coverage cap (#117) comes AFTER every findings and history rule, so none of
+        # them sees it: convergence would otherwise relieve the WARN straight back to PASS,
+        # and the clearance guard above judges the finding-based verdict, so a capped
+        # zero-finding round holds a standing block exactly as a clean one would. A gap
+        # never softens a FAIL and never withholds the verdict — it caps PASS at WARN.
+        finding_verdict = verdict
+        verdict = coverage_verdict(verdict, gaps)
         trailer = (
             render_notes_section(notes) + render_grounding_footnote(ungrounded) + render_unreadable_footnote(unreadable)
         )
@@ -1646,6 +1723,8 @@ class Dispatcher:
             notes=trailer,
             hold_blocks=bool(dropped_finding) or bool(unaccounted),
             complete=complete,
+            coverage_gaps=gaps,
+            lanes=lanes,
             review_check_id=review_check_id,
             # Did anything actually CHECK these findings? Empty over a clean panel is
             # normal; empty over real findings means the verdict is ungrounded, and the
@@ -1689,6 +1768,8 @@ class Dispatcher:
             incomplete_finders=incomplete_finders or None,
             complete=complete,
             structural_unavailable=structural_unavailable or None,
+            # A clean PASS posted as WARN because a lane did not deliver a full pass (#117).
+            coverage_capped=(verdict != finding_verdict) or None,
             posted=posted,
             shadow=self.shadow,
         )
@@ -1804,6 +1885,8 @@ class Dispatcher:
         review_check_id: int | None = None,
         verified: bool = True,
         diff_id: str | None = None,
+        coverage_gaps: dict[str, str] | None = None,
+        lanes: int = 0,
     ) -> bool:
         # Immediately before posting — the last moment a mid-round push can be caught.
         # The marker keeps the PINNED head on purpose: the round ran against it, and
@@ -1827,6 +1910,8 @@ class Dispatcher:
             verified=verified,
             stale_note=stale_note,
             diff_id=diff_id or "",
+            coverage_gaps=coverage_gaps,
+            lanes=lanes,
         )
         event = "COMMENT"
         if not self.shadow and verdict == FAIL:
@@ -1906,7 +1991,7 @@ class Dispatcher:
             review_check_id,
             SUCCESS if verdict != FAIL else FAILURE,
             f"QA panel: {verdict}",
-            self._review_check_summary(verdict, findings),
+            self._review_check_summary(verdict, findings, coverage_gaps),
         )
         return True
 
@@ -2379,16 +2464,24 @@ class Dispatcher:
         )
 
     @staticmethod
-    def _review_check_summary(verdict: str, findings: list[dict] | None) -> str:
-        """The `output.summary` for a concluded check — carries the verdict text (r6)."""
+    def _review_check_summary(verdict: str, findings: list[dict] | None, gaps: dict[str, str] | None = None) -> str:
+        """The `output.summary` for a concluded check — carries the verdict text (r6), and
+        says so when a lane did not deliver a full pass, so a green check never reads as
+        full coverage it did not have (#117)."""
         n = len([f for f in (findings or []) if isinstance(f, dict)])
         tail = f" ({n} finding{'s' if n != 1 else ''})" if n else ""
+        coverage = (
+            f" Coverage was incomplete — {', '.join(f'`{s}`' for s in gaps)} did not complete a full "
+            "pass, so this is not a clean pass."
+            if gaps
+            else ""
+        )
         if verdict == FAIL:
             return (
                 f"The QA panel returned **{verdict}** — blocking defects stand against this "
-                f"head{tail}. See the review for details; push a fix to clear it."
+                f"head{tail}. See the review for details; push a fix to clear it.{coverage}"
             )
-        return f"The QA panel returned **{verdict}**{tail}. See the review for details."
+        return f"The QA panel returned **{verdict}**{tail}. See the review for details.{coverage}"
 
     async def _publish_qa_check(self, repo: str, sha: str, run: CheckRun) -> None:
         """Publish (or update) this head's `QA panel` check run. Degrades, never raises.

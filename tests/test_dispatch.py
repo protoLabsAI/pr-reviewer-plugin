@@ -1180,23 +1180,258 @@ async def test_promotion_holds_on_an_incomplete_clear_verdict(tmp_path):
     assert gh.reviews_posted == []  # held, not approved
 
 
-async def test_a_structural_gateway_failure_stamps_complete_false_on_the_verdict(tmp_path):
-    # End to end: protoPatch returns its PROTOPATCH UNAVAILABLE Gap (gateway auth/config),
-    # the LLM finders find nothing, so the verdict is a clean PASS — but the marker records
-    # complete=false so the promotion gate above will refuse to auto-approve it.
-    gh = RoutedGH(pr_facts=facts(changed_files=6, additions=300, deletions=50), files="x.py\nb\nc\nd\ne\nf\n")
+LLM_LANES = ("find_correctness", "find_removed_behavior", "find_crossfile", "find_conventions")
+CLEAN_LANE = "No issues from this angle.\n\n```json\n[]\n```\nFINDER_STATUS: reviewed n=0"
+
+
+def _lane(step: str, body: str = CLEAN_LANE, recipe: str = "code-review-structural") -> str:
+    """A finder step's output as the host's run_subagent returns it: the delegation
+    banner, then the reply — a clean angle ends with an explicit fenced `[]`."""
+    return f"[review-finder completed: workflow {recipe}:{step}]\n\n{body}"
+
+
+def _panel_steps(**over) -> dict:
+    """Every step of the structural recipe delivering an explicit `[]`, with `over` swapped in."""
+    steps = {s: _lane(s) for s in LLM_LANES}
+    steps["find_structural"] = "protoPatch run: head/base resolved, 6 files.\n\n```json\n[]\n```"
+    steps["synthesize"] = "<!-- brief -->\nNothing raised.\n<!-- /brief -->\n\n```json\n[]\n```"
+    steps["verify"] = "VERIFY_STATUS: nothing-to-verify\n\n```json\n[]\n```"
+    steps.update(over)
+    return steps
+
+
+def _structural_gh() -> RoutedGH:
+    return RoutedGH(pr_facts=facts(changed_files=6, additions=300, deletions=50), files="x.py\nb\nc\nd\ne\nf\n")
+
+
+def _events(tmp_path, name: str) -> list[dict]:
+    return [e for e in Telemetry(tmp_path).read_all() if e.get("event") == name]
+
+
+STRUCTURAL_HARD_STOP = (
+    "[structural-finder hard-stopped at max_turns: workflow code-review-structural:find_structural] "
+    "-- no salvageable output; treat this lane as a Gap, not a verdict."
+)
+
+
+async def test_a_structural_gateway_failure_stamps_complete_false_and_caps_the_pass(tmp_path):
+    # End to end: protoPatch returns its PROTOPATCH UNAVAILABLE Gap (gateway auth/config)
+    # and the four LLM finders find nothing. The marker records complete=false so the
+    # promotion gate above refuses to auto-approve it (#49) — and the verdict is capped at
+    # WARN rather than posted as a clean PASS, because the structural angle never ran (#117).
+    gh = _structural_gh()
+    unavailable = (
+        "PROTOPATCH UNAVAILABLE — gateway auth/config failure\n\nGap: structural pass unavailable\n\n```json\n[]\n```"
+    )
+
+    async def runner(name, inputs):
+        return {"output": CLEAN_REPORT, "failed": [], "steps": _panel_steps(find_structural=unavailable)}
+
+    d = make(tmp_path, cfg={"shadow_mode": False}, gh=gh, runner=runner)
+    out = await d.handle_pr_event("o/r", 1, HEAD, "opened")
+    assert out == "reviewed:WARN"
+    body = gh.reviews_posted[0]["body"]
+    assert "complete=false" in body
+    assert "`find_structural` (structural pass unavailable or cut short)" in body
+    assert "came back clean" not in body
+
+
+# ── a lane that did not run is visible, and is not a clean PASS (#117) ─────────
+
+
+async def test_blind_lanes_cap_a_clean_pass_at_warn_and_the_body_names_them(tmp_path):
+    """protoAgent#3494 @ 73d8ee90: conventions died after its opening line, structural
+    gave up at its turn limit — and every completeness signal read clean, the brief
+    claimed "no coverage gaps", and the PASS was promoted and merged. Here crossfile is
+    also cut off by the engine, whose timeout Gap carries a synthetic `[]`."""
+    gh = _structural_gh()
+    steps = _panel_steps(
+        find_conventions=_lane(
+            "find_conventions", "Let me read the relevant source files to understand the context around the changes."
+        ),
+        find_structural=STRUCTURAL_HARD_STOP,
+        find_crossfile=(
+            "Gap: step 'find_crossfile' exceeded its 900s time budget and was cut off — no result "
+            "from this step this run.\n\n```json\n[]\n```"
+        ),
+    )
+    overclaiming = (
+        "<!-- brief -->\nThe structural pass completed; no coverage gaps.\n<!-- /brief -->\n\n```json\n[]\n```"
+    )
+
+    async def runner(name, inputs):
+        return {"output": overclaiming, "failed": [], "degraded": ["find_crossfile"], "steps": steps}
+
+    d = make(tmp_path, cfg={"shadow_mode": False}, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "reviewed:WARN"
+    body = gh.reviews_posted[0]["body"]
+    assert "verdict=WARN" in body and "complete=false" in body
+    assert "Coverage incomplete — this is not a clean pass." in body
+    assert "3 of 5 review lane(s)" in body
+    assert "`find_crossfile` (hit its time budget)" in body
+    assert "`find_conventions` (did not complete a real pass)" in body
+    assert "`find_structural` (structural pass unavailable or cut short)" in body
+    assert "`find_correctness`" not in body  # a lane that ran is not swept in
+    assert "came back clean" not in body
+    # The code-authored record comes first; the model's overclaim is below it.
+    assert body.index("Coverage incomplete") < body.index("no coverage gaps")
+
+    reviewed = _events(tmp_path, "reviewed")[-1]
+    assert reviewed["verdict"] == "WARN"
+    assert reviewed["degraded"] == ["find_crossfile"]
+    assert reviewed["incomplete_finders"] == ["find_conventions"]
+    assert reviewed["structural_unavailable"] is True
+    assert reviewed["complete"] is False
+    assert reviewed["coverage_capped"] is True
+
+    # WARN stays non-blocking on the dispatch check, and its summary does not overclaim.
+    patch = [w for w in gh.check_writes if w["method"] == "PATCH"][-1]
+    assert patch["conclusion"] == "success"
+    assert "Coverage was incomplete" in patch["output[summary]"]
+
+
+async def test_a_coverage_gap_never_softens_a_fail(tmp_path):
+    gh = _structural_gh()
+
+    async def runner(name, inputs):
+        return {"output": REPORT, "failed": [], "steps": _panel_steps(find_structural=STRUCTURAL_HARD_STOP)}
+
+    d = make(tmp_path, cfg={"shadow_mode": False}, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "reviewed:FAIL"
+    assert "`find_structural` (structural pass unavailable or cut short)" in gh.reviews_posted[0]["body"]
+    assert _events(tmp_path, "reviewed")[-1]["coverage_capped"] is None  # FAIL was not capped
+
+
+async def test_an_explicit_empty_array_at_every_boundary_is_still_a_clean_pass(tmp_path):
+    """The guards must not turn a genuinely clean review into a gap: every lane, the
+    synthesizer and the report each delivered an explicit `[]`."""
+    gh = _structural_gh()
+    calls = []
+
+    async def runner(name, inputs):
+        calls.append(name)
+        return {"output": CLEAN_REPORT, "failed": [], "steps": _panel_steps()}
+
+    d = make(tmp_path, cfg={"shadow_mode": False}, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "reviewed:PASS"
+    assert len(calls) == 1  # no retry
+    body = gh.reviews_posted[0]["body"]
+    assert "_No findings — the review came back clean._" in body
+    assert "complete=false" not in body and "Coverage incomplete" not in body
+    reviewed = _events(tmp_path, "reviewed")[-1]
+    assert reviewed["complete"] is True and reviewed["coverage_capped"] is None
+    assert reviewed["degraded"] is None and reviewed["structural_unavailable"] is None
+
+
+async def test_a_small_diff_review_is_not_incomplete_for_a_contract_it_never_had(tmp_path):
+    """The small-diff `code-review` recipe (protoAgent's) has no structural seat and never
+    asks for a FINDER_STATUS line. Judging it by the structural recipe's contract marked
+    every healthy small-diff review incomplete — and would now cap every one at WARN."""
+    gh = RoutedGH(pr_facts=facts())  # 2 files / 15 lines: the trigger does not fire
+    seen = {}
+    lane = "No issues from this angle.\n\n```json\n[]\n```"  # no status line: never asked for
+
+    async def runner(name, inputs):
+        seen["recipe"] = name
+        steps = {s: _lane(s, lane, recipe="code-review") for s in LLM_LANES}
+        steps["synthesize"] = "<!-- brief -->\nNothing.\n<!-- /brief -->\n\n```json\n[]\n```"
+        return {"output": CLEAN_REPORT, "failed": [], "steps": steps}
+
+    d = make(tmp_path, cfg={"shadow_mode": False}, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "reviewed:PASS"
+    assert seen["recipe"] == "code-review"
+    body = gh.reviews_posted[0]["body"]
+    assert "complete=false" not in body and "did not complete a real pass" not in body
+    reviewed = _events(tmp_path, "reviewed")[-1]
+    assert reviewed["complete"] is True
+    assert reviewed["incomplete_finders"] is None and reviewed["structural_unavailable"] is None
+
+
+# ── an absent findings payload is not an empty one (#113) ─────────────────────
+
+
+async def test_an_undelivered_synthesis_is_retried_then_posts_no_verdict(tmp_path):
+    """#113: the synthesizer delivered nothing, so the verifier "received no findings array
+    to annotate" — and the report still printed `[]`, which posted PASS under a note saying
+    the findings may have been lost. An absent payload is an incomplete round: retry it,
+    then say there is no verdict. Never render it as clean."""
+    gh = _structural_gh()
+    calls = []
+    escalations = []
+    lost = (
+        "<!-- brief -->\nThe verification pass was a no-op: the verifier received no findings array "
+        "(or the findings were lost before reaching the verifier).\n<!-- /brief -->\n\n```json\n[]\n```"
+    )
+
+    async def runner(name, inputs):
+        calls.append(name)
+        synth = "[review-synthesizer completed: workflow code-review-structural:synthesize] -- no output produced."
+        return {"output": lost, "failed": [], "steps": _panel_steps(synthesize=synth)}
+
+    d = make(tmp_path, gh=gh, runner=runner, inbox=lambda text, **kw: escalations.append(text))
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "error:panel-incomplete"
+    assert len(calls) == 2  # retried once before giving up
+    assert gh.reviews_posted == []  # no verdict — above all, no PASS
+    assert not any("came back clean" in str(p.get("body") or "") for p in gh.posted)
+    patch = [w for w in gh.check_writes if w["method"] == "PATCH"][-1]
+    assert patch["conclusion"] == "failure" and patch["output[title]"] == "QA panel incomplete — no verdict"
+    assert "no findings payload at stage(s) synthesize" in patch["output[summary]"]
+    assert escalations and "UNREVIEWED" in escalations[0]
+    assert _events(tmp_path, "panel_retry")[0]["undelivered"] == ["synthesize"]
+    exhaustion = _events(tmp_path, "exhaustion")[-1]
+    assert exhaustion["undelivered"] == ["synthesize"] and exhaustion["attempts"] == 2
+    assert _events(tmp_path, "reviewed") == []
+
+
+async def test_a_report_with_no_findings_array_is_not_a_clean_pass(tmp_path):
+    """The final boundary, on a host result with no per-step outputs at all: parsing an
+    absent array as `[]` would post a clean PASS."""
+    gh = RoutedGH(pr_facts=facts())
+
+    async def runner(name, inputs):
+        return {"output": "<!-- brief -->\nLooks fine to me.\n<!-- /brief -->\n", "failed": []}
+
+    d = make(tmp_path, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "error:panel-incomplete"
+    assert gh.reviews_posted == []
+    assert _events(tmp_path, "exhaustion")[-1]["undelivered"] == ["report"]
+
+
+async def test_no_lane_delivering_is_an_absent_round_not_a_warn(tmp_path):
+    """One blind lane among live ones is a coverage gap (WARN). Every lane blind means
+    nothing was reviewed — this repo's own #120 at 4dd608e8, where "no review-finder
+    produced a findings list" and the panel still posted PASS."""
+    gh = _structural_gh()
+    dead = {s: _lane(s, "Let me read the relevant source files first.") for s in LLM_LANES}
 
     async def runner(name, inputs):
         return {
             "output": CLEAN_REPORT,
             "failed": [],
-            "steps": {"find_structural": "PROTOPATCH UNAVAILABLE — gateway auth/config failure\n\nGap: ..."},
+            "steps": _panel_steps(find_structural=STRUCTURAL_HARD_STOP, **dead),
         }
 
-    d = make(tmp_path, cfg={"shadow_mode": False}, gh=gh, runner=runner)
-    out = await d.handle_pr_event("o/r", 1, HEAD, "opened")
-    assert out == "reviewed:PASS"
-    assert "complete=false" in gh.posted[0]["body"]
+    d = make(tmp_path, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "error:panel-incomplete"
+    assert gh.reviews_posted == []
+    assert _events(tmp_path, "exhaustion")[-1]["undelivered"] == ["finders"]
+
+
+async def test_an_absent_payload_recovered_on_retry_posts_the_real_verdict(tmp_path):
+    gh = _structural_gh()
+    calls = []
+
+    async def runner(name, inputs):
+        calls.append(name)
+        if len(calls) == 1:
+            return {"output": "The report was cut off before its findings.", "failed": []}
+        return {"output": CLEAN_REPORT, "failed": [], "steps": _panel_steps()}
+
+    d = make(tmp_path, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "reviewed:PASS"
+    assert len(calls) == 2
+    assert _events(tmp_path, "panel_retry")[0]["undelivered"] == ["report"]
+    assert _events(tmp_path, "exhaustion") == []
 
 
 async def test_a_finder_missing_its_status_line_stamps_complete_false(tmp_path):
@@ -1221,10 +1456,13 @@ async def test_a_finder_missing_its_status_line_stamps_complete_false(tmp_path):
 
     d = make(tmp_path, cfg={"shadow_mode": False}, gh=gh, runner=runner)
     out = await d.handle_pr_event("o/r", 1, HEAD, "opened")
-    assert out == "reviewed:PASS"
+    # The coverage cap on top of #120's signals: a blind lane is not a clean PASS.
+    assert out == "reviewed:WARN"
     body = gh.posted[0]["body"]
     assert "complete=false" in body
     assert "did not complete a real pass" in body
+    assert "Coverage incomplete — this is not a clean pass." in body
+    assert "came back clean" not in body
     assert "`find_removed_behavior`" in body and "`find_crossfile`" in body
     # The two that DID declare themselves reviewed must not be swept in with them.
     assert "`find_correctness`" not in body
@@ -2116,6 +2354,28 @@ async def test_a_clean_pass_that_drops_a_prior_major_does_not_dismiss_the_block(
     body = gh.reviews_posted[0]["body"]
     assert "does not lift the standing block" in body
     assert "real bug" in body  # the dropped finding is named, not merely counted
+
+
+async def test_a_coverage_capped_round_still_holds_the_standing_block(tmp_path):
+    """The coverage cap (#117) comes AFTER the clearance guard. Capped first, this
+    zero-finding round would read as WARN, the guard (which only watches a clean PASS)
+    would stand down, and a round that reviewed LESS would lift the block a full round
+    never could."""
+    major = json.dumps([{"file": "x.py", "line": 3, "severity": "major", "claim": "real bug", "evidence": "e"}])
+    gh = RoutedGH(
+        pr_facts=facts(changed_files=6, additions=300, deletions=50),
+        files="x.py\nb\nc\nd\ne\nf\n",
+        reviews=[review_row(OLD_HEAD, "FAIL", state="CHANGES_REQUESTED", findings_json=major, id=77)],
+    )
+
+    async def runner(name, inputs):
+        return {"output": CLEAN_PASS_REPORT, "failed": [], "steps": _panel_steps(find_structural=STRUCTURAL_HARD_STOP)}
+
+    d = make(tmp_path, cfg={"shadow_mode": False}, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "synchronize")) == "reviewed:WARN"
+    assert gh.dismissed == []  # the standing REQUEST_CHANGES stays up
+    body = gh.reviews_posted[0]["body"]
+    assert "does not lift the standing block" in body and "real bug" in body
 
 
 async def test_a_second_consecutive_clean_pass_lifts_the_block(tmp_path):

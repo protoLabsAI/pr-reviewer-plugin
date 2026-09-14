@@ -166,6 +166,29 @@ structural-trigger dispatch, approve-on-green + sweep, and the review eval.
   recall reads it back out of the body, so it can't be removed. A clean pass (`[]`) or a
   prose-only report is left untouched.
 
+- **Absent is not empty; a blind lane is not a clean pass (issues #113, #117)** — an
+  explicit `[]` means "looked, found nothing"; *no array at all* means nothing reached that
+  boundary. Both used to parse as `[]`, so a lost payload posted PASS with "the review came
+  back clean" (#113), and a PASS over one real lane of five was promoted and merged (#117).
+  - **An absent payload is an incomplete round, never a verdict.** If no finder lane
+    delivered a findings array (a timeout Gap, a `PROTOPATCH UNAVAILABLE` relay, or a
+    `FINDER_STATUS: blocked` lane is not a delivery), or the synthesize step or the final
+    report emitted none, the panel is re-run (`panel_retries`); if it still delivers
+    nothing it ends like an exhausted panel — no review posted, `protoReview` red ("QA
+    panel incomplete — no verdict"), the operator escalated, an `exhaustion` event with
+    `undelivered: [...]`, and the sweep's backfill retries the head later. A missing
+    `FINDER_STATUS` line alone never voids a lane: that is a coverage gap, below.
+  - **A coverage gap caps a clean PASS at WARN.** Any lane the engine timed out, any LLM
+    finder that did not declare `FINDER_STATUS: reviewed`, or a structural relay that was
+    unavailable or cut short: `complete=false` (promotion holds, as before), a
+    code-authored **coverage line above the brief** naming each lane and why (it
+    supersedes any claim of full coverage in the model-written brief), no "came back
+    clean" line, and PASS posted as **WARN** (`coverage_capped` in telemetry). Not FAIL
+    and not "no verdict": a gap means the review covered less, not that the code is bad,
+    and the structural lane gaps on most large protoAgent reviews today (#119). Lanes are
+    judged only where the recipe ran them under that contract — the small-diff
+    `code-review` recipe has no structural seat and asks for no status line.
+
 ## The draft → ready contract — undrafting a PR is the act of shipping it
 
 On a repository this plugin watches, a PR's **draft** state is its merge gate. Read
@@ -198,9 +221,10 @@ panel, and a PASS is not a skeleton key past any of these:
   verdict for a superseded head is **stale** and holds (`hold:stale-head`), so a PASS
   never lands a commit the panel never saw;
 - that verdict has **not already been promoted** (per-head dedup);
-- the pass was **verified** (the verify pass ran) over **complete** coverage (no
-  finder was down) — an incomplete pass is "nobody looked", not "nothing there", and
-  holds;
+- the pass was **verified** (the verify pass ran) over **complete** coverage (every
+  finder lane delivered a full pass — none timed out, came back blocked or without its
+  status line, or found its structural engine down) — an incomplete pass is "nobody
+  looked", not "nothing there", and holds;
 - **CI is terminal-green** — checks unknown, pending, or failing all hold; and
 - there are **zero unresolved review threads**.
 
@@ -307,6 +331,7 @@ posts no review is indistinguishable from an approved one.
 | `PASS` / `WARN` verdict posted | ✅ success |
 | `FAIL` verdict posted | ❌ failure |
 | **Panel exhausted / crashed** (no verdict) | ❌ failure — *the key new signal* |
+| Panel delivered **no findings payload** — absent, not `[]` (no verdict) | ❌ failure |
 | Verdict produced but the post was refused | ❌ failure (not left dangling) |
 | Dropped (draft, closed, allowlist miss) | *no check — the panel never ran* |
 
