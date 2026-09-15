@@ -845,15 +845,15 @@ async def test_a_locked_pr_holds_promotion_and_regate_too(tmp_path):
 
 async def test_a_wrong_viewer_login_is_caught_by_our_own_posted_reviews(tmp_path):
     """`viewer_login` is a string an operator typed — a typo silently disarms the
-    self-authored rail instead of erroring, and (rounds being read only from reviews by
-    that login) leaves our own reviews unread. A marker-bearing review is almost always
-    ours, so its author disagreeing is the likely sign of a typo; the rows are already
-    fetched, so checking costs nothing."""
+    self-authored rail instead of erroring. Our own reviews then arrive under an App
+    login that is not `viewer_login`: that is warned about once, and the review history
+    reads as unreadable (every caller holds) rather than as "no reviews". The rows are
+    already fetched, so checking costs nothing."""
     gh = RoutedGH(pr_facts=facts(), reviews=[review_row(HEAD, "PASS")])
     gh.review_author = "protoreview[bot]"
     d = make(tmp_path, cfg={"viewer_login": "protoreviw[bot]"}, gh=gh)  # typo
     await d._viewer_login()
-    assert (await d._our_reviews("o/r", 1)) == []  # a mistyped login reads none as ours
+    assert (await d._our_reviews("o/r", 1)) is None  # a mistyped login holds: unreadable, not "none"
 
     rows = [
         json.loads(line)
@@ -2978,6 +2978,110 @@ async def test_an_unreadable_viewer_login_holds_promotion(tmp_path):
     assert (await d._our_reviews("o/r", 1)) is None
     assert (await d.evaluate_promotion("o/r", 1)) == "hold:reviews-unreadable"
     assert gh.reviews_posted == []
+
+
+# ── our own login: exact, one-directional (`is_own_login`) ─────────────────────
+
+
+def test_is_own_login_accepts_the_login_and_only_widens_a_bare_one():
+    from pr_reviewer.dispatch import is_own_login
+
+    # A configured App login accepts exactly that login, in any case...
+    assert is_own_login("x[bot]", "x[bot]")
+    assert is_own_login("X[Bot]", "x[bot]")
+    # ...and never the plain account of the same name: that is a different account.
+    assert not is_own_login("x", "x[bot]")
+    # A bare login also accepts its App form: GitHub allows no App name that collides
+    # with an existing account, so `x[bot]` can only be ours.
+    assert is_own_login("x", "x")
+    assert is_own_login("x[bot]", "x")
+    assert is_own_login("X[BOT]", "X")
+    # Nothing else, and nothing when either side is unknown.
+    assert not is_own_login("xy[bot]", "x")
+    assert not is_own_login("", "x") and not is_own_login("x", "")
+
+
+async def test_a_plain_account_named_like_our_app_is_not_ours(tmp_path):
+    # Under `viewer_login: qa-bot[bot]`, a review by a plain account named `qa-bot` is
+    # another account's: not a round, so it does not recover coverage for the head.
+    green = [{"status": "completed", "conclusion": "success"}]
+    ours = _authored(review_row(HEAD, "WARN", complete=False), "qa-bot[bot]")
+    plain = _authored(review_row(HEAD, "PASS"), "qa-bot")
+    gh = RoutedGH(pr_facts=facts(), reviews=[ours, plain], checks=green)
+    d = make(tmp_path, cfg={"shadow_mode": False, "promotion_owner": True, "viewer_login": "qa-bot[bot]"}, gh=gh)
+    assert (await d.evaluate_promotion("o/r", 1)) == "hold:incomplete-coverage"
+    assert gh.reviews_posted == []
+    assert [r["verdict"] for r in await d._our_reviews("o/r", 1)] == ["WARN"]
+
+
+async def test_thread_ownership_uses_the_same_one_directional_login(tmp_path):
+    # The QA check's count of the panel's own threads uses the same rule: under
+    # `viewer_login: qa-bot[bot]`, a thread opened by a plain `qa-bot` account is external.
+    threads = [thread_node("qa-bot"), thread_node("qa-bot[bot]"), thread_node("QA-Bot[bot]")]
+    gh = RoutedGH(pr_facts=facts(), threads=threads)
+    d = make(tmp_path, cfg={"viewer_login": "qa-bot[bot]"}, gh=gh)
+    assert (await d._panel_owned_unresolved("o/r", 1)) == 2
+
+
+# ── a mistyped viewer_login holds instead of re-reviewing everything ───────────
+
+
+def _telemetry_events(path, event):
+    rows = [
+        json.loads(line)
+        for f in (path / "telemetry").glob("*.jsonl")
+        for line in f.read_text().splitlines()
+        if line.strip()
+    ]
+    return [r for r in rows if r.get("event") == event]
+
+
+async def test_a_mistyped_viewer_login_holds_instead_of_re_reviewing(tmp_path):
+    # Our own reviews arrive under an App login that is not `viewer_login`. Read as "no
+    # reviews", every head would look unreviewed: the sweep would backfill and the event
+    # path re-run the full panel on every PR, every tick, with the round count stuck at 1
+    # (issue #71's failure mode). Another App's marker makes the history UNREADABLE
+    # instead, so each caller holds — and the operator is told, once.
+    from pr_reviewer.dispatch import DROP_REVIEWS_UNREADABLE
+
+    ran = []
+
+    async def runner(name, inputs):
+        ran.append(name)
+        return {"output": REPORT, "failed": []}
+
+    rows = [_authored(review_row(HEAD, "PASS"), "protoreview[bot]")]
+    gh = RoutedGH(pr_facts=facts(), reviews=rows)
+    d = make(tmp_path, cfg={"viewer_login": "protoreviw[bot]"}, gh=gh, runner=runner)  # typo
+    assert (await d._our_reviews("o/r", 1)) is None
+    assert (await d.needs_backfill("o/r", 1)) is None  # no backfill on a guess
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "synchronize")) == f"drop:{DROP_REVIEWS_UNREADABLE}"
+    assert ran == [] and gh.reviews_posted == []  # the panel never ran
+    mism = _telemetry_events(tmp_path, "viewer-mismatch")
+    assert len(mism) == 1 and mism[0]["actual"] == "protoreview[bot]"  # loud, once
+
+    # The correct login reads the same rows as ours: reaffirmed, no hold, no warning.
+    gh2 = RoutedGH(pr_facts=facts(), reviews=rows)
+    d2 = make(tmp_path / "ok", cfg={"viewer_login": "protoreview[bot]"}, gh=gh2, runner=runner)
+    assert (await d2.handle_pr_event("o/r", 1, HEAD, "synchronize")) == "reaffirmed:PASS"
+    assert ran == [] and not _telemetry_events(tmp_path / "ok", "viewer-mismatch")
+
+
+async def test_a_persons_quoted_marker_is_skipped_without_a_hold_or_a_warning(tmp_path):
+    # A person cannot post as an App, so a human quoting a verdict is simply not ours: it
+    # is skipped, the history stays readable, and the one-time viewer_login warning is
+    # NOT spent on it — so a real mismatch later is still reported.
+    rows = [_authored(review_row(HEAD, "PASS"), OTHER_ACCOUNT), review_row(HEAD, "PASS")]  # ours is `qa-bot`
+    gh = RoutedGH(pr_facts=facts(), reviews=rows)
+    d = make(tmp_path, gh=gh)
+    ours = await d._our_reviews("o/r", 1)
+    assert ours is not None and len(ours) == 1
+    assert not _telemetry_events(tmp_path, "viewer-mismatch") and d._viewer_checked is False
+
+    gh.reviews = [*rows, _authored(review_row(HEAD, "PASS"), "renamed-app[bot]")]
+    assert (await d._our_reviews("o/r", 1)) is None
+    mism = _telemetry_events(tmp_path, "viewer-mismatch")
+    assert len(mism) == 1 and mism[0]["actual"] == "renamed-app[bot]"
 
 
 # ── config is live, not snapshotted (issue #11) ──────────────────────────────

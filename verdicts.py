@@ -742,8 +742,9 @@ def read_findings_record(body: str) -> tuple[list[dict], bool]:
     what it can, so no history is lost:
       - no record block — a body from before the collapsed block (v0.19.0), which also
         predates `complete=false` — falls back to `extract_findings_json`, unchanged;
-      - more than one — text elsewhere in the body reproduced the block, so no single one
-        is trusted — recalls the union of every parseable block (more recall, never less);
+      - more than one — claim text printed after the record reproduced the block — is not
+        trusted, and recalls only the FIRST block, the renderer's own record (nothing
+        printed before the record can form one), so a quoted block adds nothing to recall;
       - one block that does not parse, or holds a non-object entry, is not recorded.
     """
     text = body or ""
@@ -757,11 +758,9 @@ def read_findings_record(body: str) -> tuple[list[dict], bool]:
             return [], False
         findings = [f for f in parsed if isinstance(f, dict)]
         return findings, len(findings) == len(parsed)
-    findings, seen = [], set()
-    for block in blocks:
-        for f in _json_list(block) or []:
-            key = json.dumps(f, sort_keys=True) if isinstance(f, dict) else None
-            if key is not None and key not in seen:
-                seen.add(key)
-                findings.append(f)
-    return findings, False
+    # Several blocks: the FIRST is the renderer's own record — nothing this renderer
+    # prints before it can form one (`_clean_brief` strips every fence from the brief,
+    # and table cells collapse newlines) — so any later block is quoted claim text.
+    # Recall the first block only, and never trust the body as a record.
+    first = _json_list(blocks[0]) or []
+    return [f for f in first if isinstance(f, dict)], False

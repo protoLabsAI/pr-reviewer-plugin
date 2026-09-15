@@ -176,6 +176,22 @@ def ineligible_reason(facts: dict | None) -> str | None:
     return None
 
 
+def is_own_login(author: str, viewer: str) -> bool:
+    """Is `author` our own account, given our login `viewer`? Case-insensitive.
+
+    Exactly `viewer`, and — only when `viewer` has no `[bot]` suffix — also
+    `<viewer>[bot]`: a bare login may be the slug of the App whose reviews post as
+    `<slug>[bot]`, and GitHub allows no App name that collides with an existing account,
+    so that form can only be ours. Never the reverse: for `viewer` = `x[bot]`, a plain
+    account named `x` is a different account and is not ours.
+    """
+    a = (author or "").strip().lower()
+    v = (viewer or "").strip().lower()
+    if not a or not v:
+        return False
+    return a == v or (not v.endswith("[bot]") and a == f"{v}[bot]")
+
+
 # Severity order for the strictest-verdict-wins tie-break (issue #89): a higher rank
 # is stricter, so a FAIL for a head can never be shadowed by a co-landed PASS.
 _VERDICT_RANK = {PASS: 0, WARN: 1, FAIL: 2}
@@ -813,35 +829,37 @@ class Dispatcher:
             log.warning("[pr-reviewer] max-rounds comment on %s#%s failed: %s", repo, pr, err[-300:])
 
     def _check_viewer_matches(self, author: str) -> None:
-        """Warn once if `viewer_login` disagrees with who posted a marker-bearing review.
+        """Warn once when another App's review carries our verdict marker.
 
         `viewer_login` is unvalidated by construction — it is a string an operator
         typed. A typo does not error; it silently makes the self-authored comparison
         never match, which is precisely the disabled rail this config exists to
-        prevent — and, since `_our_reviews` reads rounds only from reviews by this
-        login, it also leaves our own reviews unread. A marker-bearing review is almost
-        always ours, so its author disagreeing is the likely sign of that typo (or of
-        another account quoting a verdict). Comparing the two costs nothing (the rows
-        are already fetched) and turns a silent misconfiguration into one loud line.
+        prevent. Our own reviews then arrive under an App (`[bot]`) login that is not
+        `viewer_login`, which `_our_reviews` reads as an UNREADABLE history — every
+        caller holds — so this line is what tells an operator why. Only an App author is
+        considered: a person cannot post as one, so a human quoting a verdict says
+        nothing about our login and must not use up this one warning before a real typo.
 
         Warn, never correct: an operator who set this deliberately (a migration, a
         renamed app) should not have the reviewer quietly overrule them, and being
         wrong in the SAFE direction — comparing against a login that never matches —
-        only ever causes extra review and held promotions, not self-approval.
+        only ever causes held promotions and skipped reviews, not self-approval.
         """
         author = (author or "").strip().lower()
-        if not author or self._viewer_checked or not self._viewer:
+        if not author.endswith("[bot]") or self._viewer_checked or not self._viewer:
+            return
+        if is_own_login(author, self._viewer):
             return
         self._viewer_checked = True
-        if author.removesuffix("[bot]") != self._viewer.removesuffix("[bot]"):
-            log.warning(
-                "[pr-reviewer] viewer_login is %r but a marker-bearing review is authored by %r — if that "
-                "is our own review, fix pr_reviewer.viewer_login: rounds are read only from reviews by "
-                "viewer_login, and the never-review-your-own-PR rail will not fire.",
-                self._viewer,
-                author,
-            )
-            self.telemetry.emit("viewer-mismatch", configured=self._viewer, actual=author)
+        log.warning(
+            "[pr-reviewer] viewer_login is %r but a marker-bearing review is authored by the app %r — "
+            "review history reads as unreadable, so reviews and promotions hold until they agree. If "
+            "that app is ours, fix pr_reviewer.viewer_login (the never-review-your-own-PR rail will "
+            "not fire either).",
+            self._viewer,
+            author,
+        )
+        self.telemetry.emit("viewer-mismatch", configured=self._viewer, actual=author)
 
     async def _viewer_login(self) -> str:
         """Our own login, cached — ONLY on success.
@@ -989,13 +1007,21 @@ class Dispatcher:
 
         Panel rounds are read ONLY from the reviewer's own reviews. The verdict marker is
         plain text, so a review by another account can carry one too — a human quoting or
-        pasting a verdict, a bot mirroring it — and such a review is not a panel round and
-        must not count as one: not for promotion, re-gating, coverage recovery, or the
-        "already reviewed this head" check, all of which read this list. Telling the two
-        apart needs our login, so an UNKNOWN login makes the history unreadable (None),
-        the same fail-closed answer as a failed reviews read.
+        pasting a verdict, say — and such a review is not a panel round and must not count
+        as one: not for promotion, re-gating, coverage recovery, or the "already reviewed
+        this head" check, all of which read this list. Ours means `is_own_login`: exactly
+        our login, never a plain account that shares an App's name. Telling the two apart
+        needs our login, so an UNKNOWN login makes the history unreadable (None), the same
+        fail-closed answer as a failed reviews read.
+
+        A marker-bearing review by another App (`[bot]`) is different from a person's: a
+        person cannot post as an App, so it is almost always OUR reviews under a login
+        that is not `viewer_login` (a typo, a renamed app). Skipping those would make every
+        head look unreviewed and re-spend the panel on every PR each tick (issue #71's
+        failure mode), so that also returns None and warns once. A person's review that
+        carries the marker is simply skipped.
         """
-        viewer = (await self._viewer_login()).removesuffix("[bot]")
+        viewer = await self._viewer_login()
         if not viewer:
             return None
         rc, out, _err = await self._run_gh(
@@ -1024,9 +1050,16 @@ class Dispatcher:
             if not marker:
                 continue
             author = str(row.get("author") or "").strip().lower()
-            self._check_viewer_matches(author)
-            if author.removesuffix("[bot]") != viewer:
-                not_ours += 1  # carries the marker, but another account wrote it
+            if not is_own_login(author, viewer):
+                if author.endswith("[bot]"):
+                    # Another App carries our marker: most likely our own reviews under a
+                    # login that is not `viewer_login`. Unreadable, so every caller holds.
+                    self._check_viewer_matches(author)
+                    self.telemetry.emit(
+                        "reviews-unreadable", repo=repo, pr=pr, why="marker-by-another-app", author=author
+                    )
+                    return None
+                not_ours += 1  # carries the marker, but a person's account wrote it
                 continue
             ours.append({**marker, "state": row.get("state", ""), "body": row.get("body") or "", "id": row.get("id")})
         if not_ours:
@@ -1224,7 +1257,7 @@ class Dispatcher:
         never a failure. We never claim a thread as ours on an unreadable identity or an
         unreadable thread list — the safe direction is to say nothing, not to fail.
         """
-        viewer = (await self._viewer_login()).removesuffix("[bot]")
+        viewer = await self._viewer_login()
         if not viewer:
             return None  # we don't know who we are ⇒ cannot claim any thread as the panel's
         from .threads import fetch_threads
@@ -1243,7 +1276,7 @@ class Dispatcher:
             comments = (t.get("comments") or {}).get("nodes") or []
             root = next((c for c in comments if isinstance(c, dict)), None)
             author = str(((root or {}).get("author") or {}).get("login") or "").strip().lower()
-            if author and author.removesuffix("[bot]") == viewer:
+            if is_own_login(author, viewer):
                 owned += 1
         return owned
 
@@ -1358,6 +1391,9 @@ class Dispatcher:
         if (
             viewer
             and not allow_self
+            # Deliberately broader than `is_own_login`: this rail errs toward NOT reviewing.
+            # Matching a plain account that shares our App's name only skips that PR; a
+            # narrower match could let a misconfigured login review its own PR.
             and (author == viewer or author.removesuffix("[bot]") == viewer.removesuffix("[bot]"))
         ):
             self.telemetry.emit("drop", repo=repo, pr=pr, reason=DROP_SELF_AUTHORED, author=author)
