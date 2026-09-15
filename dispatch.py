@@ -813,19 +813,21 @@ class Dispatcher:
             log.warning("[pr-reviewer] max-rounds comment on %s#%s failed: %s", repo, pr, err[-300:])
 
     def _check_viewer_matches(self, author: str) -> None:
-        """Warn once if `viewer_login` disagrees with who actually posted our reviews.
+        """Warn once if `viewer_login` disagrees with who posted a marker-bearing review.
 
         `viewer_login` is unvalidated by construction — it is a string an operator
         typed. A typo does not error; it silently makes the self-authored comparison
         never match, which is precisely the disabled rail this config exists to
-        prevent. But a marker-bearing review is proof of identity: only we write that
-        marker, so its author IS us. Comparing the two costs nothing (the rows are
-        already fetched) and turns a silent misconfiguration into one loud line.
+        prevent — and, since `_our_reviews` reads rounds only from reviews by this
+        login, it also leaves our own reviews unread. A marker-bearing review is almost
+        always ours, so its author disagreeing is the likely sign of that typo (or of
+        another account quoting a verdict). Comparing the two costs nothing (the rows
+        are already fetched) and turns a silent misconfiguration into one loud line.
 
         Warn, never correct: an operator who set this deliberately (a migration, a
         renamed app) should not have the reviewer quietly overrule them, and being
         wrong in the SAFE direction — comparing against a login that never matches —
-        only ever causes extra review, not self-approval.
+        only ever causes extra review and held promotions, not self-approval.
         """
         author = (author or "").strip().lower()
         if not author or self._viewer_checked or not self._viewer:
@@ -833,8 +835,9 @@ class Dispatcher:
         self._viewer_checked = True
         if author.removesuffix("[bot]") != self._viewer.removesuffix("[bot]"):
             log.warning(
-                "[pr-reviewer] viewer_login is %r but our own posted reviews are authored by %r — "
-                "the never-review-your-own-PR rail will not fire. Fix pr_reviewer.viewer_login.",
+                "[pr-reviewer] viewer_login is %r but a marker-bearing review is authored by %r — if that "
+                "is our own review, fix pr_reviewer.viewer_login: rounds are read only from reviews by "
+                "viewer_login, and the never-review-your-own-PR rail will not fire.",
                 self._viewer,
                 author,
             )
@@ -974,7 +977,8 @@ class Dispatcher:
         return f"reaffirmed:{prior['verdict']}"
 
     async def _our_reviews(self, repo: str, pr: int) -> list[dict] | None:
-        """Our posted reviews (marker-bearing), oldest→newest: [{head, verdict, promoted, state, body, id}].
+        """Our posted reviews (marker-bearing, authored by our own login), oldest→newest:
+        [{head, verdict, promoted, state, body, id}].
 
         **None means the read FAILED — it is not the same as `[]` (this PR has no
         reviews), and callers must not collapse the two** (issue #71). Returning `[]`
@@ -982,7 +986,18 @@ class Dispatcher:
         exists" and re-reviews a PR that is already reviewed, which cost two PRs ten
         full panels each on a static head during a GitHub degradation. Every caller
         here decides explicitly, and every one of them fails CLOSED.
+
+        Panel rounds are read ONLY from the reviewer's own reviews. The verdict marker is
+        plain text, so a review by another account can carry one too — a human quoting or
+        pasting a verdict, a bot mirroring it — and such a review is not a panel round and
+        must not count as one: not for promotion, re-gating, coverage recovery, or the
+        "already reviewed this head" check, all of which read this list. Telling the two
+        apart needs our login, so an UNKNOWN login makes the history unreadable (None),
+        the same fail-closed answer as a failed reviews read.
         """
+        viewer = (await self._viewer_login()).removesuffix("[bot]")
+        if not viewer:
+            return None
         rc, out, _err = await self._run_gh(
             [
                 "api",
@@ -1001,15 +1016,21 @@ class Dispatcher:
         if rows is None:
             return None
         ours = []
+        not_ours = 0
         for row in rows:
             if not isinstance(row, dict):
                 continue
             marker = parse_verdict_marker(row.get("body") or "")
-            if marker:
-                self._check_viewer_matches(str(row.get("author") or ""))
-                ours.append(
-                    {**marker, "state": row.get("state", ""), "body": row.get("body") or "", "id": row.get("id")}
-                )
+            if not marker:
+                continue
+            author = str(row.get("author") or "").strip().lower()
+            self._check_viewer_matches(author)
+            if author.removesuffix("[bot]") != viewer:
+                not_ours += 1  # carries the marker, but another account wrote it
+                continue
+            ours.append({**marker, "state": row.get("state", ""), "body": row.get("body") or "", "id": row.get("id")})
+        if not_ours:
+            self.telemetry.emit("marker_not_ours", repo=repo, pr=pr, skipped=not_ours)
         return ours
 
     async def _pr_comments(self, repo: str, pr: int) -> list[str]:

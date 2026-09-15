@@ -191,6 +191,67 @@ def test_a_round_records_whether_its_findings_array_was_well_formed():
     assert round_of(marker + "```json\n{}\n```")["findings_recorded"] is False  # not an array
 
 
+def _round_of(body: str) -> dict:
+    """The round `panel_rounds` builds from one posted body."""
+    review = {**parse_verdict_marker(body), "state": "COMMENTED", "body": body, "id": 1}
+    return panel_rounds([review])[-1]
+
+
+def _incomplete_warn(findings: list[dict], **kw) -> str:
+    return render_verdict_body(
+        repo="o/r",
+        pr=88,
+        head_sha=HEAD_1,
+        verdict=WARN,
+        brief="p",
+        findings=findings,
+        shadow=True,
+        recipe="code-review-structural",
+        complete=False,
+        **kw,
+    )
+
+
+def test_a_fenced_array_quoted_after_the_record_does_not_stand_in_for_it():
+    # Claim text is printed AFTER the findings record — the confinement footnote, the
+    # convergence notes, the held and unaccounted notes — and a claim can quote a fenced
+    # array. The round reads the renderer's own record, never the quoted array.
+    real = finding(claim="real minor defect")
+    quoting = finding(file="other.py", line=1, severity="nit", claim="see\n```json\n[]\n```")
+    confined = _round_of(_incomplete_warn([real, quoting], confined=[quoting]))
+    assert confined["findings_recorded"] is True
+    assert [f["claim"] for f in confined["findings"]] == ["real minor defect", quoting["claim"]]
+
+    noted = _round_of(_incomplete_warn([real], notes="\n\n- note: ```json\n[]\n```"))
+    assert noted["findings_recorded"] is True
+    assert [f["claim"] for f in noted["findings"]] == ["real minor defect"]
+
+
+def test_a_body_that_repeats_the_record_block_is_not_a_trusted_record():
+    # If text elsewhere in the body reproduces the record block itself, no single block is
+    # trusted: the round is not recorded (fails closed), but recall keeps the real finding.
+    block = "<details>\n<summary>findings JSON (machine-readable)</summary>\n\n```json\n[]\n```\n</details>"
+    real = finding(claim="real minor defect")
+    copying = finding(file="other.py", line=1, severity="nit", claim="see\n" + block)
+    r = _round_of(_incomplete_warn([real, copying], confined=[copying]))
+    assert r["findings_recorded"] is False
+    assert "real minor defect" in [f["claim"] for f in r["findings"]]
+
+
+def test_an_older_body_without_the_record_block_still_recalls_its_findings():
+    # Bodies from before the collapsed record block (v0.19.0) carried a bare fenced array.
+    # They still recall their findings, but are never read as a trusted record — and they
+    # predate `complete=false`, so the coverage-recovery rule never needs one from them.
+    old = (
+        f"<!-- protoagent-qa-review head={HEAD_1} verdict=WARN -->\n## QA panel review\n\n```json\n"
+        + json.dumps([finding(claim="older round")])
+        + "\n```"
+    )
+    r = _round_of(old)
+    assert [f["claim"] for f in r["findings"]] == ["older round"]
+    assert r["findings_recorded"] is False
+
+
 # ── prior-request memory ──────────────────────────────────────────────────────
 
 

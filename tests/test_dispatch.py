@@ -268,9 +268,10 @@ class RoutedGH(FakeGH):
         if "/reviews" in joined:
             if self.reviews_rc:
                 return self.reviews_rc, "", self.reviews_err
-            # `author` is what the viewer_login cross-check reads; the real jq selects
-            # `.user.login` into that key.
-            return 0, json.dumps([{**r, "author": self.review_author} for r in self.reviews]), ""
+            # `author` is what the viewer_login cross-check and the own-reviews filter read;
+            # the real jq selects `.user.login` into that key. A row's own `author` wins, so a
+            # test can serve a review written by another account.
+            return 0, json.dumps([{"author": self.review_author, **r} for r in self.reviews]), ""
         if "/check-runs" in joined:
             return (0, json.dumps(self.checks), "") if self.checks is not None else (1, "", "403")
         if "comments(first" in joined:  # the threads fetch (before the count query below)
@@ -844,14 +845,15 @@ async def test_a_locked_pr_holds_promotion_and_regate_too(tmp_path):
 
 async def test_a_wrong_viewer_login_is_caught_by_our_own_posted_reviews(tmp_path):
     """`viewer_login` is a string an operator typed — a typo silently disarms the
-    self-authored rail instead of erroring. But only WE write the verdict marker, so
-    the author of a marker-bearing review is proof of who we are; the rows are already
+    self-authored rail instead of erroring, and (rounds being read only from reviews by
+    that login) leaves our own reviews unread. A marker-bearing review is almost always
+    ours, so its author disagreeing is the likely sign of a typo; the rows are already
     fetched, so checking costs nothing."""
     gh = RoutedGH(pr_facts=facts(), reviews=[review_row(HEAD, "PASS")])
     gh.review_author = "protoreview[bot]"
     d = make(tmp_path, cfg={"viewer_login": "protoreviw[bot]"}, gh=gh)  # typo
     await d._viewer_login()
-    await d._our_reviews("o/r", 1)
+    assert (await d._our_reviews("o/r", 1)) == []  # a mistyped login reads none as ours
 
     rows = [
         json.loads(line)
@@ -868,7 +870,7 @@ async def test_a_wrong_viewer_login_is_caught_by_our_own_posted_reviews(tmp_path
     gh2.review_author = "protoreview[bot]"
     d2 = make(tmp_path / "ok", cfg={"viewer_login": "protoreview[bot]"}, gh=gh2)
     await d2._viewer_login()
-    await d2._our_reviews("o/r", 1)
+    assert len(await d2._our_reviews("o/r", 1)) == 1
     rows2 = [
         json.loads(line)
         for f in (tmp_path / "ok" / "telemetry").glob("*.jsonl")
@@ -1894,7 +1896,9 @@ async def test_our_reviews_reads_every_page_not_just_the_first(tmp_path):
     """A PR crossing 30 reviews used to make this read permanently unparseable, and
     post-#71's fail-closed posture that is a permanent stall: never backfilled, never
     promoted, never re-gated."""
-    rows = [review_row(HEAD, "PASS"), review_row(OLD_HEAD, "FAIL")]
+    # Shaped like the real read: its jq selects `.user.login` into `author`, and only our
+    # own reviews are read as rounds — so each served row carries our login.
+    rows = [{**review_row(HEAD, "PASS"), "author": "qa-bot"}, {**review_row(OLD_HEAD, "FAIL"), "author": "qa-bot"}]
 
     class PagedGH(RoutedGH):
         async def __call__(self, args, timeout=30):
@@ -2806,24 +2810,21 @@ async def test_a_complete_pass_recovers_a_coverage_only_warn_on_the_same_head(tm
 
 
 async def test_a_warn_with_findings_still_governs_after_a_later_complete_pass(tmp_path):
-    # #89's guarantee holds: a WARN that raised a REAL finding is not a coverage cap, so
-    # a later complete PASS for the same head cannot shadow it — complete or not. It
-    # governs as today: the panel's open thread holds promotion (and fails the QA check);
-    # once resolved, the approval promotes the WARN, carrying its finding forward (#22).
+    # #89's guarantee holds: a WARN that raised a REAL finding is not a coverage cap, so a
+    # complete PASS for the same head cannot shadow it — whether that WARN was complete or
+    # not. It governs exactly as a complete WARN does today. The panel does not open review
+    # threads itself (checks.py), so on green it promotes straight away and the approval
+    # carries the WARN's finding forward (#22); the later PASS does not replace it.
     green = [{"status": "completed", "conclusion": "success"}]
     for complete in (True, False):
         reviews = [review_row(HEAD, "WARN", findings_json=WARN_FINDING, complete=complete), review_row(HEAD, "PASS")]
-        gh = RoutedGH(pr_facts=facts(), reviews=reviews, checks=green, threads=[thread_node("qa-bot[bot]")])
+        gh = RoutedGH(pr_facts=facts(), reviews=reviews, checks=green)
         d = make(tmp_path, cfg={"shadow_mode": False, "promotion_owner": True}, gh=gh)
-        assert (await d.evaluate_promotion("o/r", 1)) == "hold:threads-unresolved"
-        assert gh.reviews_posted == []
-        assert _qa_check(gh).get("conclusion") == "failure"  # the panel's own finding is open
-
-        gh.threads = [thread_node("qa-bot[bot]", resolved=True)]
         assert (await d.evaluate_promotion("o/r", 1)) == "promote"
         body = gh.reviews_posted[0]["body"]
         assert f"head={HEAD} verdict=WARN promoted=true findings=1 -->" in body  # the WARN, not the PASS
         assert "malformed diff: label" in body
+        assert _qa_check(gh).get("conclusion") == "success"
 
 
 async def test_only_incomplete_rounds_for_the_head_still_hold_incomplete(tmp_path):
@@ -2865,6 +2866,118 @@ async def test_an_incomplete_round_without_a_readable_findings_record_stays_stri
         d = make(tmp_path, cfg={"shadow_mode": False, "promotion_owner": True}, gh=gh)
         assert (await d.evaluate_promotion("o/r", 1)) == "hold:incomplete-coverage"
         assert gh.reviews_posted == []
+
+
+async def test_an_incomplete_fail_with_an_empty_record_still_holds_after_a_complete_pass(tmp_path):
+    # A FAIL is never a coverage cap, even with no findings recorded. `verdict_for` never
+    # yields one, but the gate must not lean on that: the FAIL keeps its full #89 weight
+    # and a complete PASS for the same head, in either order, cannot promote past it.
+    green = [{"status": "completed", "conclusion": "success"}]
+    blind_fail = review_row(HEAD, "FAIL", complete=False)
+    complete_pass = review_row(HEAD, "PASS")
+    for reviews in ([blind_fail, complete_pass], [complete_pass, blind_fail]):
+        gh = RoutedGH(pr_facts=facts(), reviews=reviews, checks=green)
+        d = make(tmp_path, cfg={"shadow_mode": False, "promotion_owner": True}, gh=gh)
+        assert (await d.evaluate_promotion("o/r", 1)) == "hold:no-clear-verdict"
+        assert gh.reviews_posted == []
+
+
+async def test_a_fenced_array_quoted_in_a_claim_cannot_empty_a_rounds_findings(tmp_path):
+    # Claim text is printed after the findings record (here, the confinement footnote),
+    # and a claim can quote a fenced array. The round reads the renderer's own record, so
+    # the incomplete WARN keeps its real finding: it is not a coverage cap, it governs,
+    # and the approval carries that finding forward rather than promoting the PASS.
+    green = [{"status": "completed", "conclusion": "success"}]
+    real = {"file": "x.py", "line": 4, "severity": "minor", "claim": "real minor defect", "evidence": "e"}
+    quoting = {"file": "other.py", "line": 1, "severity": "nit", "claim": "see\n```json\n[]\n```"}
+    body = render_verdict_body(
+        repo="o/r",
+        pr=1,
+        head_sha=HEAD,
+        verdict="WARN",
+        brief="prose",
+        findings=[real, quoting],
+        shadow=True,
+        recipe="code-review-structural",
+        confined=[quoting],
+        complete=False,
+    )
+    reviews = [{"state": "COMMENTED", "id": 5, "body": body}, review_row(HEAD, "PASS")]
+    gh = RoutedGH(pr_facts=facts(), reviews=reviews, checks=green)
+    d = make(tmp_path, cfg={"shadow_mode": False, "promotion_owner": True}, gh=gh)
+    assert (await d.evaluate_promotion("o/r", 1)) == "promote"
+    approval = gh.reviews_posted[0]["body"]
+    assert "verdict=WARN promoted=true" in approval and "real minor defect" in approval
+
+
+# ── panel rounds come only from the reviewer's own reviews ────────────────────
+
+OTHER_ACCOUNT = "some-human"
+
+
+def _authored(row: dict, author: str) -> dict:
+    """`row` as written by `author` — RoutedGH serves a row's own `author` when it has one."""
+    return {**row, "author": author}
+
+
+async def test_a_review_by_another_account_is_not_a_panel_round(tmp_path):
+    # Panel rounds are read only from the reviewer's own reviews. The verdict marker is
+    # plain text, and a review by another account that carries one (a human pasting a
+    # verdict, say) must not count as a round — not as the complete round that recovers
+    # coverage for a head, and not as a verdict to promote on its own.
+    green = [{"status": "completed", "conclusion": "success"}]
+    quoted = _authored(review_row(HEAD, "PASS"), OTHER_ACCOUNT)
+    gh = RoutedGH(pr_facts=facts(), reviews=[review_row(HEAD, "WARN", complete=False), quoted], checks=green)
+    d = make(tmp_path, cfg={"shadow_mode": False, "promotion_owner": True}, gh=gh)
+    assert (await d.evaluate_promotion("o/r", 1)) == "hold:incomplete-coverage"
+    assert gh.reviews_posted == []
+
+    gh2 = RoutedGH(pr_facts=facts(), reviews=[quoted], checks=green)
+    d2 = make(tmp_path, cfg={"shadow_mode": False, "promotion_owner": True}, gh=gh2)
+    assert (await d2.evaluate_promotion("o/r", 1)) == "hold:no-clear-verdict"
+    assert gh2.reviews_posted == []
+
+
+async def test_a_review_by_another_account_does_not_mark_the_head_reviewed(tmp_path):
+    # The "already reviewed this head" check reads the same list, so another account's
+    # marker-bearing review does not make the head reviewed: the panel still runs.
+    ran = []
+
+    async def runner(name, inputs):
+        ran.append(name)
+        return {"output": REPORT, "failed": []}
+
+    gh = RoutedGH(pr_facts=facts(), reviews=[_authored(review_row(HEAD, "PASS"), OTHER_ACCOUNT)])
+    d = make(tmp_path, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "synchronize")) == "reviewed:FAIL"
+    assert ran  # reviewed, not reaffirmed
+
+
+async def test_our_own_reviews_still_count_under_either_login_form(tmp_path):
+    # Our login is probed as `qa-bot`; an App posts as `qa-bot[bot]`. Both are ours, and a
+    # verdict of ours for the head still reaffirms without spending the panel.
+    for author in ("qa-bot", "qa-bot[bot]", "QA-Bot[bot]"):
+        gh = RoutedGH(pr_facts=facts(), reviews=[_authored(review_row(HEAD, "PASS"), author)])
+        d = make(tmp_path / author, gh=gh)
+        assert (await d.handle_pr_event("o/r", 1, HEAD, "synchronize")) == "reaffirmed:PASS"
+        assert len(await d._our_reviews("o/r", 1)) == 1
+
+
+async def test_an_unreadable_viewer_login_holds_promotion(tmp_path):
+    # Without our login, our own reviews cannot be told from another account's, so the
+    # history is unreadable — the same fail-closed hold as a failed reviews read (#71).
+    class NoViewerGH(RoutedGH):
+        async def __call__(self, args, timeout=30):
+            if len(args) > 1 and args[1] == "user":
+                return 1, "", "HTTP 403: Resource not accessible by integration"
+            return await super().__call__(args, timeout)
+
+    green = [{"status": "completed", "conclusion": "success"}]
+    gh = NoViewerGH(pr_facts=facts(), reviews=[review_row(HEAD, "PASS")], checks=green)
+    d = make(tmp_path, cfg={"shadow_mode": False, "promotion_owner": True}, gh=gh)
+    assert (await d._our_reviews("o/r", 1)) is None
+    assert (await d.evaluate_promotion("o/r", 1)) == "hold:reviews-unreadable"
+    assert gh.reviews_posted == []
 
 
 # ── config is live, not snapshotted (issue #11) ──────────────────────────────
