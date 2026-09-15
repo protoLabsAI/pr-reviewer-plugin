@@ -36,7 +36,7 @@ import hashlib
 import json
 import re
 
-from .verdicts import PASS, WARN, extract_findings_json
+from .verdicts import PASS, WARN, read_findings_record
 
 # From this round on, the convergence rule is eligible to fire. Rounds 1–2 are the
 # review doing its job; #88's loop only became self-referential at round 3+.
@@ -114,14 +114,9 @@ def panel_rounds(reviews: list[dict]) -> list[dict]:
         head = str(review.get("head") or "")
         if not head:
             continue
-        findings = []
-        text = extract_findings_json(str(review.get("body") or ""))
-        if text:
-            try:
-                parsed = json.loads(text)
-            except json.JSONDecodeError:
-                parsed = []
-            findings = [f for f in parsed if isinstance(f, dict)] if isinstance(parsed, list) else []
+        # From the body's findings RECORD only, never "the last fenced array anywhere":
+        # claim text printed after the record can hold an array of its own.
+        findings, recorded = read_findings_record(str(review.get("body") or ""))
         by_head[head] = {
             "head": head,
             "verdict": str(review.get("verdict") or ""),
@@ -129,6 +124,13 @@ def panel_rounds(reviews: list[dict]) -> list[dict]:
             # Carried from the marker so the promotion gate can refuse a clean verdict
             # that was produced over incomplete coverage (#49). Absent ⇒ complete.
             "complete": bool(review.get("complete", True)),
+            # Did the body carry exactly ONE well-formed findings record? An explicit `[]`
+            # (the panel looked and raised nothing) and an absent, malformed or ambiguous
+            # record can all come out as `findings == []`, and the promotion gate must tell
+            # them apart: only the former proves an incomplete round's WARN is the coverage
+            # cap and nothing more (`dispatch.coverage_only_round`). Otherwise False ⇒ fails
+            # closed.
+            "findings_recorded": recorded,
             # The base↔head diff identity this round reviewed (issue #91), so a later
             # rebased head with a byte-identical diff can reaffirm this verdict without
             # re-spending the panel. Absent (older bodies) ⇒ None ⇒ reaffirm fails closed.

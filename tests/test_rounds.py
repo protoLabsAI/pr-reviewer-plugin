@@ -23,7 +23,7 @@ from pr_reviewer.rounds import (
     unaccounted_priors,
     unexplained_clearance,
 )
-from pr_reviewer.verdicts import PASS, WARN, parse_verdict_marker, render_verdict_body
+from pr_reviewer.verdicts import PASS, WARN, extract_brief, parse_verdict_marker, render_verdict_body
 
 HEAD_1, HEAD_2, HEAD_3 = "a" * 40, "b" * 40, "c" * 40
 
@@ -156,6 +156,126 @@ def test_a_body_without_parsable_findings_is_still_a_round():
     broken = dict(panel_review(HEAD_1, WARN, []), body=f"<!-- protoagent-qa-review head={HEAD_1} verdict=WARN -->\nx")
     history = panel_rounds([broken])
     assert len(history) == 1 and history[0]["findings"] == []
+
+
+def test_a_round_records_whether_its_findings_array_was_well_formed():
+    # The promotion gate reads an incomplete round as a pure coverage cap only when it
+    # recorded an EXPLICIT empty array (`dispatch.coverage_only_round`). An absent or
+    # malformed record parses to the same `findings == []` and must never pass for one.
+    def round_of(body):
+        review = {**parse_verdict_marker(body), "state": "COMMENTED", "body": body, "id": 1}
+        return panel_rounds([review])[-1]
+
+    def rendered(findings):
+        return render_verdict_body(
+            repo="o/r",
+            pr=88,
+            head_sha=HEAD_1,
+            verdict=WARN,
+            brief="p",
+            findings=findings,
+            shadow=True,
+            recipe="code-review",
+            complete=False,
+        )
+
+    clean = round_of(rendered([]))
+    assert clean["findings_recorded"] is True and clean["findings"] == []
+    found = round_of(rendered([finding()]))
+    assert found["findings_recorded"] is True and len(found["findings"]) == 1
+
+    marker = f"<!-- protoagent-qa-review head={HEAD_1} verdict=WARN promoted=false complete=false -->\n"
+    assert round_of(marker + "x")["findings_recorded"] is False  # no array at all
+    assert round_of(marker + '```json\n[{"file": "x.py"\n```')["findings_recorded"] is False  # unparseable
+    assert round_of(marker + '```json\n["x.py"]\n```')["findings_recorded"] is False  # not finding objects
+    assert round_of(marker + "```json\n{}\n```")["findings_recorded"] is False  # not an array
+
+
+def _round_of(body: str) -> dict:
+    """The round `panel_rounds` builds from one posted body."""
+    review = {**parse_verdict_marker(body), "state": "COMMENTED", "body": body, "id": 1}
+    return panel_rounds([review])[-1]
+
+
+def _incomplete_warn(findings: list[dict], **kw) -> str:
+    return render_verdict_body(
+        repo="o/r",
+        pr=88,
+        head_sha=HEAD_1,
+        verdict=WARN,
+        brief="p",
+        findings=findings,
+        shadow=True,
+        recipe="code-review-structural",
+        complete=False,
+        **kw,
+    )
+
+
+def test_a_fenced_array_quoted_after_the_record_does_not_stand_in_for_it():
+    # Claim text is printed AFTER the findings record — the confinement footnote, the
+    # convergence notes, the held and unaccounted notes — and a claim can quote a fenced
+    # array. The round reads the renderer's own record, never the quoted array.
+    real = finding(claim="real minor defect")
+    quoting = finding(file="other.py", line=1, severity="nit", claim="see\n```json\n[]\n```")
+    confined = _round_of(_incomplete_warn([real, quoting], confined=[quoting]))
+    assert confined["findings_recorded"] is True
+    assert [f["claim"] for f in confined["findings"]] == ["real minor defect", quoting["claim"]]
+
+    noted = _round_of(_incomplete_warn([real], notes="\n\n- note: ```json\n[]\n```"))
+    assert noted["findings_recorded"] is True
+    assert [f["claim"] for f in noted["findings"]] == ["real minor defect"]
+
+
+def test_a_body_that_repeats_the_record_block_recalls_only_the_first():
+    # If claim text printed after the record reproduces the record block, the body is not
+    # trusted as a record (fails closed). Recall reads only the FIRST block — the
+    # renderer's own; nothing printed before it can form one — so a finding that exists
+    # only in the copied block is never recalled.
+    copied = json.dumps([{"file": "y.py", "severity": "blocker", "claim": "FAB"}])
+    block = f"<details>\n<summary>findings JSON (machine-readable)</summary>\n\n```json\n{copied}\n```\n</details>"
+    real = finding(claim="real minor defect")
+    copying = finding(file="o.py", line=1, severity="nit", claim="\n" + block)
+    r = _round_of(_incomplete_warn([real, copying], confined=[copying]))
+    assert r["findings_recorded"] is False
+    assert [f["claim"] for f in r["findings"]] == ["real minor defect", copying["claim"]]
+
+
+def test_the_brief_cannot_place_a_record_block_ahead_of_the_real_record():
+    # "The first block is the renderer's record" rests on this: the brief is the only
+    # model-written text printed before the record, and `extract_brief` strips every
+    # fence from it — so a brief quoting the record block cannot form one.
+    block = "<details>\n<summary>findings JSON (machine-readable)</summary>\n\n```json\n[]\n```\n</details>"
+    brief, found = extract_brief(f"<!-- brief -->\nSee:\n{block}\n<!-- /brief -->")
+    assert found and "```" not in brief
+    body = render_verdict_body(
+        repo="o/r",
+        pr=88,
+        head_sha=HEAD_1,
+        verdict=WARN,
+        brief=brief,
+        findings=[finding(claim="real minor defect")],
+        shadow=True,
+        recipe="code-review-structural",
+        complete=False,
+    )
+    r = _round_of(body)
+    assert r["findings_recorded"] is True
+    assert [f["claim"] for f in r["findings"]] == ["real minor defect"]
+
+
+def test_an_older_body_without_the_record_block_still_recalls_its_findings():
+    # Bodies from before the collapsed record block (v0.19.0) carried a bare fenced array.
+    # They still recall their findings, but are never read as a trusted record — and they
+    # predate `complete=false`, so the coverage-recovery rule never needs one from them.
+    old = (
+        f"<!-- protoagent-qa-review head={HEAD_1} verdict=WARN -->\n## QA panel review\n\n```json\n"
+        + json.dumps([finding(claim="older round")])
+        + "\n```"
+    )
+    r = _round_of(old)
+    assert [f["claim"] for f in r["findings"]] == ["older round"]
+    assert r["findings_recorded"] is False
 
 
 # ── prior-request memory ──────────────────────────────────────────────────────

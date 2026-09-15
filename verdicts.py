@@ -252,7 +252,7 @@ def render_findings_block(findings: list[dict], *, covered: bool = True) -> str:
     clean" line: zero findings from part of the panel is not a clean review.
     """
     payload = json.dumps(findings, indent=2)
-    collapsed = f"<details>\n<summary>findings JSON (machine-readable)</summary>\n\n```json\n{payload}\n```\n</details>"
+    collapsed = f"<details>\n<summary>{_RECORD_SUMMARY}</summary>\n\n```json\n{payload}\n```\n</details>"
     if not findings:
         if not covered:
             return (
@@ -692,6 +692,17 @@ def parse_verdict_marker(body: str) -> dict | None:
     }
 
 
+# The findings RECORD exactly as `render_findings_block` writes it: one collapsed
+# `<details>` block under this summary. The payload is `json.dumps` output, so it holds no
+# raw newline inside a string, and the record ends at the first "\n```\n</details>".
+_RECORD_SUMMARY = "findings JSON (machine-readable)"
+_RECORD_RE = re.compile(
+    r"<details>[ \t]*\r?\n<summary>" + re.escape(_RECORD_SUMMARY) + r"</summary>[ \t]*(?:\r?\n[ \t]*)+"
+    r"```json[ \t]*\r?\n(.*?)\r?\n```[ \t]*\r?\n</details>",
+    re.DOTALL,
+)
+
+
 def extract_findings_json(body: str) -> str:
     """The findings JSON block from a posted verdict body (for `prior_findings` on a
     delta re-review). Returns the fenced block text, or '' when absent."""
@@ -705,3 +716,51 @@ def extract_findings_json(body: str) -> str:
                 continue
             return text
     return ""
+
+
+def _json_list(text: str) -> list | None:
+    """`text` parsed as a JSON array, or None when it is empty, invalid, or not an array."""
+    try:
+        parsed = json.loads(text) if text and text.strip() else None
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, list) else None
+
+
+def read_findings_record(body: str) -> tuple[list[dict], bool]:
+    """A POSTED verdict body's findings → `(findings, recorded)`.
+
+    Reads the findings record `render_findings_block` wrote — the collapsed block under
+    `_RECORD_SUMMARY` — and nothing else. `extract_findings_json` takes the LAST fenced
+    array anywhere, which suits raw model output but not a posted body: claim text is
+    printed AFTER the record (the confinement footnote, convergence notes, the held and
+    unaccounted notes), so an array quoted inside a claim would stand in for the record.
+
+    `recorded` is True only when the body holds exactly ONE record block and it parses to
+    a JSON list of finding objects — the one shape in which an empty list means "this
+    round raised nothing". Every other shape reads False (fails closed) yet still recalls
+    what it can, so no history is lost:
+      - no record block — a body from before the collapsed block (v0.19.0), which also
+        predates `complete=false` — falls back to `extract_findings_json`, unchanged;
+      - more than one — claim text printed after the record reproduced the block — is not
+        trusted, and recalls only the FIRST block, the renderer's own record (nothing
+        printed before the record can form one), so a quoted block adds nothing to recall;
+      - one block that does not parse, or holds a non-object entry, is not recorded.
+    """
+    text = body or ""
+    blocks = _RECORD_RE.findall(text)
+    if not blocks:
+        legacy = _json_list(extract_findings_json(text)) or []
+        return [f for f in legacy if isinstance(f, dict)], False
+    if len(blocks) == 1:
+        parsed = _json_list(blocks[0])
+        if parsed is None:
+            return [], False
+        findings = [f for f in parsed if isinstance(f, dict)]
+        return findings, len(findings) == len(parsed)
+    # Several blocks: the FIRST is the renderer's own record — nothing this renderer
+    # prints before it can form one (`_clean_brief` strips every fence from the brief,
+    # and table cells collapse newlines) — so any later block is quoted claim text.
+    # Recall the first block only, and never trust the body as a record.
+    first = _json_list(blocks[0]) or []
+    return [f for f in first if isinstance(f, dict)], False

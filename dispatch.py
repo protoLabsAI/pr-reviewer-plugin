@@ -176,9 +176,47 @@ def ineligible_reason(facts: dict | None) -> str | None:
     return None
 
 
+def is_own_login(author: str, viewer: str) -> bool:
+    """Is `author` our own account, given our login `viewer`? Case-insensitive.
+
+    Exactly `viewer`, and — only when `viewer` has no `[bot]` suffix — also
+    `<viewer>[bot]`: a bare login may be the slug of the App whose reviews post as
+    `<slug>[bot]`, and GitHub allows no App name that collides with an existing account,
+    so that form can only be ours. Never the reverse: for `viewer` = `x[bot]`, a plain
+    account named `x` is a different account and is not ours.
+    """
+    a = (author or "").strip().lower()
+    v = (viewer or "").strip().lower()
+    if not a or not v:
+        return False
+    return a == v or (not v.endswith("[bot]") and a == f"{v}[bot]")
+
+
 # Severity order for the strictest-verdict-wins tie-break (issue #89): a higher rank
 # is stricter, so a FAIL for a head can never be shadowed by a co-landed PASS.
 _VERDICT_RANK = {PASS: 0, WARN: 1, FAIL: 2}
+
+
+def coverage_only_round(round_: dict) -> bool:
+    """Is this round's verdict the incomplete-coverage cap and nothing more?
+
+    True for an INCOMPLETE round (a lane did not deliver a full pass — marker
+    `complete=false`, #49) that recorded an explicit, EMPTY findings array. Its WARN is
+    `coverage_verdict` capping a clean PASS (#117): a statement that the panel covered
+    less, not that it found anything. A COMPLETE round for the same head answers exactly
+    that question, so this round stops speaking for the head once one exists.
+
+    Everything else is a real verdict and keeps its full #89 weight: a FAIL (whatever its
+    completeness), any round with findings, and a round whose findings record is absent
+    or malformed (`findings_recorded` False) — we cannot prove it raised nothing, so it
+    fails closed and is never discarded.
+    """
+    return (
+        not round_.get("complete", True)
+        and round_.get("verdict") in (PASS, WARN)
+        and bool(round_.get("findings_recorded"))
+        and not round_.get("findings")
+    )
 
 
 def strictest_head_round(reviews: list[dict], head: str) -> dict | None:
@@ -193,6 +231,18 @@ def strictest_head_round(reviews: list[dict], head: str) -> dict | None:
     arrival order. Findings/`complete` come from the NEWEST round bearing that verdict,
     so a promoted WARN still carries its most recent findings forward (issue #22).
 
+    Coverage recovered: once a COMPLETE round exists for the head, a `coverage_only_round`
+    (incomplete, zero findings — its WARN is the coverage cap alone) is left out of the
+    tie-break. Otherwise ONE blind lane poisoned the head for good: the strictest pick
+    stayed that `WARN complete=false` round however many complete PASSes followed, so
+    promotion held `hold:incomplete-coverage` and the `QA panel` check sat at "Incomplete
+    pass" until a new commit (qaEngineer#59 @ 13fbcaba). Order-free, like the tie-break.
+    A FAIL or any round with findings still competes — incomplete or not — so this never
+    promotes past a real finding. If such an incomplete round wins, its verdict and
+    findings govern, but the head's coverage WAS recovered by the complete round, so the
+    pick is judged complete (WARN ⇒ the threads/findings gate), not held forever — as long
+    as its findings record is readable; an unreadable one still holds, fail-closed.
+
     Promotions (`promoted=true`) are not rounds and are excluded, same as `panel_rounds`.
     """
     rounds = [
@@ -203,8 +253,19 @@ def strictest_head_round(reviews: list[dict], head: str) -> dict | None:
     ]
     if not rounds:
         return None
+    recovered = any(r["complete"] for r in rounds)
+    if recovered:
+        # Never empties the list: a complete round is not coverage-only by definition.
+        rounds = [r for r in rounds if not coverage_only_round(r)]
     strictest = max(_VERDICT_RANK.get(r["verdict"], -1) for r in rounds)
-    return next(r for r in reversed(rounds) if _VERDICT_RANK.get(r["verdict"], -1) == strictest)
+    pick = next(r for r in reversed(rounds) if _VERDICT_RANK.get(r["verdict"], -1) == strictest)
+    # Only a pick whose findings we can READ is judged complete: its findings then govern
+    # through the threads gate and carry forward on promotion. One with an absent or
+    # malformed record stays incomplete (holds) — promoting it would carry nothing forward
+    # while it may hold a real finding.
+    if recovered and not pick["complete"] and pick.get("findings_recorded"):
+        pick = {**pick, "complete": True}
+    return pick
 
 
 def _with_api_detail(err: str, out: str) -> str:
@@ -768,32 +829,37 @@ class Dispatcher:
             log.warning("[pr-reviewer] max-rounds comment on %s#%s failed: %s", repo, pr, err[-300:])
 
     def _check_viewer_matches(self, author: str) -> None:
-        """Warn once if `viewer_login` disagrees with who actually posted our reviews.
+        """Warn once when another App's review carries our verdict marker.
 
         `viewer_login` is unvalidated by construction — it is a string an operator
         typed. A typo does not error; it silently makes the self-authored comparison
         never match, which is precisely the disabled rail this config exists to
-        prevent. But a marker-bearing review is proof of identity: only we write that
-        marker, so its author IS us. Comparing the two costs nothing (the rows are
-        already fetched) and turns a silent misconfiguration into one loud line.
+        prevent. Our own reviews then arrive under an App (`[bot]`) login that is not
+        `viewer_login`, which `_our_reviews` reads as an UNREADABLE history — every
+        caller holds — so this line is what tells an operator why. Only an App author is
+        considered: a person cannot post as one, so a human quoting a verdict says
+        nothing about our login and must not use up this one warning before a real typo.
 
         Warn, never correct: an operator who set this deliberately (a migration, a
         renamed app) should not have the reviewer quietly overrule them, and being
         wrong in the SAFE direction — comparing against a login that never matches —
-        only ever causes extra review, not self-approval.
+        only ever causes held promotions and skipped reviews, not self-approval.
         """
         author = (author or "").strip().lower()
-        if not author or self._viewer_checked or not self._viewer:
+        if not author.endswith("[bot]") or self._viewer_checked or not self._viewer:
+            return
+        if is_own_login(author, self._viewer):
             return
         self._viewer_checked = True
-        if author.removesuffix("[bot]") != self._viewer.removesuffix("[bot]"):
-            log.warning(
-                "[pr-reviewer] viewer_login is %r but our own posted reviews are authored by %r — "
-                "the never-review-your-own-PR rail will not fire. Fix pr_reviewer.viewer_login.",
-                self._viewer,
-                author,
-            )
-            self.telemetry.emit("viewer-mismatch", configured=self._viewer, actual=author)
+        log.warning(
+            "[pr-reviewer] viewer_login is %r but a marker-bearing review is authored by the app %r — "
+            "review history reads as unreadable, so reviews and promotions hold until they agree. If "
+            "that app is ours, fix pr_reviewer.viewer_login (the never-review-your-own-PR rail will "
+            "not fire either).",
+            self._viewer,
+            author,
+        )
+        self.telemetry.emit("viewer-mismatch", configured=self._viewer, actual=author)
 
     async def _viewer_login(self) -> str:
         """Our own login, cached — ONLY on success.
@@ -929,7 +995,8 @@ class Dispatcher:
         return f"reaffirmed:{prior['verdict']}"
 
     async def _our_reviews(self, repo: str, pr: int) -> list[dict] | None:
-        """Our posted reviews (marker-bearing), oldest→newest: [{head, verdict, promoted, state, body, id}].
+        """Our posted reviews (marker-bearing, authored by our own login), oldest→newest:
+        [{head, verdict, promoted, state, body, id}].
 
         **None means the read FAILED — it is not the same as `[]` (this PR has no
         reviews), and callers must not collapse the two** (issue #71). Returning `[]`
@@ -937,7 +1004,26 @@ class Dispatcher:
         exists" and re-reviews a PR that is already reviewed, which cost two PRs ten
         full panels each on a static head during a GitHub degradation. Every caller
         here decides explicitly, and every one of them fails CLOSED.
+
+        Panel rounds are read ONLY from the reviewer's own reviews. The verdict marker is
+        plain text, so a review by another account can carry one too — a human quoting or
+        pasting a verdict, say — and such a review is not a panel round and must not count
+        as one: not for promotion, re-gating, coverage recovery, or the "already reviewed
+        this head" check, all of which read this list. Ours means `is_own_login`: exactly
+        our login, never a plain account that shares an App's name. Telling the two apart
+        needs our login, so an UNKNOWN login makes the history unreadable (None), the same
+        fail-closed answer as a failed reviews read.
+
+        A marker-bearing review by another App (`[bot]`) is different from a person's: a
+        person cannot post as an App, so it is almost always OUR reviews under a login
+        that is not `viewer_login` (a typo, a renamed app). Skipping those would make every
+        head look unreviewed and re-spend the panel on every PR each tick (issue #71's
+        failure mode), so that also returns None and warns once. A person's review that
+        carries the marker is simply skipped.
         """
+        viewer = await self._viewer_login()
+        if not viewer:
+            return None
         rc, out, _err = await self._run_gh(
             [
                 "api",
@@ -956,15 +1042,28 @@ class Dispatcher:
         if rows is None:
             return None
         ours = []
+        not_ours = 0
         for row in rows:
             if not isinstance(row, dict):
                 continue
             marker = parse_verdict_marker(row.get("body") or "")
-            if marker:
-                self._check_viewer_matches(str(row.get("author") or ""))
-                ours.append(
-                    {**marker, "state": row.get("state", ""), "body": row.get("body") or "", "id": row.get("id")}
-                )
+            if not marker:
+                continue
+            author = str(row.get("author") or "").strip().lower()
+            if not is_own_login(author, viewer):
+                if author.endswith("[bot]"):
+                    # Another App carries our marker: most likely our own reviews under a
+                    # login that is not `viewer_login`. Unreadable, so every caller holds.
+                    self._check_viewer_matches(author)
+                    self.telemetry.emit(
+                        "reviews-unreadable", repo=repo, pr=pr, why="marker-by-another-app", author=author
+                    )
+                    return None
+                not_ours += 1  # carries the marker, but a person's account wrote it
+                continue
+            ours.append({**marker, "state": row.get("state", ""), "body": row.get("body") or "", "id": row.get("id")})
+        if not_ours:
+            self.telemetry.emit("marker_not_ours", repo=repo, pr=pr, skipped=not_ours)
         return ours
 
     async def _pr_comments(self, repo: str, pr: int) -> list[str]:
@@ -1158,7 +1257,7 @@ class Dispatcher:
         never a failure. We never claim a thread as ours on an unreadable identity or an
         unreadable thread list — the safe direction is to say nothing, not to fail.
         """
-        viewer = (await self._viewer_login()).removesuffix("[bot]")
+        viewer = await self._viewer_login()
         if not viewer:
             return None  # we don't know who we are ⇒ cannot claim any thread as the panel's
         from .threads import fetch_threads
@@ -1177,7 +1276,7 @@ class Dispatcher:
             comments = (t.get("comments") or {}).get("nodes") or []
             root = next((c for c in comments if isinstance(c, dict)), None)
             author = str(((root or {}).get("author") or {}).get("login") or "").strip().lower()
-            if author and author.removesuffix("[bot]") == viewer:
+            if is_own_login(author, viewer):
                 owned += 1
         return owned
 
@@ -1292,6 +1391,9 @@ class Dispatcher:
         if (
             viewer
             and not allow_self
+            # Deliberately broader than `is_own_login`: this rail errs toward NOT reviewing.
+            # Matching a plain account that shares our App's name only skips that PR; a
+            # narrower match could let a misconfigured login review its own PR.
             and (author == viewer or author.removesuffix("[bot]") == viewer.removesuffix("[bot]"))
         ):
             self.telemetry.emit("drop", repo=repo, pr=pr, reason=DROP_SELF_AUTHORED, author=author)
@@ -2265,6 +2367,9 @@ class Dispatcher:
         # co-landed FAIL would otherwise shadow it and auto-approve straight past the
         # blocker. Fails closed: FAIL > WARN > PASS, the harsher verdict wins the tie. A
         # stale-head `latest` is left untouched — it holds regardless of its verdict.
+        # A zero-finding incomplete round (the coverage cap alone) drops out once a
+        # COMPLETE round exists for the head, so one blind lane cannot hold the head at
+        # hold:incomplete-coverage forever (qaEngineer#59) — see `strictest_head_round`.
         if latest is not None and latest["head"] == head:
             latest = strictest_head_round(ours, head) or latest
         clear = latest if latest and latest["verdict"] in (PASS, WARN) else None
