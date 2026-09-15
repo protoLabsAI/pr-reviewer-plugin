@@ -181,6 +181,28 @@ def ineligible_reason(facts: dict | None) -> str | None:
 _VERDICT_RANK = {PASS: 0, WARN: 1, FAIL: 2}
 
 
+def coverage_only_round(round_: dict) -> bool:
+    """Is this round's verdict the incomplete-coverage cap and nothing more?
+
+    True for an INCOMPLETE round (a lane did not deliver a full pass — marker
+    `complete=false`, #49) that recorded an explicit, EMPTY findings array. Its WARN is
+    `coverage_verdict` capping a clean PASS (#117): a statement that the panel covered
+    less, not that it found anything. A COMPLETE round for the same head answers exactly
+    that question, so this round stops speaking for the head once one exists.
+
+    Everything else is a real verdict and keeps its full #89 weight: a FAIL (whatever its
+    completeness), any round with findings, and a round whose findings record is absent
+    or malformed (`findings_recorded` False) — we cannot prove it raised nothing, so it
+    fails closed and is never discarded.
+    """
+    return (
+        not round_.get("complete", True)
+        and round_.get("verdict") in (PASS, WARN)
+        and bool(round_.get("findings_recorded"))
+        and not round_.get("findings")
+    )
+
+
 def strictest_head_round(reviews: list[dict], head: str) -> dict | None:
     """The STRICTEST panel round posted for `head`, or None when the head has none.
 
@@ -193,6 +215,18 @@ def strictest_head_round(reviews: list[dict], head: str) -> dict | None:
     arrival order. Findings/`complete` come from the NEWEST round bearing that verdict,
     so a promoted WARN still carries its most recent findings forward (issue #22).
 
+    Coverage recovered: once a COMPLETE round exists for the head, a `coverage_only_round`
+    (incomplete, zero findings — its WARN is the coverage cap alone) is left out of the
+    tie-break. Otherwise ONE blind lane poisoned the head for good: the strictest pick
+    stayed that `WARN complete=false` round however many complete PASSes followed, so
+    promotion held `hold:incomplete-coverage` and the `QA panel` check sat at "Incomplete
+    pass" until a new commit (qaEngineer#59 @ 13fbcaba). Order-free, like the tie-break.
+    A FAIL or any round with findings still competes — incomplete or not — so this never
+    promotes past a real finding. If such an incomplete round wins, its verdict and
+    findings govern, but the head's coverage WAS recovered by the complete round, so the
+    pick is judged complete (WARN ⇒ the threads/findings gate), not held forever — as long
+    as its findings record is readable; an unreadable one still holds, fail-closed.
+
     Promotions (`promoted=true`) are not rounds and are excluded, same as `panel_rounds`.
     """
     rounds = [
@@ -203,8 +237,19 @@ def strictest_head_round(reviews: list[dict], head: str) -> dict | None:
     ]
     if not rounds:
         return None
+    recovered = any(r["complete"] for r in rounds)
+    if recovered:
+        # Never empties the list: a complete round is not coverage-only by definition.
+        rounds = [r for r in rounds if not coverage_only_round(r)]
     strictest = max(_VERDICT_RANK.get(r["verdict"], -1) for r in rounds)
-    return next(r for r in reversed(rounds) if _VERDICT_RANK.get(r["verdict"], -1) == strictest)
+    pick = next(r for r in reversed(rounds) if _VERDICT_RANK.get(r["verdict"], -1) == strictest)
+    # Only a pick whose findings we can READ is judged complete: its findings then govern
+    # through the threads gate and carry forward on promotion. One with an absent or
+    # malformed record stays incomplete (holds) — promoting it would carry nothing forward
+    # while it may hold a real finding.
+    if recovered and not pick["complete"] and pick.get("findings_recorded"):
+        pick = {**pick, "complete": True}
+    return pick
 
 
 def _with_api_detail(err: str, out: str) -> str:
@@ -2265,6 +2310,9 @@ class Dispatcher:
         # co-landed FAIL would otherwise shadow it and auto-approve straight past the
         # blocker. Fails closed: FAIL > WARN > PASS, the harsher verdict wins the tie. A
         # stale-head `latest` is left untouched — it holds regardless of its verdict.
+        # A zero-finding incomplete round (the coverage cap alone) drops out once a
+        # COMPLETE round exists for the head, so one blind lane cannot hold the head at
+        # hold:incomplete-coverage forever (qaEngineer#59) — see `strictest_head_round`.
         if latest is not None and latest["head"] == head:
             latest = strictest_head_round(ours, head) or latest
         clear = latest if latest and latest["verdict"] in (PASS, WARN) else None

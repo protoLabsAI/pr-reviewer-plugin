@@ -115,13 +115,18 @@ def panel_rounds(reviews: list[dict]) -> list[dict]:
         if not head:
             continue
         findings = []
+        recorded = False
         text = extract_findings_json(str(review.get("body") or ""))
         if text:
             try:
                 parsed = json.loads(text)
             except json.JSONDecodeError:
-                parsed = []
-            findings = [f for f in parsed if isinstance(f, dict)] if isinstance(parsed, list) else []
+                parsed = None
+            if isinstance(parsed, list):
+                findings = [f for f in parsed if isinstance(f, dict)]
+                # Well-formed only when EVERY entry is a finding object; a stray scalar
+                # means the record is not what we wrote, so it proves nothing.
+                recorded = len(findings) == len(parsed)
         by_head[head] = {
             "head": head,
             "verdict": str(review.get("verdict") or ""),
@@ -129,6 +134,12 @@ def panel_rounds(reviews: list[dict]) -> list[dict]:
             # Carried from the marker so the promotion gate can refuse a clean verdict
             # that was produced over incomplete coverage (#49). Absent ⇒ complete.
             "complete": bool(review.get("complete", True)),
+            # Did the body record a well-formed findings array? An explicit `[]` (the panel
+            # looked and raised nothing) and an absent or malformed record both come out as
+            # `findings == []` above, and the promotion gate must tell them apart: only the
+            # former proves an incomplete round's WARN is the coverage cap and nothing more
+            # (`dispatch.coverage_only_round`). Absent/malformed ⇒ False ⇒ fails closed.
+            "findings_recorded": recorded,
             # The base↔head diff identity this round reviewed (issue #91), so a later
             # rebased head with a byte-identical diff can reaffirm this verdict without
             # re-spending the panel. Absent (older bodies) ⇒ None ⇒ reaffirm fails closed.

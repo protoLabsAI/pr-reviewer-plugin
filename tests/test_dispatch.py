@@ -2768,6 +2768,105 @@ async def test_our_own_promotion_body_does_not_shadow_the_verdict_it_promoted(tm
     assert (await d.evaluate_promotion("o/r", 1)) == "hold:stale-head"
 
 
+# ── coverage recovered: a coverage-only WARN never outranks a complete round ────
+
+FAIL_FINDING = json.dumps(
+    [{"file": "x.py", "line": 3, "severity": "major", "claim": "Bug.", "evidence": "e", "verdict": "confirmed"}]
+)
+
+
+def _qa_check(gh):
+    """The last `QA panel` check-run write the promotion path published."""
+    writes = [p for p in gh.posted if "check-runs" in p.get("url", "")]
+    assert writes, "the QA-panel check should be published"
+    return writes[-1]
+
+
+async def test_a_complete_pass_recovers_a_coverage_only_warn_on_the_same_head(tmp_path):
+    # qaEngineer#59 @ 13fbcaba, live: `find_removed_behavior` did not complete, so the
+    # round posted `WARN complete=false` with NO findings; a re-review 18 min later was a
+    # complete, finding-free PASS. The #89 strictest pick kept the incomplete WARN, so the
+    # head held hold:incomplete-coverage (QA panel "Incomplete pass") until a new commit —
+    # neither `@vera review` nor a check re-run could ever clear it.
+    green = [{"status": "completed", "conclusion": "success"}]
+    capped = review_row(HEAD, "WARN", complete=False)
+    assert "verdict=WARN promoted=false complete=false" in capped["body"]  # the #59 marker
+    complete_pass = review_row(HEAD, "PASS")
+    # Order-free, like #89: GitHub returns same-head reviews in an arbitrary order.
+    for reviews in ([capped, complete_pass], [complete_pass, capped]):
+        gh = RoutedGH(pr_facts=facts(), reviews=reviews, checks=green)
+        d = make(tmp_path, cfg={"shadow_mode": False, "promotion_owner": True}, gh=gh)
+        assert (await d.evaluate_promotion("o/r", 1)) == "promote"
+        approval = gh.reviews_posted[0]
+        assert approval["event"] == "APPROVE"
+        assert f"head={HEAD} verdict=PASS promoted=true -->" in approval["body"]  # the complete PASS governs
+        qa = _qa_check(gh)
+        assert qa.get("status") == "completed" and qa.get("conclusion") == "success"
+        assert qa.get("output[title]") == "Cleared by the QA panel"
+
+
+async def test_a_warn_with_findings_still_governs_after_a_later_complete_pass(tmp_path):
+    # #89's guarantee holds: a WARN that raised a REAL finding is not a coverage cap, so
+    # a later complete PASS for the same head cannot shadow it — complete or not. It
+    # governs as today: the panel's open thread holds promotion (and fails the QA check);
+    # once resolved, the approval promotes the WARN, carrying its finding forward (#22).
+    green = [{"status": "completed", "conclusion": "success"}]
+    for complete in (True, False):
+        reviews = [review_row(HEAD, "WARN", findings_json=WARN_FINDING, complete=complete), review_row(HEAD, "PASS")]
+        gh = RoutedGH(pr_facts=facts(), reviews=reviews, checks=green, threads=[thread_node("qa-bot[bot]")])
+        d = make(tmp_path, cfg={"shadow_mode": False, "promotion_owner": True}, gh=gh)
+        assert (await d.evaluate_promotion("o/r", 1)) == "hold:threads-unresolved"
+        assert gh.reviews_posted == []
+        assert _qa_check(gh).get("conclusion") == "failure"  # the panel's own finding is open
+
+        gh.threads = [thread_node("qa-bot[bot]", resolved=True)]
+        assert (await d.evaluate_promotion("o/r", 1)) == "promote"
+        body = gh.reviews_posted[0]["body"]
+        assert f"head={HEAD} verdict=WARN promoted=true findings=1 -->" in body  # the WARN, not the PASS
+        assert "malformed diff: label" in body
+
+
+async def test_only_incomplete_rounds_for_the_head_still_hold_incomplete(tmp_path):
+    # No complete round ⇒ nothing recovered coverage: two blind passes are not one full
+    # pass (#49), so the head still holds exactly as before.
+    green = [{"status": "completed", "conclusion": "success"}]
+    reviews = [review_row(HEAD, "WARN", complete=False), review_row(HEAD, "WARN", complete=False)]
+    gh = RoutedGH(pr_facts=facts(), reviews=reviews, checks=green)
+    d = make(tmp_path, cfg={"shadow_mode": False, "promotion_owner": True}, gh=gh)
+    assert (await d.evaluate_promotion("o/r", 1)) == "hold:incomplete-coverage"
+    assert gh.reviews_posted == []
+    qa = _qa_check(gh)
+    assert qa.get("status") == "in_progress" and qa.get("output[title]") == "Incomplete pass"
+
+
+async def test_an_incomplete_fail_with_findings_still_holds_after_a_complete_pass(tmp_path):
+    # An incomplete round's findings stand: a FAIL is never a coverage cap, so a complete
+    # PASS for the same head — in either arrival order — cannot promote past it.
+    green = [{"status": "completed", "conclusion": "success"}]
+    blind_fail = review_row(HEAD, "FAIL", findings_json=FAIL_FINDING, complete=False)
+    complete_pass = review_row(HEAD, "PASS")
+    for reviews in ([blind_fail, complete_pass], [complete_pass, blind_fail]):
+        gh = RoutedGH(pr_facts=facts(), reviews=reviews, checks=green)
+        d = make(tmp_path, cfg={"shadow_mode": False, "promotion_owner": True}, gh=gh)
+        assert (await d.evaluate_promotion("o/r", 1)) == "hold:no-clear-verdict"
+        assert gh.reviews_posted == []
+        assert _qa_check(gh).get("conclusion") != "success"
+
+
+async def test_an_incomplete_round_without_a_readable_findings_record_stays_strict(tmp_path):
+    # Only an EXPLICIT empty array proves a round raised nothing. A body whose findings
+    # record is absent or malformed (older, truncated, hand-edited) cannot be read as a
+    # pure coverage cap, so it keeps holding even after a complete PASS — fails closed.
+    green = [{"status": "completed", "conclusion": "success"}]
+    marker = f"<!-- protoagent-qa-review head={HEAD} verdict=WARN promoted=false complete=false -->\n"
+    for tail in ("x", '```json\n[{"file": "x.py"\n```'):
+        blind = {"state": "COMMENTED", "id": None, "body": marker + tail}
+        gh = RoutedGH(pr_facts=facts(), reviews=[blind, review_row(HEAD, "PASS")], checks=green)
+        d = make(tmp_path, cfg={"shadow_mode": False, "promotion_owner": True}, gh=gh)
+        assert (await d.evaluate_promotion("o/r", 1)) == "hold:incomplete-coverage"
+        assert gh.reviews_posted == []
+
+
 # ── config is live, not snapshotted (issue #11) ──────────────────────────────
 
 

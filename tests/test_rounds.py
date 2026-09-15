@@ -158,6 +158,39 @@ def test_a_body_without_parsable_findings_is_still_a_round():
     assert len(history) == 1 and history[0]["findings"] == []
 
 
+def test_a_round_records_whether_its_findings_array_was_well_formed():
+    # The promotion gate reads an incomplete round as a pure coverage cap only when it
+    # recorded an EXPLICIT empty array (`dispatch.coverage_only_round`). An absent or
+    # malformed record parses to the same `findings == []` and must never pass for one.
+    def round_of(body):
+        review = {**parse_verdict_marker(body), "state": "COMMENTED", "body": body, "id": 1}
+        return panel_rounds([review])[-1]
+
+    def rendered(findings):
+        return render_verdict_body(
+            repo="o/r",
+            pr=88,
+            head_sha=HEAD_1,
+            verdict=WARN,
+            brief="p",
+            findings=findings,
+            shadow=True,
+            recipe="code-review",
+            complete=False,
+        )
+
+    clean = round_of(rendered([]))
+    assert clean["findings_recorded"] is True and clean["findings"] == []
+    found = round_of(rendered([finding()]))
+    assert found["findings_recorded"] is True and len(found["findings"]) == 1
+
+    marker = f"<!-- protoagent-qa-review head={HEAD_1} verdict=WARN promoted=false complete=false -->\n"
+    assert round_of(marker + "x")["findings_recorded"] is False  # no array at all
+    assert round_of(marker + '```json\n[{"file": "x.py"\n```')["findings_recorded"] is False  # unparseable
+    assert round_of(marker + '```json\n["x.py"]\n```')["findings_recorded"] is False  # not finding objects
+    assert round_of(marker + "```json\n{}\n```")["findings_recorded"] is False  # not an array
+
+
 # ── prior-request memory ──────────────────────────────────────────────────────
 
 
