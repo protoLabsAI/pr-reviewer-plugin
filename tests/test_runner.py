@@ -133,7 +133,7 @@ async def test_missing_binary_degrades_with_install_hint(tmp_path, gateway_env, 
 async def test_nonzero_exit_degrades_with_typed_reason_and_redacted_token(tmp_path, gateway_env, pr_refs):
     r = runner(tmp_path, run_clawpatch=make_clawpatch(rc=4, stderr="auth ghtok rejected"))
     out = await r.review(1, "octo/repo")
-    assert "exit 4 (gateway auth/config failure)" in out
+    assert "exit 4 (gateway provider failure: auth, HTTP error, or an unusable model reply)" in out
     assert "ghtok" not in out
 
 

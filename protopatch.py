@@ -45,7 +45,10 @@ SEVERITY_MAP = {"critical": "blocker", "high": "major", "medium": "minor", "low"
 _EXIT_REASONS = {
     2: "invalid usage/config or git failure",
     3: "dirty worktree",
-    4: "gateway auth/config failure",
+    # clawpatch raises exit 4 for EVERY provider failure — auth, an HTTP error, a failed
+    # request, an empty reply, or a reply that isn't parseable JSON (its `provider-failure`
+    # class). Naming only auth sent diagnosis the wrong way; the detail after this says which.
+    4: "gateway provider failure: auth, HTTP error, or an unusable model reply",
     5: "gateway quota/rate limit",
     6: "tests/validation failed",
     7: "state lock conflict (another run in flight?)",
