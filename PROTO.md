@@ -23,6 +23,8 @@ ruff check . && ruff format --check . && pytest -q
 
 Run this gate locally before any PR. There is **no changelog file** — describe the change in the PR title and commit message only.
 
+`ruff` is **pinned** in `requirements-dev.txt`, and the local gate must run that exact version. An unpinned range let CI resolve a newer ruff than the gate's venv, and the two disagreed — 0.16 formats Python inside markdown code blocks, 0.15 does not — so a change passed the gate and CI rejected it. A local gate that can't predict CI costs a coder run to reach the failure it exists to prevent. Bump the pin deliberately, and upgrade the gate's venv in the same move.
+
 ---
 
 ## 3. Architecture rules
