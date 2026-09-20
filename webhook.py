@@ -371,6 +371,7 @@ def build_routers(dispatcher, telemetry, get_secret, run_gh_fn=None):
                         trial=trial,
                         stamp=stamp,
                         include_raw=include_raw,
+                        finder_timeout=dispatcher.finder_timeout_s,
                     )
                 )
         return {"runs": runs}

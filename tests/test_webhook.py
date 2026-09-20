@@ -453,9 +453,14 @@ def test_a_malformed_thread_payload_is_dropped(tmp_path):
 
 async def test_replay_endpoint_runs_the_panel_and_never_posts(tmp_path):
 
+    seen_inputs = {}
+
     class ReplayDispatcher(SpyDispatcher):
+        finder_timeout_s = 1500  # the deployment's budget — a replay must run under it too
+
         def _runner(self):
             async def run(recipe, inputs):
+                seen_inputs.update(inputs)
                 return {"output": "brief\n```json\n[]\n```", "failed": [], "timings": {}, "usage": {}}
 
             return run
@@ -491,6 +496,7 @@ async def test_replay_endpoint_runs_the_panel_and_never_posts(tmp_path):
     assert len(runs) == 1
     assert runs[0]["run"]["model"] == "protolabs/fast" and runs[0]["verdict"] == "PASS"
     assert posted == []  # side-effect-free
+    assert seen_inputs["finder_timeout"] == 1500  # same finder budget as the live panel
 
 
 async def test_replay_endpoint_503s_without_a_runner(tmp_path):
