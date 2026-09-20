@@ -494,7 +494,10 @@ def undelivered_stages(
 
 
 def coverage_gaps(
-    degraded: list[str] | None, incomplete_finders: list[str] | None, structural_unavailable: bool
+    degraded: list[str] | None,
+    incomplete_finders: list[str] | None,
+    structural_unavailable: bool,
+    structural_reason: str = "",
 ) -> dict[str, str]:
     """{lane: why} for every lane that did not deliver a full pass — the three signals
     the dispatcher already records (`degraded`, `incomplete_finders`,
@@ -503,7 +506,11 @@ def coverage_gaps(
     for s in incomplete_finders or []:
         gaps.setdefault(str(s), "did not complete a real pass")
     if structural_unavailable:
-        gaps.setdefault("find_structural", "structural pass unavailable or cut short")
+        why = "structural pass unavailable or cut short"
+        # The lane's own reason, when it gave one (#140): without it the synthesizer guessed
+        # a cause per round — "auth error", "provider error" — for what was one fault, and a
+        # reader could not tell a wrong gateway key from an unusable model reply.
+        gaps.setdefault("find_structural", f"{why}: {structural_reason}" if structural_reason else why)
     return gaps
 
 

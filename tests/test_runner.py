@@ -137,6 +137,23 @@ async def test_nonzero_exit_degrades_with_typed_reason_and_redacted_token(tmp_pa
     assert "ghtok" not in out
 
 
+async def test_an_outage_is_logged_with_its_reason(tmp_path, gateway_env, pr_refs, caplog):
+    # #140: the reason went only to the relay, which paraphrased it away — `docker logs`
+    # held no protopatch line at all, so nobody could tell a bad key from an unusable reply.
+    r = runner(tmp_path, run_clawpatch=make_clawpatch(rc=4, stderr="response was not parseable JSON; key ghtok"))
+    with caplog.at_level("WARNING"):
+        await r.review(7, "octo/repo")
+    (line,) = [m for m in caplog.messages if "structural pass unavailable" in m]
+    assert "octo/repo#7" in line and "clawpatch exit 4" in line and "not parseable JSON" in line
+    assert "ghtok" not in line  # the log gets the REDACTED reason, same as the relay
+
+    caplog.clear()
+    ok = runner(tmp_path, run_clawpatch=make_clawpatch(rc=0))
+    with caplog.at_level("WARNING"):
+        await ok.review(7, "octo/repo")
+    assert not [m for m in caplog.messages if "structural pass unavailable" in m]  # silent when it works
+
+
 async def test_never_raises_even_on_unexpected_errors(tmp_path, gateway_env, pr_refs, monkeypatch):
     import pr_reviewer
 

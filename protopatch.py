@@ -30,6 +30,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 from pathlib import Path
 
@@ -63,6 +64,33 @@ UNAVAILABLE_PREFIX = "PROTOPATCH UNAVAILABLE"
 GAP_LINE_PREFIX = "Gap: structural pass unavailable"
 # Either one in the structural lane's output means the structural pass did not run.
 STRUCTURAL_GAP_MARKERS = (UNAVAILABLE_PREFIX, GAP_LINE_PREFIX)
+
+
+_URL_RE = re.compile(r"\b[a-z][a-z0-9+.-]*://\S+")
+_ABS_PATH_RE = re.compile(r"(?<![\w.])/(?:[\w.@-]+/)+[\w.@-]*")
+_MARKDOWN_RE = re.compile(r"[`*_\[\]|<>]")
+
+
+def outage_reason(structural_output: str, limit: int = 180) -> str:
+    """The reason a structural outage gave, fit to print in a PR comment — "" when none.
+
+    Read from the lane's own Gap line (either marker). The text has been through the relay
+    model and began as clawpatch's stderr, so it is untrusted display text: URLs and
+    absolute paths are dropped (a PR is no place for the reviewer's gateway address or
+    filesystem layout), markdown control characters are removed, and it is clipped. Tokens
+    were already redacted at the source.
+    """
+    text = structural_output or ""
+    for marker in STRUCTURAL_GAP_MARKERS:
+        _before, found, after = text.partition(marker)
+        if not found:
+            continue
+        reason = (after.splitlines() or [""])[0].lstrip(" —-:")
+        reason = _ABS_PATH_RE.sub("(path)", _URL_RE.sub("(url)", reason))
+        reason = " ".join(_MARKDOWN_RE.sub("", reason).split())
+        if reason:
+            return reason if len(reason) <= limit else reason[: limit - 1].rstrip() + "…"
+    return ""
 
 
 def unavailable(reason: str) -> str:
@@ -258,7 +286,14 @@ class ProtoPatchRunner:
             self._startup_pruned = True
             self._prune()  # first use: sweep pre-fix accumulation before anything runs
         try:
-            return await self._run_review(pr, repo)
+            result = await self._run_review(pr, repo)
+            if result.startswith(UNAVAILABLE_PREFIX):
+                # The ONLY place the reason is kept (#140). It goes to the relay subagent,
+                # which paraphrases it, and a synthesizer that guessed "gateway auth error"
+                # one round and "provider error" the next for the same fault; nothing logged
+                # it, so the operator who could fix a route or a key never saw which it was.
+                log.warning("[pr-reviewer] structural pass unavailable on %s#%s: %s", repo, pr, result.splitlines()[0])
+            return result
         finally:
             self._prune()  # after each use — success or degradation alike
 
