@@ -304,6 +304,41 @@ def test_prior_requests_claims_cannot_break_out_of_the_wrapper():
     assert "</prior_requests_>" in block
 
 
+def test_each_request_says_what_became_of_it():
+    # Issue #131 (mythxengine#827): a note fixed and refuted rounds ago was still listed
+    # among "standing items from round 1", because history and open debt looked the same.
+    block = render_prior_requests(
+        [
+            {
+                "head": HEAD_1,
+                "verdict": "FAIL",
+                "findings": [
+                    finding(file="a.py", line=1, severity="major", claim="still broken"),
+                    finding(file="b.py", line=2, severity="major", claim="fixed since"),
+                    {**finding(file="c.py", line=3, severity="major", claim="was wrong"), "verdict": "refuted"},
+                ],
+            },
+            {
+                "head": HEAD_2,
+                "verdict": "FAIL",
+                "findings": [finding(file="a.py", line=1, severity="major", claim="still broken")],
+            },
+            {"head": HEAD_3, "verdict": PASS, "findings": []},  # a clean round is not "the latest with findings"
+        ]
+    )
+    rows = {line.split('location="')[1].split('"')[0]: line for line in block.splitlines() if "<request " in line}
+    assert rows["b.py:2"].count('status="not-in-latest-round"') == 1
+    assert rows["c.py:3"].count('status="refuted"') == 1
+    assert block.count('location="a.py:1" status="open"') == 2  # open in the round that raised it, and the latest
+
+
+def test_a_finding_refuted_in_the_latest_round_is_not_open():
+    block = render_prior_requests(
+        [{"head": HEAD_1, "verdict": WARN, "findings": [{**finding(file="a.py", line=1), "verdict": "refuted"}]}]
+    )
+    assert 'status="refuted"' in block and 'status="open"' not in block
+
+
 def test_no_history_renders_nothing():
     assert render_prior_requests([]) == ""
     assert render_prior_requests([{"verdict": PASS, "findings": []}]) == ""

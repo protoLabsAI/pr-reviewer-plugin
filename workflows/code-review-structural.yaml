@@ -508,7 +508,7 @@ steps:
 
       If the prior-requests block below is non-empty, then BEFORE the findings
       JSON emit a fenced ```json block of dispositions — one row per prior
-      **blocker or major**, no exceptions:
+      **blocker or major** whose `status` is `open`, no exceptions:
 
       ```json
       [{"prior": "path/to/file.py:42", "disposition": "fixed", "why": "the new
@@ -524,6 +524,15 @@ steps:
       a clean PASS, the standing block lifted, and the defect merged 44 seconds
       later. "I didn't see it this time" is not a disposition — if you cannot
       tell whether it was fixed, say `open` and let the next round settle it.
+
+      Each request carries a `status`: `open` (the latest round still carries
+      it — these are the panel's standing items), `refuted` (this panel's own
+      verifier refuted it), or `not-in-latest-round` (raised once, since
+      cleared or dropped). Only `open` rows are standing items. The other two
+      are history, kept so you can answer "did we ask for this?" — do not list
+      them as standing, outstanding or unresolved in the brief, and do not owe
+      them a disposition. If the current diff shows one of them is a live
+      defect again, report it as a finding on its own evidence.
 
       ## Prior requests
       <prior_requests>
