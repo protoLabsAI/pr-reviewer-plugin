@@ -1417,11 +1417,14 @@ class Dispatcher:
                 self.telemetry.emit("drop", repo=repo, pr=pr, sha=head, reason=DROP_PAUSED)
                 return f"drop:{DROP_PAUSED}"
         paths = await self._changed_paths(repo, pr)
-        fires, reasons = structural_trigger(
-            changed_files=int(facts.get("changed_files") or len(paths)),
-            lines_changed=int(facts.get("additions") or 0) + int(facts.get("deletions") or 0),
-            changed_paths=paths,
-        )
+        # The PR's size rides on the dispatch / reviewed / exhaustion rows: a PR too large for
+        # the lanes' budgets exhausts on every head (issue #116), and a "too large" threshold
+        # can only be measured, not guessed — nothing recorded size against outcome before.
+        size = {
+            "changed_files": int(facts.get("changed_files") or len(paths)),
+            "lines_changed": int(facts.get("additions") or 0) + int(facts.get("deletions") or 0),
+        }
+        fires, reasons = structural_trigger(**size, changed_paths=paths)
         recipe = "code-review-structural" if fires else "code-review"
 
         ours = await self._our_reviews(repo, pr)
@@ -1488,6 +1491,7 @@ class Dispatcher:
             trigger_reasons=reasons,
             delta=bool(prior_findings),
             round=round_number,
+            **size,
         )
         # Open the `protoReview` check the moment we commit to a panel — every drop/skip
         # gate is already behind us (r5), so this fires for exactly the reviews that run
@@ -1600,7 +1604,7 @@ class Dispatcher:
                 head_sha=head,
             )
             self.telemetry.emit(
-                "exhaustion", repo=repo, pr=pr, sha=head, failed=failed, attempts=self.panel_retries + 1
+                "exhaustion", repo=repo, pr=pr, sha=head, failed=failed, attempts=self.panel_retries + 1, **size
             )
             return "error:panel-exhausted"
         if undelivered:
@@ -1629,7 +1633,14 @@ class Dispatcher:
                 head_sha=head,
             )
             self.telemetry.emit(
-                "exhaustion", repo=repo, pr=pr, sha=head, failed=[], undelivered=undelivered, attempts=attempts
+                "exhaustion",
+                repo=repo,
+                pr=pr,
+                sha=head,
+                failed=[],
+                undelivered=undelivered,
+                attempts=attempts,
+                **size,
             )
             return "error:panel-incomplete"
 
@@ -1844,6 +1855,7 @@ class Dispatcher:
             recipe=recipe,
             verdict=verdict,
             round=round_number,
+            **size,
             findings=len(findings),
             notes=len(notes),
             held=bool(dropped_finding) or bool(unaccounted),
