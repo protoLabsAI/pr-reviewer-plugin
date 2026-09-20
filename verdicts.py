@@ -386,7 +386,13 @@ def finder_completed(output: str) -> bool:
     return FINDER_REVIEWED in text
 
 
-def structural_relay_ok(output: str, unavailable_prefix: str) -> bool:
+def mentions_any(text: str, markers: str | tuple[str, ...]) -> bool:
+    """Is any of `markers` in `text`? A bare string is one marker; empty markers never match."""
+    options = (markers,) if isinstance(markers, str) else tuple(markers or ())
+    return any(m and m in (text or "") for m in options)
+
+
+def structural_relay_ok(output: str, unavailable_prefix: str | tuple[str, ...]) -> bool:
     """Did the structural finder actually relay a findings block or a proper Gap?
 
     Its contract (subagents.py) is narrower than the four LLM finders' — call
@@ -399,7 +405,7 @@ def structural_relay_ok(output: str, unavailable_prefix: str) -> bool:
     UNAVAILABLE text, so it read as a normal, complete, empty-ish pass.
     """
     text = output or ""
-    if unavailable_prefix in text:
+    if mentions_any(text, unavailable_prefix):
         return True
     return bool(_FINDINGS_FENCE_RE.search(text))
 
@@ -445,18 +451,18 @@ def findings_payload_present(output: str) -> bool:
     return False
 
 
-def _lane_delivered(output: str, timed_out: bool, unavailable_prefix: str) -> bool:
+def _lane_delivered(output: str, timed_out: bool, unavailable_prefix: str | tuple[str, ...]) -> bool:
     """Did this lane hand the synthesizer a findings payload it stands behind? The
     engine's timeout Gap and the structural relay's UNAVAILABLE Gap both carry a synthetic
     `[]` for a pass that never happened, and a lane that declares `FINDER_STATUS: blocked`
     has said its array covers nothing — none of those is a delivery."""
-    if timed_out or FINDER_BLOCKED_PREFIX in output or (unavailable_prefix and unavailable_prefix in output):
+    if timed_out or FINDER_BLOCKED_PREFIX in output or mentions_any(output, unavailable_prefix):
         return False
     return findings_payload_present(output)
 
 
 def undelivered_stages(
-    output: str, steps: dict | None, degraded: list[str] | None, unavailable_prefix: str
+    output: str, steps: dict | None, degraded: list[str] | None, unavailable_prefix: str | tuple[str, ...]
 ) -> list[str]:
     """The stage boundaries at which this round's findings payload never arrived, in
     pipeline order — empty when every boundary delivered (an explicit `[]` included).

@@ -1238,6 +1238,41 @@ async def test_a_structural_gateway_failure_stamps_complete_false_and_caps_the_p
     assert "came back clean" not in body
 
 
+async def test_a_relay_that_obeys_the_tool_still_reads_as_a_structural_outage(tmp_path):
+    # The tool tells the relay to write the Gap line and an empty array INSTEAD of echoing
+    # its own text, so a faithful relay's reply has no "PROTOPATCH UNAVAILABLE" in it. Knowing
+    # only that prefix, the gate read the empty array as a clean structural pass: live, 33
+    # rounds with protoPatch down were recorded complete and 22 of them auto-approved. This
+    # is the reply verbatim (mythxengine#807, 2026-09-19).
+    gh = _structural_gh()
+    obedient = _lane(
+        "find_structural",
+        "Gap: structural pass unavailable — clawpatch exit 4 (gateway provider failure: auth, HTTP "
+        "error, or an unusable model reply): ors=2\n\n```json\n[]\n```",
+    )
+    assert "PROTOPATCH UNAVAILABLE" not in obedient
+
+    async def runner(name, inputs):
+        return {"output": CLEAN_REPORT, "failed": [], "steps": _panel_steps(find_structural=obedient)}
+
+    d = make(tmp_path, cfg={"shadow_mode": False}, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "reviewed:WARN"  # not a clean PASS
+    body = gh.reviews_posted[0]["body"]
+    assert "complete=false" in body  # so the promotion gate will not auto-approve it
+    assert "`find_structural` (structural pass unavailable or cut short)" in body
+    (row,) = _telemetry_events(tmp_path, "reviewed")
+    assert row["structural_unavailable"] is True and row["complete"] is False
+
+
+def test_the_gap_line_the_tool_prescribes_is_the_one_the_gate_recognises():
+    # One constant on both sides, so the instruction and the detector cannot drift apart.
+    from pr_reviewer.protopatch import GAP_LINE_PREFIX, STRUCTURAL_GAP_MARKERS, UNAVAILABLE_PREFIX, unavailable
+
+    text = unavailable("clone failed")
+    assert f"`{GAP_LINE_PREFIX} — clone failed`" in text and text.startswith(UNAVAILABLE_PREFIX)
+    assert set(STRUCTURAL_GAP_MARKERS) == {UNAVAILABLE_PREFIX, GAP_LINE_PREFIX}
+
+
 # ── a lane that did not run is visible, and is not a clean PASS (#117) ─────────
 
 
@@ -2089,6 +2124,7 @@ async def test_sweep_backfills_a_never_reviewed_pr(tmp_path):
 
     d = make(tmp_path, cfg={"shadow_mode": False, "promotion_owner": True}, gh=gh, runner=runner)
     assert (await d.sweep_once()) == 1
+    await d.drain_backfills()  # the sweep starts the panel and moves on
     assert ran == ["1"]  # the sweep created the first review itself
     assert gh.posted and "verdict=FAIL" in gh.posted[0]["body"]
 
@@ -2148,7 +2184,53 @@ async def test_backfill_budget_bounds_one_sweep_pass(tmp_path):
 
     d = make(tmp_path, cfg={"backfill_per_pass": 2, "shadow_mode": False}, gh=gh, runner=runner)
     assert (await d.sweep_once()) == 5  # every PR still reconciled
+    await d.drain_backfills()
     assert len(ran) == 2  # but only the budgeted number of panels spent
+
+
+async def test_a_slow_backfill_does_not_hold_up_the_rest_of_the_sweep(tmp_path):
+    """The pass is the only thing that re-gates and promotes, for every PR: a 10-minute
+    panel run inline froze all of it. The sweep starts the backfill and moves on."""
+
+    class TwoPRsGH(RoutedGH):
+        async def __call__(self, args, timeout=30):
+            joined = " ".join(args)
+            if "/pulls?" in joined:
+                self.calls.append(args)
+                return 0, "[1, 2]", ""
+            return await super().__call__(args, timeout)
+
+    release = asyncio.Event()
+    started = []
+
+    async def runner(name, inputs):
+        started.append(inputs["pr"])
+        await release.wait()  # a panel that never finishes on its own
+        return {"output": REPORT, "failed": []}
+
+    gh = TwoPRsGH(pr_facts=facts(), reviews=[])
+    d = make(tmp_path, cfg={"backfill_per_pass": 1, "shadow_mode": False}, gh=gh, runner=runner)
+    assert (await asyncio.wait_for(d.sweep_once(), timeout=5)) == 2  # returned with the panel still running
+    await asyncio.sleep(0)
+    assert len(d._backfills) == 1
+    # A second pass while it runs: the cap is full, so nothing new starts and nothing blocks.
+    assert (await asyncio.wait_for(d.sweep_once(), timeout=5)) == 2
+    assert len(d._backfills) == 1
+    release.set()
+    await d.drain_backfills()
+    assert len(started) == 1 and not d._backfills  # one panel, never a duplicate
+
+
+async def test_a_detached_backfill_that_raises_is_logged_not_lost(tmp_path, caplog):
+    d = make(tmp_path, gh=RoutedGH(pr_facts=facts(), reviews=[]))
+
+    async def boom(repo, pr, head):
+        raise RuntimeError("panel blew up")
+
+    d.backfill_review = boom
+    assert d._detach_backfill("o/r", 1, HEAD) == "backfill:started"
+    await d.drain_backfills()
+    assert not d._backfills and "detached backfill of o/r#1 failed" in caplog.text
 
 
 async def test_reconcile_prefers_regate_over_promotion_on_the_same_pass(tmp_path):
@@ -3080,6 +3162,30 @@ def _telemetry_events(path, event):
     return [r for r in rows if r.get("event") == event]
 
 
+async def test_pr_size_rides_on_the_dispatch_reviewed_and_exhaustion_rows(tmp_path):
+    # Issue #116: a PR too large for the lanes exhausts on every head, and nothing recorded
+    # size against outcome — so a "too large" threshold could only be guessed.
+    size = {"changed_files": 61, "lines_changed": 15514}
+    big = facts(changed_files=61, additions=15392, deletions=122)
+
+    async def clean(name, inputs):
+        return {"output": REPORT, "failed": []}
+
+    d = make(tmp_path / "ok", gh=RoutedGH(pr_facts=big), runner=clean)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")).startswith("reviewed:")
+    for event in ("dispatch", "reviewed"):
+        (row,) = _telemetry_events(tmp_path / "ok", event)
+        assert {k: row[k] for k in size} == size, event
+
+    async def dead(name, inputs):
+        return {"output": "partial", "failed": ["find_correctness"]}
+
+    d = make(tmp_path / "dead", gh=RoutedGH(pr_facts=big), runner=dead, inbox=lambda text, **kw: None)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "error:panel-exhausted"
+    (row,) = _telemetry_events(tmp_path / "dead", "exhaustion")
+    assert {k: row[k] for k in size} == size
+
+
 async def test_a_mistyped_viewer_login_holds_instead_of_re_reviewing(tmp_path):
     # Our own reviews arrive under an App login that is not `viewer_login`. Read as "no
     # reviews", every head would look unreviewed: the sweep would backfill and the event
@@ -3390,6 +3496,38 @@ async def test_push_capped_after_max_rounds_posts_comment_and_drops(tmp_path):
     assert len(comments) == 1
     assert "Review cap reached" in comments[0]["body"]
     assert "<!-- protoagent-qa-max-rounds" in comments[0]["body"]
+
+
+async def test_incomplete_rounds_do_not_spend_the_cap(tmp_path):
+    """A round that lost a lane is the panel's failure, not a push the author spent (#130):
+    mythxengine#830's fix push was capped because flaky lanes had eaten its budget."""
+    reviews = [review_row(OLD_HEAD, "WARN", complete=False), review_row(MID_HEAD, "WARN", complete=False)]
+    gh = RoutedGH(pr_facts=facts(), reviews=reviews)
+    ran = []
+
+    async def runner(name, inputs):
+        ran.append(name)
+        return {"output": REPORT, "failed": []}
+
+    d = make(tmp_path, cfg={"max_rounds": 2}, gh=gh, runner=runner)
+    out = await d.handle_pr_event("o/r", 1, HEAD, "synchronize")
+    assert out != "drop:max-rounds-capped"
+    assert ran  # the panel ran: two incomplete rounds did not use up a cap of two
+
+
+async def test_incomplete_rounds_still_hit_a_hard_ceiling(tmp_path):
+    """The cap is a flood guard, and a flood of pushes whose panels keep failing is still a flood."""
+    heads = [f"{i:x}" * 40 for i in range(1, 5)]
+    gh = RoutedGH(pr_facts=facts(), reviews=[review_row(h, "WARN", complete=False) for h in heads])
+    ran = []
+
+    async def runner(name, inputs):
+        ran.append(name)
+        return {"output": REPORT, "failed": []}
+
+    d = make(tmp_path, cfg={"max_rounds": 2}, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "synchronize")) == "drop:max-rounds-capped"
+    assert ran == []
 
 
 async def test_subsequent_push_drops_early_without_comment(tmp_path):

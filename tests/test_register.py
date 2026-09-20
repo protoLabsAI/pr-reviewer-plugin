@@ -84,3 +84,48 @@ def test_app_auth_surface_registers_only_when_configured(monkeypatch, no_app_env
     # app-auth registers BEFORE sweep so the installation token exists before the
     # sweep's first repo enumeration runs (issue #99).
     assert [s["name"] for s in reg2.surfaces] == ["pr-reviewer-app-auth", "pr-reviewer-sweep"]
+
+
+# ── the structural relay declares what a finished answer contains (protoAgent#3553) ──
+
+
+def test_the_relay_contract_rejects_a_paraphrased_payload():
+    from pr_reviewer.subagents import relay_delivered
+
+    # Verbatim from a live run (pr-reviewer-plugin#133, 2026-09-20): protoPatch returned
+    # three findings and the relay re-wrote them as a report. No array, so they were lost.
+    paraphrase = (
+        "## Protopatch Findings — `dispatch.py` & `tests/test_dispatch.py`\n\n"
+        "**Scope:** 6 changed files · 3 reportable findings · all high-confidence\n\n---\n\n"
+        "### 1. 🔹 `dispatch.py:493` — API Contract (minor)\n\n"
+        "**Claim:** Unresolved review-thread count ignores GraphQL pagination."
+    )
+    assert not relay_delivered(paraphrase)
+    assert not relay_delivered("I will relay the ```json array now.")  # an unclosed fence is not a payload
+    assert not relay_delivered("")
+    assert relay_delivered('head abc · 3 findings\n\n```json\n[{"file": "dispatch.py", "line": 493}]\n```')
+    # The Gap reply is a complete answer too: the outage is reported, not dropped.
+    assert relay_delivered("Gap: structural pass unavailable — clone failed\n\n```json\n[]\n```")
+
+
+def test_the_relay_gets_the_contract_only_on_a_host_that_has_the_fields():
+    from dataclasses import dataclass
+    from typing import Any
+
+    from pr_reviewer.subagents import _completion_contract, relay_delivered
+
+    @dataclass
+    class NewHost:
+        name: str = ""
+        completion_check: Any = None
+        completion_contract: str = ""
+
+    @dataclass
+    class OldHost:  # rejects unknown kwargs — the plugin must not pass them
+        name: str = ""
+
+    fields = _completion_contract(NewHost)
+    assert fields["completion_check"] is relay_delivered and "verbatim" in fields["completion_contract"]
+    NewHost(name="structural-finder", **fields)
+    assert _completion_contract(OldHost) == {}
+    OldHost(name="structural-finder", **_completion_contract(OldHost))

@@ -42,7 +42,7 @@ from .grounding import (
     render_grounding_footnote,
     render_unreadable_footnote,
 )
-from .protopatch import UNAVAILABLE_PREFIX
+from .protopatch import STRUCTURAL_GAP_MARKERS
 from .rounds import (
     DEFAULT_CONVERGENCE_ROUNDS,
     converge,
@@ -57,6 +57,7 @@ from .rounds import (
     render_prior_requests,
     render_promotion_findings,
     render_unaccounted_note,
+    round_cap_reached,
     unaccounted_priors,
     unexplained_clearance,
 )
@@ -73,6 +74,7 @@ from .verdicts import (
     demote_stale_findings,
     extract_brief,
     finder_completed,
+    mentions_any,
     merge_carried_findings,
     parse_verdict_marker,
     render_verdict_body,
@@ -335,6 +337,9 @@ REGATE_MAX_FAILURES = 3
 # actions only fire for LIVE events, so anything opened before the reviewer existed
 # (or while it was down, or that exhausted its panel) never gets a first review.
 BACKFILL_ACTION = "sweep-backfill"
+# `reconcile_pr` outcomes for a backfill the sweep did not wait for (`_detach_backfill`).
+BACKFILL_STARTED = "backfill:started"
+BACKFILL_DEFERRED = "backfill:deferred"  # the per-pass cap of outstanding backfills is full
 
 # How long an enumerated GitHub App installation scope is reused before re-reading it.
 # The sweep ticks every ~3 min and installation membership changes rarely, so this
@@ -472,6 +477,11 @@ class Dispatcher:
         self._post_failures: dict[str, int] = {}  # repo#pr@head -> NON-transient verdict-post refusals
         self._viewer_checked = False  # viewer_login vs our reviews' real author, warned once
         self._round_cap: dict[str, float] = {}  # repo#pr -> monotonic timestamp when capped
+        # Backfill panels the sweep started and did not wait for (`_detach_backfill`). Held
+        # here so the tasks are not garbage-collected mid-run, and counted against
+        # `backfill_per_pass` so successive passes cannot pile an unbounded queue onto the
+        # panel semaphore.
+        self._backfills: set[asyncio.Task] = set()
         self._installation_repos: list[str] = []  # last good App-installation scope
         self._installation_repos_at: float = 0.0
         # The cross-PR panel cap (#96) is a WEBHOOK-LAYER concern: build_routers sizes an
@@ -817,8 +827,8 @@ class Dispatcher:
         """Post a visible notice that the push-triggered review cap has been hit — fail-open."""
         cooldown_h = self.max_rounds_cooldown_s // 3600
         body = (
-            f"🛑 **Review cap reached** — this PR has had {self.max_rounds} automated review "
-            f"round(s). Further pushes will not trigger new reviews.\n\n"
+            f"🛑 **Review cap reached** — this PR has used its budget of {self.max_rounds} complete "
+            f"automated review round(s). Further pushes will not trigger new reviews.\n\n"
             f"The cap resets when:\n"
             f"- The PR is marked **ready-for-review**\n"
             f"- An operator runs `@vera review` (manual summon)\n"
@@ -1439,11 +1449,14 @@ class Dispatcher:
                 self.telemetry.emit("drop", repo=repo, pr=pr, sha=head, reason=DROP_PAUSED)
                 return f"drop:{DROP_PAUSED}"
         paths = await self._changed_paths(repo, pr)
-        fires, reasons = structural_trigger(
-            changed_files=int(facts.get("changed_files") or len(paths)),
-            lines_changed=int(facts.get("additions") or 0) + int(facts.get("deletions") or 0),
-            changed_paths=paths,
-        )
+        # The PR's size rides on the dispatch / reviewed / exhaustion rows: a PR too large for
+        # the lanes' budgets exhausts on every head (issue #116), and a "too large" threshold
+        # can only be measured, not guessed — nothing recorded size against outcome before.
+        size = {
+            "changed_files": int(facts.get("changed_files") or len(paths)),
+            "lines_changed": int(facts.get("additions") or 0) + int(facts.get("deletions") or 0),
+        }
+        fires, reasons = structural_trigger(**size, changed_paths=paths)
         recipe = "code-review-structural" if fires else "code-review"
 
         ours = await self._our_reviews(repo, pr)
@@ -1486,7 +1499,8 @@ class Dispatcher:
         # Max-rounds cap: arm on the first push-triggered review that exceeds the limit so
         # the panel is never spent — post the notice once, then drop all subsequent pushes.
         # Backfill and summon calls pass push_triggered=False and are always exempt.
-        if push_triggered and self.max_rounds and round_number > self.max_rounds:
+        # The budget counts complete rounds (#130): see `round_cap_reached`.
+        if push_triggered and round_cap_reached(history, self.max_rounds):
             cap_key = f"{repo}#{pr}"
             self._round_cap[cap_key] = time.monotonic()
             if len(self._round_cap) > 1024:
@@ -1510,6 +1524,7 @@ class Dispatcher:
             trigger_reasons=reasons,
             delta=bool(prior_findings),
             round=round_number,
+            **size,
         )
         # Open the `protoReview` check the moment we commit to a panel — every drop/skip
         # gate is already behind us (r5), so this fires for exactly the reviews that run
@@ -1590,7 +1605,7 @@ class Dispatcher:
                 []
                 if failed
                 else undelivered_stages(
-                    str(result.get("output") or ""), steps_now, result.get("degraded"), UNAVAILABLE_PREFIX
+                    str(result.get("output") or ""), steps_now, result.get("degraded"), STRUCTURAL_GAP_MARKERS
                 )
             )
             if not failed and not undelivered:
@@ -1622,7 +1637,7 @@ class Dispatcher:
                 head_sha=head,
             )
             self.telemetry.emit(
-                "exhaustion", repo=repo, pr=pr, sha=head, failed=failed, attempts=self.panel_retries + 1
+                "exhaustion", repo=repo, pr=pr, sha=head, failed=failed, attempts=self.panel_retries + 1, **size
             )
             return "error:panel-exhausted"
         if undelivered:
@@ -1651,7 +1666,14 @@ class Dispatcher:
                 head_sha=head,
             )
             self.telemetry.emit(
-                "exhaustion", repo=repo, pr=pr, sha=head, failed=[], undelivered=undelivered, attempts=attempts
+                "exhaustion",
+                repo=repo,
+                pr=pr,
+                sha=head,
+                failed=[],
+                undelivered=undelivered,
+                attempts=attempts,
+                **size,
             )
             return "error:panel-incomplete"
 
@@ -1681,8 +1703,11 @@ class Dispatcher:
         # structural "unavailable" — which held its promotion and would cap it at WARN
         # below. A result with no `steps` at all (an older host) says nothing either way.
         structural_unavailable = "find_structural" in steps_out and (
-            UNAVAILABLE_PREFIX in structural_out
-            or ("find_structural" not in degraded and not structural_relay_ok(structural_out, UNAVAILABLE_PREFIX))
+            # Either marker: a relay that OBEYS the tool writes the Gap line and an empty
+            # array, not the tool's own prefix — which read as a clean structural pass, so
+            # 33 rounds with protoPatch down were recorded complete and 22 auto-approved.
+            mentions_any(structural_out, STRUCTURAL_GAP_MARKERS)
+            or ("find_structural" not in degraded and not structural_relay_ok(structural_out, STRUCTURAL_GAP_MARKERS))
         )
         # The four LLM finders' own completeness (#117): a finder that ran to a
         # normal-looking finish on garbage input (every file read 404ing, a crash mid-
@@ -1867,6 +1892,7 @@ class Dispatcher:
             recipe=recipe,
             verdict=verdict,
             round=round_number,
+            **size,
             findings=len(findings),
             notes=len(notes),
             held=bool(dropped_finding) or bool(unaccounted),
@@ -2751,7 +2777,41 @@ class Dispatcher:
         finally:
             self.chokepoint.done(repo, pr)
 
-    async def reconcile_pr(self, repo: str, pr: int, *, backfill_budget: int = 0) -> tuple[str, int]:
+    def _detach_backfill(self, repo: str, pr: int, head: str) -> str:
+        """Start a backfill panel WITHOUT waiting for it, so the sweep pass moves on.
+
+        A panel takes 5–15 minutes, plus however long it waits for a `panel_sem` slot. Run
+        inline, one backfill froze the whole level pass for that long — and the pass is also
+        the ONLY thing that re-gates a FAIL or promotes a clear verdict, for every PR in every
+        repo. Under a review flood the sweep went from ~80 gate decisions per 10 minutes to
+        none: complete PASS verdicts sat unpromoted for 20+ minutes behind someone else's
+        backfill, and a re-gate — "the merge-race is live NOW" — waited just as long.
+
+        Safe to detach: `backfill_review` admits through the chokepoint before its first
+        await, so a webhook or a later pass reaching the same PR drops as `in-flight`, never
+        a second panel. Outstanding backfills are capped at `backfill_per_pass`.
+        """
+        if len(self._backfills) >= max(1, self.backfill_per_pass):
+            return BACKFILL_DEFERRED
+        task = asyncio.ensure_future(self.backfill_review(repo, pr, head))
+        self._backfills.add(task)
+
+        def _settled(t: asyncio.Task) -> None:
+            self._backfills.discard(t)
+            if not t.cancelled() and t.exception() is not None:
+                log.error("[pr-reviewer] detached backfill of %s#%s failed", repo, pr, exc_info=t.exception())
+
+        task.add_done_callback(_settled)
+        return BACKFILL_STARTED
+
+    async def drain_backfills(self) -> None:
+        """Wait for every detached backfill to settle — shutdown, and tests."""
+        while self._backfills:
+            await asyncio.gather(*list(self._backfills), return_exceptions=True)
+
+    async def reconcile_pr(
+        self, repo: str, pr: int, *, backfill_budget: int = 0, detach_backfill: bool = False
+    ) -> tuple[str, int]:
         """One PR reconciled to the state its verdict implies. Returns (outcome, budget left).
 
         Order matters, and it is the cheap-and-decisive-first order:
@@ -2764,6 +2824,8 @@ class Dispatcher:
         if backfill_budget > 0:
             head = await self.needs_backfill(repo, pr)
             if head:
+                if detach_backfill:  # the sweep: see `_detach_backfill`
+                    return self._detach_backfill(repo, pr, head), backfill_budget - 1
                 return await self.backfill_review(repo, pr, head), backfill_budget - 1
         regated = await self.evaluate_regate(repo, pr)
         if regated == REGATE:
@@ -2786,7 +2848,9 @@ class Dispatcher:
                 numbers = []
             for pr in numbers if isinstance(numbers, list) else []:
                 try:
-                    _outcome, budget = await self.reconcile_pr(repo, int(pr), backfill_budget=budget)
+                    _outcome, budget = await self.reconcile_pr(
+                        repo, int(pr), backfill_budget=budget, detach_backfill=True
+                    )
                     count += 1
                 except Exception:  # noqa: BLE001
                     log.exception("[pr-reviewer] sweep reconcile failed on %s#%s", repo, pr)

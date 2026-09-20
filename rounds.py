@@ -91,6 +91,30 @@ def _escape(text: str) -> str:
     return _CLOSING_TAG_RE.sub(lambda m: f"</{m.group(1).lower()}_>", text)
 
 
+# An incomplete round is free against the cap only up to this multiple of it. The cap is
+# a flood guard, and a flood of pushes whose panels keep failing is still a flood.
+ROUND_CAP_CEILING = 2
+
+
+def round_cap_reached(history: list[dict], max_rounds: int) -> bool:
+    """Has this PR spent its push-triggered review budget? `max_rounds` 0 ⇒ never.
+
+    The budget counts COMPLETE rounds. A round that lost a lane (a finder that died, the
+    structural pass unavailable) is the panel's failure, not the author's push: it posts a
+    coverage-capped verdict the gate will not promote, so the author has to push again to
+    get a real one. Counting those locked PRs out of review on the panel's own flakiness —
+    mythxengine#830 had a complete PASS, then the push fixing a human reviewer's findings
+    was capped because incomplete rounds had eaten the budget (issue #130).
+
+    Every round still counts toward a hard ceiling of `ROUND_CAP_CEILING` × the cap, so
+    an unbounded run of incomplete rounds cannot spend the panel forever.
+    """
+    if not max_rounds:
+        return False
+    complete = sum(1 for r in history if r.get("complete", True))
+    return complete >= max_rounds or len(history) >= max_rounds * ROUND_CAP_CEILING
+
+
 def panel_rounds(reviews: list[dict]) -> list[dict]:
     """Our posted reviews → the ROUNDS the panel actually spent, oldest→newest.
 

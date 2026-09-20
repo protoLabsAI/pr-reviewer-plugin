@@ -20,6 +20,7 @@ from pr_reviewer.rounds import (
     render_notes_section,
     render_prior_requests,
     render_unaccounted_note,
+    round_cap_reached,
     unaccounted_priors,
     unexplained_clearance,
 )
@@ -841,3 +842,23 @@ def test_ungrounded_flag_survives_round_recall_and_is_still_excluded():
     history = panel_rounds(reviews)
     assert history[0]["findings"][0].get("ungrounded") is True
     assert unaccounted_priors(history, [dispo("unrelated.py:1", "fixed")]) == []
+
+
+# ── the round cap counts complete rounds (issue #130) ─────────────────────────
+
+
+def _round(complete=True):
+    return {"head": "h", "verdict": "WARN", "findings": [], "complete": complete}
+
+
+def test_round_cap_counts_complete_rounds_only():
+    assert not round_cap_reached([], 2)
+    assert not round_cap_reached([_round(), _round(False), _round(False)], 2)
+    assert round_cap_reached([_round(), _round(False), _round()], 2)
+    assert round_cap_reached([{"head": "h"}, {"head": "i"}], 2)  # no `complete` key ⇒ complete
+
+
+def test_round_cap_has_a_ceiling_and_an_off_switch():
+    assert round_cap_reached([_round(False)] * 4, 2)  # 2 × the cap, all incomplete
+    assert not round_cap_reached([_round(False)] * 3, 2)
+    assert not round_cap_reached([_round()] * 50, 0)  # 0 disables the cap
