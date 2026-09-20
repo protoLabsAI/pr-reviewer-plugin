@@ -2089,6 +2089,7 @@ async def test_sweep_backfills_a_never_reviewed_pr(tmp_path):
 
     d = make(tmp_path, cfg={"shadow_mode": False, "promotion_owner": True}, gh=gh, runner=runner)
     assert (await d.sweep_once()) == 1
+    await d.drain_backfills()  # the sweep starts the panel and moves on
     assert ran == ["1"]  # the sweep created the first review itself
     assert gh.posted and "verdict=FAIL" in gh.posted[0]["body"]
 
@@ -2148,7 +2149,53 @@ async def test_backfill_budget_bounds_one_sweep_pass(tmp_path):
 
     d = make(tmp_path, cfg={"backfill_per_pass": 2, "shadow_mode": False}, gh=gh, runner=runner)
     assert (await d.sweep_once()) == 5  # every PR still reconciled
+    await d.drain_backfills()
     assert len(ran) == 2  # but only the budgeted number of panels spent
+
+
+async def test_a_slow_backfill_does_not_hold_up_the_rest_of_the_sweep(tmp_path):
+    """The pass is the only thing that re-gates and promotes, for every PR: a 10-minute
+    panel run inline froze all of it. The sweep starts the backfill and moves on."""
+
+    class TwoPRsGH(RoutedGH):
+        async def __call__(self, args, timeout=30):
+            joined = " ".join(args)
+            if "/pulls?" in joined:
+                self.calls.append(args)
+                return 0, "[1, 2]", ""
+            return await super().__call__(args, timeout)
+
+    release = asyncio.Event()
+    started = []
+
+    async def runner(name, inputs):
+        started.append(inputs["pr"])
+        await release.wait()  # a panel that never finishes on its own
+        return {"output": REPORT, "failed": []}
+
+    gh = TwoPRsGH(pr_facts=facts(), reviews=[])
+    d = make(tmp_path, cfg={"backfill_per_pass": 1, "shadow_mode": False}, gh=gh, runner=runner)
+    assert (await asyncio.wait_for(d.sweep_once(), timeout=5)) == 2  # returned with the panel still running
+    await asyncio.sleep(0)
+    assert len(d._backfills) == 1
+    # A second pass while it runs: the cap is full, so nothing new starts and nothing blocks.
+    assert (await asyncio.wait_for(d.sweep_once(), timeout=5)) == 2
+    assert len(d._backfills) == 1
+    release.set()
+    await d.drain_backfills()
+    assert len(started) == 1 and not d._backfills  # one panel, never a duplicate
+
+
+async def test_a_detached_backfill_that_raises_is_logged_not_lost(tmp_path, caplog):
+    d = make(tmp_path, gh=RoutedGH(pr_facts=facts(), reviews=[]))
+
+    async def boom(repo, pr, head):
+        raise RuntimeError("panel blew up")
+
+    d.backfill_review = boom
+    assert d._detach_backfill("o/r", 1, HEAD) == "backfill:started"
+    await d.drain_backfills()
+    assert not d._backfills and "detached backfill of o/r#1 failed" in caplog.text
 
 
 async def test_reconcile_prefers_regate_over_promotion_on_the_same_pass(tmp_path):

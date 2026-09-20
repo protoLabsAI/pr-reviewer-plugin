@@ -331,6 +331,9 @@ REGATE_MAX_FAILURES = 3
 # actions only fire for LIVE events, so anything opened before the reviewer existed
 # (or while it was down, or that exhausted its panel) never gets a first review.
 BACKFILL_ACTION = "sweep-backfill"
+# `reconcile_pr` outcomes for a backfill the sweep did not wait for (`_detach_backfill`).
+BACKFILL_STARTED = "backfill:started"
+BACKFILL_DEFERRED = "backfill:deferred"  # the per-pass cap of outstanding backfills is full
 
 # How long an enumerated GitHub App installation scope is reused before re-reading it.
 # The sweep ticks every ~3 min and installation membership changes rarely, so this
@@ -468,6 +471,11 @@ class Dispatcher:
         self._post_failures: dict[str, int] = {}  # repo#pr@head -> NON-transient verdict-post refusals
         self._viewer_checked = False  # viewer_login vs our reviews' real author, warned once
         self._round_cap: dict[str, float] = {}  # repo#pr -> monotonic timestamp when capped
+        # Backfill panels the sweep started and did not wait for (`_detach_backfill`). Held
+        # here so the tasks are not garbage-collected mid-run, and counted against
+        # `backfill_per_pass` so successive passes cannot pile an unbounded queue onto the
+        # panel semaphore.
+        self._backfills: set[asyncio.Task] = set()
         self._installation_repos: list[str] = []  # last good App-installation scope
         self._installation_repos_at: float = 0.0
         # The cross-PR panel cap (#96) is a WEBHOOK-LAYER concern: build_routers sizes an
@@ -2740,7 +2748,41 @@ class Dispatcher:
         finally:
             self.chokepoint.done(repo, pr)
 
-    async def reconcile_pr(self, repo: str, pr: int, *, backfill_budget: int = 0) -> tuple[str, int]:
+    def _detach_backfill(self, repo: str, pr: int, head: str) -> str:
+        """Start a backfill panel WITHOUT waiting for it, so the sweep pass moves on.
+
+        A panel takes 5–15 minutes, plus however long it waits for a `panel_sem` slot. Run
+        inline, one backfill froze the whole level pass for that long — and the pass is also
+        the ONLY thing that re-gates a FAIL or promotes a clear verdict, for every PR in every
+        repo. Under a review flood the sweep went from ~80 gate decisions per 10 minutes to
+        none: complete PASS verdicts sat unpromoted for 20+ minutes behind someone else's
+        backfill, and a re-gate — "the merge-race is live NOW" — waited just as long.
+
+        Safe to detach: `backfill_review` admits through the chokepoint before its first
+        await, so a webhook or a later pass reaching the same PR drops as `in-flight`, never
+        a second panel. Outstanding backfills are capped at `backfill_per_pass`.
+        """
+        if len(self._backfills) >= max(1, self.backfill_per_pass):
+            return BACKFILL_DEFERRED
+        task = asyncio.ensure_future(self.backfill_review(repo, pr, head))
+        self._backfills.add(task)
+
+        def _settled(t: asyncio.Task) -> None:
+            self._backfills.discard(t)
+            if not t.cancelled() and t.exception() is not None:
+                log.error("[pr-reviewer] detached backfill of %s#%s failed", repo, pr, exc_info=t.exception())
+
+        task.add_done_callback(_settled)
+        return BACKFILL_STARTED
+
+    async def drain_backfills(self) -> None:
+        """Wait for every detached backfill to settle — shutdown, and tests."""
+        while self._backfills:
+            await asyncio.gather(*list(self._backfills), return_exceptions=True)
+
+    async def reconcile_pr(
+        self, repo: str, pr: int, *, backfill_budget: int = 0, detach_backfill: bool = False
+    ) -> tuple[str, int]:
         """One PR reconciled to the state its verdict implies. Returns (outcome, budget left).
 
         Order matters, and it is the cheap-and-decisive-first order:
@@ -2753,6 +2795,8 @@ class Dispatcher:
         if backfill_budget > 0:
             head = await self.needs_backfill(repo, pr)
             if head:
+                if detach_backfill:  # the sweep: see `_detach_backfill`
+                    return self._detach_backfill(repo, pr, head), backfill_budget - 1
                 return await self.backfill_review(repo, pr, head), backfill_budget - 1
         regated = await self.evaluate_regate(repo, pr)
         if regated == REGATE:
@@ -2775,7 +2819,9 @@ class Dispatcher:
                 numbers = []
             for pr in numbers if isinstance(numbers, list) else []:
                 try:
-                    _outcome, budget = await self.reconcile_pr(repo, int(pr), backfill_budget=budget)
+                    _outcome, budget = await self.reconcile_pr(
+                        repo, int(pr), backfill_budget=budget, detach_backfill=True
+                    )
                     count += 1
                 except Exception:  # noqa: BLE001
                     log.exception("[pr-reviewer] sweep reconcile failed on %s#%s", repo, pr)
