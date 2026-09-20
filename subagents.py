@@ -15,6 +15,41 @@ test suite imports this module with no host present.
 from __future__ import annotations
 
 
+def relay_delivered(text: str) -> bool:
+    """Did the relay hand over a payload the panel can read — a CLOSED fenced JSON array
+    (the findings, or the `[]` that goes with a Gap line)?
+
+    The relay's whole contract is "call the tool once, relay the fenced array verbatim",
+    and on 23% of structural runs the model instead re-wrote protoPatch's findings as a
+    markdown report ("## Protopatch Review … ### 1. `dispatch.py:493` — minor"): no array,
+    so the findings were lost and the lane read as unavailable. Same test as
+    `verdicts.structural_relay_ok`'s fence check, asked while the run can still be fixed.
+    """
+    from .verdicts import _FINDINGS_FENCE_RE
+
+    return bool(_FINDINGS_FENCE_RE.search(text or ""))
+
+
+def _completion_contract(config_cls) -> dict:
+    """The completion-guard fields, when the host has them (protoAgent#3553).
+
+    With them, a relay turn that ends without the array is sent back to the model — one
+    extra call instead of a lost structural lane. An older host's `SubagentConfig` rejects
+    unknown kwargs, so there the fields are left out and the relay behaves as before.
+    """
+    fields = getattr(config_cls, "__dataclass_fields__", None)
+    if fields is not None and "completion_check" not in fields:
+        return {}
+    return {
+        "completion_check": relay_delivered,
+        "completion_contract": (
+            "the fenced ```json array exactly as protopatch_review returned it (or the Gap line and an "
+            "empty ```json [] array if it was unavailable) — relay it verbatim; do not summarise, "
+            "re-format or re-grade the findings"
+        ),
+    }
+
+
 def get_subagents() -> list:
     from graph.subagents.config import SubagentConfig
 
@@ -55,5 +90,6 @@ that edits its payload corrupts the panel. A clean (empty) result is a good resu
         # stray second call; tests/test_structural_budget.py drives the real graph.
         max_turns=10,
         allow_skill_emission=False,
+        **_completion_contract(SubagentConfig),
     )
     return [structural_finder]
