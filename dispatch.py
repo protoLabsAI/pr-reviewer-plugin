@@ -42,7 +42,7 @@ from .grounding import (
     render_grounding_footnote,
     render_unreadable_footnote,
 )
-from .protopatch import UNAVAILABLE_PREFIX
+from .protopatch import STRUCTURAL_GAP_MARKERS
 from .rounds import (
     DEFAULT_CONVERGENCE_ROUNDS,
     converge,
@@ -73,6 +73,7 @@ from .verdicts import (
     demote_stale_findings,
     extract_brief,
     finder_completed,
+    mentions_any,
     merge_carried_findings,
     parse_verdict_marker,
     render_verdict_body,
@@ -1580,7 +1581,7 @@ class Dispatcher:
                 []
                 if failed
                 else undelivered_stages(
-                    str(result.get("output") or ""), steps_now, result.get("degraded"), UNAVAILABLE_PREFIX
+                    str(result.get("output") or ""), steps_now, result.get("degraded"), STRUCTURAL_GAP_MARKERS
                 )
             )
             if not failed and not undelivered:
@@ -1678,8 +1679,11 @@ class Dispatcher:
         # structural "unavailable" — which held its promotion and would cap it at WARN
         # below. A result with no `steps` at all (an older host) says nothing either way.
         structural_unavailable = "find_structural" in steps_out and (
-            UNAVAILABLE_PREFIX in structural_out
-            or ("find_structural" not in degraded and not structural_relay_ok(structural_out, UNAVAILABLE_PREFIX))
+            # Either marker: a relay that OBEYS the tool writes the Gap line and an empty
+            # array, not the tool's own prefix — which read as a clean structural pass, so
+            # 33 rounds with protoPatch down were recorded complete and 22 auto-approved.
+            mentions_any(structural_out, STRUCTURAL_GAP_MARKERS)
+            or ("find_structural" not in degraded and not structural_relay_ok(structural_out, STRUCTURAL_GAP_MARKERS))
         )
         # The four LLM finders' own completeness (#117): a finder that ran to a
         # normal-looking finish on garbage input (every file read 404ing, a crash mid-

@@ -1238,6 +1238,41 @@ async def test_a_structural_gateway_failure_stamps_complete_false_and_caps_the_p
     assert "came back clean" not in body
 
 
+async def test_a_relay_that_obeys_the_tool_still_reads_as_a_structural_outage(tmp_path):
+    # The tool tells the relay to write the Gap line and an empty array INSTEAD of echoing
+    # its own text, so a faithful relay's reply has no "PROTOPATCH UNAVAILABLE" in it. Knowing
+    # only that prefix, the gate read the empty array as a clean structural pass: live, 33
+    # rounds with protoPatch down were recorded complete and 22 of them auto-approved. This
+    # is the reply verbatim (mythxengine#807, 2026-09-19).
+    gh = _structural_gh()
+    obedient = _lane(
+        "find_structural",
+        "Gap: structural pass unavailable — clawpatch exit 4 (gateway provider failure: auth, HTTP "
+        "error, or an unusable model reply): ors=2\n\n```json\n[]\n```",
+    )
+    assert "PROTOPATCH UNAVAILABLE" not in obedient
+
+    async def runner(name, inputs):
+        return {"output": CLEAN_REPORT, "failed": [], "steps": _panel_steps(find_structural=obedient)}
+
+    d = make(tmp_path, cfg={"shadow_mode": False}, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "reviewed:WARN"  # not a clean PASS
+    body = gh.reviews_posted[0]["body"]
+    assert "complete=false" in body  # so the promotion gate will not auto-approve it
+    assert "`find_structural` (structural pass unavailable or cut short)" in body
+    (row,) = _telemetry_events(tmp_path, "reviewed")
+    assert row["structural_unavailable"] is True and row["complete"] is False
+
+
+def test_the_gap_line_the_tool_prescribes_is_the_one_the_gate_recognises():
+    # One constant on both sides, so the instruction and the detector cannot drift apart.
+    from pr_reviewer.protopatch import GAP_LINE_PREFIX, STRUCTURAL_GAP_MARKERS, UNAVAILABLE_PREFIX, unavailable
+
+    text = unavailable("clone failed")
+    assert f"`{GAP_LINE_PREFIX} — clone failed`" in text and text.startswith(UNAVAILABLE_PREFIX)
+    assert set(STRUCTURAL_GAP_MARKERS) == {UNAVAILABLE_PREFIX, GAP_LINE_PREFIX}
+
+
 # ── a lane that did not run is visible, and is not a clean PASS (#117) ─────────
 
 
