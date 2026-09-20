@@ -155,6 +155,10 @@ LLM_FINDER_STEPS = ("find_correctness", "find_removed_behavior", "find_crossfile
 # missing marked every small-diff review incomplete.
 STATUS_LINE_RECIPES = frozenset({"code-review-structural"})
 
+# Compare calls one round may spend re-proving carried findings against the heads they
+# were raised at (`_since_ranges`). Carried findings of one PR share a handful of heads.
+SINCE_RANGES_LIMIT = 4
+
 
 def ineligible_reason(facts: dict | None) -> str | None:
     """Why this PR cannot be reviewed, or None if it can.
@@ -1173,6 +1177,24 @@ class Dispatcher:
             sources[file] = (blob, combined)
         return sources
 
+    async def _since_ranges(self, repo: str, history: list[dict], head: str) -> dict[str, dict | None]:
+        """`{raised-at head: delta from it to `head`}` for the carried findings of the last
+        substantive round (issue #131), so a `fixed` on a finding carried across rounds is
+        checked against everything pushed since it was RAISED. Only heads older than the
+        prior round's are fetched — that one is `ranges` already — and at most
+        `SINCE_RANGES_LIMIT` compares are spent; an unread head falls back to `ranges`."""
+        carried = next((r for r in reversed(history) if r.get("findings")), None)
+        if carried is None:
+            return {}
+        # A finding with no `since` was raised by this round itself (`unaccounted_priors`
+        # stamps it the same way) — which is older than the prior round when the rounds
+        # after it raised nothing.
+        raised_at = (
+            str(f.get("since") or carried.get("head") or "") for f in carried["findings"] if isinstance(f, dict)
+        )
+        heads = [h for h in dict.fromkeys(raised_at) if h and h != history[-1].get("head")]
+        return {h: await self._delta_ranges(repo, h, head) for h in heads[:SINCE_RANGES_LIMIT]}
+
     async def _delta_ranges(self, repo: str, base: str, head: str) -> dict | None:
         """Line ranges that moved between two reviewed heads, or None (unreadable).
 
@@ -1756,7 +1778,8 @@ class Dispatcher:
         # so it isn't trusted.
         if dispositions and ranges is None and prior:
             ranges = await self._delta_ranges(repo, prior["head"], head)
-        unaccounted = unaccounted_priors(history, dispositions, ranges=ranges)
+        since_ranges = await self._since_ranges(repo, history, head) if dispositions and prior else None
+        unaccounted = unaccounted_priors(history, dispositions, ranges=ranges, since_ranges=since_ranges)
         # The two guards are a fallback chain, not a belt-and-braces pair. When the panel
         # HAS dispositioned its priors, that statement is the authority — re-applying the
         # clean-PASS heuristic on top would hold a block the panel just explained, making

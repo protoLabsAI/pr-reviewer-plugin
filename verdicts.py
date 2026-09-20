@@ -304,7 +304,11 @@ def merge_carried_findings(findings: list[dict], carried: list[dict]) -> list[di
         if key in seen:
             continue
         seen.add(key)
+        # `since` rides along so the next round can prove a fix against the head this was
+        # raised at, not merely against the round that carried it (issue #131).
         item = {k: finding.get(k) for k in ("file", "line", "severity", "claim") if finding.get(k) is not None}
+        if finding.get("since"):
+            item["since"] = str(finding["since"])
         item.setdefault("severity", "major")
         item["verdict"] = "confirmed"
         item["carried"] = True
