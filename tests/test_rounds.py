@@ -658,6 +658,14 @@ def test_a_hallucinated_fixed_on_a_carried_finding_still_does_not_clear():
     assert len(missing) == 1
 
 
+def test_an_empty_delta_since_the_raising_head_is_proof_the_line_never_moved():
+    # Readable-but-empty is not "missing": it must not fall back to a window that could clear it.
+    history = [_major(), _carried_round()]
+    touched = delta_ranges([{"filename": "operator_api/config_routes.py", "patch": _FIX_PATCH}])
+    assert delta_ranges([]) == {}
+    assert len(unaccounted_priors(history, _DISPO_FIXED, ranges=touched, since_ranges={HEAD_1: {}})) == 1
+
+
 def test_an_unreadable_raising_head_falls_back_to_the_prior_round_delta():
     history = [_major(), _carried_round()]
     untouched = delta_ranges([{"filename": "docs/unrelated.md", "patch": PATCH}])

@@ -464,7 +464,11 @@ def unaccounted_priors(
             # An unverifiable "fixed" accounts for nothing — the finding stays a debt.
             fkey = f"{file}:{line}" if isinstance(line, int) else file
             raised = prior_index.get(fkey) or prior_index.get(file) or {}
-            proof = (since_ranges or {}).get(str(raised.get("since") or "")) or ranges
+            # `is None`, not falsy: a READABLE delta with nothing in it proves the line never
+            # moved since it was raised, and must not fall through to the narrower window.
+            proof = (since_ranges or {}).get(str(raised.get("since") or ""))
+            if proof is None:
+                proof = ranges
             if proof is None:
                 continue
             probe = {"file": file, "line": line}
