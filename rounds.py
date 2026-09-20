@@ -449,6 +449,8 @@ def unaccounted_priors(
     for row in dispositions:
         disposition = str(row.get("disposition") or "").lower()
         file, line = _disposition_anchor(row)
+        # The prior this row names — `file:line`, or the bare file for a file-level one.
+        anchor = f"{file}:{line}" if isinstance(line, int) else file
         if disposition == "open":
             # Still present by the panel's own admission — never clears a blocker/major.
             continue
@@ -456,14 +458,12 @@ def unaccounted_priors(
             # A `refuted` against a *confirmed* prior is treated as `open`: the block stands
             # until delta-verified `fixed` or operator dismissal (issue #38). Only a prior
             # finding graded `uncertain` can be cleared by refutation alone.
-            dkey = f"{file}:{line}" if isinstance(line, int) else file
-            prior_f = prior_index.get(dkey) or prior_index.get(file)
+            prior_f = prior_index.get(anchor) or prior_index.get(file)
             if prior_f is None or str(prior_f.get("verdict") or "").lower() != "uncertain":
                 continue  # confirmed (or unknown verdict) → refuted rejected; block held
         if disposition == "fixed":
             # An unverifiable "fixed" accounts for nothing — the finding stays a debt.
-            fkey = f"{file}:{line}" if isinstance(line, int) else file
-            raised = prior_index.get(fkey) or prior_index.get(file) or {}
+            raised = prior_index.get(anchor) or prior_index.get(file) or {}
             # `is None`, not falsy: a READABLE delta with nothing in it proves the line never
             # moved since it was raised, and must not fall through to the narrower window.
             proof = (since_ranges or {}).get(str(raised.get("since") or ""))
@@ -474,7 +474,6 @@ def unaccounted_priors(
             probe = {"file": file, "line": line}
             if not in_delta(probe, proof):
                 continue
-        anchor = f"{file}:{line}" if isinstance(line, int) else file
         accounted.add(anchor)
         accounted.add(file)
 
