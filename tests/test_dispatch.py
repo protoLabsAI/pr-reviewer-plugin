@@ -1234,7 +1234,7 @@ async def test_a_structural_gateway_failure_stamps_complete_false_and_caps_the_p
     assert out == "reviewed:WARN"
     body = gh.reviews_posted[0]["body"]
     assert "complete=false" in body
-    assert "`find_structural` (structural pass unavailable or cut short)" in body
+    assert "`find_structural` (structural pass unavailable or cut short" in body  # …then its reason (#140)
     assert "came back clean" not in body
 
 
@@ -1259,9 +1259,43 @@ async def test_a_relay_that_obeys_the_tool_still_reads_as_a_structural_outage(tm
     assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "reviewed:WARN"  # not a clean PASS
     body = gh.reviews_posted[0]["body"]
     assert "complete=false" in body  # so the promotion gate will not auto-approve it
-    assert "`find_structural` (structural pass unavailable or cut short)" in body
+    assert "`find_structural` (structural pass unavailable or cut short" in body  # …then its reason (#140)
     (row,) = _telemetry_events(tmp_path, "reviewed")
     assert row["structural_unavailable"] is True and row["complete"] is False
+
+
+async def test_the_outage_reason_reaches_the_coverage_banner(tmp_path):
+    # #140: the detail was captured, handed to the relay, and paraphrased away — one fault
+    # posted as "gateway auth error" one round and "provider error" the next.
+    gh = _structural_gh()
+    outage = _lane(
+        "find_structural",
+        "Gap: structural pass unavailable — clawpatch exit 4 (gateway provider failure: auth, HTTP error, or an "
+        "unusable model reply): gateway review: full response saved to "
+        "/sandbox/pr-reviewer/clawpatch/o-r/provider-failures/20260919T184825346Z-gateway-review-5cc64695.json — "
+        "response was not parseable JSON (finish_reason=stop)\n\n```json\n[]\n```",
+    )
+
+    async def runner(name, inputs):
+        return {"output": CLEAN_REPORT, "failed": [], "steps": _panel_steps(find_structural=outage)}
+
+    d = make(tmp_path, cfg={"shadow_mode": False}, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "reviewed:WARN"
+    body = gh.reviews_posted[0]["body"]
+    assert "structural pass unavailable or cut short: clawpatch exit 4" in body
+    assert "/sandbox/" not in body and "(path)" in body  # never the reviewer's filesystem layout
+
+
+def test_outage_reason_is_display_safe():
+    from pr_reviewer.protopatch import outage_reason
+
+    assert outage_reason("") == "" and outage_reason("```json\n[]\n```") == ""
+    assert outage_reason("PROTOPATCH UNAVAILABLE — checkout failed: clone error") == "checkout failed: clone error"
+    hostile = "Gap: structural pass unavailable — 401 from http://gateway:4000/v1/chat `rm -rf` [x](y) **bold** | <b>"
+    got = outage_reason(hostile)
+    assert "gateway:4000" not in got and "(url)" in got
+    assert not set(got) & set("`*[]|<>")
+    assert len(outage_reason("Gap: structural pass unavailable — " + "x" * 500)) == 180
 
 
 def test_the_gap_line_the_tool_prescribes_is_the_one_the_gate_recognises():

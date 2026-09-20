@@ -42,7 +42,7 @@ from .grounding import (
     render_grounding_footnote,
     render_unreadable_footnote,
 )
-from .protopatch import STRUCTURAL_GAP_MARKERS
+from .protopatch import STRUCTURAL_GAP_MARKERS, outage_reason
 from .rounds import (
     DEFAULT_CONVERGENCE_ROUNDS,
     converge,
@@ -1702,7 +1702,7 @@ class Dispatcher:
         ]
         complete = not structural_unavailable and not degraded and not incomplete_finders
         # The same three signals as one record, for the coverage cap and note below (#117).
-        gaps = coverage_gaps(degraded, incomplete_finders, structural_unavailable)
+        gaps = coverage_gaps(degraded, incomplete_finders, structural_unavailable, outage_reason(structural_out))
         lanes = len({str(s) for s in (*steps_out, *degraded) if str(s).startswith(FINDER_STEP_PREFIX)})
         output = str(result.get("output") or "")
         # The raw output is read for BLOCKS and never published as text (protoAgent#2439
