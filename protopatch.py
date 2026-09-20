@@ -56,13 +56,20 @@ _EXIT_REASONS = {
 }
 
 UNAVAILABLE_PREFIX = "PROTOPATCH UNAVAILABLE"
+# The line `unavailable()` tells the relay to write INSTEAD of echoing the tool's text. A
+# relay that obeys produces this and an empty array, with `UNAVAILABLE_PREFIX` nowhere in
+# its reply — so an outage check that knows only the prefix reads a faithful relay of an
+# outage as a clean, delivered, empty structural pass.
+GAP_LINE_PREFIX = "Gap: structural pass unavailable"
+# Either one in the structural lane's output means the structural pass did not run.
+STRUCTURAL_GAP_MARKERS = (UNAVAILABLE_PREFIX, GAP_LINE_PREFIX)
 
 
 def unavailable(reason: str) -> str:
     return (
         f"{UNAVAILABLE_PREFIX} — {reason}\n\n"
         "The structural pass did not run. In your reply, state exactly one Gap line — "
-        f"`Gap: structural pass unavailable — {reason}` — and emit an empty findings "
+        f"`{GAP_LINE_PREFIX} — {reason}` — and emit an empty findings "
         "array (```json\n[]\n```). Do not retry, do not invent findings."
     )
 
