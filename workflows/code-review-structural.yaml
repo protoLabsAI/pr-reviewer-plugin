@@ -36,9 +36,20 @@ max_concurrency: 5
 # `failed`) so the panel reviews with one fewer angle instead of exhausting into no verdict.
 # 900s is deliberately conservative — just above both slow finders' p95 (crossfile 841s,
 # correctness 774s) — so it rescues the exhaustion/hang tail while rarely touching a
-# productive run; tune down as the eval harness's labeled set grows. Needs an engine that
-# honours the step `timeout` key; an older engine ignores it (the panel is unchanged).
+# productive run; tune down as the eval harness's labeled set grows.
+#
+# The budget is an INPUT, not a constant (issue #93): 900s was calibrated on one gateway
+# lane, and the model is operator-configurable — on a slower lane crossfile's p95 sat
+# CENSORED at the cap and productive finders were cut to a Gap. The dispatcher passes
+# `pr_reviewer.finder_timeout_s` as `finder_timeout`; unset, the default below applies.
+# Needs protoAgent >= 0.170.0 (a step `timeout` that references an input, #3555) — hence
+# the manifest's `min_protoagent_version`.
 inputs:
+  - name: finder_timeout
+    description: >-
+      Seconds each parallel finder may run before the engine degrades it to a Gap.
+      Set by the dispatcher from `pr_reviewer.finder_timeout_s`.
+    default: 900
   - name: pr
     description: The pull-request number to review.
     required: true
@@ -87,7 +98,7 @@ inputs:
 steps:
   - id: find_correctness
     subagent: review-finder
-    timeout: 900
+    timeout: "{{inputs.finder_timeout}}"
     prompt: |
       Review PR #{{inputs.pr}} (repo: "{{inputs.repo}}" — empty means the
       default repo). Your assigned angle: **correctness**. Logic errors,
@@ -139,7 +150,7 @@ steps:
 
   - id: find_removed_behavior
     subagent: review-finder
-    timeout: 900
+    timeout: "{{inputs.finder_timeout}}"
     prompt: |
       Review PR #{{inputs.pr}} (repo: "{{inputs.repo}}" — empty means the
       default repo). Your assigned angle: **removed or changed behavior**. Read
@@ -192,7 +203,7 @@ steps:
 
   - id: find_crossfile
     subagent: review-finder
-    timeout: 900
+    timeout: "{{inputs.finder_timeout}}"
     prompt: |
       Review PR #{{inputs.pr}} (repo: "{{inputs.repo}}" — empty means the
       default repo). Your assigned angle: **cross-file consistency**. Signatures
@@ -252,7 +263,7 @@ steps:
 
   - id: find_conventions
     subagent: review-finder
-    timeout: 900
+    timeout: "{{inputs.finder_timeout}}"
     prompt: |
       Review PR #{{inputs.pr}} (repo: "{{inputs.repo}}" — empty means the
       default repo). Your assigned angle: **conventions and hygiene**. The
@@ -314,7 +325,7 @@ steps:
 
   - id: find_structural
     subagent: structural-finder
-    timeout: 900
+    timeout: "{{inputs.finder_timeout}}"
     prompt: |
       Run the structural pass on PR #{{inputs.pr}} (repo: "{{inputs.repo}}" —
       empty means the default repo): call protopatch_review once and relay its

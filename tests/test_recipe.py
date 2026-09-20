@@ -17,6 +17,7 @@ STEPS = {s["id"]: s for s in RECIPE["steps"]}
 def test_recipe_shape():
     assert RECIPE["name"] == "code-review-structural"
     assert {i["name"] for i in RECIPE["inputs"]} == {
+        "finder_timeout",
         "pr",
         "repo",
         "prior_findings",
@@ -188,3 +189,23 @@ def test_the_tool_heavy_lanes_get_a_bounded_evidence_reminder():
     # The tool-light lanes reason over the given diff directly — no such reminder needed.
     for sid in ("find_correctness", "find_removed_behavior"):
         assert "bounded, honest pass beats an exhaustive one" not in STEPS[sid]["prompt"], sid
+
+
+def test_the_finder_budget_is_an_input_with_the_calibrated_default():
+    # Issue #93: a recipe constant calibrated on one model silently truncates productive
+    # finders on a slower one. Every parallel finder takes its budget from one input, whose
+    # default keeps today's 900s for a dispatcher that passes nothing.
+    declared = {i["name"]: i for i in RECIPE["inputs"]}
+    assert declared["finder_timeout"]["default"] == 900
+    finders = [s for s in RECIPE["steps"] if s["id"].startswith("find_")]
+    assert len(finders) == 5
+    assert {s["timeout"] for s in finders} == {"{{inputs.finder_timeout}}"}
+    assert all("timeout" not in s for s in RECIPE["steps"] if not s["id"].startswith("find_"))
+
+
+def test_the_manifest_requires_a_core_that_accepts_an_input_timeout():
+    # An older engine REJECTS a string `timeout` at validation: the recipe would not load.
+    manifest = yaml.safe_load((Path(__file__).resolve().parent.parent / "protoagent.plugin.yaml").read_text())
+    have = tuple(int(x) for x in str(manifest["min_protoagent_version"]).split("."))
+    assert have >= (0, 170, 0)
+    assert manifest["config"]["finder_timeout_s"] == 0

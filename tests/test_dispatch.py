@@ -2346,6 +2346,39 @@ def capturing_runner(report=REPORT):
     return runner, seen
 
 
+# ── the finder budget is operator config, not a recipe constant (issue #93) ────
+
+
+async def test_finder_timeout_is_passed_to_the_recipe_only_when_set(tmp_path):
+    runner, seen = capturing_runner()
+    d = make(tmp_path / "unset", gh=RoutedGH(pr_facts=facts()), runner=runner)
+    await d.handle_pr_event("o/r", 1, HEAD, "opened")
+    assert "finder_timeout" not in seen["inputs"]  # the recipe's own default applies
+
+    runner, seen = capturing_runner()
+    d = make(tmp_path / "set", cfg={"finder_timeout_s": 1200}, gh=RoutedGH(pr_facts=facts()), runner=runner)
+    await d.handle_pr_event("o/r", 1, HEAD, "opened")
+    assert seen["inputs"]["finder_timeout"] == 1200
+
+
+def test_finder_timeout_reads_env_clamps_and_never_means_unbounded(tmp_path, monkeypatch, caplog):
+    assert make(tmp_path / "a").finder_timeout_s == 0
+    for junk in ("soon", "", None, -5, 0):  # unset, never "no timeout"
+        assert make(tmp_path / f"j{junk}", cfg={"finder_timeout_s": junk}).finder_timeout_s == 0
+    assert make(tmp_path / "s", cfg={"finder_timeout_s": "1500"}).finder_timeout_s == 1500
+
+    monkeypatch.setenv("PR_REVIEWER_FINDER_TIMEOUT", "1100")
+    assert make(tmp_path / "env").finder_timeout_s == 1100
+    assert make(tmp_path / "cfg-wins", cfg={"finder_timeout_s": 700}).finder_timeout_s == 700
+
+    # At or above the attempt's own budget, the attempt would be cancelled first — a
+    # crashed panel instead of a one-lane Gap. Clamped a minute under it, and said so.
+    with caplog.at_level("WARNING"):
+        d = make(tmp_path / "big", cfg={"finder_timeout_s": 5000, "panel_attempt_timeout": 1800})
+        assert d.finder_timeout_s == 1740
+    assert "finder_timeout_s=5000" in caplog.text
+
+
 async def test_a_promotion_no_longer_shadows_the_prior_findings_recall(tmp_path):
     # #23's root cause: with the promotion review newest, recall used to read a body
     # with no findings JSON — `prior_findings` came through empty and the delta

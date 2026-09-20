@@ -15,7 +15,12 @@ description: >-
   a partial structural pass must not void the panel review (ADR 0078 D3).
 enabled: false                 # SHIP DISABLED — enabling is the operator's trust decision
 repository: https://github.com/protoLabsAI/pr-reviewer-plugin
-min_protoagent_version: "0.95.0"   # needs the findings `source` field (ADR 0078 B2 core half)
+min_protoagent_version: "0.170.0"  # a step `timeout` that references an input (protoAgent#3555):
+# the bundled recipe takes its finder budget from `inputs.finder_timeout` (issue #93), and an
+# older engine REJECTS that at validation — the recipe would not load and every structural
+# review would fail. Refusing to load on an old core is the loud version of that. 0.170.0 also
+# carries the completion guard (protoAgent#3553) the structural relay's contract relies on.
+# (Previously 0.95.0, for the findings `source` field — ADR 0078 B2 core half.)
 # NOT raised for v0.25.0's built-not-echoed comment body (protoAgent#2439). The LEAK is
 # closed by this plugin alone — the body is assembled from parsed blocks, so an older
 # core that never learned the brief delimiters cannot leak deliberation into a review,
@@ -27,6 +32,10 @@ min_protoagent_version: "0.95.0"   # needs the findings `source` field (ADR 0078
 config_section: pr_reviewer
 config:
   default_repo: ""             # repo the tool falls back to when `repo` is omitted (owner/name)
+  finder_timeout_s: 0          # seconds each parallel finder may run (issue #93). 0 = the recipe's
+                               # default (900). Calibrate to YOUR model: just above the slow finders'
+                               # p95 (telemetry `step_s`). Clamped below `panel_attempt_timeout`.
+                               # Env fallback: PR_REVIEWER_FINDER_TIMEOUT.
   repos: []                    # repos the DISPATCHER manages (owner/name) — NARROWS scope when set.
                                # empty HERE falls back to PR_REVIEWER_REPOS; empty in BOTH = every
                                # repo the GitHub App installation covers (webhook accepts any
