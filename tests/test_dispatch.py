@@ -3036,6 +3036,30 @@ def _telemetry_events(path, event):
     return [r for r in rows if r.get("event") == event]
 
 
+async def test_pr_size_rides_on_the_dispatch_reviewed_and_exhaustion_rows(tmp_path):
+    # Issue #116: a PR too large for the lanes exhausts on every head, and nothing recorded
+    # size against outcome — so a "too large" threshold could only be guessed.
+    size = {"changed_files": 61, "lines_changed": 15514}
+    big = facts(changed_files=61, additions=15392, deletions=122)
+
+    async def clean(name, inputs):
+        return {"output": REPORT, "failed": []}
+
+    d = make(tmp_path / "ok", gh=RoutedGH(pr_facts=big), runner=clean)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")).startswith("reviewed:")
+    for event in ("dispatch", "reviewed"):
+        (row,) = _telemetry_events(tmp_path / "ok", event)
+        assert {k: row[k] for k in size} == size, event
+
+    async def dead(name, inputs):
+        return {"output": "partial", "failed": ["find_correctness"]}
+
+    d = make(tmp_path / "dead", gh=RoutedGH(pr_facts=big), runner=dead, inbox=lambda text, **kw: None)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "error:panel-exhausted"
+    (row,) = _telemetry_events(tmp_path / "dead", "exhaustion")
+    assert {k: row[k] for k in size} == size
+
+
 async def test_a_mistyped_viewer_login_holds_instead_of_re_reviewing(tmp_path):
     # Our own reviews arrive under an App login that is not `viewer_login`. Read as "no
     # reviews", every head would look unreviewed: the sweep would backfill and the event
