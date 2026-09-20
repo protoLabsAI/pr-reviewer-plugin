@@ -413,6 +413,13 @@ def test_carried_major_forces_a_fail_when_the_next_round_recalls_it():
     assert verdict_for(recalled) == FAIL
 
 
+def test_a_carried_finding_keeps_the_head_it_was_raised_at():
+    # The next round proves a fix against THIS head, not the carrying round's (issue #131).
+    merged = merge_carried_findings([], [{**_MAJOR, "since": "a" * 40}])
+    assert merged[0]["since"] == "a" * 40 and merged[0]["carried"] is True
+    assert "since" not in merge_carried_findings([], [_MAJOR])[0]  # nothing to record, nothing invented
+
+
 def test_carry_dedups_against_a_finding_this_round_already_reports():
     # A round that DOES re-report the bug at the same file:line must not record it twice.
     assert len(merge_carried_findings([_MAJOR], [_MAJOR])) == 1

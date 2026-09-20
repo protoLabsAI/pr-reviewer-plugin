@@ -627,6 +627,60 @@ def test_fixed_fails_closed_when_the_delta_is_unreadable():
     assert len(unaccounted_priors(history, dispo, ranges=None)) == 1
 
 
+# ── a carried finding's fix is proven against the head it was RAISED at (issue #131) ──
+
+_FIX_PATCH = (
+    "@@ -268,3 +268,4 @@\n ctx\n-    _apply(config=updates)\n+    await asyncio.to_thread(_apply, config=updates)\n"
+)
+_DISPO_FIXED = [{"prior": "operator_api/config_routes.py:271", "disposition": "fixed", "why": "now uses to_thread"}]
+
+
+def _carried_round(head="b" * 40, since=HEAD_1):
+    """The round AFTER the fix landed: it lost a lane, so the major was carried into its record."""
+    row = finding(file="operator_api/config_routes.py", line=271, severity="major", claim="sync call blocks")
+    return {"head": head, "verdict": "WARN", "findings": [{**row, "carried": True, "since": since}]}
+
+
+def test_a_fix_that_landed_before_the_carrying_round_is_proven_against_the_raising_head():
+    # mythxengine#805: fixed several commits ago; the prior-head→head delta no longer
+    # contains the line, so `fixed` was unprovable forever and only a rebase cleared it.
+    history = [_major(), _carried_round()]
+    since_prior = delta_ranges([{"filename": "docs/unrelated.md", "patch": PATCH}])
+    since_raised = delta_ranges([{"filename": "operator_api/config_routes.py", "patch": _FIX_PATCH}])
+    assert len(unaccounted_priors(history, _DISPO_FIXED, ranges=since_prior)) == 1  # the old behaviour
+    assert unaccounted_priors(history, _DISPO_FIXED, ranges=since_prior, since_ranges={HEAD_1: since_raised}) == []
+
+
+def test_a_hallucinated_fixed_on_a_carried_finding_still_does_not_clear():
+    # Same fail-closed rule, wider window: the line never moved since it was raised.
+    history = [_major(), _carried_round()]
+    untouched = delta_ranges([{"filename": "docs/unrelated.md", "patch": PATCH}])
+    missing = unaccounted_priors(history, _DISPO_FIXED, ranges=untouched, since_ranges={HEAD_1: untouched})
+    assert len(missing) == 1
+
+
+def test_an_empty_delta_since_the_raising_head_is_proof_the_line_never_moved():
+    # Readable-but-empty is not "missing": it must not fall back to a window that could clear it.
+    history = [_major(), _carried_round()]
+    touched = delta_ranges([{"filename": "operator_api/config_routes.py", "patch": _FIX_PATCH}])
+    assert delta_ranges([]) == {}
+    assert len(unaccounted_priors(history, _DISPO_FIXED, ranges=touched, since_ranges={HEAD_1: {}})) == 1
+
+
+def test_an_unreadable_raising_head_falls_back_to_the_prior_round_delta():
+    history = [_major(), _carried_round()]
+    untouched = delta_ranges([{"filename": "docs/unrelated.md", "patch": PATCH}])
+    assert len(unaccounted_priors(history, _DISPO_FIXED, ranges=untouched, since_ranges={HEAD_1: None})) == 1
+    assert len(unaccounted_priors(history, _DISPO_FIXED, ranges=None, since_ranges={HEAD_1: None})) == 1
+
+
+def test_unaccounted_findings_are_stamped_with_the_head_that_raised_them():
+    fresh = unaccounted_priors([_major()], [{"prior": "x.py:1", "disposition": "open"}], ranges=None)
+    assert fresh[0]["since"] == HEAD_1  # raised by this round
+    kept = unaccounted_priors([_major(), _carried_round()], [{"prior": "x.py:1", "disposition": "open"}], ranges=None)
+    assert kept[0]["since"] == HEAD_1  # NOT the carrying round's head: the stamp survives a carry
+
+
 def test_open_holds_and_refuted_against_confirmed_also_holds():
     history = [_major()]
     ranges = delta_ranges([{"filename": "unrelated.py", "patch": PATCH}])

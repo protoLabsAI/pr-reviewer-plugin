@@ -2807,6 +2807,50 @@ async def test_a_dispositioned_major_lets_the_verdict_clear(tmp_path):
     assert "Unaccounted prior finding" not in gh.posted[0]["body"]
 
 
+class _CompareByBase(RoutedGH):
+    """`compare` keyed by the BASE head of the request, so a test can tell which delta was read."""
+
+    def __init__(self, by_base, **kw):
+        super().__init__(**kw)
+        self.by_base = by_base
+
+    async def __call__(self, args, timeout=30):
+        joined = " ".join(args)
+        if "/compare/" in joined and "merge_base" not in joined:
+            base = joined.split("/compare/", 1)[1].split("...", 1)[0]
+            if base in self.by_base:
+                self.calls.append(args)
+                return 0, json.dumps(self.by_base[base]), ""
+        return await super().__call__(args, timeout=timeout)
+
+
+async def test_a_carried_major_is_cleared_by_a_fix_that_predates_the_carrying_round(tmp_path):
+    # Issue #131 / mythxengine#805: the major was raised at OLD_HEAD and fixed before
+    # MID_HEAD, but MID_HEAD's round lost a lane and CARRIED it. MID_HEAD→HEAD never
+    # touches x.py again, so `fixed` was unprovable for good. OLD_HEAD→HEAD shows the fix.
+    major = {"file": "x.py", "line": 3, "severity": "major", "claim": "real bug", "evidence": "e"}
+    carried = {**major, "verdict": "confirmed", "carried": True, "since": OLD_HEAD}
+    gh = _CompareByBase(
+        {
+            MID_HEAD: [{"filename": "unrelated.py", "patch": "@@ -1,2 +1,3 @@\n a\n+b\n c\n"}],
+            OLD_HEAD: [{"filename": "x.py", "patch": "@@ -1,4 +1,4 @@\n a\n b\n-old line 3\n+fixed line 3\n"}],
+        },
+        pr_facts=facts(),
+        reviews=[
+            review_row(OLD_HEAD, "FAIL", state="CHANGES_REQUESTED", findings_json=json.dumps([major]), id=77),
+            review_row(MID_HEAD, "FAIL", state="CHANGES_REQUESTED", findings_json=json.dumps([carried]), id=78),
+        ],
+    )
+    runner, _seen = capturing_runner(
+        report_with_dispositions([{"prior": "x.py:3", "disposition": "fixed", "why": "guard added"}])
+    )
+    d = make(tmp_path, cfg={"shadow_mode": False, "evidence_grounding": False}, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "synchronize")) == "reviewed:PASS"
+    assert "Unaccounted prior finding" not in gh.posted[0]["body"]
+    assert "carried from a prior round" not in gh.posted[0]["body"]
+    assert any(f"/compare/{OLD_HEAD}..." in " ".join(c) for c in gh.calls)  # proven against the raising head
+
+
 async def test_a_hallucinated_fixed_disposition_holds_the_block_end_to_end(tmp_path):
     # protoAgent#2208 exactly: FAIL on x.py:3, then a clean PASS whose report claims
     # `fixed` — but the delta touches only OTHER files, so x.py:3 never moved.

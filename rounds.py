@@ -397,6 +397,7 @@ def unaccounted_priors(
     dispositions: list[dict],
     *,
     ranges: dict[str, list[tuple[int, int]]] | None = None,
+    since_ranges: dict[str, dict[str, list[tuple[int, int]]] | None] | None = None,
 ) -> list[dict]:
     """Prior blocker/major findings this round neither reported nor honestly dispositioned.
 
@@ -434,6 +435,17 @@ def unaccounted_priors(
     refutation is plausible). The unaccounted list already serves as the telemetry-ready
     signal: any `refuted` that was rejected appears in `missing` for `render_unaccounted_note`.
 
+    A CARRIED finding is verified against the delta since the head it was RAISED at, not
+    since the previous round (issue #131). `ranges` spans only prior-head→head, so a fix
+    could be proven in exactly one round — the one right after it landed. If that round was
+    incomplete, or called the finding "cannot confirm", the finding was carried into its
+    record, and from then on the line never moved again inside any prior-head→head delta:
+    `fixed` was unprovable forever and only a rebase cleared the PR (mythxengine#805, both
+    majors fixed several commits before the rounds that kept carrying them). Each returned
+    finding is stamped `since` — the head of the round that raised it, kept across carries —
+    and `since_ranges[since]` (that head→current head) is what a `fixed` on it is checked
+    against. Still fail-closed: a `since` with no readable delta falls back to `ranges`.
+
     Only the LAST substantive round is consulted, same as `unexplained_clearance`.
     """
     if not dispositions:
@@ -445,7 +457,10 @@ def unaccounted_priors(
     for round_ in reversed(history or []):
         prior = [f for f in (round_.get("findings") or []) if isinstance(f, dict)]
         if prior:
-            last_round_findings = prior
+            # `since`: a carried finding keeps the head it was raised at; a fresh one was
+            # raised at this round's head.
+            origin = str(round_.get("head") or "")
+            last_round_findings = [{**f, "since": str(f.get("since") or origin)} for f in prior]
             break
 
     # Index prior findings by anchor for O(1) verdict lookup during disposition processing.
@@ -458,6 +473,8 @@ def unaccounted_priors(
     for row in dispositions:
         disposition = str(row.get("disposition") or "").lower()
         file, line = _disposition_anchor(row)
+        # The prior this row names — `file:line`, or the bare file for a file-level one.
+        anchor = f"{file}:{line}" if isinstance(line, int) else file
         if disposition == "open":
             # Still present by the panel's own admission — never clears a blocker/major.
             continue
@@ -465,18 +482,22 @@ def unaccounted_priors(
             # A `refuted` against a *confirmed* prior is treated as `open`: the block stands
             # until delta-verified `fixed` or operator dismissal (issue #38). Only a prior
             # finding graded `uncertain` can be cleared by refutation alone.
-            dkey = f"{file}:{line}" if isinstance(line, int) else file
-            prior_f = prior_index.get(dkey) or prior_index.get(file)
+            prior_f = prior_index.get(anchor) or prior_index.get(file)
             if prior_f is None or str(prior_f.get("verdict") or "").lower() != "uncertain":
                 continue  # confirmed (or unknown verdict) → refuted rejected; block held
         if disposition == "fixed":
             # An unverifiable "fixed" accounts for nothing — the finding stays a debt.
-            if ranges is None:
+            raised = prior_index.get(anchor) or prior_index.get(file) or {}
+            # `is None`, not falsy: a READABLE delta with nothing in it proves the line never
+            # moved since it was raised, and must not fall through to the narrower window.
+            proof = (since_ranges or {}).get(str(raised.get("since") or ""))
+            if proof is None:
+                proof = ranges
+            if proof is None:
                 continue
             probe = {"file": file, "line": line}
-            if not in_delta(probe, ranges):
+            if not in_delta(probe, proof):
                 continue
-        anchor = f"{file}:{line}" if isinstance(line, int) else file
         accounted.add(anchor)
         accounted.add(file)
 
