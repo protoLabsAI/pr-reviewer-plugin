@@ -163,6 +163,12 @@ def panel_rounds(reviews: list[dict]) -> list[dict]:
     return list(by_head.values())
 
 
+# A `<request>`'s `status` — what became of it, so history is not mistaken for open debt.
+REQUEST_OPEN = "open"  # the latest round with findings still carries it
+REQUEST_REFUTED = "refuted"  # this panel's own verifier refuted it in that round
+REQUEST_NOT_IN_LATEST = "not-in-latest-round"  # raised once, no longer carried
+
+
 def render_prior_requests(rounds: list[dict]) -> str:
     """The `<prior_requests>` data block: what THIS panel has already asked for.
 
@@ -174,17 +180,34 @@ def render_prior_requests(rounds: list[dict]) -> str:
     numbered = [(i + 1, r) for i, r in enumerate(rounds or []) if isinstance(r, dict) and r.get("findings")]
     if not numbered:
         return ""
+    # What became of each request (issue #131). The block is the WHOLE history, and without
+    # this an item the verifier refuted three rounds ago, or one fixed and dropped since,
+    # reads exactly like an open one — so a brief listed a fixed, refuted note among
+    # "standing items from round 1" (mythxengine#827). "Open" is what the LATEST round with
+    # findings still carries: an unaccounted blocker/major is re-recorded every round
+    # (`merge_carried_findings`), so one that is absent there was positively cleared.
+    latest = {
+        _anchor(f.get("file"), f.get("line"))
+        for f in numbered[-1][1]["findings"]
+        if isinstance(f, dict) and str(f.get("verdict") or "").lower() != "refuted"
+    }
     out = ["<prior_requests>"]
     for number, round_ in numbered:
         out.append(f'  <round number="{number}" verdict="{_attr(round_.get("verdict"))}">')
         for finding in round_["findings"][:MAX_REQUESTS_PER_ROUND]:
+            if str(finding.get("verdict") or "").lower() == "refuted":
+                status = REQUEST_REFUTED
+            elif _anchor(finding.get("file"), finding.get("line")) in latest:
+                status = REQUEST_OPEN
+            else:
+                status = REQUEST_NOT_IN_LATEST
             severity = _attr(finding.get("severity"))
             location = str(finding.get("file") or "")
             line = finding.get("line")
             if isinstance(line, int):
                 location = f"{location}:{line}"
             claim = str(finding.get("claim") or "")[:MAX_CLAIM_CHARS]
-            out.append(f'    <request severity="{severity}" location="{_attr(location)}">')
+            out.append(f'    <request severity="{severity}" location="{_attr(location)}" status="{status}">')
             out.append(_escape(claim))
             out.append("    </request>")
         out.append("  </round>")
