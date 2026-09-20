@@ -108,6 +108,36 @@ async def test_the_model_and_pinned_head_reach_the_runner():
     assert r.seen["inputs"]["base_ref"] == "main"
 
 
+async def test_a_replay_runs_under_the_deployments_finder_budget():
+    # A replay stands in for the live panel, so it takes the live panel's finder budget.
+    # Found live: a deployment tuned to 1500s replayed at the recipe's 900s default.
+    row = {"repo": "o/r", "pr": 7, "head": "d" * 40}
+
+    r = _runner(CLEAN_REPORT)
+    await replay_review(row, run_gh=ReplayGH(blob="x"), runner=r, parse_findings=_parse)
+    assert "finder_timeout" not in r.seen["inputs"]  # unset: the recipe's own default applies
+
+    r = _runner(CLEAN_REPORT)
+    await replay_review(row, run_gh=ReplayGH(blob="x"), runner=r, parse_findings=_parse, finder_timeout=1500)
+    assert r.seen["inputs"]["finder_timeout"] == 1500
+
+    # A manifest row can pin its own — the A/B knob — and junk reads as "not set".
+    r = _runner(CLEAN_REPORT)
+    await replay_review(
+        {**row, "finder_timeout": "600"},
+        run_gh=ReplayGH(blob="x"),
+        runner=r,
+        parse_findings=_parse,
+        finder_timeout=1500,
+    )
+    assert r.seen["inputs"]["finder_timeout"] == 600
+    r = _runner(CLEAN_REPORT)
+    await replay_review(
+        {**row, "finder_timeout": "soon"}, run_gh=ReplayGH(blob="x"), runner=r, parse_findings=_parse, finder_timeout=-3
+    )
+    assert "finder_timeout" not in r.seen["inputs"]
+
+
 # ── truncation is first-class (the fast incident) ─────────────────────────────
 
 

@@ -60,6 +60,15 @@ def looks_truncated(output: str, findings: list[dict]) -> bool:
     return not _FENCED_ARRAY_RE.search(output or "")
 
 
+def _positive_int(value: object) -> int:
+    """`value` as a positive whole number of seconds, else 0 (= "not set")."""
+    try:
+        seconds = int(float(value or 0))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0
+    return seconds if seconds > 0 else 0
+
+
 async def replay_review(
     row: dict,
     *,
@@ -69,6 +78,7 @@ async def replay_review(
     trial: int = 0,
     stamp: str = "",
     include_raw: bool = False,
+    finder_timeout: int = 0,
 ) -> dict:
     """Run the panel against one pinned round and return the JSON run-output.
 
@@ -80,6 +90,12 @@ async def replay_review(
                                     honesty/false-negative probes — #2208 r2, #2141 r3)
         prior_requests            — pre-rendered <prior_requests> block (optional)
         round                     — round number (default 1)
+        finder_timeout            — seconds per finder for THIS row (optional; an A/B knob)
+
+    `finder_timeout` (the argument) is the deployment's `pr_reviewer.finder_timeout_s`. A
+    replay reproduces the live panel, so it runs under the live panel's finder budget: left
+    at the recipe's default, a replay on a deployment tuned to 1500s cut finders at 900s and
+    measured a different panel from the one it was standing in for. 0 ⇒ the recipe's default.
 
     `runner(recipe, inputs)` is bound to the model under test by the caller — that binding
     IS the A/B knob. `parse_findings` is injected (the host's findings parser, or the
@@ -101,6 +117,9 @@ async def replay_review(
     round_number = int(row.get("round") or 1)
 
     inputs = {"pr": str(pr), "repo": repo, "head_sha": head, "base_ref": base_ref}
+    budget = _positive_int(row.get("finder_timeout")) or _positive_int(finder_timeout)
+    if budget:
+        inputs["finder_timeout"] = budget
     if row.get("prior_findings"):
         inputs["prior_findings"] = str(row["prior_findings"])
     if row.get("prior_requests"):
