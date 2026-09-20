@@ -627,6 +627,37 @@ class Dispatcher:
         )
 
     @property
+    def finder_timeout_s(self) -> int:
+        """Seconds each parallel finder may run, or 0 to leave the recipe's default (#93).
+
+        The right budget depends on the model the deployment runs — a constant calibrated on
+        one lane silently truncates productive finders on a slower one — so it is operator
+        config, passed to the recipe as its `finder_timeout` input. Clamped a minute under
+        `panel_attempt_timeout_s`: a finder budget at or above the attempt's own would let
+        the attempt be cancelled first, which concludes as a crashed panel instead of a
+        one-lane Gap. A value that is not a positive number reads as unset, never as "no
+        timeout" — an unbounded finder is what the budget exists to prevent.
+        """
+        cfg = self.cfg
+        raw = cfg["finder_timeout_s"] if "finder_timeout_s" in cfg else _env_int("PR_REVIEWER_FINDER_TIMEOUT", 0)
+        try:
+            seconds = int(float(raw or 0))
+        except (TypeError, ValueError):
+            seconds = 0
+        if seconds <= 0:
+            return 0
+        ceiling = int(self.panel_attempt_timeout_s) - 60
+        if ceiling > 0 and seconds > ceiling:
+            log.warning(
+                "[pr-reviewer] finder_timeout_s=%s is not below panel_attempt_timeout (%ss); using %ss",
+                seconds,
+                int(self.panel_attempt_timeout_s),
+                ceiling,
+            )
+            return ceiling
+        return seconds
+
+    @property
     def round_timeout_s(self) -> float:
         """Backstop for a WHOLE round — every attempt plus the GitHub calls around them —
         for a hang outside the panel runner. Defaults to every attempt's budget plus ten
@@ -1540,6 +1571,8 @@ class Dispatcher:
             "head_sha": head,
             "base_ref": str(facts.get("base_ref") or ""),
         }
+        if self.finder_timeout_s:
+            inputs["finder_timeout"] = self.finder_timeout_s  # else the recipe's default (#93)
         if prior_findings:
             inputs["prior_findings"] = prior_findings
         if prior_requests:
