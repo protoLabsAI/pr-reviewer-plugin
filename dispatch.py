@@ -57,6 +57,7 @@ from .rounds import (
     render_prior_requests,
     render_promotion_findings,
     render_unaccounted_note,
+    round_cap_reached,
     unaccounted_priors,
     unexplained_clearance,
 )
@@ -813,8 +814,8 @@ class Dispatcher:
         """Post a visible notice that the push-triggered review cap has been hit — fail-open."""
         cooldown_h = self.max_rounds_cooldown_s // 3600
         body = (
-            f"🛑 **Review cap reached** — this PR has had {self.max_rounds} automated review "
-            f"round(s). Further pushes will not trigger new reviews.\n\n"
+            f"🛑 **Review cap reached** — this PR has used its budget of {self.max_rounds} complete "
+            f"automated review round(s). Further pushes will not trigger new reviews.\n\n"
             f"The cap resets when:\n"
             f"- The PR is marked **ready-for-review**\n"
             f"- An operator runs `@vera review` (manual summon)\n"
@@ -1464,7 +1465,8 @@ class Dispatcher:
         # Max-rounds cap: arm on the first push-triggered review that exceeds the limit so
         # the panel is never spent — post the notice once, then drop all subsequent pushes.
         # Backfill and summon calls pass push_triggered=False and are always exempt.
-        if push_triggered and self.max_rounds and round_number > self.max_rounds:
+        # The budget counts complete rounds (#130): see `round_cap_reached`.
+        if push_triggered and round_cap_reached(history, self.max_rounds):
             cap_key = f"{repo}#{pr}"
             self._round_cap[cap_key] = time.monotonic()
             if len(self._round_cap) > 1024:

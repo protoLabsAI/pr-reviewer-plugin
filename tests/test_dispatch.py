@@ -3348,6 +3348,38 @@ async def test_push_capped_after_max_rounds_posts_comment_and_drops(tmp_path):
     assert "<!-- protoagent-qa-max-rounds" in comments[0]["body"]
 
 
+async def test_incomplete_rounds_do_not_spend_the_cap(tmp_path):
+    """A round that lost a lane is the panel's failure, not a push the author spent (#130):
+    mythxengine#830's fix push was capped because flaky lanes had eaten its budget."""
+    reviews = [review_row(OLD_HEAD, "WARN", complete=False), review_row(MID_HEAD, "WARN", complete=False)]
+    gh = RoutedGH(pr_facts=facts(), reviews=reviews)
+    ran = []
+
+    async def runner(name, inputs):
+        ran.append(name)
+        return {"output": REPORT, "failed": []}
+
+    d = make(tmp_path, cfg={"max_rounds": 2}, gh=gh, runner=runner)
+    out = await d.handle_pr_event("o/r", 1, HEAD, "synchronize")
+    assert out != "drop:max-rounds-capped"
+    assert ran  # the panel ran: two incomplete rounds did not use up a cap of two
+
+
+async def test_incomplete_rounds_still_hit_a_hard_ceiling(tmp_path):
+    """The cap is a flood guard, and a flood of pushes whose panels keep failing is still a flood."""
+    heads = [f"{i:x}" * 40 for i in range(1, 5)]
+    gh = RoutedGH(pr_facts=facts(), reviews=[review_row(h, "WARN", complete=False) for h in heads])
+    ran = []
+
+    async def runner(name, inputs):
+        ran.append(name)
+        return {"output": REPORT, "failed": []}
+
+    d = make(tmp_path, cfg={"max_rounds": 2}, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "synchronize")) == "drop:max-rounds-capped"
+    assert ran == []
+
+
 async def test_subsequent_push_drops_early_without_comment(tmp_path):
     """After the cap is set, a second push drops in handle_pr_event before the panel or comment."""
     gh = RoutedGH(pr_facts=facts(), reviews=two_rounds())
