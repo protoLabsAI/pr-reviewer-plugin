@@ -175,6 +175,7 @@ def test_body_marker_roundtrip():
         "complete": True,
         "verified": True,
         "diff_id": None,
+        "reaffirmed": "",
     }
     assert "shadow" in body and "QA panel review" in body
 
@@ -250,6 +251,7 @@ def test_a_marker_with_trailing_attributes_still_parses():
         "complete": True,
         "verified": True,
         "diff_id": None,
+        "reaffirmed": "",
     }
 
 
@@ -521,6 +523,7 @@ def test_the_stale_header_rides_the_body_and_the_demotion_survives_recall():
         "complete": True,
         "verified": True,
         "diff_id": None,
+        "reaffirmed": "",
     }
 
 

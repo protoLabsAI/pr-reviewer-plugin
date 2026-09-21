@@ -9,7 +9,7 @@ import time
 
 from pr_reviewer.dispatch import POST_MAX_FAILURES, Dispatcher
 from pr_reviewer.telemetry import Telemetry
-from pr_reviewer.verdicts import extract_findings_json, render_verdict_body
+from pr_reviewer.verdicts import extract_findings_json, parse_verdict_marker, render_verdict_body
 
 HEAD = "a" * 40
 OLD_HEAD = "b" * 40
@@ -359,8 +359,9 @@ def _no_panel_runner(ran):
 
 async def test_a_rebased_head_with_a_byte_identical_diff_reaffirms(tmp_path):
     """A new head SHA (rebase / reworded commit / moved-but-identical base) whose base↔head
-    tree pair is byte-identical to the last round reaffirms that verdict — no panel, no
-    duplicate review, no check for the new head (acceptance r1, r5)."""
+    tree pair is byte-identical to the last round reaffirms that verdict — no panel, and
+    the verdict is RECORDED at the new head so the SHA-keyed gate can find it (issue #135:
+    left unrecorded, 12 of 23 such heads sat `hold:stale-head` until a real-diff push)."""
     from pr_reviewer.rounds import diff_identity
 
     did = diff_identity("mbA", "treeA")
@@ -374,8 +375,104 @@ async def test_a_rebased_head_with_a_byte_identical_diff_reaffirms(tmp_path):
     d = make(tmp_path, gh=gh, runner=_no_panel_runner(ran))
     assert (await d.handle_pr_event("o/r", 1, HEAD, "synchronize")) == "reaffirmed:PASS"
     assert ran == []  # the panel never ran
-    assert gh.posted == []  # nothing posted — no duplicate panel review, no promotion
-    assert gh.check_writes == []  # and no check opened/concluded for the new head
+    (post,) = gh.posted  # exactly one review: the carried verdict, at the NEW head
+    assert post["event"] == "COMMENT"
+    marker = parse_verdict_marker(post["body"])
+    assert (marker["head"], marker["verdict"], marker["reaffirmed"]) == (HEAD, "PASS", OLD_HEAD)
+    assert marker["diff_id"] == did and marker["complete"] is True
+    assert "No panel was spent" in post["body"] and OLD_HEAD[:12] in post["body"]
+    assert gh.check_writes == []  # no review check was opened, so none is concluded
+    (row,) = _telemetry_events(tmp_path, "reaffirm-recorded")
+    assert row["posted"] is True and row["prior_head"] == OLD_HEAD
+
+
+def _reaffirm_gh(prior_review, **kw):
+    from pr_reviewer.rounds import diff_identity
+
+    return DiffIdGH(
+        pr_facts=facts(),
+        reviews=[prior_review(diff_identity("mbA", "treeA"))],
+        head_trees={OLD_HEAD: "treeA", HEAD: "treeA"},
+        merge_base_tree="mbA",
+        **kw,
+    )
+
+
+async def test_a_reaffirmed_fail_is_not_carried_to_the_new_head(tmp_path):
+    # Fail-closed: a FAIL at the old head leaves the new head with NO verdict, as before.
+    gh = _reaffirm_gh(lambda did: review_row(OLD_HEAD, "FAIL", state="CHANGES_REQUESTED", diff_id=did))
+    d = make(tmp_path, gh=gh, runner=_no_panel_runner([]))
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "synchronize")) == "reaffirmed:FAIL"
+    assert gh.posted == [] and not _telemetry_events(tmp_path, "reaffirm-recorded")
+
+
+async def test_an_incomplete_round_stays_incomplete_when_carried(tmp_path):
+    # The carried verdict is no better than the round it came from: the gate still holds it.
+    gh = _reaffirm_gh(lambda did: review_row(OLD_HEAD, "WARN", complete=False, diff_id=did))
+    d = make(tmp_path, gh=gh, runner=_no_panel_runner([]))
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "synchronize")) == "reaffirmed:WARN"
+    marker = parse_verdict_marker(gh.posted[0]["body"])
+    assert marker["complete"] is False and marker["reaffirmed"] == OLD_HEAD
+
+
+async def test_a_carried_verdict_never_dismisses_a_standing_block(tmp_path):
+    # Nothing new was judged, so the reaffirm post must not lift anything (`hold_blocks`).
+    gh = _reaffirm_gh(lambda did: review_row(OLD_HEAD, "PASS", diff_id=did))
+    d = make(tmp_path, cfg={"shadow_mode": False}, gh=gh, runner=_no_panel_runner([]))
+    await d.handle_pr_event("o/r", 1, HEAD, "synchronize")
+    assert gh.dismissed == []
+
+
+async def test_the_carried_verdict_is_posted_once_not_on_every_event(tmp_path):
+    # Second event for the same head: the recorded verdict IS this head's verdict now.
+    from pr_reviewer.rounds import diff_identity
+
+    did = diff_identity("mbA", "treeA")
+    carried = review_row(HEAD, "PASS", diff_id=did)
+    carried["body"] = carried["body"].replace(" -->", f" reaffirmed={OLD_HEAD} -->", 1)
+    gh = DiffIdGH(
+        pr_facts=facts(),
+        reviews=[review_row(OLD_HEAD, "PASS", diff_id=did), carried],
+        head_trees={OLD_HEAD: "treeA", HEAD: "treeA"},
+        merge_base_tree="mbA",
+    )
+    d = make(tmp_path, gh=gh, runner=_no_panel_runner([]))
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "synchronize")) == "reaffirmed:PASS"
+    assert gh.posted == []
+
+
+def test_a_carried_verdict_is_a_verdict_but_not_a_round():
+    from pr_reviewer.rounds import panel_rounds, round_cap_reached, spent_rounds
+
+    carried = review_row(HEAD, "PASS")
+    carried["body"] = carried["body"].replace(" -->", f" reaffirmed={OLD_HEAD} -->", 1)
+    rows = [{**parse_verdict_marker(r["body"]), **r} for r in (review_row(OLD_HEAD, "PASS"), carried)]
+    verdicts = panel_rounds(rows)
+    assert [v["head"] for v in verdicts] == [OLD_HEAD, HEAD]  # the gate can find the new head's
+    assert [r["head"] for r in spent_rounds(verdicts)] == [OLD_HEAD]  # but one panel was spent
+    assert round_cap_reached(verdicts, 2) and not round_cap_reached(spent_rounds(verdicts), 2)
+
+
+async def test_the_gate_promotes_a_carried_pass_at_the_new_head(tmp_path):
+    # End to end for #135: the head that used to sit `hold:stale-head` now promotes.
+    green = [{"status": "completed", "conclusion": "success"}]
+    carried = review_row(HEAD, "PASS")
+    carried["body"] = carried["body"].replace(" -->", f" reaffirmed={OLD_HEAD} -->", 1)
+    gh = RoutedGH(pr_facts=facts(), reviews=[review_row(OLD_HEAD, "PASS"), carried], checks=green)
+    assert (await formal(tmp_path, gh).evaluate_promotion("o/r", 1)) == "promote"
+    # Without the carried verdict the same PR holds — the old behaviour.
+    gh = RoutedGH(pr_facts=facts(), reviews=[review_row(OLD_HEAD, "PASS")], checks=green)
+    assert (await formal(tmp_path / "old", gh).evaluate_promotion("o/r", 1)) == "hold:stale-head"
+
+
+async def test_an_unverified_round_holds_the_gate_end_to_end(tmp_path):
+    # `verified=false` was parsed from the marker and then DROPPED by `panel_rounds`, so the
+    # gate's `hold:unverified` could never fire. A carried verdict needs the flag to ride along.
+    green = [{"status": "completed", "conclusion": "success"}]
+    unverified = review_row(HEAD, "PASS")
+    unverified["body"] = unverified["body"].replace(" -->", " verified=false -->", 1)
+    gh = RoutedGH(pr_facts=facts(), reviews=[unverified], checks=green)
+    assert (await formal(tmp_path, gh).evaluate_promotion("o/r", 1)) == "hold:unverified"
 
 
 async def test_a_material_diff_change_runs_a_new_panel(tmp_path):
