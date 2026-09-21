@@ -222,4 +222,14 @@ def test_a_404_on_a_guessed_path_is_not_a_reason_to_declare_blocked():
         prompt = step["prompt"]
         assert "A 404 on a path you GUESSED is not a blocker" in prompt, step["id"]
         assert "files the diff" in prompt and "itself names" in prompt, step["id"]
-        assert '"file reads\n        404ing"' not in prompt and '"file reads 404ing"' not in prompt, step["id"]
+        # Whitespace-normalised: the example wrapped across lines in the YAML, and a block
+        # scalar re-indents on parse, so matching the literal layout could never fail.
+        assert '"file reads 404ing"' not in " ".join(prompt.split()), step["id"]
+
+
+def test_the_old_blocked_example_would_be_caught():
+    # The assertion above must have teeth: run it against the wording this replaced.
+    old = """you could not
+  complete a real pass. Say briefly what stopped you (e.g. "file reads
+  404ing", "out of turns before finishing")."""
+    assert '"file reads 404ing"' in " ".join(old.split())
