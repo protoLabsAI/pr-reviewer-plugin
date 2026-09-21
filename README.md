@@ -309,6 +309,7 @@ publishes one, named **`QA panel`**, driven by the same decision as approve-on-g
 | `FAIL` verdict standing against this head | ❌ failure |
 | No verdict yet / stale head / incomplete pass | ⏳ in progress |
 | CI pending, red, or unreadable | ⏳ in progress — CI already blocks; we don't say it twice |
+| PR closed or merged while the check was still in progress | ⚪ neutral — every wait above ends with the PR; a run that already concluded is left as it stands (#153) |
 
 Note the WARN rule is unchanged: a WARN whose threads are all resolved goes **green**.
 What blocks is feedback nobody addressed.

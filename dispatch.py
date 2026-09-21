@@ -32,7 +32,7 @@ import time
 from urllib.parse import quote
 
 from .approve import HOLD_NOT_OWNER, HOLD_THREADS_UNRESOLVED, PROMOTE, Observations, promotion_decision
-from .checks import CHECK_NAME, COMPLETED, FAILURE, IN_PROGRESS, SUCCESS, CheckRun, check_for
+from .checks import CHECK_NAME, COMPLETED, FAILURE, IN_PROGRESS, SUCCESS, CheckRun, check_for, closed_run
 from .chokepoint import DISPATCH_ACTIONS, Chokepoint
 from .gh_cli import bad_repo, run_gh
 from .grounding import (
@@ -1414,6 +1414,11 @@ class Dispatcher:
         if action == "ready_for_review":
             self._round_cap.pop(f"{repo}#{pr}", None)
         if action not in DISPATCH_ACTIONS:
+            # A close is not a dispatch, but it is the last event this head will ever get:
+            # give a still-waiting `QA panel` run its terminal state now (#153). Behind the
+            # same allowlist gate as everything else — no GitHub call for an unmanaged repo.
+            if action == "closed" and head_sha and not (bad_repo(repo) or (self.repos and repo not in self.repos)):
+                await self._publish_qa_check(repo, head_sha, closed_run(), only_if_open=True)
             self.telemetry.emit("drop", repo=repo, pr=pr, reason="not-a-dispatch-action", action=action)
             return "drop:not-a-dispatch-action"
         if bad_repo(repo) or (self.repos and repo not in self.repos):
@@ -2740,7 +2745,7 @@ class Dispatcher:
             )
         return f"The QA panel returned **{verdict}**{tail}. See the review for details.{coverage}"
 
-    async def _publish_qa_check(self, repo: str, sha: str, run: CheckRun) -> None:
+    async def _publish_qa_check(self, repo: str, sha: str, run: CheckRun, *, only_if_open: bool = False) -> None:
         """Publish (or update) this head's `QA panel` check run. Degrades, never raises.
 
         Idempotent by state, not by call: the sweep re-evaluates every open PR every few
@@ -2748,6 +2753,9 @@ class Dispatcher:
         all, so a week-old PR would carry hundreds and the PR's check list would become
         unreadable. So: read ours for this SHA, PATCH it when what we would say changed,
         and write nothing at all when it hasn't.
+
+        `only_if_open` is for the close path: it may finish a run that is still waiting,
+        and must never create one or overwrite a verdict that already concluded.
         """
         if not self.qa_check:
             return
@@ -2769,6 +2777,8 @@ class Dispatcher:
             # (a jq that matched nothing, a shape change) — treat it as "no run yet" and
             # create one, rather than subscripting whatever came back.
             existing = parsed if isinstance(parsed, dict) else {}
+        if only_if_open and (not existing.get("id") or existing.get("status") == COMPLETED):
+            return
         if (
             existing.get("status") == run.status
             and (existing.get("conclusion") or None) == run.conclusion

@@ -65,6 +65,7 @@ IN_PROGRESS = "in_progress"
 COMPLETED = "completed"
 SUCCESS = "success"
 FAILURE = "failure"
+NEUTRAL = "neutral"
 
 
 @dataclass(frozen=True)
@@ -193,4 +194,23 @@ def check_for(
         None,
         "Not cleared yet",
         f"The panel has not cleared this head ({decision}).",
+    )
+
+
+def closed_run() -> CheckRun:
+    """What a still-open run says once its PR closes or merges (#153, #130).
+
+    Every non-terminal state above waits on something — CI going green, a complete pass,
+    a verdict — that stops arriving the moment the PR closes: the sweep only evaluates
+    open PRs, so nothing ever revisits the run and it sat `in_progress` for good (5 of 28
+    merged PRs sampled, one four days old). `neutral`, not success or failure: the panel
+    neither cleared this head nor found against it, and a closed PR has no merge left to
+    gate. Only ever applied to a run that is still open — a concluded verdict stands.
+    """
+    return CheckRun(
+        COMPLETED,
+        NEUTRAL,
+        "PR closed before the panel cleared this head",
+        "This pull request was closed or merged while the check was still waiting, so "
+        "nothing remains for it to gate. The panel did not clear this head.",
     )
