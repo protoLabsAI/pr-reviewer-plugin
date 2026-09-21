@@ -260,3 +260,49 @@ async def test_the_knob_turns_the_check_off_without_touching_promotion(tmp_path)
     assert (await d.evaluate_promotion("o/r", 1)) == "promote"
     assert gh.writes == []
     assert gh.reviews_posted[0]["event"] == "APPROVE"
+
+
+# ── a closed PR ends the wait (#153) ──────────────────────────────────────────
+
+
+WAITING_ON_CI = {"id": 106266412003, "status": "in_progress", "conclusion": None, "title": "Waiting on CI"}
+
+
+async def test_closing_a_pr_concludes_a_run_that_was_still_waiting(tmp_path):
+    """protoAgent#3564: the round parked on "Waiting on CI", the PR merged six minutes later,
+    and the run was still `in_progress` eleven hours on — the sweep only visits OPEN PRs, so
+    nothing was ever going to revisit it. The close is the last event the head gets."""
+    gh = ChecksGH(pr_facts=facts(), existing=WAITING_ON_CI)
+    d = owned(tmp_path, gh)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "closed")) == "drop:not-a-dispatch-action"
+    (write,) = gh.writes
+    assert write["method"] == "PATCH" and write["url"].endswith("/check-runs/106266412003")
+    assert (write["status"], write["conclusion"]) == ("completed", "neutral")
+    assert "closed" in write["output[title]"].lower()
+
+
+async def test_closing_a_pr_never_rewrites_a_verdict_that_already_concluded(tmp_path):
+    for conclusion in ("success", "failure"):
+        done = {"id": 7, "status": "completed", "conclusion": conclusion, "title": "x"}
+        gh = ChecksGH(pr_facts=facts(), existing=done)
+        await owned(tmp_path, gh).handle_pr_event("o/r", 1, HEAD, "closed")
+        assert gh.writes == []
+
+
+async def test_closing_a_pr_that_never_had_a_run_creates_none(tmp_path):
+    gh = ChecksGH(pr_facts=facts(), existing=None)
+    await owned(tmp_path, gh).handle_pr_event("o/r", 1, HEAD, "closed")
+    assert gh.writes == []
+
+
+async def test_a_close_on_an_unlisted_repo_makes_no_github_call(tmp_path):
+    gh = ChecksGH(pr_facts=facts(), existing=WAITING_ON_CI)
+    d = make(tmp_path, cfg={"shadow_mode": False, "repos": ["o/other"]}, gh=gh)
+    await d.handle_pr_event("o/r", 1, HEAD, "closed")
+    assert gh.calls == [] and gh.writes == []
+
+
+async def test_other_non_dispatch_actions_still_touch_nothing(tmp_path):
+    gh = ChecksGH(pr_facts=facts(), existing=WAITING_ON_CI)
+    await owned(tmp_path, gh).handle_pr_event("o/r", 1, HEAD, "labeled")
+    assert gh.calls == [] and gh.writes == []
