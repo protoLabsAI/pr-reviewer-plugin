@@ -1839,6 +1839,17 @@ class Dispatcher:
             degraded, incomplete_finders, structural_unavailable, outage_reason(structural_out), verify_undelivered
         )
         brief, brief_found = extract_brief(output)
+        # A report that dropped its brief (#168: 5 of 150 posted reviews, every one a clean
+        # round) leaves the author a PASS with no word on what was looked at. The
+        # synthesizer's brief is the same round's, already delimited — but it is written
+        # BEFORE verification, so it is only borrowed when it cannot disagree with the
+        # verdict: the synthesizer carried no findings and neither does the report.
+        brief_source = "report" if brief_found else ""
+        if not brief_found and not reported:
+            synthesized = str(steps_out.get("synthesize") or "")
+            if not self._parse_findings(synthesized):
+                brief, brief_found = extract_brief(synthesized)
+                brief_source = "synthesize" if brief_found else ""
         truncated = report_hard_stopped(output)
         findings, confined = confine_findings(reported, paths)
         if confined:
@@ -2011,6 +2022,9 @@ class Dispatcher:
             # explicit "brief could not be read" instead — the review still lands, but a
             # rising count here is the panel drifting off its output contract (#2439).
             brief_found=brief_found,
+            # The report dropped its brief and the synthesizer's stood in (#168) — still the
+            # report step off its contract, so it stays countable.
+            brief_borrowed=(brief_source == "synthesize") or None,
             report_truncated=truncated or None,
             grounding_checked=grounding_checked,
             grounding_downgraded=len(ungrounded),

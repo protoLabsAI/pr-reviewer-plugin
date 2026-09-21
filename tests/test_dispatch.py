@@ -1193,6 +1193,42 @@ async def test_a_report_with_no_delimited_brief_still_posts_and_says_so(tmp_path
     assert json.loads(extract_findings_json(body))[0]["file"] == "x.py"  # the review still lands
 
 
+_SYNTH_CLEAN = "<!-- brief -->\nAll five finders came back clean.\n<!-- /brief -->\n\n```json\n[]\n```"
+_SYNTH_FOUND = (
+    "<!-- brief -->\nOne defect in x.py.\n<!-- /brief -->\n\n"
+    '```json\n[{"file": "x.py", "line": 1, "severity": "minor", "claim": "c"}]\n```'
+)
+
+
+async def test_a_clean_report_that_dropped_its_brief_borrows_the_synthesizers(tmp_path):
+    """#168: 5 of 150 posted reviews, every one a clean round — a PASS with no word on
+    what was looked at, while the synthesizer's delimited brief sat in the same run."""
+    gh = RoutedGH(pr_facts=facts(), files="x.py\n")
+
+    async def runner(name, inputs):
+        return {"output": "```json\n[]\n```\n\nNo findings.", "failed": [], "steps": {"synthesize": _SYNTH_CLEAN}}
+
+    d = make(tmp_path, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "reviewed:PASS"
+    body = gh.reviews_posted[0]["body"]
+    assert "All five finders came back clean." in body and "brief could not be read" not in body
+    row = _telemetry_events(tmp_path, "reviewed")[-1]
+    assert row["brief_borrowed"] is True  # the report step is still off its contract: countable
+
+
+async def test_a_synthesizer_brief_that_could_disagree_with_the_verdict_is_not_borrowed(tmp_path):
+    # Written BEFORE verification: it describes a finding the report no longer carries.
+    gh = RoutedGH(pr_facts=facts(), files="x.py\n")
+
+    async def runner(name, inputs):
+        return {"output": "```json\n[]\n```\n\nNo findings.", "failed": [], "steps": {"synthesize": _SYNTH_FOUND}}
+
+    d = make(tmp_path, gh=gh, runner=runner)
+    await d.handle_pr_event("o/r", 1, HEAD, "opened")
+    body = gh.reviews_posted[0]["body"]
+    assert "One defect in x.py." not in body and "brief could not be read" in body
+
+
 async def test_formal_fail_blocks_only_on_terminal_ci(tmp_path):
     pending = [{"status": "in_progress", "conclusion": None}]
     gh = RoutedGH(pr_facts=facts(), checks=pending)
