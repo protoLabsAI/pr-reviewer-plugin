@@ -502,10 +502,12 @@ def coverage_gaps(
     incomplete_finders: list[str] | None,
     structural_unavailable: bool,
     structural_reason: str = "",
+    verify_undelivered: bool = False,
 ) -> dict[str, str]:
-    """{lane: why} for every lane that did not deliver a full pass — the three signals
-    the dispatcher already records (`degraded`, `incomplete_finders`,
-    `structural_unavailable`), as the one record the coverage cap and note read."""
+    """{lane: why} for every lane that did not deliver a full pass — the signals the
+    dispatcher already records (`degraded`, `incomplete_finders`,
+    `structural_unavailable`, and a verify step that returned nothing on a clean round),
+    as the one record the coverage cap and note read."""
     gaps = {str(s): "hit its time budget" for s in (degraded or [])}
     for s in incomplete_finders or []:
         gaps.setdefault(str(s), "did not complete a real pass")
@@ -515,6 +517,8 @@ def coverage_gaps(
         # a cause per round — "auth error", "provider error" — for what was one fault, and a
         # reader could not tell a wrong gateway key from an unusable model reply.
         gaps.setdefault("find_structural", f"{why}: {structural_reason}" if structural_reason else why)
+    if verify_undelivered:
+        gaps.setdefault("verify", "returned no findings array and no status line — the verify pass did not run")
     return gaps
 
 
@@ -547,6 +551,28 @@ def render_coverage_note(gaps: dict[str, str] | None, lanes: int = 0) -> str:
         "capped at WARN. Where the brief below implies full coverage, this line supersedes "
         "it. The next push re-runs the full panel."
     )
+
+
+def verify_delivered(verify_output: str) -> bool:
+    """Did the verify step hand anything back? The one question `verification_ran` cannot
+    ask on a clean round (#151).
+
+    With findings, a dead verifier shows: nothing is annotated, so `verification_ran` is
+    False. With none, `verification_ran` returns True before it looks at the output — so
+    "the verifier had nothing to check" and "the verifier announced its intent and
+    stopped" were the same state, and on protoAgent#3564 the second one posted a clean
+    PASS above a report body saying the verifier's input never arrived.
+
+    Lenient on purpose: a fenced block that OPENS an array counts even when it is not
+    valid JSON (verifier notes carry stray `\'` escapes often enough that strict parsing
+    would flag working rounds), and so does either status line. Measured over 112 saved
+    zero-finding runs this flags 4 — three verifiers that stopped at a preamble or asked
+    to be sent the findings, and one that did the work in prose but returned no array.
+    """
+    out = verify_output or ""
+    if NOTHING_TO_VERIFY in out or VERIFY_GAP_PREFIX in out or re.search(r"VERIFY_STATUS:\s*annotated", out):
+        return True
+    return any(m.group(1).lstrip().startswith("[") for m in _FENCE_RE.finditer(out))
 
 
 def verification_ran(verify_output: str, findings: list[dict] | None) -> bool:

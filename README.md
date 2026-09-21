@@ -188,6 +188,14 @@ structural-trigger dispatch, approve-on-green + sweep, and the review eval.
     and the structural lane gaps on most large protoAgent reviews today (#119). Lanes are
     judged only where the recipe ran them under that contract — the small-diff
     `code-review` recipe has no structural seat and asks for no status line.
+  - **A verify step that hands nothing back on a clean round is a gap too (#151).** With
+    findings, a dead verifier already shows (nothing is annotated → `verified=false`).
+    With none it could not: "nothing to check" and "stopped at its preamble" looked the
+    same, and the round posted "came back clean" above a report saying the verifier never
+    ran. Now a zero-finding round whose `verify` output carries no fenced array and no
+    `VERIFY_STATUS` line names `verify` in the coverage line and posts WARN
+    (`verify_undelivered` in telemetry). `complete` stays true — every finder covered the
+    diff — and the round is not retried: nothing went unverified.
 
 ## The draft → ready contract — undrafting a PR is the act of shipping it
 
