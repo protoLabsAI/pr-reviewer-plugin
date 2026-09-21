@@ -145,8 +145,16 @@ steps:
         and completed a real pass (`count` = findings you're reporting; 0 is a
         normal, honest clean result).
       - `FINDER_STATUS: blocked reason=<short reason>` — you could not
-        complete a real pass. Say briefly what stopped you (e.g. "file reads
-        404ing", "out of turns before finishing").
+        complete a real pass. Say briefly what stopped you (e.g. "reads of
+        the PR's own changed files erroring", "out of turns before finishing").
+
+      A 404 on a path you GUESSED is not a blocker — it is an answer: that
+      file does not exist at that ref. Looking for a `__version__` module and
+      finding none tells you there is no such module to update; record it in
+      your prose (or as a `Gap:` if it matters) and carry on. You are blocked
+      only when you could not read what your angle NEEDED: files the diff
+      itself names, or a tool failing on every call. One missing file never
+      means "the repo is inaccessible" — the diff you were given came from it.
 
   - id: find_removed_behavior
     subagent: review-finder
@@ -198,8 +206,16 @@ steps:
         and completed a real pass (`count` = findings you're reporting; 0 is a
         normal, honest clean result).
       - `FINDER_STATUS: blocked reason=<short reason>` — you could not
-        complete a real pass. Say briefly what stopped you (e.g. "file reads
-        404ing", "out of turns before finishing").
+        complete a real pass. Say briefly what stopped you (e.g. "reads of
+        the PR's own changed files erroring", "out of turns before finishing").
+
+      A 404 on a path you GUESSED is not a blocker — it is an answer: that
+      file does not exist at that ref. Looking for a `__version__` module and
+      finding none tells you there is no such module to update; record it in
+      your prose (or as a `Gap:` if it matters) and carry on. You are blocked
+      only when you could not read what your angle NEEDED: files the diff
+      itself names, or a tool failing on every call. One missing file never
+      means "the repo is inaccessible" — the diff you were given came from it.
 
   - id: find_crossfile
     subagent: review-finder
@@ -258,8 +274,16 @@ steps:
         and completed a real pass (`count` = findings you're reporting; 0 is a
         normal, honest clean result).
       - `FINDER_STATUS: blocked reason=<short reason>` — you could not
-        complete a real pass. Say briefly what stopped you (e.g. "file reads
-        404ing", "out of turns before finishing").
+        complete a real pass. Say briefly what stopped you (e.g. "reads of
+        the PR's own changed files erroring", "out of turns before finishing").
+
+      A 404 on a path you GUESSED is not a blocker — it is an answer: that
+      file does not exist at that ref. Looking for a `__version__` module and
+      finding none tells you there is no such module to update; record it in
+      your prose (or as a `Gap:` if it matters) and carry on. You are blocked
+      only when you could not read what your angle NEEDED: files the diff
+      itself names, or a tool failing on every call. One missing file never
+      means "the repo is inaccessible" — the diff you were given came from it.
 
   - id: find_conventions
     subagent: review-finder
@@ -320,8 +344,16 @@ steps:
         and completed a real pass (`count` = findings you're reporting; 0 is a
         normal, honest clean result).
       - `FINDER_STATUS: blocked reason=<short reason>` — you could not
-        complete a real pass. Say briefly what stopped you (e.g. "file reads
-        404ing", "out of turns before finishing").
+        complete a real pass. Say briefly what stopped you (e.g. "reads of
+        the PR's own changed files erroring", "out of turns before finishing").
+
+      A 404 on a path you GUESSED is not a blocker — it is an answer: that
+      file does not exist at that ref. Looking for a `__version__` module and
+      finding none tells you there is no such module to update; record it in
+      your prose (or as a `Gap:` if it matters) and carry on. You are blocked
+      only when you could not read what your angle NEEDED: files the diff
+      itself names, or a tool failing on every call. One missing file never
+      means "the repo is inaccessible" — the diff you were given came from it.
 
   - id: find_structural
     subagent: structural-finder
