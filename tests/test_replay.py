@@ -9,6 +9,8 @@ import json
 
 from pr_reviewer.replay import looks_truncated, replay_review
 
+from tests.conftest import UNEXPECTED_WRITES
+
 
 def _parse(output: str) -> list[dict]:
     """The plugin's host-free findings parser — the last fenced array."""
@@ -35,6 +37,11 @@ class ReplayGH:
     async def __call__(self, args, timeout=30):
         self.calls.append(args)
         j = " ".join(args)
+        # Recorded as well as asserted (#136): replay's GitHub reads degrade on error, so an
+        # AssertionError raised here can be swallowed by the code under test. The autouse
+        # fixture in conftest fails the test from the record, which nothing can swallow.
+        if "-X" in args:
+            UNEXPECTED_WRITES.append(list(args))
         assert "-X" not in args, "replay must never write to GitHub"
         if "/contents/" in j:
             import base64
@@ -342,6 +349,11 @@ class ContentsGH:
     async def __call__(self, args, timeout=30):
         self.calls.append(args)
         j = " ".join(args)
+        # Recorded as well as asserted (#136): replay's GitHub reads degrade on error, so an
+        # AssertionError raised here can be swallowed by the code under test. The autouse
+        # fixture in conftest fails the test from the record, which nothing can swallow.
+        if "-X" in args:
+            UNEXPECTED_WRITES.append(list(args))
         assert "-X" not in args, "replay must never write to GitHub"
         if "/contents/" in j:
             rc, out = self.contents
