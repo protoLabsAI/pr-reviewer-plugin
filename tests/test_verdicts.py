@@ -846,3 +846,20 @@ def test_ordinary_fences_read_exactly_as_before():
     # A fence closed on the payload's own line is not line-anchored: the legacy form still reads it.
     assert findings_payload_present("```json\n[]```")
     assert not findings_payload_present('```json\n[{"claim": "cut off')  # truncated stays undelivered
+
+
+def test_a_line_closed_and_a_same_line_closed_fence_can_share_a_report():
+    """The close is chosen per fence. One pattern for the whole text, with the other as an
+    all-or-nothing fallback, read only one of these — and neither in the second order."""
+    from pr_reviewer.verdicts import fenced_blocks
+
+    one, two = '[{"claim": "one ``x.py```"}]', '[{"claim": "two"}]'
+    for text in (f"```json\n{one}\n```\n\n```json\n{two}```", f"```json\n{two}```\n\n```json\n{one}\n```"):
+        assert sorted(fenced_blocks(text, json_only=True)) == sorted([one, two])
+
+
+def test_a_fence_holding_no_json_hides_nothing_after_it():
+    from pr_reviewer.verdicts import fenced_blocks
+
+    assert fenced_blocks("```\ndiff --git a/x b/x\n```\n\n```json\n[]\n```") == ["diff --git a/x b/x", "[]"]
+    assert fenced_blocks("```json\n[1, 2") == []  # unclosed: not a block

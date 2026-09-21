@@ -363,19 +363,21 @@ FINDER_REVIEWED = "FINDER_STATUS: reviewed"
 FINDER_BLOCKED_PREFIX = "FINDER_STATUS: blocked"
 
 # ── reading fenced blocks ─────────────────────────────────────────────────────
-# A fence CLOSES at a ``` that starts a line — not at the first ``` anywhere. The old
-# pattern (`.*?```) ended the block at the first triple backtick it met, including one
-# INSIDE a JSON string: a finding quoting a reST-style docstring (``tests/x.py`` wrapped in
-# a markdown code span) puts three backticks in a row mid-string, the block was cut there,
-# the JSON failed to parse, and the stage read as "undelivered". A complete, correctly
-# verified round was discarded and retried (protoPatch#13) — and because the text is
-# deterministic, such a PR could never get a verdict however often it was summoned.
+# A fence does NOT close at the first ``` anywhere. The old pattern (`.*?```) ended the
+# block at the first triple backtick it met, including one INSIDE a JSON string: a finding
+# quoting a reST-style docstring (``tests/x.py`` wrapped in a markdown code span) puts three
+# backticks in a row mid-string, the block was cut there, the JSON failed to parse, and the
+# stage read as "undelivered". A complete, correctly verified round was discarded and
+# retried (protoPatch#13) — and because the text is deterministic, such a PR could never
+# get a verdict however often it was summoned.
 #
-# Anchoring to a line start is exact, not a heuristic: a JSON string cannot hold a raw
-# newline, so "\n```" can never occur inside one. Blocks the strict form cannot delimit
-# (a fence closed on the payload's own line) still fall back to the legacy pattern.
-_FENCE_STRICT = r"```{lang}[ \t]*\n(.*?)\n[ \t]*```"
-_FENCE_LEGACY = r"```{lang}\s*\n(.*?)```"
+# So the close is chosen PER FENCE, by what it yields: the first ``` after the opener whose
+# body is valid JSON ends the block. A ``` inside a string leaves a body that cannot parse
+# and is passed over; a fence closed on the payload's own line still parses at its first
+# ```, as it always did — and the two shapes can share a text, in either order (one pattern
+# for the whole text, with the other as an all-or-nothing fallback, lost a block there).
+# A fence holding no JSON at all closes at its first ```, as before.
+_FENCE_CLOSE_TRIES = 32  # bounds the scan of a fence that never parses
 
 
 def fenced_blocks(text: str, *, json_only: bool = False) -> list[str]:
@@ -383,9 +385,30 @@ def fenced_blocks(text: str, *, json_only: bool = False) -> list[str]:
 
     `json_only` takes ```json fences alone; otherwise an untagged ``` fence counts too.
     """
-    lang = "json" if json_only else "(?:json)?"
-    strict = re.findall(_FENCE_STRICT.format(lang=lang), text or "", re.DOTALL)
-    return strict or re.findall(_FENCE_LEGACY.format(lang=lang), text or "", re.DOTALL)
+    text = text or ""
+    opener_re = re.compile(r"```json\s*\n" if json_only else r"```(?:json)?\s*\n")
+    out: list[str] = []
+    pos = 0
+    while (opener := opener_re.search(text, pos)) is not None:
+        start = opener.end()
+        first = close = text.find("```", start)
+        if first == -1:
+            break  # an unclosed fence is not a block
+        for _ in range(_FENCE_CLOSE_TRIES):
+            try:
+                json.loads(text[start:close])
+                break
+            except json.JSONDecodeError:
+                close = text.find("```", close + 3)
+                if close == -1:
+                    break
+        else:
+            close = -1
+        if close == -1:
+            close = first
+        out.append(re.sub(r"\n[ \t]*\Z", "", text[start:close]))
+        pos = close + 3
+    return out
 
 
 def finder_completed(output: str) -> bool:

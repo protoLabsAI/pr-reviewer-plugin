@@ -2034,18 +2034,44 @@ class Dispatcher:
 
     @staticmethod
     def _parse_findings(output: str) -> list[dict]:
+        """The report's findings, for the verdict — never FEWER than the report carries.
+
+        The host's `parse_findings` is the normal reader (it coerces and picks the best
+        array). But its fence pattern ends a block at the first ``` it meets, including
+        one inside a JSON string, so a finding quoting stacked backticks makes it lose
+        the findings block; when an earlier block (the dispositions array) still parses,
+        its bare-array fallback never runs and it returns ZERO findings — a clean PASS
+        over a report that carries a finding. Until v0.45.2 the plugin's own delivery
+        check tripped on the same text and discarded the round; #162 fixed that check,
+        which left this reader as the only thing standing between that report and a PASS.
+
+        So the plugin reads the report too, with the line-anchored `fenced_blocks`, and
+        takes whichever reader found MORE findings. Dropping a finding is the one failure
+        this must not have; an extra look costs nothing.
+        """
+        from .verdicts import extract_findings_json
+
+        own: list[dict] = []
+        text = extract_findings_json(output)
+        if text:
+            try:
+                own = [f for f in json.loads(text) if isinstance(f, dict) and ("claim" in f or "severity" in f)]
+            except json.JSONDecodeError:
+                own = []
         try:
             from graph.review.findings import parse_findings
 
-            return [f.to_dict() for f in parse_findings(output)]
-        except Exception:  # noqa: BLE001 — host-free fallback: last fenced array
-            from .verdicts import extract_findings_json
-
-            text = extract_findings_json(output)
-            try:
-                return json.loads(text) if text else []
-            except json.JSONDecodeError:
-                return []
+            host = [f.to_dict() for f in parse_findings(output)]
+        except Exception:  # noqa: BLE001 — host-free: the plugin's own read is all there is
+            return own
+        if len(own) > len(host):
+            log.warning(
+                "[pr-reviewer] the host parser read %d finding(s) where the report carries %d; using the report's",
+                len(host),
+                len(own),
+            )
+            return own
+        return host
 
     # ── stale-head demotion: the PR moved while the panel ran (issue #82) ──────
 
