@@ -692,8 +692,9 @@ def render_verdict_body(
 
 
 def parse_verdict_marker(body: str) -> dict | None:
-    """{'head', 'verdict', 'promoted', 'complete', 'verified', 'diff_id'} from a posted
-    body, or None if it isn't ours."""
+    """{'head', 'verdict', 'promoted', 'complete', 'verified', 'diff_id', 'reaffirmed'} from
+    a posted body, or None if it isn't ours. `reaffirmed` is the head a verdict was carried
+    FROM by an identical-diff reaffirm (issue #135), or "" for a round the panel ran."""
     m = _MARKER_RE.search(body or "")
     if not m:
         return None
