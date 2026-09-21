@@ -36,7 +36,7 @@ import hashlib
 import json
 import re
 
-from .verdicts import PASS, WARN, read_findings_record
+from .verdicts import PASS, WARN, fenced_blocks, read_findings_record
 
 # From this round on, the convergence rule is eligible to fire. Rounds 1–2 are the
 # review doing its job; #88's loop only became self-referential at round 3+.
@@ -371,7 +371,6 @@ def unexplained_clearance(
     return None
 
 
-_DISPOSITIONS_RE = re.compile(r"```json\s*\n(\[.*?\])\s*```", re.DOTALL)
 _VALID_DISPOSITIONS = ("fixed", "open", "refuted")
 
 
@@ -393,7 +392,9 @@ def parse_dispositions(output: str) -> list[dict]:
     it was discarded for. This guard decides whether a prior blocker stays blocking, so
     "which block did we read" is a correctness question, not a formatting one.
     """
-    for block in reversed(_DISPOSITIONS_RE.findall(output or "")):
+    # `fenced_blocks`: a fence closes at a line start, never at a ``` inside a JSON string.
+    arrays = [b.strip() for b in fenced_blocks(output, json_only=True) if b.strip().startswith("[")]
+    for block in reversed(arrays):
         try:
             parsed = json.loads(block)
         except json.JSONDecodeError:

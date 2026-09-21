@@ -362,7 +362,30 @@ VERIFY_GAP_PREFIX = "VERIFY_GAP:"
 FINDER_REVIEWED = "FINDER_STATUS: reviewed"
 FINDER_BLOCKED_PREFIX = "FINDER_STATUS: blocked"
 
-_FINDINGS_FENCE_RE = re.compile(r"```json\s*\n.*?```", re.DOTALL)
+# ── reading fenced blocks ─────────────────────────────────────────────────────
+# A fence CLOSES at a ``` that starts a line — not at the first ``` anywhere. The old
+# pattern (`.*?```) ended the block at the first triple backtick it met, including one
+# INSIDE a JSON string: a finding quoting a reST-style docstring (``tests/x.py`` wrapped in
+# a markdown code span) puts three backticks in a row mid-string, the block was cut there,
+# the JSON failed to parse, and the stage read as "undelivered". A complete, correctly
+# verified round was discarded and retried (protoPatch#13) — and because the text is
+# deterministic, such a PR could never get a verdict however often it was summoned.
+#
+# Anchoring to a line start is exact, not a heuristic: a JSON string cannot hold a raw
+# newline, so "\n```" can never occur inside one. Blocks the strict form cannot delimit
+# (a fence closed on the payload's own line) still fall back to the legacy pattern.
+_FENCE_STRICT = r"```{lang}[ \t]*\n(.*?)\n[ \t]*```"
+_FENCE_LEGACY = r"```{lang}\s*\n(.*?)```"
+
+
+def fenced_blocks(text: str, *, json_only: bool = False) -> list[str]:
+    """The bodies of the fenced code blocks in `text`, in order.
+
+    `json_only` takes ```json fences alone; otherwise an untagged ``` fence counts too.
+    """
+    lang = "json" if json_only else "(?:json)?"
+    strict = re.findall(_FENCE_STRICT.format(lang=lang), text or "", re.DOTALL)
+    return strict or re.findall(_FENCE_LEGACY.format(lang=lang), text or "", re.DOTALL)
 
 
 def finder_completed(output: str) -> bool:
@@ -407,7 +430,7 @@ def structural_relay_ok(output: str, unavailable_prefix: str | tuple[str, ...]) 
     text = output or ""
     if mentions_any(text, unavailable_prefix):
         return True
-    return bool(_FINDINGS_FENCE_RE.search(text))
+    return bool(fenced_blocks(text, json_only=True))
 
 
 # ── absent is not empty (issue #113) ───────────────────────────────────────────
@@ -418,7 +441,6 @@ def structural_relay_ok(output: str, unavailable_prefix: str | tuple[str, ...]) 
 # `_parse_findings` reads both as `[]`, so an undelivered payload rendered as "came back
 # clean" and posted PASS beneath a verify note saying the findings may have been lost
 # (#113). This is replay's `looks_truncated` rule, applied at every stage boundary.
-_FENCE_RE = re.compile(r"```(?:json)?\s*\n(.*?)```", re.DOTALL)
 
 # A recipe's review lanes are its `find_*` steps — true of the core four-finder
 # `code-review` recipe and of `code-review-structural` alike.
@@ -438,8 +460,8 @@ def findings_payload_present(output: str) -> bool:
     Fenced only, as the contract (and replay's `looks_truncated`) has it: a bare `[...]`
     in prose is too easy to hit by accident to count as delivery.
     """
-    for m in _FENCE_RE.finditer(output or ""):
-        body = m.group(1).strip()
+    for block in fenced_blocks(output):
+        body = block.strip()
         if not body.startswith("["):
             continue
         try:
@@ -572,7 +594,7 @@ def verify_delivered(verify_output: str) -> bool:
     out = verify_output or ""
     if NOTHING_TO_VERIFY in out or VERIFY_GAP_PREFIX in out or re.search(r"VERIFY_STATUS:\s*annotated", out):
         return True
-    return any(m.group(1).lstrip().startswith("[") for m in _FENCE_RE.finditer(out))
+    return any(block.lstrip().startswith("[") for block in fenced_blocks(out))
 
 
 def verification_ran(verify_output: str, findings: list[dict] | None) -> bool:
@@ -760,7 +782,7 @@ _RECORD_RE = re.compile(
 def extract_findings_json(body: str) -> str:
     """The findings JSON block from a posted verdict body (for `prior_findings` on a
     delta re-review). Returns the fenced block text, or '' when absent."""
-    blocks = re.findall(r"```json\s*\n(.*?)```", body or "", re.DOTALL)
+    blocks = fenced_blocks(body, json_only=True)
     for block in reversed(blocks):  # the findings array is the report's FINAL block
         text = block.strip()
         if text.startswith("["):

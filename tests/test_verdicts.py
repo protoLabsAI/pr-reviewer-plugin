@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 
+import pytest
 from pr_reviewer.protopatch import UNAVAILABLE_PREFIX
 from pr_reviewer.verdicts import (
     FAIL,
@@ -800,3 +801,48 @@ def test_a_gapped_round_never_says_it_came_back_clean():
     assert body.index("Coverage incomplete") < body.index("No coverage gaps")  # the record precedes the brief
     assert json.loads(extract_findings_json(body)) == []  # recall still reads an explicit []
     assert parse_verdict_marker(body)["complete"] is False
+
+
+# ── a fence closes at a line start, never at a ``` inside a JSON string ────────
+
+# The shape that discarded a complete, verified round on protoPatch#13: a finding quoting
+# a reST-style docstring (``path``) inside a markdown code span puts THREE backticks in a
+# row in the middle of a JSON string.
+_STACKED = "reads `covered by ``tests/test_review_at_head.py```; the sweep skips the rest"
+_TRICKY_REPORT = (
+    "<!-- brief -->\nLow-risk PR.\n<!-- /brief -->\n\n"
+    '```json\n[\n  {"prior": "scripts/x.py:220", "disposition": "open", "why": "unchanged"}\n]\n```\n\n'
+    "```json\n"
+    + json.dumps([{"file": "scripts/x.py", "line": 12, "severity": "minor", "claim": _STACKED}], indent=2)
+    + "\n```"
+)
+
+
+def test_triple_backticks_inside_a_json_string_do_not_end_the_block():
+    from pr_reviewer.verdicts import fenced_blocks, findings_payload_present
+
+    assert "```" in _STACKED  # the premise: three in a row, mid-string
+    blocks = fenced_blocks(_TRICKY_REPORT, json_only=True)
+    assert len(blocks) == 2 and json.loads(blocks[1])[0]["claim"] == _STACKED
+    assert findings_payload_present(_TRICKY_REPORT)  # was False: the round read as "undelivered"
+    assert json.loads(extract_findings_json(_TRICKY_REPORT))[0]["claim"] == _STACKED  # recall keeps it too
+
+
+def test_the_legacy_pattern_really_did_lose_it():
+    # Pins the bug, so the strict pattern cannot be "simplified" back.
+    import re
+
+    legacy = re.findall(r"```(?:json)?\s*\n(.*?)```", _TRICKY_REPORT, re.DOTALL)
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(legacy[1])
+
+
+def test_ordinary_fences_read_exactly_as_before():
+    from pr_reviewer.verdicts import fenced_blocks, findings_payload_present
+
+    assert fenced_blocks("x\n```json\n[]\n```\ny", json_only=True) == ["[]"]
+    assert fenced_blocks("```\n[1]\n```") == ["[1]"] and fenced_blocks("```\n[1]\n```", json_only=True) == []
+    assert fenced_blocks("prose with no fence at all") == []
+    # A fence closed on the payload's own line is not line-anchored: the legacy form still reads it.
+    assert findings_payload_present("```json\n[]```")
+    assert not findings_payload_present('```json\n[{"claim": "cut off')  # truncated stays undelivered

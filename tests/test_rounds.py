@@ -897,3 +897,15 @@ def test_round_cap_has_a_ceiling_and_an_off_switch():
     assert round_cap_reached([_round(False)] * 4, 2)  # 2 × the cap, all incomplete
     assert not round_cap_reached([_round(False)] * 3, 2)
     assert not round_cap_reached([_round()] * 50, 0)  # 0 disables the cap
+
+
+def test_dispositions_survive_stacked_backticks_in_the_findings_block():
+    # The same fence bug, other parser: the dispositions block precedes a findings block
+    # whose string holds three backticks in a row.
+    claim = "reads `covered by ``tests/test_review_at_head.py```; the sweep skips the rest"
+    report = (
+        '```json\n[{"prior": "scripts/x.py:220", "disposition": "open", "why": "unchanged"}]\n```\n\n'
+        "```json\n" + json.dumps([{"file": "scripts/x.py", "severity": "minor", "claim": claim}], indent=2) + "\n```"
+    )
+    rows = parse_dispositions(report)
+    assert len(rows) == 1 and rows[0]["disposition"] == "open"
