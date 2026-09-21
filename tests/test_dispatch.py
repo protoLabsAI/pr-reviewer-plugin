@@ -9,7 +9,7 @@ import time
 
 from pr_reviewer.dispatch import POST_MAX_FAILURES, Dispatcher
 from pr_reviewer.telemetry import Telemetry
-from pr_reviewer.verdicts import extract_findings_json, parse_verdict_marker, render_verdict_body
+from pr_reviewer.verdicts import extract_findings_json, parse_verdict_marker, render_verdict_body, verdict_for
 
 from tests.conftest import note_write
 
@@ -4109,3 +4109,68 @@ def test_the_slot_ttl_outlasts_every_legitimate_round(tmp_path):
     d = make(tmp_path, cfg={"panel_attempt_timeout": 1800, "panel_retries": 1})
     assert d.round_timeout_s >= (d.panel_retries + 1) * d.panel_attempt_timeout_s
     assert d.chokepoint.in_flight_ttl_s > d.round_timeout_s
+
+
+# ── the verdict never reads FEWER findings than the report carries ─────────────
+
+
+def _host_parser(monkeypatch, result):
+    """Install a stand-in `graph.review.findings.parse_findings` (the host's reader)."""
+    import sys
+    import types
+
+    class _F:
+        def __init__(self, d):
+            self._d = d
+
+        def to_dict(self):
+            return dict(self._d)
+
+    mod = types.ModuleType("graph.review.findings")
+    mod.parse_findings = lambda _text: [_F(d) for d in result]
+    review = types.ModuleType("graph.review")
+    review.findings = mod
+    monkeypatch.setitem(sys.modules, "graph.review", review)
+    monkeypatch.setitem(sys.modules, "graph.review.findings", mod)
+
+
+_STACKED_CLAIM = "reads `covered by ``tests/test_review_at_head.py```; the sweep skips the rest"
+_STACKED_REPORT = (
+    '```json\n[{"prior": "scripts/x.py:220", "disposition": "open", "why": "unchanged"}]\n```\n\n'
+    "```json\n"
+    + json.dumps([{"file": "scripts/x.py", "line": 12, "severity": "major", "claim": _STACKED_CLAIM}], indent=2)
+    + "\n```"
+)
+
+
+def test_a_host_parser_that_drops_the_findings_block_does_not_produce_a_clean_pass(monkeypatch, caplog):
+    # The host's fence pattern ends a block at a ``` INSIDE a JSON string; with a dispositions
+    # block ahead of it, its fallback never runs and it returns ZERO findings. After #162 the
+    # plugin no longer discards such a report — so this reader is what stands between it and
+    # a PASS. Reproduced against the real host parser: parse_findings -> 0.
+    from pr_reviewer.dispatch import Dispatcher
+
+    _host_parser(monkeypatch, [])  # what the host returns for _STACKED_REPORT today
+    with caplog.at_level("WARNING"):
+        findings = Dispatcher._parse_findings(_STACKED_REPORT)
+    assert [f["claim"] for f in findings] == [_STACKED_CLAIM] and findings[0]["severity"] == "major"
+    assert "host parser read 0 finding(s) where the report carries 1" in caplog.text
+    assert verdict_for(findings) != "PASS"  # an unverified major does not clear
+
+
+def test_the_host_parser_stays_the_reader_when_it_sees_at_least_as_much(monkeypatch):
+    from pr_reviewer.dispatch import Dispatcher
+
+    coerced = [
+        {
+            "file": "scripts/x.py",
+            "line": 12,
+            "severity": "major",
+            "claim": "coerced by the host",
+            "verdict": "confirmed",
+        }
+    ]
+    _host_parser(monkeypatch, coerced)
+    assert Dispatcher._parse_findings(_STACKED_REPORT) == coerced  # same count: the host's coercion wins
+    _host_parser(monkeypatch, [])
+    assert Dispatcher._parse_findings("clean.\n\n```json\n[]\n```") == []  # a clean report stays clean
