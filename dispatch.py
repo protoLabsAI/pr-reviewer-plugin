@@ -62,7 +62,7 @@ from .rounds import (
     unaccounted_priors,
     unexplained_clearance,
 )
-from .telemetry import REAFFIRM_DIFF, REAFFIRM_HEAD, REAFFIRM_MISS, Telemetry
+from .telemetry import REAFFIRM_DIFF, REAFFIRM_HEAD, REAFFIRM_MISS, REAFFIRM_RECORDED, Telemetry
 from .trigger import structural_trigger
 from .verdicts import (
     FAIL,
@@ -1085,7 +1085,7 @@ class Dispatcher:
             reaffirmed_from=origin,
         )
         self.telemetry.emit(
-            "reaffirm-recorded", repo=repo, pr=pr, sha=head, prior_head=origin, verdict=verdict, posted=posted
+            REAFFIRM_RECORDED, repo=repo, pr=pr, sha=head, prior_head=origin, verdict=verdict, posted=posted
         )
 
     async def _our_reviews(self, repo: str, pr: int) -> list[dict] | None:
