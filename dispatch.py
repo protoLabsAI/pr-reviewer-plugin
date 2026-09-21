@@ -58,10 +58,11 @@ from .rounds import (
     render_promotion_findings,
     render_unaccounted_note,
     round_cap_reached,
+    spent_rounds,
     unaccounted_priors,
     unexplained_clearance,
 )
-from .telemetry import REAFFIRM_DIFF, REAFFIRM_HEAD, REAFFIRM_MISS, Telemetry
+from .telemetry import REAFFIRM_DIFF, REAFFIRM_HEAD, REAFFIRM_MISS, REAFFIRM_RECORDED, Telemetry
 from .trigger import structural_trigger
 from .verdicts import (
     FAIL,
@@ -1020,9 +1021,10 @@ class Dispatcher:
         A PURE decision over ids the caller already read — it issues no GitHub call. Fails
         CLOSED in every uncertain direction, each telemetered so a reuse that stops is never
         silent: the current diff was unreadable, the prior round stored no identity (an older
-        body), or the two differ ⇒ None and the normal review runs. It posts nothing, promotes
-        nothing, and opens no check for the new head; the SHA-based stale-head and promotion
-        rules are untouched. Only a proven-identical diff suppresses the redundant panel.
+        body), or the two differ ⇒ None and the normal review runs. The decision itself posts
+        nothing; the caller records a reaffirmed PASS/WARN at the new head
+        (`_record_reaffirmed`, issue #135) so the SHA-keyed gate can find it. Only a
+        proven-identical diff suppresses the redundant panel.
         """
         if current_id is None:
             self.telemetry.emit(REAFFIRM_MISS, repo=repo, pr=pr, sha=head, reason="diff-unreadable")
@@ -1038,6 +1040,53 @@ class Dispatcher:
             REAFFIRM_DIFF, repo=repo, pr=pr, sha=head, prior_head=prior.get("head"), verdict=prior.get("verdict")
         )
         return f"reaffirmed:{prior['verdict']}"
+
+    async def _record_reaffirmed(self, repo: str, pr: int, head: str, prior: dict, diff_id: str | None) -> None:
+        """Record the reaffirmed verdict AT the new head, so the gate can find it (issue #135).
+
+        `_reaffirm_by_diff` rightly refuses to re-spend the panel on a byte-identical diff,
+        but it used to leave the new head with NO verdict: the panel would not review it
+        (identical diff → reaffirm, every time) and the SHA-keyed gate would not accept the
+        old head's — `hold:stale-head` until a push that CHANGED the diff, which a finished
+        PR has no honest reason to make. 12 of 23 reaffirmed heads were held that way
+        (p50 68 min, max 5.5 h).
+
+        Sound because `diff_identity` folds BOTH tree roots — the merge-base tree and the
+        head tree — so an equal identity means the whole reviewed content is byte-identical
+        and only commit metadata moved; the verdict asserts nothing the panel did not check.
+
+        Deliberately narrow. Only a PASS/WARN is carried: a reaffirmed FAIL stays as it was
+        (no verdict at the new head ⇒ the gate fails closed). The prior round's `complete`
+        and `verified` ride along unchanged, so an incomplete or unverified round still
+        holds. `hold_blocks=True`: nothing new was judged, so this post never dismisses a
+        standing block. The marker's `reaffirmed=` keeps it out of the round count.
+        """
+        verdict = str(prior.get("verdict") or "")
+        if verdict not in (PASS, WARN):
+            return
+        origin = str(prior.get("head") or "")
+        brief = (
+            f"Reaffirmed from `{origin[:12]}` — this head's base↔head content is byte-identical to what "
+            f"that round reviewed (same merge-base tree, same head tree; only commit metadata moved), so "
+            f"its **{verdict}** applies unchanged. No panel was spent on this head."
+        )
+        posted = await self._post_verdict(
+            repo,
+            pr,
+            head,
+            verdict,
+            [f for f in (prior.get("findings") or []) if isinstance(f, dict)],
+            "reaffirmed",
+            brief=brief,
+            hold_blocks=True,
+            complete=bool(prior.get("complete", True)),
+            verified=bool(prior.get("verified", True)),
+            diff_id=diff_id,
+            reaffirmed_from=origin,
+        )
+        self.telemetry.emit(
+            REAFFIRM_RECORDED, repo=repo, pr=pr, sha=head, prior_head=origin, verdict=verdict, posted=posted
+        )
 
     async def _our_reviews(self, repo: str, pr: int) -> list[dict] | None:
         """Our posted reviews (marker-bearing, authored by our own login), oldest→newest:
@@ -1505,12 +1554,15 @@ class Dispatcher:
         # delta re-review silently degraded to a cold one, which is what kept #88
         # rediscovering the same surface. `panel_rounds` also folds a re-gate's
         # verbatim re-post back into the head it belongs to.
-        history = panel_rounds(ours)
-        current = next((r for r in reversed(history) if r["head"] == head), None)
+        verdicts = panel_rounds(ours)
+        # A verdict carried to this head by an earlier reaffirm (#135) counts here — that is
+        # what stops it being re-posted on every later event — but not as a round below.
+        current = next((r for r in reversed(verdicts) if r["head"] == head), None)
         if current and not force:  # `force` = an operator summon disputing this verdict
             # Unchanged head with a posted verdict — reaffirm, don't re-spend the panel.
             self.telemetry.emit(REAFFIRM_HEAD, repo=repo, pr=pr, sha=head, verdict=current["verdict"])
             return f"reaffirmed:{current['verdict']}"
+        history = spent_rounds(verdicts)
         # The identity of the base↔head content this event would have the panel review —
         # read ONCE, pinned to the resolved head SHA (issue #91). It serves two ends: the
         # byte-identical-diff reaffirm just below, and the marker stamp further down, so a
@@ -1524,6 +1576,7 @@ class Dispatcher:
             # identity is unreadable, absent on the prior round, or different.
             reaffirmed = self._reaffirm_by_diff(repo, pr, head, history[-1], diff_id)
             if reaffirmed is not None:
+                await self._record_reaffirmed(repo, pr, head, history[-1], diff_id)
                 return reaffirmed
         prior = history[-1] if history else None
         round_number = len(history) + 1
@@ -2071,6 +2124,7 @@ class Dispatcher:
         diff_id: str | None = None,
         coverage_gaps: dict[str, str] | None = None,
         lanes: int = 0,
+        reaffirmed_from: str = "",
     ) -> bool:
         # Immediately before posting — the last moment a mid-round push can be caught.
         # The marker keeps the PINNED head on purpose: the round ran against it, and
@@ -2096,6 +2150,7 @@ class Dispatcher:
             diff_id=diff_id or "",
             coverage_gaps=coverage_gaps,
             lanes=lanes,
+            reaffirmed_from=reaffirmed_from,
         )
         event = "COMMENT"
         if not self.shadow and verdict == FAIL:

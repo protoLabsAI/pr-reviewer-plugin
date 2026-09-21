@@ -159,8 +159,24 @@ def panel_rounds(reviews: list[dict]) -> list[dict]:
             # rebased head with a byte-identical diff can reaffirm this verdict without
             # re-spending the panel. Absent (older bodies) ⇒ None ⇒ reaffirm fails closed.
             "diff_id": review.get("diff_id") or None,
+            # The head this verdict was carried from by an identical-diff reaffirm (issue
+            # #135), or "". Such an entry is a VERDICT for its head — the gate reads it —
+            # but no panel ran, so it is not a round: see `spent_rounds`.
+            "reaffirmed": str(review.get("reaffirmed") or ""),
+            "verified": bool(review.get("verified", True)),
         }
     return list(by_head.values())
+
+
+def spent_rounds(history: list[dict]) -> list[dict]:
+    """The rounds a panel was actually SPENT on — `history` without reaffirmed verdicts.
+
+    The round machinery counts and recalls these: the round number, the push-triggered
+    cap, the convergence threshold, the request history, the prior round a delta review
+    builds on. A verdict carried to a rebased head is none of those — counting it would
+    let three rebases of a finished PR exhaust its review budget.
+    """
+    return [r for r in history or [] if not r.get("reaffirmed")]
 
 
 # A `<request>`'s `status` — what became of it, so history is not mistaken for open debt.

@@ -26,6 +26,7 @@ log = logging.getLogger("protoagent.plugins.pr_reviewer")
 REAFFIRM_HEAD = "reaffirm"  # the exact same head SHA already carries this verdict
 REAFFIRM_DIFF = "reaffirm-diff"  # head SHA changed, but the base↔head diff is byte-identical
 REAFFIRM_MISS = "reaffirm-miss"  # a diff reaffirm was considered and declined (fail-closed)
+REAFFIRM_RECORDED = "reaffirm-recorded"  # a diff-reaffirmed PASS/WARN was carried to the new head (#135)
 
 
 class Telemetry:

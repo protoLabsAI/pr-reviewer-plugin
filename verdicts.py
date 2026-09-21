@@ -604,6 +604,7 @@ def render_verdict_body(
     diff_id: str = "",
     coverage_gaps: dict[str, str] | None = None,
     lanes: int = 0,
+    reaffirmed_from: str = "",
 ) -> str:
     """The comment body, ASSEMBLED — marker line (machine), header (human), the brief,
     the dispositions table, the findings table + machine-readable array, then the
@@ -661,6 +662,12 @@ def render_verdict_body(
         marker += " verified=false"
     if diff_id:
         marker += f" diff={diff_id}"
+    # `reaffirmed=<head>` marks a verdict CARRIED to this head from the round that judged
+    # it (issue #135): the base↔head content is byte-identical, so no panel was spent. It
+    # is a verdict for the gate and NOT a round — `panel_rounds` records the flag and the
+    # round machinery (cap, convergence, request history) skips it.
+    if reaffirmed_from:
+        marker += f" reaffirmed={reaffirmed_from}"
     marker += " -->"
     sections = [
         f"{marker}\n## QA panel review — **{verdict}**\n_{recipe} · head `{head_sha[:12]}` · {mode}_",
@@ -685,8 +692,9 @@ def render_verdict_body(
 
 
 def parse_verdict_marker(body: str) -> dict | None:
-    """{'head', 'verdict', 'promoted', 'complete', 'verified', 'diff_id'} from a posted
-    body, or None if it isn't ours."""
+    """{'head', 'verdict', 'promoted', 'complete', 'verified', 'diff_id', 'reaffirmed'} from
+    a posted body, or None if it isn't ours. `reaffirmed` is the head a verdict was carried
+    FROM by an identical-diff reaffirm (issue #135), or "" for a round the panel ran."""
     m = _MARKER_RE.search(body or "")
     if not m:
         return None
@@ -699,6 +707,7 @@ def parse_verdict_marker(body: str) -> dict | None:
     # any marker written before the feature ⇒ None ⇒ the reaffirm short-circuit fails closed
     # and the normal review runs.
     diff_m = re.search(r"\bdiff=([0-9a-f]+)", m.group(0))
+    reaffirmed_m = re.search(r"\breaffirmed=([0-9a-f]{7,40})", m.group(0))
     return {
         "head": m.group("head"),
         "verdict": m.group("verdict"),
@@ -706,6 +715,8 @@ def parse_verdict_marker(body: str) -> dict | None:
         "complete": complete,
         "verified": verified,
         "diff_id": diff_m.group(1) if diff_m else None,
+        # The head this verdict was carried FROM, or "" for a round the panel actually ran.
+        "reaffirmed": reaffirmed_m.group(1) if reaffirmed_m else "",
     }
 
 
