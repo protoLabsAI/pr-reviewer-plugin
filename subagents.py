@@ -25,9 +25,9 @@ def relay_delivered(text: str) -> bool:
     so the findings were lost and the lane read as unavailable. Same test as
     `verdicts.structural_relay_ok`'s fence check, asked while the run can still be fixed.
     """
-    from .verdicts import _FINDINGS_FENCE_RE
+    from .verdicts import fenced_blocks
 
-    return bool(_FINDINGS_FENCE_RE.search(text or ""))
+    return bool(fenced_blocks(text, json_only=True))
 
 
 def _completion_contract(config_cls) -> dict:
