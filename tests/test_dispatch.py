@@ -11,6 +11,8 @@ from pr_reviewer.dispatch import POST_MAX_FAILURES, Dispatcher
 from pr_reviewer.telemetry import Telemetry
 from pr_reviewer.verdicts import extract_findings_json, parse_verdict_marker, render_verdict_body
 
+from tests.conftest import note_write
+
 HEAD = "a" * 40
 OLD_HEAD = "b" * 40
 
@@ -50,6 +52,8 @@ class FakeGH:
 
     async def __call__(self, args, timeout=30):
         self.calls.append(args)
+        if note_write(args):
+            return 1, "", "unexpected write (tests/conftest.py KNOWN_WRITES)"
         url = args[1] if len(args) > 1 else ""
         if "-X" in args and "POST" in args and "/reviews" in url:
             fields = {a.split("=", 1)[0]: a.split("=", 1)[1] for a in args if "=" in a and not a.startswith("query=")}
@@ -233,6 +237,8 @@ class RoutedGH(FakeGH):
 
     async def __call__(self, args, timeout=30):
         self.calls.append(args)
+        if note_write(args):
+            return 1, "", "unexpected write (tests/conftest.py KNOWN_WRITES)"
         joined = " ".join(args)
         if "/check-runs" in joined and "-X" in args:
             fields = {a.split("=", 1)[0]: a.split("=", 1)[1] for a in args if "=" in a}

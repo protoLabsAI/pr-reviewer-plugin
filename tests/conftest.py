@@ -63,3 +63,47 @@ class FakeRegistry:
 
     def live_config(self):
         return self.config
+
+
+# ── the gh fakes fail an unrecognised WRITE (#136) ─────────────────────────────
+#
+# Both fakes answered `0, ""` to anything they did not recognise, and most tests assert
+# on one write (`reviews_posted[0]`) — so a dispatcher change that started making an
+# EXTRA GitHub write passed unnoticed. The fakes now record any write outside the routes
+# the dispatcher is known to make, and this fixture fails the test that caused it.
+# Recorded-then-asserted rather than raised: the dispatcher's publish paths "degrade,
+# never raise", so an exception thrown from inside the fake would be swallowed by the very
+# code under test. Reads stay permissive — an unmatched read changes nothing on GitHub.
+
+import re  # noqa: E402
+
+import pytest  # noqa: E402
+
+KNOWN_WRITES = (
+    ("POST", re.compile(r"^repos/[^/]+/[^/]+/pulls/\d+/reviews$")),
+    ("PUT", re.compile(r"^repos/[^/]+/[^/]+/pulls/\d+/reviews/\d+/dismissals$")),
+    ("POST", re.compile(r"^repos/[^/]+/[^/]+/issues/\d+/comments$")),
+    ("POST", re.compile(r"^repos/[^/]+/[^/]+/check-runs$")),
+    ("PATCH", re.compile(r"^repos/[^/]+/[^/]+/check-runs/\d+$")),
+)
+UNEXPECTED_WRITES: list[list[str]] = []
+
+
+def note_write(args: list[str]) -> bool:
+    """True when `args` is a write the fakes do not recognise — recorded for the fixture."""
+    if "-X" not in args:
+        return False
+    method = args[args.index("-X") + 1] if args.index("-X") + 1 < len(args) else ""
+    url = args[1] if len(args) > 1 else ""
+    if method == "GET" or any(method == m and rx.match(url) for m, rx in KNOWN_WRITES):
+        return False
+    UNEXPECTED_WRITES.append(list(args))
+    return True
+
+
+@pytest.fixture(autouse=True)
+def _no_unexpected_github_writes():
+    UNEXPECTED_WRITES.clear()
+    yield
+    seen, UNEXPECTED_WRITES[:] = list(UNEXPECTED_WRITES), []
+    assert not seen, f"the code under test made a GitHub write no fake recognises: {seen}"
