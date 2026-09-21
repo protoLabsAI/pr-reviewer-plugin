@@ -233,3 +233,19 @@ def test_the_old_blocked_example_would_be_caught():
   complete a real pass. Say briefly what stopped you (e.g. "file reads
   404ing", "out of turns before finishing")."""
     assert '"file reads 404ing"' in " ".join(old.split())
+
+
+def test_the_verifier_is_told_where_its_findings_are():
+    # Seen live: in 3 of 22 runs where the synthesizer produced findings, the verifier
+    # answered "nothing-to-verify — no findings array was provided". Its prompt ended with a
+    # BARE `{{steps.synthesize.output}}` after ~120 lines of instructions, and that output
+    # opens with a delegation banner and a prose brief, so the array read as more preamble.
+    # The findings went unverified (and, before v0.45.0, were auto-approved anyway).
+    verify = next(s for s in RECIPE["steps"] if s["id"] == "verify")
+    prompt = verify["prompt"]
+    flat = " ".join(prompt.split())
+    assert "<synthesized> {{steps.synthesize.output}} </synthesized>" in flat
+    assert prompt.rstrip().endswith("</synthesized>")  # the payload is last, and delimited
+    assert "## The findings to verify" in prompt
+    assert "inside `<synthesized>` tags" in flat  # …and announced up front
+    assert "`nothing-to-verify` is only for an array that is literally `[]`" in flat
