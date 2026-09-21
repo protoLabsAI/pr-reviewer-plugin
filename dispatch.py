@@ -84,6 +84,7 @@ from .verdicts import (
     undelivered_stages,
     verdict_for,
     verification_ran,
+    verify_delivered,
 )
 
 log = logging.getLogger("protoagent.plugins.pr_reviewer")
@@ -1811,14 +1812,27 @@ class Dispatcher:
             and not finder_completed(str(steps_out.get(s) or ""))
         ]
         complete = not structural_unavailable and not degraded and not incomplete_finders
-        # The same three signals as one record, for the coverage cap and note below (#117).
-        gaps = coverage_gaps(degraded, incomplete_finders, structural_unavailable, outage_reason(structural_out))
         lanes = len({str(s) for s in (*steps_out, *degraded) if str(s).startswith(FINDER_STEP_PREFIX)})
         output = str(result.get("output") or "")
         # The raw output is read for BLOCKS and never published as text (protoAgent#2439
         # — see verdicts.py). `reported` is what the panel said this round and what the
         # body records; `findings` is the confined subset the verdict is computed from.
         reported = self._parse_findings(output)
+        # A verify step that handed nothing back on a CLEAN round (#151). With findings,
+        # `verification_ran` already catches it; with none it cannot, and the round posted
+        # "came back clean" above a report saying the verifier never ran. A gap, not a
+        # voided round: nothing went unverified, so re-running five finders buys nothing —
+        # but the body must say so and the dead step must be countable.
+        verify_undelivered = (
+            not reported
+            and "verify" in steps_out
+            and "verify" not in degraded
+            and not verify_delivered(str(steps_out.get("verify") or ""))
+        )
+        # The same signals as one record, for the coverage cap and note below (#117).
+        gaps = coverage_gaps(
+            degraded, incomplete_finders, structural_unavailable, outage_reason(structural_out), verify_undelivered
+        )
         brief, brief_found = extract_brief(output)
         truncated = report_hard_stopped(output)
         findings, confined = confine_findings(reported, paths)
@@ -2005,6 +2019,7 @@ class Dispatcher:
             incomplete_finders=incomplete_finders or None,
             complete=complete,
             structural_unavailable=structural_unavailable or None,
+            verify_undelivered=verify_undelivered or None,
             # A clean PASS posted as WARN because a lane did not deliver a full pass (#117).
             coverage_capped=(verdict != finding_verdict) or None,
             posted=posted,

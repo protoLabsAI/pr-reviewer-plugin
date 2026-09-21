@@ -1470,6 +1470,37 @@ async def test_a_coverage_gap_never_softens_a_fail(tmp_path):
     assert _events(tmp_path, "reviewed")[-1]["coverage_capped"] is None  # FAIL was not capped
 
 
+# The verify step's real output on protoAgent#3564 (run 2f7796fe): a completion marker and a
+# statement of intent, then nothing.
+VERIFY_PREAMBLE_ONLY = (
+    "[verifier completed: workflow code-review:verify]\n\n"
+    "I'll verify the findings by examining the actual PR diff and relevant code context.\n"
+)
+
+
+async def test_a_verifier_that_returns_only_a_preamble_is_not_a_clean_pass(tmp_path):
+    """#151: with zero findings `verification_ran` is True without reading the verify output,
+    so a verifier that stopped at its preamble posted "came back clean" above a report saying
+    its input never arrived. It is a coverage gap — named, capped at WARN, counted — and NOT a
+    voided round: nothing went unverified, so re-running the panel would buy nothing."""
+    gh = _structural_gh()
+    calls = []
+
+    async def runner(name, inputs):
+        calls.append(name)
+        return {"output": CLEAN_REPORT, "failed": [], "steps": _panel_steps(verify=VERIFY_PREAMBLE_ONLY)}
+
+    d = make(tmp_path, cfg={"shadow_mode": False}, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "reviewed:WARN"
+    assert len(calls) == 1  # a gap, not a retry
+    body = gh.reviews_posted[0]["body"]
+    assert "came back clean" not in body
+    assert "`verify` (returned no findings array and no status line" in body
+    reviewed = _events(tmp_path, "reviewed")[-1]
+    assert reviewed["verify_undelivered"] is True and reviewed["coverage_capped"] is True
+    assert reviewed["complete"] is True  # every finder covered the diff; the hold is not for this
+
+
 async def test_an_explicit_empty_array_at_every_boundary_is_still_a_clean_pass(tmp_path):
     """The guards must not turn a genuinely clean review into a gap: every lane, the
     synthesizer and the report each delivered an explicit `[]`."""
@@ -1489,6 +1520,7 @@ async def test_an_explicit_empty_array_at_every_boundary_is_still_a_clean_pass(t
     reviewed = _events(tmp_path, "reviewed")[-1]
     assert reviewed["complete"] is True and reviewed["coverage_capped"] is None
     assert reviewed["degraded"] is None and reviewed["structural_unavailable"] is None
+    assert reviewed["verify_undelivered"] is None
 
 
 async def test_a_small_diff_review_is_not_incomplete_for_a_contract_it_never_had(tmp_path):

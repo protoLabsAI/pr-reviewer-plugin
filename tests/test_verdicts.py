@@ -27,6 +27,7 @@ from pr_reviewer.verdicts import (
     undelivered_stages,
     verdict_for,
     verification_ran,
+    verify_delivered,
 )
 
 
@@ -736,6 +737,27 @@ def test_a_partial_hard_stopped_lane_still_delivered_what_it_found():
 
 
 # ── a coverage gap caps a clean PASS (#117) ────────────────────────────────────
+
+
+def test_verify_delivered_reads_the_output_not_the_findings():
+    """#151: the shapes are the ones saved in Vera's run records."""
+    # Dead: a preamble (protoAgent#3564), and a verifier asking to be sent the findings.
+    assert not verify_delivered("[verifier completed: workflow code-review:verify]\n\nI'll verify the findings.")
+    assert not verify_delivered("Please paste the findings you'd like me to verify.")
+    assert not verify_delivered("")
+    # Delivered: either status line, or a fenced array — empty, annotated, or not quite JSON.
+    assert verify_delivered("VERIFY_STATUS: nothing-to-verify")
+    assert verify_delivered("VERIFY_STATUS: annotated n=2\n\nprose only")
+    assert verify_delivered("```json\n[]\n```")
+    assert verify_delivered('```json\n[{"file": "a.py", "note": "the docstring\\\'s claim"}]\n```')
+    # A fenced OBJECT is not a findings array.
+    assert not verify_delivered('```json\n{"ok": true}\n```')
+
+
+def test_an_undelivered_verify_step_is_a_named_coverage_gap():
+    gaps = coverage_gaps([], [], False, verify_undelivered=True)
+    assert list(gaps) == ["verify"] and "did not run" in gaps["verify"]
+    assert coverage_verdict(PASS, gaps) == WARN
 
 
 def test_coverage_gaps_fold_the_three_recorded_signals():
