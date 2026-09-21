@@ -209,3 +209,27 @@ def test_the_manifest_requires_a_core_that_accepts_an_input_timeout():
     have = tuple(int(x) for x in str(manifest["min_protoagent_version"]).split("."))
     assert have >= (0, 170, 0)
     assert manifest["config"]["finder_timeout_s"] == 0
+
+
+def test_a_404_on_a_guessed_path_is_not_a_reason_to_declare_blocked():
+    # Seen live on two protoAgent release PRs: the cross-file lane went looking for a
+    # `__version__` module that does not exist, got a 404, and declared the whole repo
+    # inaccessible — `FINDER_STATUS: blocked` — voiding an otherwise complete round. The
+    # status-line instructions used "file reads 404ing" as their example of being blocked.
+    llm = [s for s in RECIPE["steps"] if s["id"].startswith("find_") and s["id"] != "find_structural"]
+    assert len(llm) == 4
+    for step in llm:
+        prompt = step["prompt"]
+        assert "A 404 on a path you GUESSED is not a blocker" in prompt, step["id"]
+        assert "files the diff" in prompt and "itself names" in prompt, step["id"]
+        # Whitespace-normalised: the example wrapped across lines in the YAML, and a block
+        # scalar re-indents on parse, so matching the literal layout could never fail.
+        assert '"file reads 404ing"' not in " ".join(prompt.split()), step["id"]
+
+
+def test_the_old_blocked_example_would_be_caught():
+    # The assertion above must have teeth: run it against the wording this replaced.
+    old = """you could not
+  complete a real pass. Say briefly what stopped you (e.g. "file reads
+  404ing", "out of turns before finishing")."""
+    assert '"file reads 404ing"' in " ".join(old.split())
