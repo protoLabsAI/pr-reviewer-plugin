@@ -3191,6 +3191,35 @@ async def test_a_warn_with_findings_still_governs_after_a_later_complete_pass(tm
         assert _qa_check(gh).get("conclusion") == "success"
 
 
+async def test_a_verified_round_at_the_same_head_clears_an_unverified_hold(tmp_path):
+    # mythxengine-sdk#384, live (#170): round 1 WARN with one finding, `verified=false`
+    # (the verifier flaked, #167); round 2 on a re-summon, same head, a verified clean
+    # PASS that dispositioned the finding. The strictest pick kept round 1, so the head
+    # held hold:unverified until a new commit — the documented remedy never worked.
+    green = [{"status": "completed", "conclusion": "success"}]
+    unverified = review_row(HEAD, "WARN", findings_json=WARN_FINDING)
+    unverified["body"] = unverified["body"].replace(" -->", " verified=false -->", 1)
+    verified_pass = review_row(HEAD, "PASS")
+    for reviews in ([unverified, verified_pass], [verified_pass, unverified]):  # order-free, like #89
+        gh = RoutedGH(pr_facts=facts(), reviews=reviews, checks=green)
+        d = make(tmp_path, cfg={"shadow_mode": False, "promotion_owner": True}, gh=gh)
+        assert (await d.evaluate_promotion("o/r", 1)) == "promote"
+        body = gh.reviews_posted[0]["body"]
+        assert f"head={HEAD} verdict=WARN promoted=true findings=1 -->" in body  # the WARN still governs
+
+
+async def test_only_unverified_rounds_for_the_head_still_hold_unverified(tmp_path):
+    green = [{"status": "completed", "conclusion": "success"}]
+    rows = []
+    for _ in range(2):
+        r = review_row(HEAD, "WARN", findings_json=WARN_FINDING)
+        r["body"] = r["body"].replace(" -->", " verified=false -->", 1)
+        rows.append(r)
+    gh = RoutedGH(pr_facts=facts(), reviews=rows, checks=green)
+    d = make(tmp_path, cfg={"shadow_mode": False, "promotion_owner": True}, gh=gh)
+    assert (await d.evaluate_promotion("o/r", 1)) == "hold:unverified"
+
+
 async def test_only_incomplete_rounds_for_the_head_still_hold_incomplete(tmp_path):
     # No complete round ⇒ nothing recovered coverage: two blind passes are not one full
     # pass (#49), so the head still holds exactly as before.
