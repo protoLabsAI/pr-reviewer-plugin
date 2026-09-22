@@ -392,7 +392,7 @@ async def test_a_rebased_head_with_a_byte_identical_diff_reaffirms(tmp_path):
     assert row["posted"] is True and row["prior_head"] == OLD_HEAD
 
 
-async def test_an_incomplete_verdict_is_never_reaffirmed_the_push_runs_the_panel(tmp_path):
+async def test_an_incomplete_or_unverified_verdict_is_never_reaffirmed_the_push_runs_the_panel(tmp_path):
     """#179 (mythxengine#858): a round capped WARN complete=false said "the next push
     re-runs the full panel"; an identical-diff push was REAFFIRMED instead, so the only way
     to a complete pass was to change the content hash on purpose."""
