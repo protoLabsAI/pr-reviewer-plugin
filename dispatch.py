@@ -1078,6 +1078,15 @@ class Dispatcher:
         if current_id != prior_id:
             self.telemetry.emit(REAFFIRM_MISS, repo=repo, pr=pr, sha=head, reason="diff-changed")
             return None
+        # An INCOMPLETE or UNVERIFIED round is not a verdict worth carrying (#179): a lane was
+        # down (or the verifier flaked), the body says "coverage incomplete — the next push
+        # re-runs the full panel", and reaffirming it made that promise false — the only way
+        # left to earn a complete pass was to change the content hash on purpose. An
+        # identical diff earns the identical verdict only when that verdict was earned.
+        if not prior.get("complete", True) or not prior.get("verified", True):
+            reason = "prior-incomplete" if not prior.get("complete", True) else "prior-unverified"
+            self.telemetry.emit(REAFFIRM_MISS, repo=repo, pr=pr, sha=head, reason=reason)
+            return None
         self.telemetry.emit(
             REAFFIRM_DIFF, repo=repo, pr=pr, sha=head, prior_head=prior.get("head"), verdict=prior.get("verdict")
         )
@@ -1098,9 +1107,10 @@ class Dispatcher:
         and only commit metadata moved; the verdict asserts nothing the panel did not check.
 
         Deliberately narrow. Only a PASS/WARN is carried: a reaffirmed FAIL stays as it was
-        (no verdict at the new head ⇒ the gate fails closed). The prior round's `complete`
-        and `verified` ride along unchanged, so an incomplete or unverified round still
-        holds. `hold_blocks=True`: nothing new was judged, so this post never dismisses a
+        (no verdict at the new head ⇒ the gate fails closed). An incomplete or unverified
+        round never reaches here — `_reaffirm_by_diff` declines it and the panel runs (#179)
+        — so a carried verdict is always complete and verified; the flags ride along as a
+        record, not a hold. `hold_blocks=True`: nothing new was judged, so this post never dismisses a
         standing block. The marker's `reaffirmed=` keeps it out of the round count.
         """
         verdict = str(prior.get("verdict") or "")
