@@ -1466,6 +1466,55 @@ async def test_a_verifier_that_read_its_input_is_not_re_run(tmp_path):
     assert calls == 1 and _events(tmp_path, "verify-contradicted") == []
 
 
+_OVERRUN = (
+    "Error: step 'find_crossfile' raised SubagentError: Subagent 'review-finder' failed: Error code: 400 - "
+    "{'error': {'message': \"litellm.ContextWindowExceededError: litellm.BadRequestError: "
+    "ContextWindowExceededError: OpenAIException - This model's maximum context length is 262144 tokens. "
+    'However, you requested 32768 output tokens and your prompt contains at least 229377 input tokens"}}'
+)
+_CLEAN_REPORT = "<!-- brief -->\nFour lanes clean.\n<!-- /brief -->\n\n```json\n[]\n```"
+
+
+async def test_a_lane_that_overran_its_context_is_a_gap_not_a_failed_round(tmp_path):
+    """#176: mythxengine#858 — 8 panels, 7 killed by ContextWindowExceeded in three different
+    lanes, the other four delivered every time. Retrying the panel re-rolls the same dice."""
+    calls = 0
+
+    async def runner(name, inputs):
+        nonlocal calls
+        calls += 1
+        steps = _panel_steps(find_crossfile=_OVERRUN)
+        return {"output": _CLEAN_REPORT, "failed": ["find_crossfile"], "steps": steps}
+
+    gh = _structural_gh()
+    d = make(tmp_path, cfg={"shadow_mode": False}, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "reviewed:WARN"
+    assert calls == 1  # no retry: the round is carried, not discarded
+    body = gh.reviews_posted[0]["body"]
+    assert "verdict=WARN" in body and "complete=false" in body
+    assert "`find_crossfile` (overran the model's context window" in body
+    assert _events(tmp_path, "exhaustion") == [] and _events(tmp_path, "panel_retry") == []
+    assert [e["lanes"] for e in _events(tmp_path, "finder_overran")] == [["find_crossfile"]]
+    row = _events(tmp_path, "reviewed")[-1]
+    assert row["overran"] == ["find_crossfile"] and row["complete"] is False
+
+
+async def test_a_lane_that_crashed_for_another_reason_still_retries_and_exhausts(tmp_path):
+    calls = 0
+
+    async def runner(name, inputs):
+        nonlocal calls
+        calls += 1
+        steps = _panel_steps(find_crossfile="Error: step 'find_crossfile' raised SubagentError: boom")
+        return {"output": _CLEAN_REPORT, "failed": ["find_crossfile"], "steps": steps}
+
+    gh = _structural_gh()
+    d = make(tmp_path, cfg={"shadow_mode": False, "panel_retries": 1}, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "error:panel-exhausted"
+    assert calls == 2 and gh.reviews_posted == []
+    assert _events(tmp_path, "finder_overran") == []
+
+
 def _structural_gh() -> RoutedGH:
     return RoutedGH(pr_facts=facts(changed_files=6, additions=300, deletions=50), files="x.py\nb\nc\nd\ne\nf\n")
 

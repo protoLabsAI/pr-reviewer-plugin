@@ -542,18 +542,45 @@ def undelivered_stages(
 # ── coverage gaps cap a clean PASS (issue #117) ─────────────────────────────────
 
 
+# A finder that overran the model's context window (pr-reviewer-plugin#176): the provider
+# refused the call, the engine recorded a failed step, and the dispatcher retried the
+# whole five-finder panel — 7 of 8 panels on one PR died this way, in three different
+# lanes. It is the same shape as a lane the engine timed out: ONE lane's coverage is
+# missing and the other four delivered. Read as a Gap, not a failed round.
+CONTEXT_OVERRUN_MARKERS = ("ContextWindowExceeded", "context_length_exceeded", "maximum context length")
+
+
+def context_overrun(step_output: str) -> bool:
+    """Did this failed step die on the model's context window, not on a real crash?"""
+    return mentions_any(str(step_output or ""), CONTEXT_OVERRUN_MARKERS)
+
+
+def overrun_lanes(failed: list[str] | None, steps: dict | None) -> list[str]:
+    """The finder lanes among `failed` whose error is a context overrun — a coverage gap
+    the round can carry (like a timed-out lane), not a reason to discard it."""
+    steps = steps or {}
+    return [
+        str(s)
+        for s in (failed or [])
+        if str(s).startswith(FINDER_STEP_PREFIX) and context_overrun(str(steps.get(s) or ""))
+    ]
+
+
 def coverage_gaps(
     degraded: list[str] | None,
     incomplete_finders: list[str] | None,
     structural_unavailable: bool,
     structural_reason: str = "",
     verify_undelivered: bool = False,
+    overran: list[str] | None = None,
 ) -> dict[str, str]:
     """{lane: why} for every lane that did not deliver a full pass — the signals the
     dispatcher already records (`degraded`, `incomplete_finders`,
     `structural_unavailable`, and a verify step that returned nothing on a clean round),
     as the one record the coverage cap and note read."""
     gaps = {str(s): "hit its time budget" for s in (degraded or [])}
+    for s in overran or []:
+        gaps[str(s)] = "overran the model's context window — read more than it could hold"
     for s in incomplete_finders or []:
         gaps.setdefault(str(s), "did not complete a real pass")
     if structural_unavailable:
