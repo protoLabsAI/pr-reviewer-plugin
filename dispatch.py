@@ -62,7 +62,7 @@ from .rounds import (
     unaccounted_priors,
     unexplained_clearance,
 )
-from .telemetry import REAFFIRM_DIFF, REAFFIRM_HEAD, REAFFIRM_MISS, REAFFIRM_RECORDED, Telemetry
+from .telemetry import REAFFIRM_DIFF, REAFFIRM_HEAD, REAFFIRM_MISS, REAFFIRM_RECORDED, VERIFY_CONTRADICTED, Telemetry
 from .trigger import structural_trigger
 from .verdicts import (
     FAIL,
@@ -84,6 +84,7 @@ from .verdicts import (
     undelivered_stages,
     verdict_for,
     verification_ran,
+    verifier_contradicts_synthesis,
     verify_delivered,
 )
 
@@ -225,6 +226,19 @@ def coverage_only_round(round_: dict) -> bool:
         and bool(round_.get("findings_recorded"))
         and not round_.get("findings")
     )
+
+
+def _accepts_keyword(fn, name: str) -> bool:
+    """Does `fn` take keyword `name`? The host runner grew `seed_outputs` in
+    protoAgent#3571; an older host's (and a test fake's) does not, and calling it so
+    would turn a re-run into a crash."""
+    import inspect
+
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    return name in params or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
 
 
 def strictest_head_round(reviews: list[dict], head: str) -> dict | None:
@@ -627,6 +641,16 @@ class Dispatcher:
             if "panel_attempt_timeout" in cfg
             else _env_int("PR_REVIEWER_PANEL_ATTEMPT_TIMEOUT", 1800)
         )
+
+    @property
+    def verify_reruns(self) -> int:
+        """How many times a verifier that contradicted the synthesizer is re-run ALONE
+        (#167) before the round posts as unverified. Seconds each, seeded with the
+        finders' and synthesizer's outputs — the alternative is a fresh five-finder
+        panel or a human re-summon. 0 disables; needs a host whose runner takes
+        `seed_outputs` (protoAgent#3571), else the round is only counted."""
+        cfg = self.cfg
+        return max(0, int(cfg["verify_reruns"])) if "verify_reruns" in cfg else _env_int("PR_REVIEWER_VERIFY_RERUNS", 1)
 
     @property
     def finder_timeout_s(self) -> int:
@@ -1769,6 +1793,8 @@ class Dispatcher:
             )
             return "error:panel-incomplete"
 
+        result = await self._rerun_contradicted_verify(runner, recipe, inputs, result, repo=repo, pr=pr, head=head)
+
         # Per-step timings (protoAgent's engine, additive — {} on an older host). The
         # panel's cost is nine LLM steps and a single `latency_s` cannot say which one to
         # attack; this is what turns "the panel is slow" into a step name.
@@ -2522,6 +2548,52 @@ class Dispatcher:
         return REGATE
 
     # ── promotion (edge + sweep share this) ───────────────────────────────────
+
+    async def _rerun_contradicted_verify(
+        self, runner, recipe: str, inputs: dict, result: dict, *, repo: str, pr: int, head: str
+    ) -> dict:
+        """A verifier that answered `nothing-to-verify` over a synthesis carrying findings
+        (#167) is re-run ALONE: the finders' and synthesizer's outputs are seeded, so only
+        `verify` and `report` run again — seconds, where the panel is minutes. Bounded by
+        `verify_reruns`. A host whose runner cannot seed (protoAgent < #3571) still counts
+        the contradiction; either way, a round that stays contradicted posts exactly as
+        today (`verified=false`, held), never as clean.
+        """
+        steps = result.get("steps") if isinstance(result.get("steps"), dict) else {}
+        if "verify" not in steps or "synthesize" not in steps:
+            return result
+        synthesized = self._parse_findings(str(steps.get("synthesize") or ""))
+        if not verifier_contradicts_synthesis(str(steps.get("verify") or ""), synthesized):
+            return result
+        if not _accepts_keyword(runner, "seed_outputs") or self.verify_reruns <= 0:
+            self.telemetry.emit(VERIFY_CONTRADICTED, repo=repo, pr=pr, sha=head, attempt=0, rerun=False, cleared=False)
+            return result
+        seeded = {k: str(v) for k, v in steps.items() if k not in ("verify", "report")}
+        for attempt in range(1, self.verify_reruns + 1):
+            try:
+                async with asyncio.timeout(self.panel_attempt_timeout_s):
+                    again = await runner(recipe, inputs, seed_outputs=seeded)
+            except Exception as exc:  # noqa: BLE001 — a failed re-run leaves the original round
+                log.warning("[pr-reviewer] %s#%s verify re-run %d failed: %s", repo, pr, attempt, exc)
+                break
+            again_steps = again.get("steps") if isinstance(again.get("steps"), dict) else {}
+            if again.get("failed") or "verify" not in again_steps or not again.get("output"):
+                break
+            result = {
+                **result,
+                "output": again["output"],
+                "steps": {**steps, **{k: v for k, v in again_steps.items() if k in ("verify", "report")}},
+                "timings": {**(result.get("timings") or {}), **(again.get("timings") or {})},
+                "degraded": [*(result.get("degraded") or []), *(again.get("degraded") or [])],
+            }
+            steps = result["steps"]
+            cleared = not verifier_contradicts_synthesis(str(again_steps["verify"] or ""), synthesized)
+            self.telemetry.emit(
+                VERIFY_CONTRADICTED, repo=repo, pr=pr, sha=head, attempt=attempt, rerun=True, cleared=cleared
+            )
+            if cleared:
+                break
+        return result
 
     async def evaluate_promotion(self, repo: str, pr: int) -> str:
         """One PR through the approve-on-green pure function; applies only when we own
