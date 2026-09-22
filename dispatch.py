@@ -1107,9 +1107,10 @@ class Dispatcher:
         and only commit metadata moved; the verdict asserts nothing the panel did not check.
 
         Deliberately narrow. Only a PASS/WARN is carried: a reaffirmed FAIL stays as it was
-        (no verdict at the new head ⇒ the gate fails closed). The prior round's `complete`
-        and `verified` ride along unchanged, so an incomplete or unverified round still
-        holds. `hold_blocks=True`: nothing new was judged, so this post never dismisses a
+        (no verdict at the new head ⇒ the gate fails closed). An incomplete or unverified
+        round never reaches here — `_reaffirm_by_diff` declines it and the panel runs (#179)
+        — so a carried verdict is always complete and verified; the flags ride along as a
+        record, not a hold. `hold_blocks=True`: nothing new was judged, so this post never dismisses a
         standing block. The marker's `reaffirmed=` keeps it out of the round count.
         """
         verdict = str(prior.get("verdict") or "")
