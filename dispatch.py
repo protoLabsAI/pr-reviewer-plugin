@@ -1078,6 +1078,15 @@ class Dispatcher:
         if current_id != prior_id:
             self.telemetry.emit(REAFFIRM_MISS, repo=repo, pr=pr, sha=head, reason="diff-changed")
             return None
+        # An INCOMPLETE or UNVERIFIED round is not a verdict worth carrying (#179): a lane was
+        # down (or the verifier flaked), the body says "coverage incomplete — the next push
+        # re-runs the full panel", and reaffirming it made that promise false — the only way
+        # left to earn a complete pass was to change the content hash on purpose. An
+        # identical diff earns the identical verdict only when that verdict was earned.
+        if not prior.get("complete", True) or not prior.get("verified", True):
+            reason = "prior-incomplete" if not prior.get("complete", True) else "prior-unverified"
+            self.telemetry.emit(REAFFIRM_MISS, repo=repo, pr=pr, sha=head, reason=reason)
+            return None
         self.telemetry.emit(
             REAFFIRM_DIFF, repo=repo, pr=pr, sha=head, prior_head=prior.get("head"), verdict=prior.get("verdict")
         )
