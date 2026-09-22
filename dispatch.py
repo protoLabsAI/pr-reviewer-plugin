@@ -273,6 +273,22 @@ def strictest_head_round(reviews: list[dict], head: str) -> dict | None:
     # while it may hold a real finding.
     if recovered and not pick["complete"] and pick.get("findings_recorded"):
         pick = {**pick, "complete": True}
+    # Verification recovered (#170): one round whose verifier flaked (`verified=false`,
+    # #167) outranked every VERIFIED round that followed at the same head — WARN > PASS —
+    # so the head held `hold:unverified` until a new commit; the documented remedy, a
+    # re-summon, could never clear it (mythxengine-sdk#384). Only a verified round that
+    # came AFTER the pick lifts the hold: that round was handed the pick's findings as
+    # open prior requests and re-raised or dispositioned them, so the head's claims were
+    # checked. An earlier verified round never saw them and proves nothing — so this is
+    # NOT order-free like the coverage rule; it reads GitHub's monotonic review ids. The
+    # pick's verdict and findings still govern; only the hold lifts — and only for a pick
+    # whose findings record is readable, fail-closed like coverage.
+    if (
+        not pick.get("verified", True)
+        and pick.get("findings_recorded")
+        and any(r.get("verified", True) and r.get("id", 0) > pick.get("id", 0) for r in rounds)
+    ):
+        pick = {**pick, "verified": True}
     return pick
 
 

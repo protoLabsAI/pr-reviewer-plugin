@@ -164,8 +164,19 @@ def panel_rounds(reviews: list[dict]) -> list[dict]:
             # but no panel ran, so it is not a round: see `spent_rounds`.
             "reaffirmed": str(review.get("reaffirmed") or ""),
             "verified": bool(review.get("verified", True)),
+            # GitHub's review id, which it assigns monotonically — the one ORDER signal a
+            # round carries (#170: "did a verified round come after this one?"). Absent or
+            # unreadable ⇒ 0, which no later round is older than.
+            "id": _review_id(review.get("id")),
         }
     return list(by_head.values())
+
+
+def _review_id(value) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def spent_rounds(history: list[dict]) -> list[dict]:
