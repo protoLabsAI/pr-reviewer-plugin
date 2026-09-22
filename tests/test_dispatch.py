@@ -1430,6 +1430,25 @@ async def test_a_host_whose_runner_cannot_seed_only_counts_the_contradiction(tmp
     assert [(e["rerun"], e["cleared"]) for e in _events(tmp_path, "verify-contradicted")] == [(False, False)]
 
 
+async def test_verify_reruns_zero_disables_the_re_run_on_a_host_that_could_seed(tmp_path):
+    calls = 0
+
+    async def runner(name, inputs, *, seed_outputs=None):  # a seed-capable host
+        nonlocal calls
+        calls += 1
+        return {
+            "output": _REPORT_UNVERIFIED,
+            "steps": _panel_steps(synthesize=_SYNTH_ONE, verify=_VERIFY_FLAKED),
+            "failed": [],
+        }
+
+    gh = _structural_gh()
+    d = make(tmp_path, cfg={"verify_reruns": 0}, gh=gh, runner=runner)
+    await d.handle_pr_event("o/r", 1, HEAD, "opened")
+    assert calls == 1 and "verified=false" in gh.reviews_posted[0]["body"]
+    assert [(e["rerun"], e["cleared"]) for e in _events(tmp_path, "verify-contradicted")] == [(False, False)]
+
+
 async def test_a_verifier_that_read_its_input_is_not_re_run(tmp_path):
     calls = 0
 
