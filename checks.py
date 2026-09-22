@@ -172,11 +172,21 @@ def check_for(
             "The panel's verdict is for an earlier commit; this head has not been reviewed yet.",
         )
     if decision == HOLD_INCOMPLETE:
+        # A clear verdict on incomplete coverage: the panel found nothing blocking in what
+        # it DID cover, and a lane it meant to run did not. That withholds approve-on-green
+        # (`promotion_decision`, unchanged) — but as an `in_progress` check it also blocked
+        # the merge with no way out except a new commit, since only a complete pass
+        # cleared it and the sweep does not re-run one on its own (#130). Neutral: not
+        # cleared, not failed, and GitHub treats it as passing for a required check — the
+        # coverage line in the review body says what was not looked at. The verdict is
+        # capped at WARN already (#117); this makes the check agree with the verdict.
         return CheckRun(
-            IN_PROGRESS,
-            None,
-            "Incomplete pass",
-            "A finder did not run, so the clear verdict covers less than the whole diff. Holding for a complete pass.",
+            COMPLETED,
+            NEUTRAL,
+            "Incomplete pass — not blocking",
+            "A finder did not run, so the clear verdict covers less than the whole diff. The "
+            "review body names the lanes that did not complete. Auto-approve is withheld until "
+            "a complete pass; the merge is not.",
         )
     if decision in (HOLD_CHECKS_PENDING, HOLD_CHECKS_FAILED, HOLD_CHECKS_UNKNOWN):
         # CI's business. It already blocks the merge; the panel just hasn't cleared the

@@ -119,9 +119,20 @@ def test_ci_is_never_reported_twice():
 def test_every_unknown_holds_rather_than_fails():
     """An unreadable fact, or a hold added after this file was written, must not turn
     into a red X: refusing to say "clear" is already the closed position for a gate."""
-    for decision in (HOLD_STALE_HEAD, HOLD_INCOMPLETE, HOLD_THREADS_UNKNOWN, "hold:something-new"):
+    for decision in (HOLD_STALE_HEAD, HOLD_THREADS_UNKNOWN, "hold:something-new"):
         run = check_for(decision)
         assert (run.status, run.conclusion) == ("in_progress", None)
+
+
+def test_an_incomplete_pass_concludes_neutral_and_says_so():
+    """#130: an incomplete clear pass held the check `in_progress` with nothing red and
+    nothing to re-run — only a new commit cleared it. The verdict is already capped at WARN
+    for the same gap (#117), and WARN does not block; the check now agrees. Approve-on-green
+    is still withheld (`promotion_decision` is untouched), so this is a human's merge."""
+    run = check_for(HOLD_INCOMPLETE)
+    assert (run.status, run.conclusion) == ("completed", "neutral")
+    assert "not blocking" in run.title.lower()
+    assert "auto-approve is withheld" in run.summary.lower()
 
 
 # ── the writes ────────────────────────────────────────────────────────────────
