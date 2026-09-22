@@ -32,6 +32,7 @@ min_protoagent_version: "0.170.0"  # a step `timeout` that references an input (
 config_section: pr_reviewer
 config:
   default_repo: ""             # repo the tool falls back to when `repo` is omitted (owner/name)
+  verify_reruns: 1             # re-run a verifier that contradicted the synthesizer, alone (#167)
   finder_timeout_s: 0          # seconds each parallel finder may run (issue #93). 0 = the recipe's
                                # default (900). Calibrate to YOUR model: just above the slow finders'
                                # p95 (telemetry `step_s`). Clamped below `panel_attempt_timeout`.

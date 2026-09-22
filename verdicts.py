@@ -620,6 +620,18 @@ def verify_delivered(verify_output: str) -> bool:
     return any(block.lstrip().startswith("[") for block in fenced_blocks(out))
 
 
+def verifier_contradicts_synthesis(verify_output: str, synthesized: list[dict] | None) -> bool:
+    """The verifier says it received NOTHING while the synthesizer handed it findings (#167).
+
+    Mechanical, no judgment: `nothing-to-verify` is defined by the recipe as "the array was
+    literally `[]`", so over a non-empty synthesis it is a contradiction — the verifier did
+    not read its input (5 of 29 rounds with findings; deterministic enough to hit one PR
+    twice). Such a round is not wrong, it is unfinished: the verify step is the one to
+    re-run, not the panel.
+    """
+    return bool(synthesized) and NOTHING_TO_VERIFY in (verify_output or "")
+
+
 def verification_ran(verify_output: str, findings: list[dict] | None) -> bool:
     """Did the verify pass actually check the findings the panel is reporting?
 

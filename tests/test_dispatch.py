@@ -1341,6 +1341,131 @@ def _panel_steps(**over) -> dict:
     return steps
 
 
+_ONE_FINDING = json.dumps(
+    [{"file": "x.py", "line": 3, "severity": "minor", "category": "correctness", "claim": "Bug.", "evidence": "e"}]
+)
+_SYNTH_ONE = f"<!-- brief -->\nOne.\n<!-- /brief -->\n\n```json\n{_ONE_FINDING}\n```"
+_VERIFY_FLAKED = "VERIFY_STATUS: nothing-to-verify\n\nNo findings were provided in the <synthesized> tags."
+_VERIFY_ANNOTATED = (
+    "VERIFY_STATUS: annotated n=1\n\n```json\n"
+    + json.dumps([{**json.loads(_ONE_FINDING)[0], "verdict": "confirmed", "note": "traced"}])
+    + "\n```"
+)
+_REPORT_UNVERIFIED = (
+    f"<!-- brief -->\nOne, unverified.\n<!-- /brief -->\n\nVERIFY_GAP: unverified=1\n\n```json\n{_ONE_FINDING}\n```"
+)
+_REPORT_VERIFIED = (
+    "<!-- brief -->\nOne, confirmed.\n<!-- /brief -->\n\n```json\n"
+    + json.dumps([{**json.loads(_ONE_FINDING)[0], "verdict": "confirmed", "note": "traced"}])
+    + "\n```"
+)
+
+
+async def test_a_verifier_that_contradicts_the_synthesizer_is_re_run_alone(tmp_path):
+    """#167: the verifier said nothing-to-verify over a synthesis carrying one finding
+    (5 of 29 such rounds). Only verify + report run again, seeded with everything else."""
+    calls: list[dict] = []
+
+    async def runner(name, inputs, *, seed_outputs=None):
+        calls.append({"seed": seed_outputs})
+        if seed_outputs is None:
+            steps = _panel_steps(synthesize=_SYNTH_ONE, verify=_VERIFY_FLAKED)
+            return {"output": _REPORT_UNVERIFIED, "steps": steps, "failed": [], "timings": {"verify": 8.0}}
+        return {
+            "output": _REPORT_VERIFIED,
+            "steps": {"verify": _VERIFY_ANNOTATED, "report": _REPORT_VERIFIED},
+            "failed": [],
+            "timings": {"verify": 9.0},
+        }
+
+    d = make(tmp_path, gh=_structural_gh(), runner=runner)
+    out = await d.handle_pr_event("o/r", 1, HEAD, "opened")
+    assert out == "reviewed:WARN"
+    # The re-run was seeded with every step BUT verify and report — the finders did not run twice.
+    assert len(calls) == 2 and set(calls[1]["seed"]) == set(_panel_steps()) - {"verify", "report"}
+    row = _events(tmp_path, "reviewed")[-1]
+    assert row["verdict"] == "WARN" and row["findings"] == 1
+    events = _events(tmp_path, "verify-contradicted")
+    assert [(e["attempt"], e["rerun"], e["cleared"]) for e in events] == [(1, True, True)]
+
+
+async def test_a_verifier_that_stays_contradicted_posts_unverified_as_before(tmp_path):
+    async def runner(name, inputs, *, seed_outputs=None):
+        if seed_outputs is None:
+            return {
+                "output": _REPORT_UNVERIFIED,
+                "steps": _panel_steps(synthesize=_SYNTH_ONE, verify=_VERIFY_FLAKED),
+                "failed": [],
+            }
+        return {
+            "output": _REPORT_UNVERIFIED,
+            "steps": {"verify": _VERIFY_FLAKED, "report": _REPORT_UNVERIFIED},
+            "failed": [],
+        }
+
+    gh = _structural_gh()
+    d = make(tmp_path, gh=gh, runner=runner)
+    await d.handle_pr_event("o/r", 1, HEAD, "opened")
+    assert "verified=false" in gh.reviews_posted[0]["body"]  # fail-closed, exactly as today
+    events = _events(tmp_path, "verify-contradicted")
+    assert [(e["attempt"], e["rerun"], e["cleared"]) for e in events] == [(1, True, False)]
+
+
+async def test_a_host_whose_runner_cannot_seed_only_counts_the_contradiction(tmp_path):
+    calls = 0
+
+    async def runner(name, inputs):  # protoAgent < #3571: no seed_outputs
+        nonlocal calls
+        calls += 1
+        return {
+            "output": _REPORT_UNVERIFIED,
+            "steps": _panel_steps(synthesize=_SYNTH_ONE, verify=_VERIFY_FLAKED),
+            "failed": [],
+        }
+
+    gh = _structural_gh()
+    d = make(tmp_path, gh=gh, runner=runner)
+    await d.handle_pr_event("o/r", 1, HEAD, "opened")
+    assert calls == 1 and "verified=false" in gh.reviews_posted[0]["body"]
+    assert [(e["rerun"], e["cleared"]) for e in _events(tmp_path, "verify-contradicted")] == [(False, False)]
+
+
+async def test_verify_reruns_zero_disables_the_re_run_on_a_host_that_could_seed(tmp_path):
+    calls = 0
+
+    async def runner(name, inputs, *, seed_outputs=None):  # a seed-capable host
+        nonlocal calls
+        calls += 1
+        return {
+            "output": _REPORT_UNVERIFIED,
+            "steps": _panel_steps(synthesize=_SYNTH_ONE, verify=_VERIFY_FLAKED),
+            "failed": [],
+        }
+
+    gh = _structural_gh()
+    d = make(tmp_path, cfg={"verify_reruns": 0}, gh=gh, runner=runner)
+    await d.handle_pr_event("o/r", 1, HEAD, "opened")
+    assert calls == 1 and "verified=false" in gh.reviews_posted[0]["body"]
+    assert [(e["rerun"], e["cleared"]) for e in _events(tmp_path, "verify-contradicted")] == [(False, False)]
+
+
+async def test_a_verifier_that_read_its_input_is_not_re_run(tmp_path):
+    calls = 0
+
+    async def runner(name, inputs, *, seed_outputs=None):
+        nonlocal calls
+        calls += 1
+        return {
+            "output": _REPORT_VERIFIED,
+            "steps": _panel_steps(synthesize=_SYNTH_ONE, verify=_VERIFY_ANNOTATED),
+            "failed": [],
+        }
+
+    d = make(tmp_path, gh=_structural_gh(), runner=runner)
+    await d.handle_pr_event("o/r", 1, HEAD, "opened")
+    assert calls == 1 and _events(tmp_path, "verify-contradicted") == []
+
+
 def _structural_gh() -> RoutedGH:
     return RoutedGH(pr_facts=facts(changed_files=6, additions=300, deletions=50), files="x.py\nb\nc\nd\ne\nf\n")
 
