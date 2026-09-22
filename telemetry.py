@@ -27,7 +27,9 @@ REAFFIRM_HEAD = "reaffirm"  # the exact same head SHA already carries this verdi
 REAFFIRM_DIFF = "reaffirm-diff"  # head SHA changed, but the base↔head diff is byte-identical
 REAFFIRM_MISS = "reaffirm-miss"  # a diff reaffirm was considered and declined (fail-closed)
 REAFFIRM_RECORDED = "reaffirm-recorded"  # a diff-reaffirmed PASS/WARN was carried to the new head (#135)
-VERIFY_CONTRADICTED = "verify-contradicted"  # the verifier said nothing-to-verify over a synthesis that carried findings (#167)
+VERIFY_CONTRADICTED = (
+    "verify-contradicted"  # the verifier said nothing-to-verify over a synthesis that carried findings (#167)
+)
 
 
 class Telemetry:
