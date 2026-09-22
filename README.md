@@ -308,7 +308,8 @@ publishes one, named **`QA panel`**, driven by the same decision as approve-on-g
 | Clear verdict, findings resolved (or already promoted) | ✅ success |
 | Findings still open — unresolved review threads | ❌ failure |
 | `FAIL` verdict standing against this head | ❌ failure |
-| No verdict yet / stale head / incomplete pass | ⏳ in progress |
+| No verdict yet / stale head | ⏳ in progress |
+| Clear verdict on an **incomplete pass** (a lane did not run) | ⚪ neutral — passes a required check; auto-approve still withheld until a complete pass (#130). The verdict is WARN-capped for the same gap (#117); the review body names the lanes |
 | CI pending, red, or unreadable | ⏳ in progress — CI already blocks; we don't say it twice |
 | PR closed or merged while the check was still in progress | ⚪ neutral — every wait above ends with the PR; a run that already concluded is left as it stands (#153) |
 

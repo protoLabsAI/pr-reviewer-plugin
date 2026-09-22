@@ -3369,7 +3369,9 @@ async def test_only_incomplete_rounds_for_the_head_still_hold_incomplete(tmp_pat
     assert (await d.evaluate_promotion("o/r", 1)) == "hold:incomplete-coverage"
     assert gh.reviews_posted == []
     qa = _qa_check(gh)
-    assert qa.get("status") == "in_progress" and qa.get("output[title]") == "Incomplete pass"
+    # Held from auto-approve; concluded neutral on the check so a human can still merge (#130).
+    assert qa.get("status") == "completed" and qa.get("conclusion") == "neutral"
+    assert qa.get("output[title]") == "Incomplete pass — not blocking"
 
 
 async def test_an_incomplete_fail_with_findings_still_holds_after_a_complete_pass(tmp_path):
