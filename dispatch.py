@@ -77,6 +77,7 @@ from .verdicts import (
     finder_completed,
     mentions_any,
     merge_carried_findings,
+    overrun_lanes,
     parse_verdict_marker,
     render_verdict_body,
     report_hard_stopped,
@@ -1733,6 +1734,21 @@ class Dispatcher:
                 return "error:run-timed-out" if timed_out else "error:run-crashed"
             failed = list(result.get("failed") or [])
             steps_now = result.get("steps") if isinstance(result.get("steps"), dict) else {}
+            # A finder that overran the model's context window (#176) is a coverage gap
+            # the round carries — like a lane the engine timed out — not a failed round.
+            # The other lanes delivered; retrying all five re-rolls the same dice (7 of 8
+            # panels on one PR). The lane is moved to `degraded` with its error as the
+            # output, so everything downstream reads it exactly as a timed-out lane.
+            overran = overrun_lanes(failed, steps_now)
+            if overran:
+                failed = [s for s in failed if s not in overran]
+                result = {
+                    **result,
+                    "failed": failed,
+                    "degraded": [*(result.get("degraded") or []), *overran],
+                    "overran": overran,
+                }
+                self.telemetry.emit("finder_overran", repo=repo, pr=pr, sha=head, lanes=overran, attempt=attempt)
             undelivered = (
                 []
                 if failed
@@ -1877,8 +1893,14 @@ class Dispatcher:
             and not verify_delivered(str(steps_out.get("verify") or ""))
         )
         # The same signals as one record, for the coverage cap and note below (#117).
+        overran = [str(s) for s in (result.get("overran") or [])]
         gaps = coverage_gaps(
-            degraded, incomplete_finders, structural_unavailable, outage_reason(structural_out), verify_undelivered
+            degraded,
+            incomplete_finders,
+            structural_unavailable,
+            outage_reason(structural_out),
+            verify_undelivered,
+            overran=overran,
         )
         brief, brief_found = extract_brief(output)
         # A report that dropped its brief (#168: 5 of 150 posted reviews, every one a clean
@@ -2068,6 +2090,7 @@ class Dispatcher:
             # report step off its contract, so it stays countable.
             brief_borrowed=(brief_source == "synthesize") or None,
             report_truncated=truncated or None,
+            overran=overran or None,
             grounding_checked=grounding_checked,
             grounding_downgraded=len(ungrounded),
             grounding_unreadable=len(unreadable),
