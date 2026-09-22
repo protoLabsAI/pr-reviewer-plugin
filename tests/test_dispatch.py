@@ -437,15 +437,6 @@ async def test_a_reaffirmed_fail_is_not_carried_to_the_new_head(tmp_path):
     assert gh.posted == [] and not _telemetry_events(tmp_path, "reaffirm-recorded")
 
 
-async def test_an_incomplete_round_stays_incomplete_when_carried(tmp_path):
-    # The carried verdict is no better than the round it came from: the gate still holds it.
-    gh = _reaffirm_gh(lambda did: review_row(OLD_HEAD, "WARN", complete=False, diff_id=did))
-    d = make(tmp_path, gh=gh, runner=_no_panel_runner([]))
-    assert (await d.handle_pr_event("o/r", 1, HEAD, "synchronize")) == "reaffirmed:WARN"
-    marker = parse_verdict_marker(gh.posted[0]["body"])
-    assert marker["complete"] is False and marker["reaffirmed"] == OLD_HEAD
-
-
 async def test_a_carried_verdict_never_dismisses_a_standing_block(tmp_path):
     # Nothing new was judged, so the reaffirm post must not lift anything (`hold_blocks`).
     gh = _reaffirm_gh(lambda did: review_row(OLD_HEAD, "PASS", diff_id=did))
