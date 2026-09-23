@@ -81,6 +81,7 @@ from .verdicts import (
     parse_verdict_marker,
     render_verdict_body,
     report_hard_stopped,
+    restate_findings,
     structural_relay_ok,
     undelivered_stages,
     verdict_for,
@@ -2618,6 +2619,11 @@ class Dispatcher:
             self.telemetry.emit(VERIFY_CONTRADICTED, repo=repo, pr=pr, sha=head, attempt=0, rerun=False, cleared=False)
             return result
         seeded = {k: str(v) for k, v in steps.items() if k not in ("verify", "report")}
+        # Not a byte-for-byte repeat (#182): the identical request reproduced the identical
+        # contradiction (2 of 2, and #384's separate panels agree), while the same payload
+        # in any other shape reads fine. The re-run hands the verifier the SAME array,
+        # restated — an explicit count first, no delegation banner, no prose brief.
+        seeded["synthesize"] = restate_findings(synthesized)
         for attempt in range(1, self.verify_reruns + 1):
             try:
                 async with asyncio.timeout(self.panel_attempt_timeout_s):
@@ -2638,7 +2644,14 @@ class Dispatcher:
             steps = result["steps"]
             cleared = not verifier_contradicts_synthesis(str(again_steps["verify"] or ""), synthesized)
             self.telemetry.emit(
-                VERIFY_CONTRADICTED, repo=repo, pr=pr, sha=head, attempt=attempt, rerun=True, cleared=cleared
+                VERIFY_CONTRADICTED,
+                repo=repo,
+                pr=pr,
+                sha=head,
+                attempt=attempt,
+                rerun=True,
+                restated=True,
+                cleared=cleared,
             )
             if cleared:
                 break

@@ -647,6 +647,19 @@ def verify_delivered(verify_output: str) -> bool:
     return any(block.lstrip().startswith("[") for block in fenced_blocks(out))
 
 
+def restate_findings(findings: list[dict]) -> str:
+    """The synthesizer's findings as a verify re-run hands them over (#182): the same
+    array, byte-for-byte in substance, preceded by an explicit count and stripped of the
+    delegation banner and prose brief. A verifier that answered `nothing-to-verify` over
+    the original shape is not shown that shape again."""
+    n = len(findings)
+    return (
+        f"FINDINGS_COUNT: {n}\n"
+        f"`nothing-to-verify` is wrong here: {n} finding(s) follow — annotate every one.\n\n"
+        "```json\n" + json.dumps(findings, indent=2) + "\n```"
+    )
+
+
 def verifier_contradicts_synthesis(verify_output: str, synthesized: list[dict] | None) -> bool:
     """The verifier says it received NOTHING while the synthesizer handed it findings (#167).
 

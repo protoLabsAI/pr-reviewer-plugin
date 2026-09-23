@@ -1399,10 +1399,14 @@ async def test_a_verifier_that_contradicts_the_synthesizer_is_re_run_alone(tmp_p
     assert out == "reviewed:WARN"
     # The re-run was seeded with every step BUT verify and report — the finders did not run twice.
     assert len(calls) == 2 and set(calls[1]["seed"]) == set(_panel_steps()) - {"verify", "report"}
+    # …and the synthesis was RESTATED, not repeated (#182): same array, explicit count, no brief.
+    seeded_synth = calls[1]["seed"]["synthesize"]
+    assert seeded_synth.startswith("FINDINGS_COUNT: 1\n") and "<!-- brief -->" not in seeded_synth
+    assert json.loads(seeded_synth.split("```json\n", 1)[1].rsplit("\n```", 1)[0]) == json.loads(_ONE_FINDING)
     row = _events(tmp_path, "reviewed")[-1]
     assert row["verdict"] == "WARN" and row["findings"] == 1
     events = _events(tmp_path, "verify-contradicted")
-    assert [(e["attempt"], e["rerun"], e["cleared"]) for e in events] == [(1, True, True)]
+    assert [(e["attempt"], e["rerun"], e["restated"], e["cleared"]) for e in events] == [(1, True, True, True)]
 
 
 async def test_a_verifier_that_stays_contradicted_posts_unverified_as_before(tmp_path):
