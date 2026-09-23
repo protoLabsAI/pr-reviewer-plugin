@@ -863,3 +863,20 @@ def test_a_fence_holding_no_json_hides_nothing_after_it():
 
     assert fenced_blocks("```\ndiff --git a/x b/x\n```\n\n```json\n[]\n```") == ["diff --git a/x b/x", "[]"]
     assert fenced_blocks("```json\n[1, 2") == []  # unclosed: not a block
+
+
+def test_a_status_line_with_an_unspelled_word_and_an_explicit_array_is_a_completed_pass():
+    """#186: two rounds were capped WARN complete=false because a finder closed a full review
+    with `FINDER_STATUS: clean` instead of `reviewed n=0`. The pair — a status line and an
+    explicit array — is what a garbage exit cannot produce; the word is not the pass."""
+    from pr_reviewer.verdicts import finder_completed
+
+    clean = "No defects found that I can evidence.\n\n```json\n[]\n```\n\nFINDER_STATUS: clean"
+    assert finder_completed(clean)
+    assert finder_completed("Reviewed.\n\n```json\n[]\n```\nFINDER_STATUS: reviewed n=0")
+    assert not finder_completed("Could not read the repo.\n\n```json\n[]\n```\nFINDER_STATUS: blocked reason=404")
+    assert not finder_completed("I will now review.\n\nFINDER_STATUS: clean")  # a status line with no array
+    assert not finder_completed("Here are findings.\n\n```json\n[]\n```")  # an array with no status line
+    assert not finder_completed(
+        "the other lane wrote FINDER_STATUS: clean mid-sentence\n```json\n[]\n```"
+    )  # not a line
