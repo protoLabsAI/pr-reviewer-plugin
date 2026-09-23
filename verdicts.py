@@ -361,6 +361,7 @@ VERIFY_GAP_PREFIX = "VERIFY_GAP:"
 
 FINDER_REVIEWED = "FINDER_STATUS: reviewed"
 FINDER_BLOCKED_PREFIX = "FINDER_STATUS: blocked"
+_FINDER_STATUS_LINE = re.compile(r"^\s*FINDER_STATUS:\s*\S", re.MULTILINE)
 
 # ── reading fenced blocks ─────────────────────────────────────────────────────
 # A fence does NOT close at the first ``` anywhere. The old pattern (`.*?```) ended the
@@ -429,7 +430,14 @@ def finder_completed(output: str) -> bool:
     text = output or ""
     if FINDER_BLOCKED_PREFIX in text:
         return False
-    return FINDER_REVIEWED in text
+    if FINDER_REVIEWED in text:
+        return True
+    # A status line the recipe did not spell — `FINDER_STATUS: clean` on a full review
+    # with an explicit `[]` (#186: two rounds capped WARN complete=false for a coverage gap
+    # that did not exist). The marker tells a real pass from a garbage exit; a garbage exit
+    # produces neither a status line nor an array, so the pair is the pass, whatever the
+    # word. `blocked` above stays the one status that means "did not happen".
+    return bool(_FINDER_STATUS_LINE.search(text)) and any(b.lstrip().startswith("[") for b in fenced_blocks(text))
 
 
 def mentions_any(text: str, markers: str | tuple[str, ...]) -> bool:
