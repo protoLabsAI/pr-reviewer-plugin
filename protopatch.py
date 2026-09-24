@@ -36,6 +36,7 @@ from pathlib import Path
 
 from .checkout_cache import CheckoutCache, CheckoutError, redact
 from .gh_cli import bad_repo, resolve_token, run_gh
+from .refutations import RefutationStore, _norm_path, premark_refuted
 
 log = logging.getLogger("protoagent.plugins.pr_reviewer")
 
@@ -213,6 +214,9 @@ class ProtoPatchRunner:
         home = Path(os.environ.get("PR_REVIEWER_HOME") or Path.home() / ".protoagent" / "pr-reviewer")
         self.checkout_root = Path(self.cfg.get("checkout_root") or home / "checkouts")
         self.state_root = Path(self.cfg.get("state_root") or home / "clawpatch")
+        # Claims this repo's verifier already refuted (#190) — shared with the dispatcher,
+        # which writes them when a round posts; the structural pass reads them here.
+        self.refutations = RefutationStore.from_cfg(self.cfg)
         self.budget_s = int(self.cfg.get("time_budget_s") or 300)
         self.bin = str(self.cfg.get("clawpatch_bin") or "clawpatch")
         self.model = str(self.cfg.get("model") or "")
@@ -252,6 +256,29 @@ class ProtoPatchRunner:
             except Exception:  # noqa: BLE001 — no host present
                 pass
         return key, base
+
+    async def _changed_ranges(self, checkout: Path, base_sha: str) -> dict[str, list[tuple[int, int]]] | None:
+        """{file: [(start, end), …]} of head-side lines this PR changes — what decides whether
+        a remembered refutation still applies (#190). None when the diff is unreadable."""
+        from .checkout_cache import _default_run_git
+
+        run = self._run_git or _default_run_git
+        rc, out, _err = await run(["-C", str(checkout), "diff", "--unified=0", f"{base_sha}...HEAD"])
+        if rc != 0:
+            return None
+        ranges: dict[str, list[tuple[int, int]]] = {}
+        current = ""
+        for line in out.splitlines():
+            if line.startswith("+++ "):
+                current = line[4:].strip()
+                current = current[2:] if current.startswith("b/") else current
+            elif line.startswith("@@ ") and current:
+                m = re.search(r"\+(\d+)(?:,(\d+))?", line)
+                if m:
+                    start = int(m.group(1))
+                    count = int(m.group(2)) if m.group(2) is not None else 1
+                    ranges.setdefault(_norm_path(current), []).append((start, start + max(count, 1) - 1))
+        return ranges
 
     async def _changed_files(self, checkout: Path, base_sha: str) -> set[str] | None:
         from .checkout_cache import _default_run_git
@@ -345,10 +372,15 @@ class ProtoPatchRunner:
             return unavailable(f"clawpatch exit {rc} ({reason}): {detail}")
 
         findings = read_findings(state_dir, changed)
+        # A repeat of a claim this repo's verifier already refuted, at a spot this PR does
+        # not touch, goes to the synthesizer already marked (#190) — it is dropped there
+        # instead of costing a verify round on every PR that touches the file.
+        premarked = premark_refuted(findings, self.refutations, repo, await self._changed_ranges(checkout, base_sha))
         confinement = f"{len(changed)} changed file(s)" if changed is not None else "unconfined (diff unavailable)"
+        repeats = f", {premarked} refuted before (pre-marked)" if premarked else ""
         header = (
             f"protoPatch structural pass on {repo}#{pr} — head {head_sha[:12]}, base {base_sha[:12]}, "
-            f"{elapsed:.0f}s, {len(findings)} reportable finding(s), scope: {confinement}."
+            f"{elapsed:.0f}s, {len(findings)} reportable finding(s){repeats}, scope: {confinement}."
         )
         return f"{header}\n\n```json\n{json.dumps(findings, indent=2)}\n```"
 

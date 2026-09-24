@@ -310,3 +310,70 @@ async def test_first_review_cleans_a_preexisting_oversized_cache(tmp_path, gatew
     # The pre-fix garbage is gone; the fresh checkout for this review survives.
     assert list(stale.iterdir()) == []
     assert (co / "octo-repo" / SHA_HEAD).is_dir()
+
+
+# ── refuted before (#190) ─────────────────────────────────────────────────────
+
+
+def _git_with_hunks(hunk_lines: str, files: str = "lib/cache.ts\n"):
+    """`--name-only` lists files; `--unified=0` yields a diff with the given hunk header(s)."""
+
+    async def run_git(args, timeout_s=180):
+        if args[0] == "clone":
+            import os
+
+            os.makedirs(args[-1], exist_ok=True)
+        if "--name-only" in args:
+            return 0, files, ""
+        if "--unified=0" in args:
+            return (
+                0,
+                f"diff --git a/lib/cache.ts b/lib/cache.ts\n--- a/lib/cache.ts\n+++ b/lib/cache.ts\n{hunk_lines}",
+                "",
+            )
+        return 0, "", ""
+
+    return run_git
+
+
+async def test_a_claim_this_repo_already_refuted_is_pre_marked_unless_the_pr_touches_it(tmp_path, gateway_env, pr_refs):
+    from pr_reviewer.refutations import RefutationStore
+
+    def seed(args, cwd, env, budget_s):
+        state = tmp_path / "st" / "octo-repo" / "findings"
+        state.mkdir(parents=True, exist_ok=True)
+        (state / "f1.json").write_text(json.dumps(RECORD))
+
+    RefutationStore(tmp_path / "st").record(
+        "octo/repo",
+        [
+            {
+                "file": "lib/cache.ts",
+                "line": 42,
+                "claim": RECORD["title"],
+                "source": "protopatch",
+                "verdict": "refuted",
+                "note": "lock already held",
+            }
+        ],
+        pr=7,
+        head="abcdef123456",
+    )
+    # The PR changes lines 200-203 of the file — nowhere near the claim at 42: pre-marked.
+    r = runner(
+        tmp_path, run_git=_git_with_hunks("@@ -200,2 +200,4 @@\n+a\n+b\n"), run_clawpatch=make_clawpatch(on_run=seed)
+    )
+    out = await r.review(12, "octo/repo")
+    assert "1 refuted before (pre-marked)" in out
+    [finding] = json.loads(out.split("```json\n", 1)[1].split("```")[0])
+    assert finding["verdict"] == "refuted" and finding["refuted_before"].startswith("#7 @abcdef123456")
+    assert "lock already held" in finding["note"]
+
+    # The PR changes lines 40-44 — the claim's own spot: it is live again, reported as new.
+    r = runner(
+        tmp_path, run_git=_git_with_hunks("@@ -40,3 +40,5 @@\n+x\n+y\n"), run_clawpatch=make_clawpatch(on_run=seed)
+    )
+    out = await r.review(12, "octo/repo")
+    assert "refuted before" not in out
+    [finding] = json.loads(out.split("```json\n", 1)[1].split("```")[0])
+    assert "verdict" not in finding
