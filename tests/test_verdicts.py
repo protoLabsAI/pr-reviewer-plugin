@@ -953,3 +953,34 @@ def test_two_distinct_defects_with_boilerplate_wording_are_never_merged():
         }
     ]
     assert [f["line"] for f in merge_carried_findings(fresh, moved)] == [40]  # near and the same claim: superseded
+
+
+def test_sibling_defects_with_template_claims_within_25_lines_stay_distinct():
+    """Review on #193, round 2: similarity ~0.95, 12 lines apart — but they name different
+    things. The identifiers decide, not the ratio."""
+    boiler = "SQL built by string concatenation from a request field in "
+    fresh = [
+        {"file": "db.py", "line": 40, "severity": "major", "claim": boiler + "list_users()", "verdict": "confirmed"}
+    ]
+    sibling = [{"file": "db.py", "line": 52, "severity": "major", "claim": boiler + "delete_user()"}]
+    assert [f["line"] for f in merge_carried_findings(fresh, sibling)] == [40, 52]
+
+
+def test_same_defect_fails_closed_on_an_empty_claim_or_a_missing_line():
+    fresh = [{"file": "a.py", "line": 10, "severity": "major", "claim": "Bug in load()", "verdict": "confirmed"}]
+    out = merge_carried_findings(fresh, [{"file": "a.py", "line": 12, "severity": "major", "claim": ""}])
+    assert [f.get("line") for f in out] == [10, 12]  # an empty claim never matches
+    out = merge_carried_findings(fresh, [{"file": "a.py", "severity": "major", "claim": "Bug in load()"}])
+    assert [f.get("line") for f in out] == [10, None]  # a missing line never matches
+    out = merge_carried_findings(fresh, [{"file": "a.py", "line": 11, "severity": "major", "claim": "Bug in load()"}])
+    assert [f.get("line") for f in out] == [10]  # the same defect, one line down: superseded
+
+
+def test_identifier_tokens_pick_out_the_things_a_claim_names():
+    from pr_reviewer.verdicts import identifier_tokens
+
+    assert identifier_tokens("SQL built by concatenation from a request field in list_users()") == {"list_users()"}
+    assert identifier_tokens(
+        "taken from the raw directory basename without lowercasing, so for stacks/roxy-protoCLI it differs"
+    ) == {"stacks/roxy-protocli"}
+    assert identifier_tokens("Env/mount/label deltas are computed only one-directionally") == {"env/mount/label"}

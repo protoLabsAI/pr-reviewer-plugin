@@ -274,12 +274,25 @@ SAME_DEFECT_RATIO = 0.8  # claim similarity (SequenceMatcher) that reads as the 
 SAME_DEFECT_LINES = 25  # … at a line that MOVED, not anywhere in the file
 
 
+_IDENTIFIER_TOKEN = re.compile(r"[A-Za-z_][\w.]*\(\)|[\w.-]*[_./:\[\]][\w.\-/:\[\]()]*|\b\d+\b|\b[a-z]+[A-Z]\w*")
+
+
+def identifier_tokens(claim: str) -> frozenset[str]:
+    """The tokens in a claim that name a THING — `list_users()`, `scripts/x.sh`, `foo_bar`,
+    `Cargo.lock`, `v1`, `camelCase`, a bare number — as opposed to its prose. Two claims
+    about different sites differ exactly here, however much boilerplate they share."""
+    return frozenset(
+        t.strip(".,;:()").lower() for t in _IDENTIFIER_TOKEN.findall(str(claim or "")) if t.strip(".,;:()")
+    )
+
+
 def _same_defect(a: dict, b: dict) -> bool:
-    """Same file, a near-identical claim, and a line within a few dozen of the original —
-    the same defect in other words at a moved line. Two distinct defects that share
-    boilerplate wording ("SQL built by concatenation in …") at different sites stay
-    distinct: they are far apart, and 0.8 is above what boilerplate alone reaches.
-    Fails closed: an empty claim or a missing line on either side never matches."""
+    """Same file, a line within a few dozen of the original, a near-identical claim — and
+    the same things named. The same defect in other words at a moved line passes all
+    four; two sibling defects with template claims ("SQL built by concatenation in
+    list_users()" / "… in delete_user()") share the boilerplate but name different
+    things, and stay distinct however close they sit. Fails closed: an empty claim or a
+    missing line on either side never matches."""
     if _norm_path(str(a.get("file") or "")) != _norm_path(str(b.get("file") or "")):
         return False
     try:
@@ -291,6 +304,8 @@ def _same_defect(a: dict, b: dict) -> bool:
     ca = " ".join(str(a.get("claim") or "").lower().split())
     cb = " ".join(str(b.get("claim") or "").lower().split())
     if not ca or not cb:
+        return False
+    if identifier_tokens(ca) != identifier_tokens(cb):
         return False
     return difflib.SequenceMatcher(None, ca, cb).ratio() >= SAME_DEFECT_RATIO
 
