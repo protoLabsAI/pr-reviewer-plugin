@@ -20,6 +20,7 @@ from pr_reviewer.verdicts import (
     extract_findings_json,
     finder_completed,
     findings_payload_present,
+    identifier_tokens,
     merge_carried_findings,
     parse_verdict_marker,
     render_verdict_body,
@@ -977,8 +978,6 @@ def test_same_defect_fails_closed_on_an_empty_claim_or_a_missing_line():
 
 
 def test_identifier_tokens_pick_out_the_things_a_claim_names():
-    from pr_reviewer.verdicts import identifier_tokens
-
     assert identifier_tokens("SQL built by concatenation from a request field in list_users()") == {"list_users()"}
     assert identifier_tokens(
         "taken from the raw directory basename without lowercasing, so for stacks/roxy-protoCLI it differs"

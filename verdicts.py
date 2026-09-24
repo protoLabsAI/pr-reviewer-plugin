@@ -281,9 +281,7 @@ def identifier_tokens(claim: str) -> frozenset[str]:
     """The tokens in a claim that name a THING — `list_users()`, `scripts/x.sh`, `foo_bar`,
     `Cargo.lock`, `v1`, `camelCase`, a bare number — as opposed to its prose. Two claims
     about different sites differ exactly here, however much boilerplate they share."""
-    return frozenset(
-        t.strip(".,;:()").lower() for t in _IDENTIFIER_TOKEN.findall(str(claim or "")) if t.strip(".,;:()")
-    )
+    return frozenset(t.strip(".,;:").lower() for t in _IDENTIFIER_TOKEN.findall(str(claim or "")) if t.strip(".,;:"))
 
 
 def _same_defect(a: dict, b: dict) -> bool:
@@ -291,8 +289,11 @@ def _same_defect(a: dict, b: dict) -> bool:
     the same things named. The same defect in other words at a moved line passes all
     four; two sibling defects with template claims ("SQL built by concatenation in
     list_users()" / "… in delete_user()") share the boilerplate but name different
-    things, and stay distinct however close they sit. Fails closed: an empty claim or a
-    missing line on either side never matches."""
+    things, and stay distinct however close they sit. Accepted residual: two aspects of
+    ONE identifier at the same spot, worded alike, merge — the fresh row (with its own
+    verdict) supersedes the carried one; a real defect is never invented, at worst one
+    carried row hides behind a fresh row about the same thing. Fails closed on an empty
+    claim or a missing line on either side."""
     if _norm_path(str(a.get("file") or "")) != _norm_path(str(b.get("file") or "")):
         return False
     try:
