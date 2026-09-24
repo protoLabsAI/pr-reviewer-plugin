@@ -983,3 +983,22 @@ def test_identifier_tokens_pick_out_the_things_a_claim_names():
         "taken from the raw directory basename without lowercasing, so for stacks/roxy-protoCLI it differs"
     ) == {"stacks/roxy-protocli"}
     assert identifier_tokens("Env/mount/label deltas are computed only one-directionally") == {"env/mount/label"}
+
+
+def test_camel_case_identifiers_tell_two_defects_apart():
+    """Review on #193, round 4: tokens must come from the raw claim — lower-casing first made
+    the camelCase alternative unreachable."""
+    assert identifier_tokens("resolveCustomTest ignores the timeout") == {"resolvecustomtest"}
+    fresh = [
+        {
+            "file": "a.ts",
+            "line": 10,
+            "severity": "major",
+            "claim": "resolveCustomTest ignores the timeout it is given",
+            "verdict": "confirmed",
+        }
+    ]
+    other = [
+        {"file": "a.ts", "line": 14, "severity": "major", "claim": "resolveDefaultTest ignores the timeout it is given"}
+    ]
+    assert [f["line"] for f in merge_carried_findings(fresh, other)] == [10, 14]

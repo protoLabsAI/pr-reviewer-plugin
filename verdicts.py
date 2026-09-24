@@ -302,11 +302,13 @@ def _same_defect(a: dict, b: dict) -> bool:
         return False
     if abs(la - lb) > SAME_DEFECT_LINES:
         return False
-    ca = " ".join(str(a.get("claim") or "").lower().split())
-    cb = " ".join(str(b.get("claim") or "").lower().split())
+    ra, rb = str(a.get("claim") or ""), str(b.get("claim") or "")
+    ca, cb = " ".join(ra.lower().split()), " ".join(rb.lower().split())
     if not ca or not cb:
         return False
-    if identifier_tokens(ca) != identifier_tokens(cb):
+    # Tokens come from the RAW claims: camelCase is only recognisable before lower-casing
+    # (review on #193, round 4 — the alternative was unreachable on lowered text).
+    if identifier_tokens(ra) != identifier_tokens(rb):
         return False
     return difflib.SequenceMatcher(None, ca, cb).ratio() >= SAME_DEFECT_RATIO
 
