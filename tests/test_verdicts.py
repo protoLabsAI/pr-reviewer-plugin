@@ -885,8 +885,6 @@ def test_a_status_line_with_an_unspelled_word_and_an_explicit_array_is_a_complet
 def test_a_carried_finding_is_accounted_for_by_a_near_identical_re_raise_at_a_moved_line():
     """#185 (homelab-iac#247): the head advanced mid-round; this round re-raised the carried
     defects in other words at neighbouring lines, and both rows posted — 8 for 5."""
-    from pr_reviewer.verdicts import merge_carried_findings
-
     fresh = [
         {
             "file": "scripts/compose-drift.sh",
@@ -916,8 +914,6 @@ def test_a_carried_finding_is_accounted_for_by_a_near_identical_re_raise_at_a_mo
 
 
 def test_a_different_claim_on_the_same_file_still_carries():
-    from pr_reviewer.verdicts import merge_carried_findings
-
     fresh = [{"file": "a.py", "line": 1, "severity": "minor", "claim": "unused import os", "verdict": "confirmed"}]
     carried = [
         {
