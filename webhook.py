@@ -27,6 +27,44 @@ from .chokepoint import verify_signature
 log = logging.getLogger("protoagent.plugins.pr_reviewer")
 
 
+MAX_REPLAY_TRIALS = 10  # a replay spends one full panel per trial per row (issue #200)
+
+
+def _pr_number(body: dict):
+    """The `pr` an operator route was handed, as a positive int — or the 400 that says
+    why (issue #200). `int()` on a stray string used to surface as a 500, and a float
+    was silently truncated to a different PR."""
+    from fastapi import HTTPException
+
+    raw = body.get("pr")
+    if isinstance(raw, bool) or raw is None or raw == "":
+        return None
+    if isinstance(raw, float) and not raw.is_integer():
+        raise HTTPException(status_code=400, detail=f"pr must be a whole number, got {raw!r}")
+    try:
+        pr = int(raw)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail=f"pr must be a number, got {raw!r}") from None
+    if pr <= 0:
+        raise HTTPException(status_code=400, detail=f"pr must be positive, got {pr}")
+    return pr
+
+
+def _replay_trials(body: dict) -> int:
+    from fastapi import HTTPException
+
+    raw = body.get("trials")
+    if raw is None or raw == "":
+        return 1
+    try:
+        trials = int(raw)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail=f"trials must be a number, got {raw!r}") from None
+    if not 1 <= trials <= MAX_REPLAY_TRIALS:
+        raise HTTPException(status_code=400, detail=f"trials must be 1..{MAX_REPLAY_TRIALS}, got {trials}")
+    return trials
+
+
 def build_routers(dispatcher, telemetry, get_secret, run_gh_fn=None):
     """(public_router, api_router). `get_secret` is a callable so a webhook-secret
     edit in Settings applies without a restart (live_config pattern). `run_gh_fn`
@@ -280,7 +318,7 @@ def build_routers(dispatcher, telemetry, get_secret, run_gh_fn=None):
     @api.post("/dispatch")
     async def _dispatch(body: dict = Body(...)):
         """Manual dispatch — the operator/dry-run path. Same chokepoint, same everything."""
-        repo, pr = str(body.get("repo") or ""), int(body.get("pr") or 0)
+        repo, pr = str(body.get("repo") or ""), _pr_number(body)
         if not repo or not pr:
             raise HTTPException(status_code=400, detail="need repo (owner/name) and pr (number)")
         outcome = await dispatcher.handle_pr_event(repo, pr, str(body.get("sha") or f"manual-{pr}"), "opened")
@@ -289,7 +327,7 @@ def build_routers(dispatcher, telemetry, get_secret, run_gh_fn=None):
     @api.post("/promote")
     async def _promote(body: dict = Body(...)):
         """Evaluate (and, when owned+formal, apply) approve-on-green for one PR."""
-        repo, pr = str(body.get("repo") or ""), int(body.get("pr") or 0)
+        repo, pr = str(body.get("repo") or ""), _pr_number(body)
         if not repo or not pr:
             raise HTTPException(status_code=400, detail="need repo (owner/name) and pr (number)")
         return {"repo": repo, "pr": pr, "decision": await dispatcher.evaluate_promotion(repo, pr)}
@@ -318,7 +356,11 @@ def build_routers(dispatcher, telemetry, get_secret, run_gh_fn=None):
         # It reported a working summon surface as dead, on a deployment that had already
         # received 331 `pull_request_review_comment` deliveries. A diagnostic that cannot
         # tell "no" from "I don't know" is worse than no diagnostic: it is believed.
-        subscribed = await fetch_app_events(AppAuthConfig(dispatcher.cfg or {}))
+        try:
+            subscribed = await fetch_app_events(AppAuthConfig(dispatcher.cfg or {}))
+        except Exception:  # noqa: BLE001 — a crashed read is "I don't know", never a 500 (issue #200)
+            log.exception("[pr-reviewer] summon health: reading the App's event subscriptions crashed")
+            subscribed = None
         if subscribed is None:
             return {
                 "subscribed": None,
@@ -361,8 +403,16 @@ def build_routers(dispatcher, telemetry, get_secret, run_gh_fn=None):
         runner = dispatcher._runner()
         if runner is None:
             raise HTTPException(status_code=503, detail="no workflow runner — replay needs a live protoAgent host")
-        rows = body.get("manifest") or ([body["row"]] if body.get("row") else [body])
-        model, trials = body.get("model"), int(body.get("trials") or 1)
+        manifest = body.get("manifest")
+        if manifest is not None:
+            # An explicit manifest is the rows — including an explicit EMPTY one, which
+            # used to fall through and replay the envelope itself as a row (issue #200).
+            if not isinstance(manifest, list):
+                raise HTTPException(status_code=400, detail="manifest must be a list of rows")
+            rows = manifest
+        else:
+            rows = [body["row"]] if body.get("row") else [body]
+        model, trials = body.get("model"), _replay_trials(body)
         stamp, include_raw = str(body.get("stamp") or ""), bool(body.get("include_raw"))
         runs = []
         for row in rows:
