@@ -90,3 +90,16 @@ def test_a_different_site_with_boilerplate_wording_is_never_pre_marked(tmp_path)
         {"file": "db.py", "line": 43, "claim": boiler + "list_users() — id not parameterised", "source": "protopatch"}
     ]
     assert premark_refuted(near_same, store, "o/r", {}) == 1
+
+
+def test_a_sibling_site_within_25_lines_with_a_template_claim_is_never_pre_marked(tmp_path):
+    store = RefutationStore(tmp_path)
+    boiler = "SQL built by string concatenation from a request field in "
+    store.record(
+        "o/r",
+        [{"file": "db.py", "line": 40, "claim": boiler + "list_users()", "source": "protopatch", "verdict": "refuted"}],
+        pr=1,
+        head="abc",
+    )
+    sibling = [{"file": "db.py", "line": 52, "claim": boiler + "delete_user()", "source": "protopatch"}]
+    assert premark_refuted(sibling, store, "o/r", {}) == 0 and "verdict" not in sibling[0]  # names a different thing

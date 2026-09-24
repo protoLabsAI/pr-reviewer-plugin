@@ -38,8 +38,15 @@ def _norm_path(path: str) -> str:
 
 
 def same_claim(a: str, b: str) -> bool:
+    """Near-identical wording that names the same things: two claims about different
+    sites share their boilerplate and differ exactly in an identifier (`list_users()` vs
+    `delete_user()`), and must never match however close the wording."""
+    from .verdicts import identifier_tokens  # lazy — verdicts is the plugin's core module
+
     na, nb = _norm(a), _norm(b)
     if not na or not nb:
+        return False
+    if identifier_tokens(na) != identifier_tokens(nb):
         return False
     return na == nb or difflib.SequenceMatcher(None, na, nb).ratio() >= SAME_CLAIM_RATIO
 
