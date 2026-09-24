@@ -129,3 +129,39 @@ def test_the_relay_gets_the_contract_only_on_a_host_that_has_the_fields():
     NewHost(name="structural-finder", **fields)
     assert _completion_contract(OldHost) == {}
     OldHost(name="structural-finder", **_completion_contract(OldHost))
+
+
+# ── one dispatcher and one sweep loop per process across config reloads (issue #198) ──
+
+
+def test_re_registering_reuses_the_running_dispatcher(tmp_path, no_app_env, monkeypatch):
+    monkeypatch.setenv("PR_REVIEWER_HOME", str(tmp_path))
+    first = FakeRegistry({"default_repo": "octo/repo"})
+    pr_reviewer.register(first)
+    second = FakeRegistry({"default_repo": "octo/repo", "shadow_mode": True})
+    pr_reviewer.register(second)
+    shared = pr_reviewer._MACHINERY[str(pr_reviewer._state_home(second.config))]
+    assert shared["dispatcher"] is not None
+    # The second registration re-pointed the SAME dispatcher at the new live view.
+    assert shared["dispatcher"].cfg == second.config
+    # A different state home is a different process-of-record: fresh machinery.
+    other = FakeRegistry({"default_repo": "octo/repo", "state_root": str(tmp_path / "elsewhere")})
+    pr_reviewer.register(other)
+    assert pr_reviewer._MACHINERY[str(pr_reviewer._state_home(other.config))]["dispatcher"] is not shared["dispatcher"]
+
+
+async def test_a_second_sweep_start_returns_the_running_loop(tmp_path, no_app_env, monkeypatch):
+    monkeypatch.setenv("PR_REVIEWER_HOME", str(tmp_path))
+    reg = FakeRegistry({"default_repo": "octo/repo", "sweep_interval_s": 3600})
+    pr_reviewer.register(reg)
+    sweep = next(s for s in reg.surfaces if s["name"] == "pr-reviewer-sweep")
+    first = sweep["start"]()
+    try:
+        assert sweep["start"]() is first  # no second loop, whoever asks
+    finally:
+        sweep["stop"]()
+        first.cancel()
+        try:
+            await first
+        except BaseException:  # noqa: BLE001 — cancelled or stopped, either is fine here
+            pass

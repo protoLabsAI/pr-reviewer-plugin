@@ -33,6 +33,16 @@ def _state_home(cfg: dict) -> Path:
     )
 
 
+# One reviewer machinery per state home per PROCESS (issue #198). A host config reload
+# re-runs `register()` but keeps a surviving surface — and the sweep loop it started —
+# alive on the FIRST dispatcher, while the re-registered routers get a second one. Two
+# chokepoints cannot see each other's in-flight panels, so the sweep's backfill ran a
+# duplicate panel on a head whose webhook panel was still running (7 of 99 dispatches on
+# Vera, 2026-09-24, every one after a `POST /api/config`). Keyed by state home so tests
+# with per-test homes still get fresh instances.
+_MACHINERY: dict[str, dict] = {}
+
+
 def register(registry) -> None:
     cfg = registry.config or {}
 
@@ -64,13 +74,26 @@ def register(registry) -> None:
         from .telemetry import Telemetry
         from .webhook import build_routers
 
-        telemetry = Telemetry(_state_home(cfg))
         live = registry.live_config if hasattr(registry, "live_config") else (lambda: cfg)
-        # The dispatcher resolves its knobs through the SAME live view the webhook
-        # secret already used (issue #11) — `repos`, `shadow_mode`, the kill switches.
-        # Snapshotting them meant an operator flipping the gate through Settings got a
-        # silent no-op until the container restarted.
-        dispatcher = Dispatcher(cfg, telemetry, cfg_provider=live)
+        home = str(_state_home(cfg))
+        shared = _MACHINERY.get(home)
+        if shared is not None:
+            # Re-registered in a live process (a config reload): keep the running
+            # dispatcher — its chokepoint, backfills and round caps are the state that
+            # must stay singular — and just refresh the config it was booted with.
+            telemetry = shared["telemetry"]
+            dispatcher = shared["dispatcher"]
+            dispatcher._cfg = cfg or {}
+            dispatcher._cfg_provider = live
+            log.info("[pr-reviewer] re-registered: reusing the running dispatcher (issue #198)")
+        else:
+            telemetry = Telemetry(home)
+            # The dispatcher resolves its knobs through the SAME live view the webhook
+            # secret already used (issue #11) — `repos`, `shadow_mode`, the kill switches.
+            # Snapshotting them meant an operator flipping the gate through Settings got a
+            # silent no-op until the container restarted.
+            dispatcher = Dispatcher(cfg, telemetry, cfg_provider=live)
+            shared = _MACHINERY[home] = {"telemetry": telemetry, "dispatcher": dispatcher}
 
         def _secret() -> str:
             # Config first (Settings → secrets overlay); env fallback for headless
@@ -119,15 +142,26 @@ def register(registry) -> None:
 
                 registry.register_surface(_auth_start, _auth_stop, name="pr-reviewer-app-auth")
 
-            stop_event = asyncio.Event()
             interval = int(cfg.get("sweep_interval_s") or 180)
 
             def _start():
-                # Runs in the server's startup hook — the loop exists here.
-                return asyncio.get_running_loop().create_task(sweep_loop(dispatcher, interval, stop_event))
+                # Runs in the server's startup hook — the loop exists here. One sweep loop
+                # per process (issue #198): a second start, whatever asks for it, returns
+                # the task already running rather than racing it.
+                running = shared.get("sweep_task")
+                if running is not None and not running.done():
+                    log.info("[pr-reviewer] sweep loop already running; not starting another (issue #198)")
+                    return running
+                stop_event = asyncio.Event()
+                shared["sweep_stop"] = stop_event
+                task = asyncio.get_running_loop().create_task(sweep_loop(dispatcher, interval, stop_event))
+                shared["sweep_task"] = task
+                return task
 
             def _stop():
-                stop_event.set()
+                stop_event = shared.get("sweep_stop")
+                if stop_event is not None:
+                    stop_event.set()
 
             registry.register_surface(_start, _stop, name="pr-reviewer-sweep")
         machinery = True
