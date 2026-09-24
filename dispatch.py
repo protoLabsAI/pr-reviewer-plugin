@@ -757,6 +757,7 @@ class Dispatcher:
             bool(self.cfg["summon"]) if "summon" in self.cfg else _env_bool("PR_REVIEWER_SUMMON", True)
         )
         self.chokepoint.cooldown_s = int(self._cfg.get("cooldown_s") or 30)
+        self.chokepoint.in_flight_ttl_s = self.round_timeout_s + 600
 
     async def _bounded_review(self, repo: str, pr: int, **review_kwargs) -> str:
         """``_review`` under ``round_timeout_s``. The callers hold the chokepoint slot and

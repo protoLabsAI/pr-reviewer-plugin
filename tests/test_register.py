@@ -142,7 +142,9 @@ def test_re_registering_reuses_the_running_dispatcher(tmp_path, no_app_env, monk
     dispatcher = shared["dispatcher"]
     sem = dispatcher.panel_sem
     assert dispatcher.summon_enabled is True and dispatcher.chokepoint.cooldown_s == 30
-    second = FakeRegistry({"default_repo": "octo/repo", "shadow_mode": True, "summon": False, "cooldown_s": 5})
+    second = FakeRegistry(
+        {"default_repo": "octo/repo", "shadow_mode": True, "summon": False, "cooldown_s": 5, "round_timeout": 100}
+    )
     pr_reviewer.register(second)
     assert shared["dispatcher"] is dispatcher
     # The second registration re-pointed the SAME dispatcher at the new live view — and
@@ -150,6 +152,7 @@ def test_re_registering_reuses_the_running_dispatcher(tmp_path, no_app_env, monk
     # semaphore the in-flight handlers hold stays the one they hold.
     assert dispatcher.cfg == second.config
     assert dispatcher.summon_enabled is False and dispatcher.chokepoint.cooldown_s == 5
+    assert dispatcher.chokepoint.in_flight_ttl_s == 100 + 600  # the TTL follows the new round bound too
     assert dispatcher.panel_sem is sem
     # A different state home is a different process-of-record: fresh machinery.
     other = FakeRegistry({"default_repo": "octo/repo", "state_root": str(tmp_path / "elsewhere")})

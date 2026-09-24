@@ -53,11 +53,11 @@ def build_routers(dispatcher, telemetry, get_secret, run_gh_fn=None):
     # A re-registered dispatcher (issue #198) keeps the semaphore its in-flight handlers
     # already hold: a fresh one here would let the new routes start `panel_limit` MORE
     # panels on top of those still draining the old one (review on #199, round 1).
+    panel_limit = max(1, int(getattr(dispatcher, "max_concurrent_panels", 3)))
     existing = getattr(dispatcher, "panel_sem", None)
     if isinstance(existing, asyncio.Semaphore):
         _panel_sem = existing
     else:
-        panel_limit = max(1, int(getattr(dispatcher, "max_concurrent_panels", 3)))
         _panel_sem = asyncio.Semaphore(panel_limit)
         dispatcher.panel_sem = _panel_sem
 

@@ -675,6 +675,37 @@ def test_the_panel_semaphore_is_sized_from_config_and_injected(tmp_path):
     asyncio.run(_exhaust())
 
 
+def test_rebuilt_routers_keep_the_dispatchers_semaphore_and_still_size_the_queued_signal(tmp_path):
+    """Issue #198: a re-registered dispatcher already carries the semaphore its in-flight
+    handlers hold; a second build_routers must reuse it (not double the cap) AND still know
+    the limit for the `queued` event (review on #199 r3: `panel_limit` was unassigned on
+    the reuse path, so the first full-queue dispatch raised NameError)."""
+    dispatcher = GatedDispatcher(max_concurrent_panels=1)
+    telemetry = Telemetry(tmp_path)
+    build_routers(dispatcher, telemetry, lambda: SECRET)
+    sem = dispatcher.panel_sem
+    build_routers(dispatcher, telemetry, lambda: SECRET)
+    assert dispatcher.panel_sem is sem
+
+    async def _run():
+        app, telemetry2 = _gated_app(tmp_path, dispatcher)  # third build, same dispatcher
+        assert dispatcher.panel_sem is sem
+        async with httpx.AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as client:
+            for pr in (1, 2):
+                body = pr_payload(pr)
+                r = await client.post("/plugins/pr-reviewer/webhook", content=body, headers=signed(body))
+                assert r.json()["dispatched"] is True
+            await _yield_until(lambda: dispatcher.running >= 1)
+            for _ in range(10):
+                await asyncio.sleep(0)
+            queued = [e for e in telemetry2.read_all() if e["event"] == "queued"]
+            assert queued and queued[0]["limit"] == 1  # sized, not NameError
+            dispatcher.release.set()
+            await _yield_until(lambda: dispatcher.completed >= 2)
+
+    asyncio.run(_run())
+
+
 async def test_concurrent_webhook_dispatch_is_bounded_and_excess_queues(tmp_path):
     """A burst of five eligible events must not run five panels at once: the semaphore
     caps concurrency at two, and the overflow queues (still dispatched) — none dropped."""
