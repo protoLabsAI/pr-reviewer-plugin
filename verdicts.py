@@ -270,13 +270,23 @@ CARRIED_NOTE = (
 )
 
 
-SAME_DEFECT_RATIO = 0.6  # claim similarity (SequenceMatcher) that reads as the same defect
+SAME_DEFECT_RATIO = 0.8  # claim similarity (SequenceMatcher) that reads as the same defect …
+SAME_DEFECT_LINES = 25  # … at a line that MOVED, not anywhere in the file
 
 
 def _same_defect(a: dict, b: dict) -> bool:
-    """Same file and a near-identical claim — the same defect in other words, whatever the
-    line. Fails closed: an empty claim on either side never matches."""
+    """Same file, a near-identical claim, and a line within a few dozen of the original —
+    the same defect in other words at a moved line. Two distinct defects that share
+    boilerplate wording ("SQL built by concatenation in …") at different sites stay
+    distinct: they are far apart, and 0.8 is above what boilerplate alone reaches.
+    Fails closed: an empty claim or a missing line on either side never matches."""
     if _norm_path(str(a.get("file") or "")) != _norm_path(str(b.get("file") or "")):
+        return False
+    try:
+        la, lb = int(a.get("line")), int(b.get("line"))
+    except (TypeError, ValueError):
+        return False
+    if abs(la - lb) > SAME_DEFECT_LINES:
         return False
     ca = " ".join(str(a.get("claim") or "").lower().split())
     cb = " ".join(str(b.get("claim") or "").lower().split())

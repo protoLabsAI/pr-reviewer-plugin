@@ -924,3 +924,32 @@ def test_a_different_claim_on_the_same_file_still_carries():
         }
     ]
     assert [f["line"] for f in merge_carried_findings(fresh, carried)] == [1, 40]
+
+
+def test_two_distinct_defects_with_boilerplate_wording_are_never_merged():
+    """Review on #193: a whole-file 0.6 match could swallow a second, different defect
+    whose claim shares boilerplate. Distance and a higher bar keep them apart."""
+    boiler = "SQL built by string concatenation from a request field in "
+    fresh = [
+        {"file": "db.py", "line": 40, "severity": "major", "claim": boiler + "list_users()", "verdict": "confirmed"}
+    ]
+    far = [{"file": "db.py", "line": 400, "severity": "major", "claim": boiler + "delete_user()"}]
+    assert [f["line"] for f in merge_carried_findings(fresh, far)] == [40, 400]  # far apart: both stay
+    near_but_different = [
+        {
+            "file": "db.py",
+            "line": 52,
+            "severity": "major",
+            "claim": "Unbounded LIMIT lets a caller page the whole table",
+        }
+    ]
+    assert [f["line"] for f in merge_carried_findings(fresh, near_but_different)] == [40, 52]  # near, different claim
+    moved = [
+        {
+            "file": "db.py",
+            "line": 44,
+            "severity": "major",
+            "claim": boiler + "list_users() — the id is not parameterised",
+        }
+    ]
+    assert [f["line"] for f in merge_carried_findings(fresh, moved)] == [40]  # near and the same claim: superseded
