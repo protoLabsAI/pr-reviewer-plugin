@@ -493,7 +493,10 @@ class Dispatcher:
         from .refutations import RefutationStore
 
         _home = Path(os.environ.get("PR_REVIEWER_HOME") or Path.home() / ".protoagent" / "pr-reviewer")
-        self.refutations = RefutationStore(Path(self._cfg.get("state_root") or _home / "clawpatch"))
+        self.refutations = RefutationStore(
+            Path(self._cfg.get("state_root") or _home / "clawpatch"),
+            ttl_days=int(self._cfg.get("refutation_ttl_days") or 14),  # the same TTL the structural pass reads with
+        )
         # Boot-time by necessity: the chokepoint owns in-flight/cooldown state, so it
         # cannot be rebuilt per read without dropping the bookkeeping it exists for.
         # On-demand summon surface (issue #28). Off disables the comment commands

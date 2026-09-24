@@ -37,7 +37,7 @@ def test_record_keeps_only_refuted_protopatch_findings_and_match_finds_them(tmp_
         head="5a30cd965035",
     )
     assert n == 1
-    hit = store.match("o/r", "packs/necromunda/src/lib.rs", REWORDED)  # near-identical wording still matches
+    hit = store.match("o/r", "packs/necromunda/src/lib.rs", REWORDED, 12)  # near-identical wording, a line away
     assert hit and hit["pr"] == 384 and hit["head"] == "5a30cd965035" and "returns Result" in hit["note"]
     assert store.match("o/r", "packs/necromunda/src/other.rs", CLAIM) is None
     assert store.match("o/other", "packs/necromunda/src/lib.rs", CLAIM) is None
