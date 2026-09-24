@@ -795,20 +795,22 @@ def await_result(coro):
 
 
 def test_summon_health_reports_unknown_when_the_app_read_crashes(tmp_path, monkeypatch):
+    called = []
+
     async def boom(_cfg):
+        called.append(1)
         raise RuntimeError("network down")
 
     monkeypatch.setattr("pr_reviewer.app_auth.fetch_app_events", boom)
-    app, _dispatcher, _telemetry = make_app(tmp_path)
+    app, dispatcher, _telemetry = make_app(tmp_path)
+    dispatcher.cfg = {}  # the route reads dispatcher.cfg first — give it one, so the READ is what crashes
     r = TestClient(app).get("/api/plugins/pr-reviewer/summon/health")
+    assert called, "the App-events read was never reached"
     assert r.status_code == 200
     assert r.json()["summon_reachable"] is None and r.json()["subscribed"] is None
 
 
 async def test_replay_trials_are_bounded_and_an_empty_manifest_replays_nothing(tmp_path):
-    from fastapi import FastAPI
-    from fastapi.testclient import TestClient
-
     calls = []
 
     class ReplayDispatcher(SpyDispatcher):
@@ -828,7 +830,7 @@ async def test_replay_trials_are_bounded_and_an_empty_manifest_replays_nothing(t
     app.include_router(api, prefix="/api/plugins/pr-reviewer")
     client = TestClient(app)
     row = {"repo": "o/r", "pr": 1, "head": "a"}
-    for bad in (0, 11, "many", -3):
+    for bad in (0, 11, "many", -3, True, 2.5):  # booleans and fractions are rejected, not coerced
         r = client.post("/api/plugins/pr-reviewer/replay", json={"row": row, "trials": bad})
         assert r.status_code == 400, bad
     r = client.post("/api/plugins/pr-reviewer/replay", json={"manifest": []})

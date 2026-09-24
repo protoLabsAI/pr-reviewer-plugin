@@ -30,22 +30,31 @@ log = logging.getLogger("protoagent.plugins.pr_reviewer")
 MAX_REPLAY_TRIALS = 10  # a replay spends one full panel per trial per row (issue #200)
 
 
-def _pr_number(body: dict):
-    """The `pr` an operator route was handed, as a positive int — or the 400 that says
-    why (issue #200). `int()` on a stray string used to surface as a 500, and a float
-    was silently truncated to a different PR."""
+def _whole_number(raw, name: str):
+    """`raw` as an int, or None when absent, or the 400 that says why (issue #200).
+    Booleans and non-integral floats are rejected, not coerced: `int(True)` is 1 and
+    `int(7.5)` is 7, which is a different PR / a different spend than was typed."""
     from fastapi import HTTPException
 
-    raw = body.get("pr")
-    if isinstance(raw, bool) or raw is None or raw == "":
+    if raw is None or raw == "":
         return None
+    if isinstance(raw, bool):
+        raise HTTPException(status_code=400, detail=f"{name} must be a number, got {raw!r}")
     if isinstance(raw, float) and not raw.is_integer():
-        raise HTTPException(status_code=400, detail=f"pr must be a whole number, got {raw!r}")
+        raise HTTPException(status_code=400, detail=f"{name} must be a whole number, got {raw!r}")
     try:
-        pr = int(raw)
+        return int(raw)
     except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail=f"pr must be a number, got {raw!r}") from None
-    if pr <= 0:
+        raise HTTPException(status_code=400, detail=f"{name} must be a number, got {raw!r}") from None
+
+
+def _pr_number(body: dict):
+    """The `pr` an operator route was handed, as a positive int — or a 400. `int()` on a
+    stray string used to surface as a 500, and a float was silently truncated."""
+    from fastapi import HTTPException
+
+    pr = _whole_number(body.get("pr"), "pr")
+    if pr is not None and pr <= 0:
         raise HTTPException(status_code=400, detail=f"pr must be positive, got {pr}")
     return pr
 
@@ -53,13 +62,9 @@ def _pr_number(body: dict):
 def _replay_trials(body: dict) -> int:
     from fastapi import HTTPException
 
-    raw = body.get("trials")
-    if raw is None or raw == "":
+    trials = _whole_number(body.get("trials"), "trials")
+    if trials is None:
         return 1
-    try:
-        trials = int(raw)
-    except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail=f"trials must be a number, got {raw!r}") from None
     if not 1 <= trials <= MAX_REPLAY_TRIALS:
         raise HTTPException(status_code=400, detail=f"trials must be 1..{MAX_REPLAY_TRIALS}, got {trials}")
     return trials
