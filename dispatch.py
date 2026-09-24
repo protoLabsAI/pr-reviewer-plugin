@@ -740,6 +740,24 @@ class Dispatcher:
         )
         self.telemetry.emit("in_flight_reclaimed", repo=repo, pr=pr, held_s=round(held_s))
 
+    def rebind_config(self, cfg: dict | None, cfg_provider=None) -> None:
+        """Re-point a RUNNING dispatcher at a re-registered config (issue #198).
+
+        The in-flight/cooldown state, the backfill set and the round caps are exactly
+        what must survive a config reload — but the boot-derived knobs must not go
+        stale next to them: the summon switch, the refutation store (root + TTL) and
+        the chokepoint's cooldown are rebuilt from the new config here (review on
+        #199, round 1)."""
+        from .refutations import RefutationStore
+
+        self._cfg = cfg or {}
+        self._cfg_provider = cfg_provider
+        self.refutations = RefutationStore.from_cfg(self._cfg)
+        self.summon_enabled = (
+            bool(self.cfg["summon"]) if "summon" in self.cfg else _env_bool("PR_REVIEWER_SUMMON", True)
+        )
+        self.chokepoint.cooldown_s = int(self._cfg.get("cooldown_s") or 30)
+
     async def _bounded_review(self, repo: str, pr: int, **review_kwargs) -> str:
         """``_review`` under ``round_timeout_s``. The callers hold the chokepoint slot and
         release it in their ``finally``; bounding the round here is what guarantees they

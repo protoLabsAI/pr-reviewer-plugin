@@ -83,8 +83,7 @@ def register(registry) -> None:
             # must stay singular — and just refresh the config it was booted with.
             telemetry = shared["telemetry"]
             dispatcher = shared["dispatcher"]
-            dispatcher._cfg = cfg or {}
-            dispatcher._cfg_provider = live
+            dispatcher.rebind_config(cfg, live)
             log.info("[pr-reviewer] re-registered: reusing the running dispatcher (issue #198)")
         else:
             telemetry = Telemetry(home)

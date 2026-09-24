@@ -50,9 +50,16 @@ def build_routers(dispatcher, telemetry, get_secret, run_gh_fn=None):
     #
     # Constructed with no running loop (register-time): on Python ≥3.10 asyncio.Semaphore
     # binds to the loop lazily at first `acquire`, which is inside the async handlers.
-    panel_limit = max(1, int(getattr(dispatcher, "max_concurrent_panels", 3)))
-    _panel_sem = asyncio.Semaphore(panel_limit)
-    dispatcher.panel_sem = _panel_sem
+    # A re-registered dispatcher (issue #198) keeps the semaphore its in-flight handlers
+    # already hold: a fresh one here would let the new routes start `panel_limit` MORE
+    # panels on top of those still draining the old one (review on #199, round 1).
+    existing = getattr(dispatcher, "panel_sem", None)
+    if isinstance(existing, asyncio.Semaphore):
+        _panel_sem = existing
+    else:
+        panel_limit = max(1, int(getattr(dispatcher, "max_concurrent_panels", 3)))
+        _panel_sem = asyncio.Semaphore(panel_limit)
+        dispatcher.panel_sem = _panel_sem
 
     def _note_if_queued(kind: str, repo: str, pr: int) -> None:
         """Emit a `queued` event when the semaphore is full and this dispatch must wait —

@@ -138,12 +138,19 @@ def test_re_registering_reuses_the_running_dispatcher(tmp_path, no_app_env, monk
     monkeypatch.setenv("PR_REVIEWER_HOME", str(tmp_path))
     first = FakeRegistry({"default_repo": "octo/repo"})
     pr_reviewer.register(first)
-    second = FakeRegistry({"default_repo": "octo/repo", "shadow_mode": True})
+    shared = pr_reviewer._MACHINERY[str(pr_reviewer._state_home(first.config))]
+    dispatcher = shared["dispatcher"]
+    sem = dispatcher.panel_sem
+    assert dispatcher.summon_enabled is True and dispatcher.chokepoint.cooldown_s == 30
+    second = FakeRegistry({"default_repo": "octo/repo", "shadow_mode": True, "summon": False, "cooldown_s": 5})
     pr_reviewer.register(second)
-    shared = pr_reviewer._MACHINERY[str(pr_reviewer._state_home(second.config))]
-    assert shared["dispatcher"] is not None
-    # The second registration re-pointed the SAME dispatcher at the new live view.
-    assert shared["dispatcher"].cfg == second.config
+    assert shared["dispatcher"] is dispatcher
+    # The second registration re-pointed the SAME dispatcher at the new live view — and
+    # rebuilt the boot-derived knobs from it (review on #199) — while the panel
+    # semaphore the in-flight handlers hold stays the one they hold.
+    assert dispatcher.cfg == second.config
+    assert dispatcher.summon_enabled is False and dispatcher.chokepoint.cooldown_s == 5
+    assert dispatcher.panel_sem is sem
     # A different state home is a different process-of-record: fresh machinery.
     other = FakeRegistry({"default_repo": "octo/repo", "state_root": str(tmp_path / "elsewhere")})
     pr_reviewer.register(other)
