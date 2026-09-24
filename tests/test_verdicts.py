@@ -20,6 +20,7 @@ from pr_reviewer.verdicts import (
     extract_findings_json,
     finder_completed,
     findings_payload_present,
+    identifier_tokens,
     merge_carried_findings,
     parse_verdict_marker,
     render_verdict_body,
@@ -880,3 +881,124 @@ def test_a_status_line_with_an_unspelled_word_and_an_explicit_array_is_a_complet
     assert not finder_completed(
         "the other lane wrote FINDER_STATUS: clean mid-sentence\n```json\n[]\n```"
     )  # not a line
+
+
+def test_a_carried_finding_is_accounted_for_by_a_near_identical_re_raise_at_a_moved_line():
+    """#185 (homelab-iac#247): the head advanced mid-round; this round re-raised the carried
+    defects in other words at neighbouring lines, and both rows posted — 8 for 5."""
+    fresh = [
+        {
+            "file": "scripts/compose-drift.sh",
+            "line": 44,
+            "severity": "major",
+            "claim": "The stack project name is taken from the raw directory basename, so for stacks/roxy-protoCLI the name differs from compose",
+            "verdict": "possibly addressed",
+        }
+    ]
+    carried = [
+        {
+            "file": "scripts/compose-drift.sh",
+            "line": 41,
+            "severity": "major",
+            "claim": "The stack project name is taken from the raw directory basename without lowercasing, so for stacks/roxy-protoCLI it differs",
+        },
+        {
+            "file": "scripts/compose-drift.sh",
+            "line": 90,
+            "severity": "major",
+            "claim": "norm() wraps any string-form command in sh -c",
+        },
+    ]
+    out = merge_carried_findings(fresh, carried)
+    assert [f["line"] for f in out] == [44, 90]  # the reworded re-raise supersedes; the other debt still carries
+    assert out[0]["verdict"] == "possibly addressed" and out[1].get("carried") is True
+
+
+def test_a_different_claim_on_the_same_file_still_carries():
+    fresh = [{"file": "a.py", "line": 1, "severity": "minor", "claim": "unused import os", "verdict": "confirmed"}]
+    carried = [
+        {
+            "file": "a.py",
+            "line": 40,
+            "severity": "major",
+            "claim": "SQL built by string concatenation from a request field",
+        }
+    ]
+    assert [f["line"] for f in merge_carried_findings(fresh, carried)] == [1, 40]
+
+
+def test_two_distinct_defects_with_boilerplate_wording_are_never_merged():
+    """Review on #193: a whole-file 0.6 match could swallow a second, different defect
+    whose claim shares boilerplate. Distance and a higher bar keep them apart."""
+    boiler = "SQL built by string concatenation from a request field in "
+    fresh = [
+        {"file": "db.py", "line": 40, "severity": "major", "claim": boiler + "list_users()", "verdict": "confirmed"}
+    ]
+    far = [{"file": "db.py", "line": 400, "severity": "major", "claim": boiler + "delete_user()"}]
+    assert [f["line"] for f in merge_carried_findings(fresh, far)] == [40, 400]  # far apart: both stay
+    near_but_different = [
+        {
+            "file": "db.py",
+            "line": 52,
+            "severity": "major",
+            "claim": "Unbounded LIMIT lets a caller page the whole table",
+        }
+    ]
+    assert [f["line"] for f in merge_carried_findings(fresh, near_but_different)] == [40, 52]  # near, different claim
+    moved = [
+        {
+            "file": "db.py",
+            "line": 44,
+            "severity": "major",
+            "claim": boiler + "list_users() — the id is not parameterised",
+        }
+    ]
+    assert [f["line"] for f in merge_carried_findings(fresh, moved)] == [40]  # near and the same claim: superseded
+
+
+def test_sibling_defects_with_template_claims_within_25_lines_stay_distinct():
+    """Review on #193, round 2: similarity ~0.95, 12 lines apart — but they name different
+    things. The identifiers decide, not the ratio."""
+    boiler = "SQL built by string concatenation from a request field in "
+    fresh = [
+        {"file": "db.py", "line": 40, "severity": "major", "claim": boiler + "list_users()", "verdict": "confirmed"}
+    ]
+    sibling = [{"file": "db.py", "line": 52, "severity": "major", "claim": boiler + "delete_user()"}]
+    assert [f["line"] for f in merge_carried_findings(fresh, sibling)] == [40, 52]
+
+
+def test_same_defect_fails_closed_on_an_empty_claim_or_a_missing_line():
+    fresh = [{"file": "a.py", "line": 10, "severity": "major", "claim": "Bug in load()", "verdict": "confirmed"}]
+    out = merge_carried_findings(fresh, [{"file": "a.py", "line": 12, "severity": "major", "claim": ""}])
+    assert [f.get("line") for f in out] == [10, 12]  # an empty claim never matches
+    out = merge_carried_findings(fresh, [{"file": "a.py", "severity": "major", "claim": "Bug in load()"}])
+    assert [f.get("line") for f in out] == [10, None]  # a missing line never matches
+    out = merge_carried_findings(fresh, [{"file": "a.py", "line": 11, "severity": "major", "claim": "Bug in load()"}])
+    assert [f.get("line") for f in out] == [10]  # the same defect, one line down: superseded
+
+
+def test_identifier_tokens_pick_out_the_things_a_claim_names():
+    assert identifier_tokens("SQL built by concatenation from a request field in list_users()") == {"list_users()"}
+    assert identifier_tokens(
+        "taken from the raw directory basename without lowercasing, so for stacks/roxy-protoCLI it differs"
+    ) == {"stacks/roxy-protocli"}
+    assert identifier_tokens("Env/mount/label deltas are computed only one-directionally") == {"env/mount/label"}
+
+
+def test_camel_case_identifiers_tell_two_defects_apart():
+    """Review on #193, round 4: tokens must come from the raw claim — lower-casing first made
+    the camelCase alternative unreachable."""
+    assert identifier_tokens("resolveCustomTest ignores the timeout") == {"resolvecustomtest"}
+    fresh = [
+        {
+            "file": "a.ts",
+            "line": 10,
+            "severity": "major",
+            "claim": "resolveCustomTest ignores the timeout it is given",
+            "verdict": "confirmed",
+        }
+    ]
+    other = [
+        {"file": "a.ts", "line": 14, "severity": "major", "claim": "resolveDefaultTest ignores the timeout it is given"}
+    ]
+    assert [f["line"] for f in merge_carried_findings(fresh, other)] == [10, 14]
