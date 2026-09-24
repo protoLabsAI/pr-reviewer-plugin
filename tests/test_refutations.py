@@ -8,9 +8,7 @@ import time
 from pr_reviewer.refutations import RefutationStore, premark_refuted, same_claim
 
 CLAIM = "builtin_world panics via .expect() on TOML parse failure"
-REWORDED = (
-    "builtin_world panics via .expect() on TOML parse failure; for a public crate a Result would let callers recover"
-)
+REWORDED = "Builtin_world panics via .expect() on a TOML parse failure"  # case and an article: the same sentence
 
 
 def _finding(**over):
