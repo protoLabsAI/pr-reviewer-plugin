@@ -4506,3 +4506,88 @@ def test_the_host_parser_stays_the_reader_when_it_sees_at_least_as_much(monkeypa
     assert Dispatcher._parse_findings(_STACKED_REPORT) == coerced  # same count: the host's coercion wins
     _host_parser(monkeypatch, [])
     assert Dispatcher._parse_findings("clean.\n\n```json\n[]\n```") == []  # a clean report stays clean
+
+
+# ── a carried prior whose quoted evidence is gone at head is fixed, not a debt (issue #196) ──
+
+_STRIP_MAJOR = {
+    "file": "x.py",
+    "line": 3,
+    "severity": "major",
+    "claim": "It constructs `writable = Path(str(configured))` and drops the expanduser call.",
+    "evidence": "The diff moves `writable = Path(str(configured))` in unchanged.",
+    "verdict": "confirmed",
+}
+_MOVED_LINE_3 = [{"filename": "x.py", "patch": "@@ -1,4 +1,4 @@\n a\n b\n-old line 3\n+fixed line 3\n"}]
+
+
+async def test_a_carried_major_whose_evidence_is_gone_on_a_moved_line_is_cleared(tmp_path):
+    # plugin#193 r4–r5: the quoted `strip(...)` was gone at head and the line had moved, yet
+    # the panel — with nothing in the fresh diff to disposition — re-raised it every round.
+    gh = GroundingGH(
+        source=SRC_WITH_EXPANDUSER,
+        pr_facts=facts(),
+        reviews=[
+            review_row(OLD_HEAD, "FAIL", state="CHANGES_REQUESTED", findings_json=json.dumps([_STRIP_MAJOR]), id=77)
+        ],
+        compare=_MOVED_LINE_3,
+    )
+    runner, _seen = capturing_runner(report_with_dispositions([{"prior": "other.py:1", "disposition": "fixed"}]))
+    d = make(tmp_path, cfg={"shadow_mode": False}, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "synchronize")) == "reviewed:PASS"
+    body = gh.posted[0]["body"]
+    assert "Unaccounted prior finding" not in body
+    assert "cleared by the delta" in body and "x.py:3" in body
+    assert gh.dismissed  # the block lifts on evidence, not on a story
+    e = next(r for r in Telemetry(tmp_path).read_all() if r.get("event") == "carried_prior_cleared")
+    assert e["reason"] == "evidence-gone" and e["findings"] == [{"file": "x.py", "line": 3, "severity": "major"}]
+
+
+async def test_a_carried_major_whose_evidence_is_still_at_head_keeps_carrying(tmp_path):
+    gh = GroundingGH(
+        source="writable = Path(str(configured))\n",
+        pr_facts=facts(),
+        reviews=[
+            review_row(OLD_HEAD, "FAIL", state="CHANGES_REQUESTED", findings_json=json.dumps([_STRIP_MAJOR]), id=77)
+        ],
+        compare=_MOVED_LINE_3,
+    )
+    runner, _seen = capturing_runner(report_with_dispositions([{"prior": "other.py:1", "disposition": "fixed"}]))
+    d = make(tmp_path, cfg={"shadow_mode": False}, gh=gh, runner=runner)
+    await d.handle_pr_event("o/r", 1, HEAD, "synchronize")
+    assert "Unaccounted prior finding" in gh.posted[0]["body"]
+    assert gh.dismissed == []
+
+
+async def test_evidence_gone_on_a_line_the_delta_never_touched_does_not_clear(tmp_path):
+    # Fail-closed: absence alone is not a fix — a rename elsewhere, or a hallucinated quote
+    # that grounding already scored, must not lift a block the line's history never moved.
+    untouched = [{"filename": "unrelated.py", "patch": "@@ -1,2 +1,3 @@\n a\n+b\n c\n"}]
+    gh = GroundingGH(
+        source=SRC_WITH_EXPANDUSER,
+        pr_facts=facts(),
+        reviews=[
+            review_row(OLD_HEAD, "FAIL", state="CHANGES_REQUESTED", findings_json=json.dumps([_STRIP_MAJOR]), id=77)
+        ],
+        compare=untouched,
+    )
+    runner, _seen = capturing_runner(report_with_dispositions([{"prior": "other.py:1", "disposition": "fixed"}]))
+    d = make(tmp_path, cfg={"shadow_mode": False}, gh=gh, runner=runner)
+    await d.handle_pr_event("o/r", 1, HEAD, "synchronize")
+    assert "Unaccounted prior finding" in gh.posted[0]["body"]
+    assert not any(c.split("?")[0].endswith("/contents/x.py") for c in getattr(gh, "contents_calls", []))
+
+
+async def test_an_unreadable_head_keeps_the_carry(tmp_path):
+    gh = GroundingGH(
+        source=None,
+        pr_facts=facts(),
+        reviews=[
+            review_row(OLD_HEAD, "FAIL", state="CHANGES_REQUESTED", findings_json=json.dumps([_STRIP_MAJOR]), id=77)
+        ],
+        compare=_MOVED_LINE_3,
+    )
+    runner, _seen = capturing_runner(report_with_dispositions([{"prior": "other.py:1", "disposition": "fixed"}]))
+    d = make(tmp_path, cfg={"shadow_mode": False}, gh=gh, runner=runner)
+    await d.handle_pr_event("o/r", 1, HEAD, "synchronize")
+    assert "Unaccounted prior finding" in gh.posted[0]["body"]

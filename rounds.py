@@ -590,6 +590,23 @@ def render_unaccounted_note(missing: list[dict]) -> str:
     )
 
 
+def render_evidence_gone_note(cleared: list[dict]) -> str:
+    """Names the carried priors this round dropped because their quoted evidence is no
+    longer at the reviewed head on a line the PR moved since raising them (issue #196)."""
+    if not cleared:
+        return ""
+    lines = "\n".join(
+        f"- `{_anchor(m.get('file'), m.get('line'))}` ({m.get('severity') or '?'}) — {str(m.get('claim') or '')[:220]}"
+        for m in cleared
+    )
+    return (
+        "\n\n---\n**Prior finding(s) cleared by the delta.** The code these quoted is gone at the "
+        "reviewed head, on lines this PR changed since they were raised — treated as fixed "
+        "(issue #196):\n"
+        f"{lines}\n"
+    )
+
+
 def render_promotion_findings(findings: list[dict]) -> str:
     """Open findings restated in the APPROVE body (issue #22).
 

@@ -94,6 +94,11 @@ structural-trigger dispatch, approve-on-green + sweep, and the review eval.
   The two guards are a **fallback chain**: when dispositions are present they are the
   authority (re-applying the clean-PASS heuristic on top would hold a block the panel just
   explained); a recipe that emits no block keeps the narrower v0.9.0 rule.
+  A carried prior is also **cleared by the delta** (v0.49.0, issue #196): when the lines
+  it flagged moved since it was raised and every code quote in it is absent from the file
+  at the reviewed head *and* the PR's patch, it was fixed — the same read grounding applies
+  to a fresh finding, and stronger than a `fixed` the model asserts. Fail-closed on an
+  unreadable delta or file, and on a prior that quotes nothing checkable.
 
 - **Panel latency work (v0.12.0)** — the five finders are one parallel stage, but the
   host's `subagent_max_concurrency` defaults to **4**, so the stage silently ran as

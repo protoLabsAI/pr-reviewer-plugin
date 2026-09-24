@@ -39,6 +39,7 @@ from .grounding import (
     UNREADABLE,
     apply_grounding,
     correct_line_numbers,
+    ground_finding,
     render_grounding_footnote,
     render_unreadable_footnote,
 )
@@ -48,9 +49,11 @@ from .rounds import (
     converge,
     delta_ranges,
     diff_identity,
+    in_delta,
     panel_rounds,
     parse_dispositions,
     render_degraded_note,
+    render_evidence_gone_note,
     render_held_note,
     render_incomplete_note,
     render_notes_section,
@@ -1332,6 +1335,51 @@ class Dispatcher:
             sources[file] = (blob, combined)
         return sources
 
+    async def _clear_by_evidence(
+        self,
+        repo: str,
+        pr: int,
+        head: str,
+        priors: list[dict],
+        *,
+        ranges: dict | None,
+        since_ranges: dict[str, dict | None] | None,
+    ) -> tuple[list[dict], list[dict]]:
+        """(still unaccounted, cleared as fixed-by-evidence) — issue #196.
+
+        A prior is cleared only when ALL of these hold, each fail-closed on its own:
+        the delta since the head it was raised at (`since_ranges[since]`, else `ranges`)
+        is readable AND touches the flagged line; the cited file was READ at `head`
+        (`UNREADABLE` keeps the carry, issue #109); the prior quotes checkable code; and
+        every quote is absent from the file at head PLUS the PR's patch for it. A
+        removed-behaviour prior stays grounded through the patch's `-` lines and carries.
+        """
+        candidates: list[int] = []
+        for i, prior in enumerate(priors):
+            proof = (since_ranges or {}).get(str(prior.get("since") or ""))
+            if proof is None:
+                proof = ranges
+            if proof is None:
+                continue
+            if in_delta({"file": prior.get("file"), "line": prior.get("line")}, proof):
+                candidates.append(i)
+        if not candidates:
+            return list(priors), []
+        raw = await self._finding_sources(repo, pr, head, [priors[i] for i in candidates])
+        kept: list[dict] = []
+        cleared: list[dict] = []
+        for i, prior in enumerate(priors):
+            if i not in candidates:
+                kept.append(prior)
+                continue
+            combined = raw.get(str(prior.get("file") or ""), ("", None))[1]
+            if combined is None or combined is UNREADABLE or not isinstance(combined, str):
+                kept.append(prior)
+                continue
+            grounded, _missing = ground_finding(prior, combined)
+            (kept if grounded else cleared).append(prior)
+        return kept, cleared
+
     async def _since_ranges(self, repo: str, history: list[dict], head: str) -> dict[str, dict | None]:
         """`{raised-at head: delta from it to `head`}` for the carried findings of the last
         substantive round (issue #131), so a `fixed` on a finding carried across rounds is
@@ -2008,6 +2056,33 @@ class Dispatcher:
             ranges = await self._delta_ranges(repo, prior["head"], head)
         since_ranges = await self._since_ranges(repo, history, head) if dispositions and prior else None
         unaccounted = unaccounted_priors(history, dispositions, ranges=ranges, since_ranges=since_ranges)
+        # A carried prior whose quoted evidence is GONE at head, on a line the delta since
+        # it was raised actually touched, was fixed — that is the same read `ground_finding`
+        # applies to a fresh finding, and it is stronger than a model's `fixed` claim. Without
+        # it a fixed major carries round after round with "no evidence of fix", because the
+        # fresh diff gives the panel nothing to disposition (issue #196, plugin#193 r4–r5).
+        evidence_gone: list[dict] = []
+        if unaccounted and self.grounding_enabled:
+            unaccounted, evidence_gone = await self._clear_by_evidence(
+                repo, pr, head, unaccounted, ranges=ranges, since_ranges=since_ranges
+            )
+            if evidence_gone:
+                self.telemetry.emit(
+                    "carried_prior_cleared",
+                    repo=repo,
+                    pr=pr,
+                    sha=head,
+                    round=round_number,
+                    reason="evidence-gone",
+                    findings=[
+                        {
+                            "file": str(m.get("file") or ""),
+                            "line": m.get("line"),
+                            "severity": str(m.get("severity") or ""),
+                        }
+                        for m in evidence_gone
+                    ],
+                )
         # The two guards are a fallback chain, not a belt-and-braces pair. When the panel
         # HAS dispositioned its priors, that statement is the authority — re-applying the
         # clean-PASS heuristic on top would hold a block the panel just explained, making
@@ -2029,6 +2104,8 @@ class Dispatcher:
             trailer += render_degraded_note(degraded)
         if incomplete_finders:
             trailer += render_incomplete_note(incomplete_finders)
+        if evidence_gone:
+            trailer += render_evidence_gone_note(evidence_gone)
         if unaccounted:
             trailer += render_unaccounted_note(unaccounted)
             # Write the recovered majors into the recorded findings, not just the prose
