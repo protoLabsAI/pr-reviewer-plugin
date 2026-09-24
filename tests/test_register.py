@@ -129,3 +129,61 @@ def test_the_relay_gets_the_contract_only_on_a_host_that_has_the_fields():
     NewHost(name="structural-finder", **fields)
     assert _completion_contract(OldHost) == {}
     OldHost(name="structural-finder", **_completion_contract(OldHost))
+
+
+# ── one dispatcher and one sweep loop per process across config reloads (issue #198) ──
+
+
+def test_re_registering_reuses_the_running_dispatcher(tmp_path, no_app_env, monkeypatch):
+    monkeypatch.setenv("PR_REVIEWER_HOME", str(tmp_path))
+    first = FakeRegistry({"default_repo": "octo/repo"})
+    pr_reviewer.register(first)
+    shared = pr_reviewer._MACHINERY[str(pr_reviewer._state_home(first.config))]
+    dispatcher = shared["dispatcher"]
+    sem = dispatcher.panel_sem
+    assert dispatcher.summon_enabled is True and dispatcher.chokepoint.cooldown_s == 30
+    second = FakeRegistry(
+        {"default_repo": "octo/repo", "shadow_mode": True, "summon": False, "cooldown_s": 5, "round_timeout": 100}
+    )
+    pr_reviewer.register(second)
+    assert shared["dispatcher"] is dispatcher
+    # The second registration re-pointed the SAME dispatcher at the new live view — and
+    # rebuilt the boot-derived knobs from it (review on #199) — while the panel
+    # semaphore the in-flight handlers hold stays the one they hold.
+    assert dispatcher.cfg == second.config
+    assert dispatcher.summon_enabled is False and dispatcher.chokepoint.cooldown_s == 5
+    assert dispatcher.chokepoint.in_flight_ttl_s == 100 + 600  # the TTL follows the new round bound too
+    assert dispatcher.panel_sem is sem
+    # A different state home is a different process-of-record: fresh machinery.
+    other = FakeRegistry({"default_repo": "octo/repo", "state_root": str(tmp_path / "elsewhere")})
+    pr_reviewer.register(other)
+    assert pr_reviewer._MACHINERY[str(pr_reviewer._state_home(other.config))]["dispatcher"] is not shared["dispatcher"]
+
+
+async def test_a_second_sweep_start_returns_the_running_loop(tmp_path, no_app_env, monkeypatch):
+    monkeypatch.setenv("PR_REVIEWER_HOME", str(tmp_path))
+    reg = FakeRegistry({"default_repo": "octo/repo", "sweep_interval_s": 3600})
+    pr_reviewer.register(reg)
+    sweep = next(s for s in reg.surfaces if s["name"] == "pr-reviewer-sweep")
+    first = sweep["start"]()
+    try:
+        assert sweep["start"]() is first  # no second loop, whoever asks
+    finally:
+        sweep["stop"]()
+        first.cancel()
+        try:
+            await first
+        except BaseException:  # noqa: BLE001 — cancelled or stopped, either is fine here
+            pass
+    # Once the loop has ENDED, a start is a real restart: a new task on a fresh stop
+    # event, not the finished one handed back (review on #199, round 2).
+    again = sweep["start"]()
+    try:
+        assert again is not first and not again.done()
+    finally:
+        sweep["stop"]()
+        again.cancel()
+        try:
+            await again
+        except BaseException:  # noqa: BLE001
+            pass
