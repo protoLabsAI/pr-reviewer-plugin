@@ -172,3 +172,15 @@ async def test_a_second_sweep_start_returns_the_running_loop(tmp_path, no_app_en
             await first
         except BaseException:  # noqa: BLE001 — cancelled or stopped, either is fine here
             pass
+    # Once the loop has ENDED, a start is a real restart: a new task on a fresh stop
+    # event, not the finished one handed back (review on #199, round 2).
+    again = sweep["start"]()
+    try:
+        assert again is not first and not again.done()
+    finally:
+        sweep["stop"]()
+        again.cancel()
+        try:
+            await again
+        except BaseException:  # noqa: BLE001
+            pass
