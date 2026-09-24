@@ -764,3 +764,77 @@ async def test_concurrent_summons_are_bounded_by_the_same_cap(tmp_path):
         dispatcher.release.set()
         await _yield_until(lambda: dispatcher.completed >= 5)
         assert dispatcher.completed == 5  # queued summons all proceed
+
+
+# ── operator routes answer bad input with a 400, not a 500 (issue #200) ───────
+
+
+def test_operator_routes_reject_a_malformed_pr_with_400(tmp_path):
+    app, dispatcher, _telemetry = make_app(tmp_path)
+    client = TestClient(app)
+    for route in ("dispatch", "promote"):
+        for bad in ("abc", 7.5, -1, 0, True):
+            r = client.post(f"/api/plugins/pr-reviewer/{route}", json={"repo": "o/r", "pr": bad})
+            assert r.status_code == 400, (route, bad, r.status_code)
+        r = client.post(f"/api/plugins/pr-reviewer/{route}", json={"repo": "o/r"})
+        assert r.status_code == 400
+    # a numeric string and a whole float are still accepted, as before
+    r = client.post("/api/plugins/pr-reviewer/dispatch", json={"repo": "o/r", "pr": "7"})
+    assert r.status_code == 200 and r.json()["pr"] == 7
+
+
+def test_promote_route_returns_the_dispatchers_decision(tmp_path):
+    app, dispatcher, _telemetry = make_app(tmp_path)
+    r = TestClient(app).post("/api/plugins/pr-reviewer/promote", json={"repo": "o/r", "pr": 7.0})
+    assert r.status_code == 200
+    assert r.json() == {"repo": "o/r", "pr": 7, "decision": await_result(dispatcher.evaluate_promotion("o/r", 7))}
+
+
+def await_result(coro):
+    return asyncio.run(coro)
+
+
+def test_summon_health_reports_unknown_when_the_app_read_crashes(tmp_path, monkeypatch):
+    called = []
+
+    async def boom(_cfg):
+        called.append(1)
+        raise RuntimeError("network down")
+
+    monkeypatch.setattr("pr_reviewer.app_auth.fetch_app_events", boom)
+    app, dispatcher, _telemetry = make_app(tmp_path)
+    dispatcher.cfg = {}  # the route reads dispatcher.cfg first — give it one, so the READ is what crashes
+    r = TestClient(app).get("/api/plugins/pr-reviewer/summon/health")
+    assert called, "the App-events read was never reached"
+    assert r.status_code == 200
+    assert r.json()["summon_reachable"] is None and r.json()["subscribed"] is None
+
+
+async def test_replay_trials_are_bounded_and_an_empty_manifest_replays_nothing(tmp_path):
+    calls = []
+
+    class ReplayDispatcher(SpyDispatcher):
+        def _runner(self):
+            async def run(recipe, inputs):
+                calls.append(inputs)
+                return {"output": "brief\n```json\n[]\n```", "failed": [], "timings": {}, "usage": {}}
+
+            return run
+
+        @staticmethod
+        def _parse_findings(output):
+            return []
+
+    _pub, api = build_routers(ReplayDispatcher(), Telemetry(tmp_path), lambda: "s")
+    app = FastAPI()
+    app.include_router(api, prefix="/api/plugins/pr-reviewer")
+    client = TestClient(app)
+    row = {"repo": "o/r", "pr": 1, "head": "a"}
+    for bad in (0, 11, "many", -3, True, 2.5):  # booleans and fractions are rejected, not coerced
+        r = client.post("/api/plugins/pr-reviewer/replay", json={"row": row, "trials": bad})
+        assert r.status_code == 400, bad
+    r = client.post("/api/plugins/pr-reviewer/replay", json={"manifest": []})
+    assert r.status_code == 200 and r.json()["runs"] == []  # explicit empty ≠ "replay the envelope"
+    r = client.post("/api/plugins/pr-reviewer/replay", json={"manifest": "nope"})
+    assert r.status_code == 400
+    assert calls == []
