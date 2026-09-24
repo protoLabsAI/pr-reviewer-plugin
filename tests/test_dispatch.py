@@ -1535,6 +1535,42 @@ async def test_a_lane_that_crashed_for_another_reason_still_retries_and_exhausts
     assert _events(tmp_path, "finder_overran") == []
 
 
+async def test_a_refuted_structural_finding_is_remembered_for_the_repo_when_the_round_posts(tmp_path):
+    """#190: the next PR touching the file gets the repeat pre-marked instead of spending a
+    verify round on it."""
+    import json as _json
+
+    from pr_reviewer.refutations import RefutationStore
+
+    refuted = _json.dumps(
+        [
+            {
+                "file": "packs/necromunda/src/lib.rs",
+                "line": 11,
+                "severity": "minor",
+                "category": "bug",
+                "claim": "builtin_world panics via .expect() on TOML parse failure",
+                "evidence": "e",
+                "source": "protopatch",
+                "verdict": "refuted",
+                "note": "the function returns Result and uses ?",
+            }
+        ]
+    )
+    report = f"<!-- brief -->\nOne refuted.\n<!-- /brief -->\n\n```json\n{refuted}\n```"
+
+    async def runner(name, inputs):
+        return {"output": report, "failed": [], "steps": _panel_steps(synthesize=report, verify=report)}
+
+    gh = _structural_gh()
+    d = make(tmp_path, cfg={"state_root": str(tmp_path / "st")}, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "reviewed:PASS"
+    hit = RefutationStore(tmp_path / "st").match(
+        "o/r", "packs/necromunda/src/lib.rs", "builtin_world panics via .expect() on TOML parse failure"
+    )
+    assert hit and hit["pr"] == 1 and "returns Result" in hit["note"]
+
+
 def _structural_gh() -> RoutedGH:
     return RoutedGH(pr_facts=facts(changed_files=6, additions=300, deletions=50), files="x.py\nb\nc\nd\ne\nf\n")
 

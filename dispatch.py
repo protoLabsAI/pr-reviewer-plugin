@@ -29,6 +29,7 @@ import logging
 import os
 import re
 import time
+from pathlib import Path
 from urllib.parse import quote
 
 from .approve import HOLD_NOT_OWNER, HOLD_THREADS_UNRESOLVED, PROMOTE, Observations, promotion_decision
@@ -487,6 +488,12 @@ class Dispatcher:
         self._cfg = cfg or {}
         self._cfg_provider = cfg_provider
         self.telemetry = telemetry
+        # Refuted structural claims, remembered per repo (#190) — written here when a round
+        # posts, read by the structural pass (same root as protoPatch's state).
+        from .refutations import RefutationStore
+
+        _home = Path(os.environ.get("PR_REVIEWER_HOME") or Path.home() / ".protoagent" / "pr-reviewer")
+        self.refutations = RefutationStore(Path(self._cfg.get("state_root") or _home / "clawpatch"))
         # Boot-time by necessity: the chokepoint owns in-flight/cooldown state, so it
         # cannot be rebuilt per read without dropping the bookkeeping it exists for.
         # On-demand summon surface (issue #28). Off disables the comment commands
@@ -2075,6 +2082,12 @@ class Dispatcher:
             # later rebased/reworded head with a byte-identical diff reaffirms this verdict.
             diff_id=diff_id,
         )
+        if posted:
+            # Structural claims the verifier refuted this round: remembered for the repo, so
+            # the next PR touching the file does not spend a verify round on them (#190).
+            remembered = self.refutations.record(repo, reported, pr=pr, head=head)
+            if remembered:
+                log.info("[pr-reviewer] %s#%s remembered %d refuted structural claim(s)", repo, pr, remembered)
         self.telemetry.emit(
             "reviewed",
             repo=repo,
