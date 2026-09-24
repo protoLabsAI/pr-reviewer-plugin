@@ -103,3 +103,45 @@ def test_a_sibling_site_within_25_lines_with_a_template_claim_is_never_pre_marke
     )
     sibling = [{"file": "db.py", "line": 52, "claim": boiler + "delete_user()", "source": "protopatch"}]
     assert premark_refuted(sibling, store, "o/r", {}) == 0 and "verdict" not in sibling[0]  # names a different thing
+
+
+def test_a_dot_prefixed_file_the_pr_touches_is_left_live(tmp_path):
+    """Review on #194: `lstrip("./")` turned `.github/workflows/ci.yml` into `github/…`, so the
+    touched check never matched and the claim was pre-marked although the PR edits it."""
+    from pr_reviewer.refutations import _norm_path
+
+    assert _norm_path("./.github/workflows/ci.yml") == ".github/workflows/ci.yml"
+    store = RefutationStore(tmp_path)
+    store.record(
+        "o/r",
+        [
+            {
+                "file": ".github/workflows/ci.yml",
+                "line": 20,
+                "claim": "The job never uploads its artifact",
+                "source": "protopatch",
+                "verdict": "refuted",
+            }
+        ],
+        pr=1,
+        head="abc",
+    )
+    repeat = [
+        {
+            "file": ".github/workflows/ci.yml",
+            "line": 20,
+            "claim": "The job never uploads its artifact",
+            "source": "protopatch",
+        }
+    ]
+    assert premark_refuted(repeat, store, "o/r", {".github/workflows/ci.yml": [(18, 22)]}) == 0  # touched: live
+    assert premark_refuted(repeat, store, "o/r", {".github/workflows/ci.yml": [(80, 81)]}) == 1  # untouched: marked
+
+
+def test_from_cfg_builds_the_same_store_for_writer_and_reader(tmp_path, monkeypatch):
+    cfg = {"state_root": str(tmp_path / "st"), "refutation_ttl_days": 3}
+    a, b = RefutationStore.from_cfg(cfg), RefutationStore.from_cfg(cfg)
+    assert a.root == b.root == tmp_path / "st" and a.ttl_s == b.ttl_s == 3 * 86400
+    monkeypatch.setenv("PR_REVIEWER_HOME", str(tmp_path / "home"))
+    d = RefutationStore.from_cfg({})
+    assert d.root == tmp_path / "home" / "clawpatch" and d.ttl_s == 14 * 86400

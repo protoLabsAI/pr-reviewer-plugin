@@ -29,7 +29,6 @@ import logging
 import os
 import re
 import time
-from pathlib import Path
 from urllib.parse import quote
 
 from .approve import HOLD_NOT_OWNER, HOLD_THREADS_UNRESOLVED, PROMOTE, Observations, promotion_decision
@@ -489,14 +488,10 @@ class Dispatcher:
         self._cfg_provider = cfg_provider
         self.telemetry = telemetry
         # Refuted structural claims, remembered per repo (#190) — written here when a round
-        # posts, read by the structural pass (same root as protoPatch's state).
+        # posts, read by the structural pass; one constructor so root and TTL cannot drift.
         from .refutations import RefutationStore
 
-        _home = Path(os.environ.get("PR_REVIEWER_HOME") or Path.home() / ".protoagent" / "pr-reviewer")
-        self.refutations = RefutationStore(
-            Path(self._cfg.get("state_root") or _home / "clawpatch"),
-            ttl_days=int(self._cfg.get("refutation_ttl_days") or 14),  # the same TTL the structural pass reads with
-        )
+        self.refutations = RefutationStore.from_cfg(self._cfg)  # one constructor: root and TTL cannot drift
         # Boot-time by necessity: the chokepoint owns in-flight/cooldown state, so it
         # cannot be rebuilt per read without dropping the bookkeeping it exists for.
         # On-demand summon surface (issue #28). Off disables the comment commands

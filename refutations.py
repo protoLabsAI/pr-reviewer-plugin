@@ -35,7 +35,12 @@ def _norm(text: str) -> str:
 
 
 def _norm_path(path: str) -> str:
-    return str(path or "").strip().lstrip("./")
+    """Strip a leading `./` PREFIX — never leading characters: `.github/x.yml` keeps its dot
+    (review on #194: `lstrip("./")` made every dot-prefixed file look untouched)."""
+    path = str(path or "").strip()
+    while path.startswith("./"):
+        path = path[2:]
+    return path
 
 
 _IDENTIFIER_TOKEN = re.compile(r"[A-Za-z_][\w.]*\(\)|[\w.-]*[_./:\[\]][\w.\-/:\[\]()]*|\b\d+\b|\b[a-z]+[A-Z]\w*")
@@ -65,6 +70,17 @@ class RefutationStore:
     def __init__(self, root: Path, *, ttl_days: int = DEFAULT_TTL_DAYS):
         self.root = Path(root)
         self.ttl_s = max(1, int(ttl_days)) * 86400
+
+    @classmethod
+    def from_cfg(cls, cfg: dict) -> "RefutationStore":
+        """The ONE way both the writer (dispatcher) and the reader (structural pass) build
+        the store, so root and TTL cannot drift apart between them (review on #194)."""
+        import os
+
+        home = Path(os.environ.get("PR_REVIEWER_HOME") or Path.home() / ".protoagent" / "pr-reviewer")
+        root = Path((cfg or {}).get("state_root") or home / "clawpatch")
+        ttl = (cfg or {}).get("refutation_ttl_days")
+        return cls(root, ttl_days=int(ttl) if ttl else DEFAULT_TTL_DAYS)
 
     def _path(self, repo: str) -> Path:
         return self.root / repo.replace("/", "-") / "refuted.json"

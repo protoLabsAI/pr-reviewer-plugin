@@ -36,7 +36,7 @@ from pathlib import Path
 
 from .checkout_cache import CheckoutCache, CheckoutError, redact
 from .gh_cli import bad_repo, resolve_token, run_gh
-from .refutations import RefutationStore, premark_refuted
+from .refutations import RefutationStore, _norm_path, premark_refuted
 
 log = logging.getLogger("protoagent.plugins.pr_reviewer")
 
@@ -216,7 +216,7 @@ class ProtoPatchRunner:
         self.state_root = Path(self.cfg.get("state_root") or home / "clawpatch")
         # Claims this repo's verifier already refuted (#190) — shared with the dispatcher,
         # which writes them when a round posts; the structural pass reads them here.
-        self.refutations = RefutationStore(self.state_root, ttl_days=int(self.cfg.get("refutation_ttl_days") or 14))
+        self.refutations = RefutationStore.from_cfg(self.cfg)
         self.budget_s = int(self.cfg.get("time_budget_s") or 300)
         self.bin = str(self.cfg.get("clawpatch_bin") or "clawpatch")
         self.model = str(self.cfg.get("model") or "")
@@ -277,7 +277,7 @@ class ProtoPatchRunner:
                 if m:
                     start = int(m.group(1))
                     count = int(m.group(2)) if m.group(2) is not None else 1
-                    ranges.setdefault(current, []).append((start, start + max(count, 1) - 1))
+                    ranges.setdefault(_norm_path(current), []).append((start, start + max(count, 1) - 1))
         return ranges
 
     async def _changed_files(self, checkout: Path, base_sha: str) -> set[str] | None:
