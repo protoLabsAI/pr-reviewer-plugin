@@ -1466,6 +1466,51 @@ async def test_a_fallback_panel_that_also_contradicts_posts_held_and_stops(tmp_p
     assert calls == 3 and "verified=false" in gh.reviews_posted[0]["body"]  # bounded: no second fallback
 
 
+async def test_a_re_run_that_does_not_clear_leaves_the_original_rounds_findings(tmp_path):
+    """protoAgent#3591: the restated re-run contradicted again and its report carried 1 of
+    the original round's 2 findings; adopting it dropped a finding on the held path."""
+    two = json.dumps(
+        [
+            {
+                "file": "x.py",
+                "line": 3,
+                "severity": "minor",
+                "category": "correctness",
+                "claim": "Bug one.",
+                "evidence": "e",
+            },
+            {
+                "file": "x.py",
+                "line": 9,
+                "severity": "minor",
+                "category": "correctness",
+                "claim": "Bug two.",
+                "evidence": "e",
+            },
+        ]
+    )
+    one = json.dumps([json.loads(two)[0]])
+    synth_two = f"<!-- brief -->\nTwo.\n<!-- /brief -->\n\n```json\n{two}\n```"
+    report_two = f"<!-- brief -->\nTwo, unverified.\n<!-- /brief -->\n\nVERIFY_GAP: unverified=2\n\n```json\n{two}\n```"
+    report_one = f"<!-- brief -->\nOne, unverified.\n<!-- /brief -->\n\nVERIFY_GAP: unverified=1\n\n```json\n{one}\n```"
+
+    async def runner(name, inputs, *, seed_outputs=None):
+        if seed_outputs is None:
+            return {
+                "output": report_two,
+                "steps": _panel_steps(synthesize=synth_two, verify=_VERIFY_FLAKED),
+                "failed": [],
+            }
+        return {"output": report_one, "steps": {"verify": _VERIFY_FLAKED, "report": report_one}, "failed": []}
+
+    gh = _structural_gh()
+    d = make(tmp_path, cfg={"verify_fallback_panel": False}, gh=gh, runner=runner)
+    await d.handle_pr_event("o/r", 1, HEAD, "opened")
+    body = gh.reviews_posted[0]["body"]
+    assert "verified=false" in body  # held, as before
+    assert len(json.loads(extract_findings_json(body))) == 2  # the original two — not the re-run's one
+
+
 async def test_a_verifier_that_stays_contradicted_posts_unverified_as_before(tmp_path):
     async def runner(name, inputs, *, seed_outputs=None):
         if seed_outputs is None:

@@ -2657,15 +2657,21 @@ class Dispatcher:
             again_steps = again.get("steps") if isinstance(again.get("steps"), dict) else {}
             if again.get("failed") or "verify" not in again_steps or not again.get("output"):
                 break
-            result = {
-                **result,
-                "output": again["output"],
-                "steps": {**steps, **{k: v for k, v in again_steps.items() if k in ("verify", "report")}},
-                "timings": {**(result.get("timings") or {}), **(again.get("timings") or {})},
-                "degraded": [*(result.get("degraded") or []), *(again.get("degraded") or [])],
-            }
-            steps = result["steps"]
             cleared = not verifier_contradicts_synthesis(str(again_steps["verify"] or ""), synthesized)
+            if cleared:
+                # Only a re-run that VERIFIED replaces the round's verify and report. A re-run
+                # that contradicted again wrote its report over a "nothing-to-verify" reply
+                # and, on protoAgent#3591, carried 1 of the 2 findings the original carried —
+                # adopting it would drop a finding on the fail-closed path. The original
+                # round (all findings, `verified=false`) stands until something verifies.
+                result = {
+                    **result,
+                    "output": again["output"],
+                    "steps": {**steps, **{k: v for k, v in again_steps.items() if k in ("verify", "report")}},
+                    "timings": {**(result.get("timings") or {}), **(again.get("timings") or {})},
+                    "degraded": [*(result.get("degraded") or []), *(again.get("degraded") or [])],
+                }
+                steps = result["steps"]
             self.telemetry.emit(
                 VERIFY_CONTRADICTED,
                 repo=repo,
