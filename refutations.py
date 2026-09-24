@@ -19,6 +19,7 @@ from __future__ import annotations
 import difflib
 import json
 import logging
+import re
 import time
 from pathlib import Path
 
@@ -37,12 +38,21 @@ def _norm_path(path: str) -> str:
     return str(path or "").strip().lstrip("./")
 
 
+_IDENTIFIER_TOKEN = re.compile(r"[A-Za-z_][\w.]*\(\)|[\w.-]*[_./:\[\]][\w.\-/:\[\]()]*|\b\d+\b|\b[a-z]+[A-Z]\w*")
+
+
+def identifier_tokens(claim: str) -> frozenset[str]:
+    """The tokens in a claim that name a THING — `list_users()`, `scripts/x.sh`, `foo_bar`,
+    `Cargo.lock`, `v1`, camelCase, a bare number — as opposed to its prose."""
+    return frozenset(
+        t.strip(".,;:()").lower() for t in _IDENTIFIER_TOKEN.findall(str(claim or "")) if t.strip(".,;:()")
+    )
+
+
 def same_claim(a: str, b: str) -> bool:
     """Near-identical wording that names the same things: two claims about different
     sites share their boilerplate and differ exactly in an identifier (`list_users()` vs
     `delete_user()`), and must never match however close the wording."""
-    from .verdicts import identifier_tokens  # lazy — verdicts is the plugin's core module
-
     na, nb = _norm(a), _norm(b)
     if not na or not nb:
         return False
