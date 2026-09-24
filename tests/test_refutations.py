@@ -75,3 +75,20 @@ def test_premark_marks_a_repeat_the_pr_does_not_touch_and_leaves_a_touched_one_l
 def test_same_claim_is_normalised_and_fails_closed_on_empty():
     assert same_claim("  Builtin_World  panics ", "builtin_world panics")
     assert not same_claim("", CLAIM) and not same_claim(CLAIM, "")
+
+
+def test_a_different_site_with_boilerplate_wording_is_never_pre_marked(tmp_path):
+    store = RefutationStore(tmp_path)
+    boiler = "SQL built by string concatenation from a request field in "
+    store.record(
+        "o/r",
+        [{"file": "db.py", "line": 40, "claim": boiler + "list_users()", "source": "protopatch", "verdict": "refuted"}],
+        pr=1,
+        head="abc",
+    )
+    far = [{"file": "db.py", "line": 400, "claim": boiler + "delete_user()", "source": "protopatch"}]
+    assert premark_refuted(far, store, "o/r", {}) == 0 and "verdict" not in far[0]
+    near_same = [
+        {"file": "db.py", "line": 43, "claim": boiler + "list_users() — id not parameterised", "source": "protopatch"}
+    ]
+    assert premark_refuted(near_same, store, "o/r", {}) == 1

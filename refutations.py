@@ -25,7 +25,8 @@ from pathlib import Path
 log = logging.getLogger("protoagent.plugins.pr_reviewer")
 
 DEFAULT_TTL_DAYS = 14
-SAME_CLAIM_RATIO = 0.6  # SequenceMatcher on normalised claims — the #185 threshold
+SAME_CLAIM_RATIO = 0.8  # SequenceMatcher on normalised claims — above what boilerplate alone reaches
+SAME_CLAIM_LINES = 25  # a remembered refutation applies at (about) the line it was refuted at
 
 
 def _norm(text: str) -> str:
@@ -106,12 +107,21 @@ class RefutationStore:
             return 0
         return len(refuted)
 
-    def match(self, repo: str, file: str, claim: str) -> dict | None:
-        """The remembered refutation of this claim on this file, or None."""
+    def match(self, repo: str, file: str, claim: str, line: int | None = None) -> dict | None:
+        """The remembered refutation of this claim on this file, or None. With `line`, only
+        a refutation recorded within `SAME_CLAIM_LINES` of it counts — a different site
+        whose claim shares boilerplate wording is a different finding, never pre-marked."""
         nf = _norm_path(file)
         for e in self._load(repo):
-            if _norm_path(e.get("file", "")) == nf and same_claim(e.get("claim", ""), claim):
-                return e
+            if _norm_path(e.get("file", "")) != nf or not same_claim(e.get("claim", ""), claim):
+                continue
+            if line is not None and e.get("line") is not None:
+                try:
+                    if abs(int(e["line"]) - int(line)) > SAME_CLAIM_LINES:
+                        continue
+                except (TypeError, ValueError):
+                    continue
+            return e
         return None
 
 
@@ -128,10 +138,10 @@ def premark_refuted(
     for f in findings:
         if str(f.get("source") or "").lower() != "protopatch":
             continue
-        hit = store.match(repo, str(f.get("file") or ""), str(f.get("claim") or ""))
+        line = int(f.get("line") or 0)
+        hit = store.match(repo, str(f.get("file") or ""), str(f.get("claim") or ""), line)
         if not hit:
             continue
-        line = int(f.get("line") or 0)
         touched = any(a - 3 <= line <= b + 3 for a, b in changed_ranges.get(_norm_path(str(f.get("file") or "")), []))
         if touched:
             continue
