@@ -1409,6 +1409,63 @@ async def test_a_verifier_that_contradicts_the_synthesizer_is_re_run_alone(tmp_p
     assert [(e["attempt"], e["rerun"], e["restated"], e["cleared"]) for e in events] == [(1, True, True, True)]
 
 
+async def test_a_restated_miss_falls_back_to_one_fresh_panel(tmp_path):
+    """#189: mythxengine-sdk#406 — restated re-run still contradicted; the round posted a held
+    PASS and waited 20 minutes for a human summon whose fresh round verified. One fresh
+    panel, then post whatever it says."""
+    calls: list[str] = []
+
+    async def runner(name, inputs, *, seed_outputs=None):
+        calls.append("seeded" if seed_outputs is not None else "fresh")
+        if seed_outputs is not None:  # the restated re-run: still contradicted
+            return {
+                "output": _REPORT_UNVERIFIED,
+                "steps": {"verify": _VERIFY_FLAKED, "report": _REPORT_UNVERIFIED},
+                "failed": [],
+            }
+        if calls.count("fresh") == 1:  # the original panel: contradicted
+            return {
+                "output": _REPORT_UNVERIFIED,
+                "steps": _panel_steps(synthesize=_SYNTH_ONE, verify=_VERIFY_FLAKED),
+                "failed": [],
+            }
+        return {
+            "output": _REPORT_VERIFIED,
+            "steps": _panel_steps(synthesize=_SYNTH_ONE, verify=_VERIFY_ANNOTATED),
+            "failed": [],
+        }
+
+    gh = _structural_gh()
+    d = make(tmp_path, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "reviewed:WARN"
+    assert calls == ["fresh", "seeded", "fresh"]  # original, restated re-run, ONE fallback panel
+    assert "verified=false" not in gh.reviews_posted[0]["body"]  # the fallback round's verified WARN posted
+    events = _events(tmp_path, "verify-contradicted")
+    assert [(e.get("restated", False), e.get("fallback", False), e["cleared"]) for e in events] == [
+        (True, False, False),
+        (False, True, True),
+    ]
+
+
+async def test_a_fallback_panel_that_also_contradicts_posts_held_and_stops(tmp_path):
+    calls = 0
+
+    async def runner(name, inputs, *, seed_outputs=None):
+        nonlocal calls
+        calls += 1
+        steps = (
+            _panel_steps(synthesize=_SYNTH_ONE, verify=_VERIFY_FLAKED)
+            if seed_outputs is None
+            else {"verify": _VERIFY_FLAKED, "report": _REPORT_UNVERIFIED}
+        )
+        return {"output": _REPORT_UNVERIFIED, "steps": steps, "failed": []}
+
+    gh = _structural_gh()
+    d = make(tmp_path, gh=gh, runner=runner)
+    await d.handle_pr_event("o/r", 1, HEAD, "opened")
+    assert calls == 3 and "verified=false" in gh.reviews_posted[0]["body"]  # bounded: no second fallback
+
+
 async def test_a_verifier_that_stays_contradicted_posts_unverified_as_before(tmp_path):
     async def runner(name, inputs, *, seed_outputs=None):
         if seed_outputs is None:
@@ -1424,7 +1481,7 @@ async def test_a_verifier_that_stays_contradicted_posts_unverified_as_before(tmp
         }
 
     gh = _structural_gh()
-    d = make(tmp_path, gh=gh, runner=runner)
+    d = make(tmp_path, cfg={"verify_fallback_panel": False}, gh=gh, runner=runner)
     await d.handle_pr_event("o/r", 1, HEAD, "opened")
     assert "verified=false" in gh.reviews_posted[0]["body"]  # fail-closed, exactly as today
     events = _events(tmp_path, "verify-contradicted")

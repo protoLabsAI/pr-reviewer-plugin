@@ -671,6 +671,18 @@ class Dispatcher:
         return max(0, int(cfg["verify_reruns"])) if "verify_reruns" in cfg else _env_int("PR_REVIEWER_VERIFY_RERUNS", 1)
 
     @property
+    def verify_fallback_panel(self) -> bool:
+        """After a RESTATED verify re-run is still contradicted, run one fresh panel before
+        posting a held PASS (#189). Every observed fresh round on this shape has verified;
+        without it the PR waits for a human summon. Off ⇒ the held PASS posts as before."""
+        cfg = self.cfg
+        return (
+            bool(cfg["verify_fallback_panel"])
+            if "verify_fallback_panel" in cfg
+            else _env_bool("PR_REVIEWER_VERIFY_FALLBACK_PANEL", True)
+        )
+
+    @property
     def finder_timeout_s(self) -> int:
         """Seconds each parallel finder may run, or 0 to leave the recipe's default (#93).
 
@@ -2654,8 +2666,42 @@ class Dispatcher:
                 cleared=cleared,
             )
             if cleared:
-                break
-        return result
+                return result
+        # Still contradicted after the restated re-run (#189: 1 in 11). Every fresh round
+        # on this shape has verified — the contradiction is a property of the verify turn,
+        # not the PR — and the sweep re-dispatches nothing for a head that holds a verdict,
+        # so a held PASS here waits for a person. One fresh panel, counted like any attempt.
+        if not self.verify_fallback_panel:
+            return result
+        try:
+            async with asyncio.timeout(self.panel_attempt_timeout_s):
+                fresh = await runner(recipe, inputs)
+        except Exception as exc:  # noqa: BLE001 — a failed fallback leaves the restated round
+            log.warning("[pr-reviewer] %s#%s verify fallback panel failed: %s", repo, pr, exc)
+            return result
+        fresh_steps = fresh.get("steps") if isinstance(fresh.get("steps"), dict) else {}
+        if (
+            fresh.get("failed")
+            or "verify" not in fresh_steps
+            or "synthesize" not in fresh_steps
+            or not fresh.get("output")
+        ):
+            return result
+        fresh_synth = self._parse_findings(str(fresh_steps.get("synthesize") or ""))
+        cleared = not verifier_contradicts_synthesis(str(fresh_steps.get("verify") or ""), fresh_synth)
+        self.telemetry.emit(
+            VERIFY_CONTRADICTED,
+            repo=repo,
+            pr=pr,
+            sha=head,
+            attempt=self.verify_reruns + 1,
+            rerun=True,
+            fallback=True,
+            cleared=cleared,
+        )
+        # The fresh panel is a whole round: its finders, synthesis and report replace the
+        # contradicted round's — whichever way its verifier went, it is the newer evidence.
+        return fresh
 
     async def evaluate_promotion(self, repo: str, pr: int) -> str:
         """One PR through the approve-on-green pure function; applies only when we own
