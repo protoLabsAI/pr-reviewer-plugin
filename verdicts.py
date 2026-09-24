@@ -20,6 +20,7 @@ reaches this function (the report pass drops them).
 
 from __future__ import annotations
 
+import difflib
 import json
 import re
 
@@ -269,6 +270,21 @@ CARRIED_NOTE = (
 )
 
 
+SAME_DEFECT_RATIO = 0.6  # claim similarity (SequenceMatcher) that reads as the same defect
+
+
+def _same_defect(a: dict, b: dict) -> bool:
+    """Same file and a near-identical claim — the same defect in other words, whatever the
+    line. Fails closed: an empty claim on either side never matches."""
+    if _norm_path(str(a.get("file") or "")) != _norm_path(str(b.get("file") or "")):
+        return False
+    ca = " ".join(str(a.get("claim") or "").lower().split())
+    cb = " ".join(str(b.get("claim") or "").lower().split())
+    if not ca or not cb:
+        return False
+    return difflib.SequenceMatcher(None, ca, cb).ratio() >= SAME_DEFECT_RATIO
+
+
 def _carry_key(finding: dict) -> tuple[str, object]:
     """The (file, line) a carried finding dedups on — so a round that DOES re-report the
     bug doesn't record it twice."""
@@ -302,6 +318,14 @@ def merge_carried_findings(findings: list[dict], carried: list[dict]) -> list[di
     for finding in carried:
         key = _carry_key(finding)
         if key in seen:
+            continue
+        # The same defect re-raised at a moved line, in other words (#185): a re-review
+        # whose head advanced mid-round raised "the stack project name is taken from the
+        # raw directory basename, so for stacks/roxy…" beside the carried "…basename
+        # without lowercasing, so fo…" — 8 rows for 5 findings. A near-identical claim on
+        # the same file is this round accounting for the carried one; the fresh row, with
+        # its own (demoted) verdict, supersedes it.
+        if any(_same_defect(finding, f) for f in existing):
             continue
         seen.add(key)
         # `since` rides along so the next round can prove a fix against the head this was

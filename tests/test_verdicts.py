@@ -880,3 +880,51 @@ def test_a_status_line_with_an_unspelled_word_and_an_explicit_array_is_a_complet
     assert not finder_completed(
         "the other lane wrote FINDER_STATUS: clean mid-sentence\n```json\n[]\n```"
     )  # not a line
+
+
+def test_a_carried_finding_is_accounted_for_by_a_near_identical_re_raise_at_a_moved_line():
+    """#185 (homelab-iac#247): the head advanced mid-round; this round re-raised the carried
+    defects in other words at neighbouring lines, and both rows posted — 8 for 5."""
+    from pr_reviewer.verdicts import merge_carried_findings
+
+    fresh = [
+        {
+            "file": "scripts/compose-drift.sh",
+            "line": 44,
+            "severity": "major",
+            "claim": "The stack project name is taken from the raw directory basename, so for stacks/roxy-protoCLI the name differs from compose",
+            "verdict": "possibly addressed",
+        }
+    ]
+    carried = [
+        {
+            "file": "scripts/compose-drift.sh",
+            "line": 41,
+            "severity": "major",
+            "claim": "The stack project name is taken from the raw directory basename without lowercasing, so for stacks/roxy-protoCLI it differs",
+        },
+        {
+            "file": "scripts/compose-drift.sh",
+            "line": 90,
+            "severity": "major",
+            "claim": "norm() wraps any string-form command in sh -c",
+        },
+    ]
+    out = merge_carried_findings(fresh, carried)
+    assert [f["line"] for f in out] == [44, 90]  # the reworded re-raise supersedes; the other debt still carries
+    assert out[0]["verdict"] == "possibly addressed" and out[1].get("carried") is True
+
+
+def test_a_different_claim_on_the_same_file_still_carries():
+    from pr_reviewer.verdicts import merge_carried_findings
+
+    fresh = [{"file": "a.py", "line": 1, "severity": "minor", "claim": "unused import os", "verdict": "confirmed"}]
+    carried = [
+        {
+            "file": "a.py",
+            "line": 40,
+            "severity": "major",
+            "claim": "SQL built by string concatenation from a request field",
+        }
+    ]
+    assert [f["line"] for f in merge_carried_findings(fresh, carried)] == [1, 40]
