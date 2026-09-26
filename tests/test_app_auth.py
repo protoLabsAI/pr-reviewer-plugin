@@ -175,3 +175,25 @@ async def test_fetch_app_events_survives_an_unusable_private_key():
         raise AssertionError("should not have got as far as the request")
 
     assert (await fetch_app_events(cfg, http_get=get)) is None
+
+
+async def test_refresh_loop_signals_ready_only_after_the_first_successful_mint(monkeypatch, keypair):
+    pem, _ = keypair
+    cfg = AppAuthConfig({"app_id": "1", "app_private_key": pem})
+    stop, ready = asyncio.Event(), asyncio.Event()
+    outcomes = [RuntimeError("mint failed"), ("ghs_ok", time.time() + 3600)]
+    seen_ready_before_success: list[bool] = []
+
+    async def fake_fetch(_cfg):
+        seen_ready_before_success.append(ready.is_set())
+        out = outcomes.pop(0)
+        if isinstance(out, Exception):
+            raise out
+        if not outcomes:
+            stop.set()
+        return out
+
+    monkeypatch.setattr("pr_reviewer.app_auth.RETRY_BASE_S", 0.01)
+    await asyncio.wait_for(token_refresh_loop(cfg, stop, fetch=fake_fetch, ready=ready), timeout=5)
+    assert seen_ready_before_success == [False, False]  # a failed mint never signals ready
+    assert ready.is_set()

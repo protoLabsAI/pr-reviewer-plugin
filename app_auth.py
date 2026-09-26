@@ -172,15 +172,25 @@ def apply_token(token: str) -> None:
     os.environ["GITHUB_TOKEN"] = token
 
 
-async def token_refresh_loop(config: AppAuthConfig, stop_event: asyncio.Event, *, fetch=None) -> None:
+async def token_refresh_loop(
+    config: AppAuthConfig, stop_event: asyncio.Event, *, fetch=None, ready: asyncio.Event | None = None
+) -> None:
     """The background surface body: mint, publish, sleep until T-margin; on
-    failure, backoff-retry. Never raises (a failing App auth must not kill boot)."""
+    failure, backoff-retry. Never raises (a failing App auth must not kill boot).
+
+    `ready` is set once the FIRST token has been published — the sweep's first pass waits
+    on it (issue #99): registering this surface before the sweep ordered the two starts,
+    but the token still landed ~600 ms after the sweep's first enumeration, which failed
+    and swept 0 repos for one interval on every boot. It is never set on failure; the
+    waiter's own timeout bounds that case."""
     fetch = fetch or fetch_installation_token
     failures = 0
     while not stop_event.is_set():
         try:
             token, expires_at = await fetch(config)
             apply_token(token)
+            if ready is not None:
+                ready.set()
             failures = 0
             delay = max(expires_at - time.time() - REFRESH_MARGIN_S, 60)
             log.info("[pr-reviewer] App installation token refreshed (next in %ds)", int(delay))

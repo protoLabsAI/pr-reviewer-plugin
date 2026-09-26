@@ -4672,3 +4672,90 @@ async def test_an_unreadable_head_keeps_the_carry(tmp_path):
     d = make(tmp_path, cfg={"shadow_mode": False}, gh=gh, runner=runner)
     await d.handle_pr_event("o/r", 1, HEAD, "synchronize")
     assert "Unaccounted prior finding" in gh.posted[0]["body"]
+
+
+# ── the structural outage becomes a countable class (issue #205) ─────────────
+
+
+def test_classify_outage_names_the_timeout_class_apart_from_auth():
+    from pr_reviewer.protopatch import classify_outage
+
+    assert (
+        classify_outage(
+            "clawpatch exit 4 (gateway provider failure: auth, HTTP error, or an unusable model reply): "
+            "r=gateway review: request failed (no reply within the 270000ms gateway timeout)"
+        )
+        == "exit-4:gateway-timeout"
+    )
+    assert classify_outage("clawpatch exit 4 (gateway provider failure: …): HTTP 401 Unauthorized") == "exit-4:provider"
+    assert classify_outage("clawpatch exit 5 (gateway quota/rate limit): 429") == "exit-5"
+    assert classify_outage("timed out after 300s (budget exceeded; review proceeds without it)") == "budget-timeout"
+    assert classify_outage("`clawpatch` is not installed (npm: @protolabsai/protopatch)") == "not-installed"
+    assert classify_outage("no gateway credentials (GATEWAY_API_KEY / OPENAI_API_KEY unset…)") == "no-credentials"
+    assert classify_outage("checkout failed: clone timed out") == "checkout"
+    assert classify_outage("something new") == "other"
+    assert classify_outage("") == ""
+
+
+async def test_reviewed_row_records_the_structural_outage_class(tmp_path, monkeypatch):
+    """Regression for the row shape: `structural_reason` rides next to `structural_unavailable`."""
+    from pr_reviewer.protopatch import classify_outage, outage_reason, unavailable
+
+    reason = "clawpatch exit 4 (gateway provider failure: auth, HTTP error, or an unusable model reply): no reply within the 270000ms gateway timeout"
+    lane = unavailable(reason)
+    assert classify_outage(outage_reason(lane)) == "exit-4:gateway-timeout"
+
+
+# ── the first sweep pass waits for the App token (issue #99) ─────────────────
+
+
+class _CountingDispatcher:
+    def __init__(self):
+        self.passes = 0
+        self.first_pass_at: float | None = None
+
+    async def sweep_once(self):
+        self.passes += 1
+        if self.first_pass_at is None:
+            self.first_pass_at = time.monotonic()
+        return 0
+
+
+async def test_first_sweep_pass_waits_until_the_token_is_published():
+    from pr_reviewer.dispatch import sweep_loop
+
+    d = _CountingDispatcher()
+    stop, ready = asyncio.Event(), asyncio.Event()
+    task = asyncio.create_task(sweep_loop(d, 60, stop, auth_ready=ready, auth_ready_wait_s=5))
+    await asyncio.sleep(0.05)
+    assert d.passes == 0  # nothing swept before the token exists
+    ready.set()
+    await asyncio.sleep(0.05)
+    assert d.passes == 1  # …and the first pass ran as soon as it did
+    stop.set()
+    await asyncio.wait_for(task, timeout=2)
+
+
+async def test_first_sweep_pass_proceeds_after_a_bounded_wait_when_auth_never_arrives():
+    from pr_reviewer.dispatch import sweep_loop
+
+    d = _CountingDispatcher()
+    stop, ready = asyncio.Event(), asyncio.Event()
+    started = time.monotonic()
+    task = asyncio.create_task(sweep_loop(d, 60, stop, auth_ready=ready, auth_ready_wait_s=0.1))
+    await asyncio.sleep(0.25)
+    assert d.passes == 1 and d.first_pass_at is not None and d.first_pass_at - started >= 0.09
+    stop.set()
+    await asyncio.wait_for(task, timeout=2)
+
+
+async def test_sweep_without_app_auth_starts_immediately():
+    from pr_reviewer.dispatch import sweep_loop
+
+    d = _CountingDispatcher()
+    stop = asyncio.Event()
+    task = asyncio.create_task(sweep_loop(d, 60, stop))
+    await asyncio.sleep(0.02)
+    assert d.passes == 1
+    stop.set()
+    await asyncio.wait_for(task, timeout=2)
