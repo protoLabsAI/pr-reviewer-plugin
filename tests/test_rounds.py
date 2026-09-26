@@ -909,3 +909,111 @@ def test_dispositions_survive_stacked_backticks_in_the_findings_block():
     )
     rows = parse_dispositions(report)
     assert len(rows) == 1 and rows[0]["disposition"] == "open"
+
+
+# ── a recorded-empty round clears the request history (issue #204) ───────────
+
+
+def test_a_round_that_recorded_no_findings_clears_earlier_requests():
+    # terminal-plugin#10: the minor was re-listed in round 3, rounds 4 and 5 recorded `[]`,
+    # and round 6 still read it as `open` because only NON-EMPTY records used to count.
+    block = render_prior_requests(
+        [
+            {"head": HEAD_1, "verdict": WARN, "findings": [finding(file="pty.py", line=44, claim="LC_ALL shadows")]},
+            {"head": HEAD_2, "verdict": WARN, "findings": [finding(file="pty.py", line=44, claim="LC_ALL shadows")]},
+            {"head": HEAD_3, "verdict": WARN, "findings": [], "findings_recorded": True},
+        ]
+    )
+    assert block.count('location="pty.py:44" status="not-in-latest-round"') == 2
+    assert 'status="open"' not in block
+
+
+def test_a_round_with_no_readable_record_does_not_clear_anything():
+    # `findings == []` without `findings_recorded` is a malformed/absent record: fail closed,
+    # exactly as before (#131's fixture pins the same shape).
+    block = render_prior_requests(
+        [
+            {"head": HEAD_1, "verdict": WARN, "findings": [finding(file="pty.py", line=44)]},
+            {"head": HEAD_2, "verdict": PASS, "findings": [], "findings_recorded": False},
+            {"head": HEAD_3, "verdict": PASS, "findings": []},
+        ]
+    )
+    assert block.count('location="pty.py:44" status="open"') == 1
+
+
+# ── a synthesizer re-listing of a prior minor is not a finding (issue #204) ──
+
+
+def _history_with(prior):
+    return [{"head": HEAD_1, "verdict": WARN, "findings": [prior]}]
+
+
+def test_relisted_prior_minor_is_carried_uncertain_and_inherits_the_quote():
+    from pr_reviewer.rounds import RELISTED_NOTE, normalize_relisted_priors
+
+    prior = {
+        "file": "pty_session.py",
+        "line": 44,
+        "severity": "minor",
+        "claim": "utf8_locale sets LANG but does not override LC_ALL",
+        "evidence": '`current = env.get("LC_ALL") or env.get("LC_CTYPE") or env.get("LANG")`',
+        "verdict": "confirmed",
+    }
+    relisting = {
+        "file": "pty_session.py",
+        "line": 44,
+        "severity": "minor",
+        "claim": "utf8_locale sets LANG but does not override LC_ALL",
+        "evidence": "Carried from prior rounds 2 and 3; no fix observed in current head.",  # prose, no quote
+    }
+    fresh = {"file": "api.py", "line": 9, "severity": "minor", "claim": "new thing", "evidence": "x = 1"}
+    out, relisted = normalize_relisted_priors([relisting, fresh], _history_with(prior))
+    assert [f["file"] for f in relisted] == ["pty_session.py"]
+    row = out[0]
+    assert row["verdict"] == "uncertain" and row["carried"] is True and row["carried_by"] == "synthesizer"
+    assert row["since"] == HEAD_1 and row["note"] == RELISTED_NOTE
+    assert row["evidence"] == prior["evidence"]  # grounding now checks the ORIGINAL quote
+    assert out[1] == fresh  # a genuinely new finding is untouched
+    # A prior that quoted nothing checkable has nothing to lend: the echo keeps its own text.
+    bare_prior = {**prior, "evidence": "sets LANG but not LC_ALL"}
+    out2, _ = normalize_relisted_priors([relisting], _history_with(bare_prior))
+    assert out2[0]["evidence"] == relisting["evidence"] and out2[0]["verdict"] == "uncertain"
+
+
+def test_relisting_keeps_its_own_quote_when_it_has_one():
+    from pr_reviewer.rounds import normalize_relisted_priors
+
+    prior = finding(file="a.py", line=10, claim="x is never closed", severity="minor")
+    relisting = {
+        "file": "a.py",
+        "line": 12,
+        "severity": "minor",
+        "claim": "x is never closed",
+        "evidence": "x = open(p)",
+    }
+    out, relisted = normalize_relisted_priors([relisting], _history_with(prior))
+    assert relisted and out[0]["evidence"] == "x = open(p)" and out[0]["verdict"] == "uncertain"
+
+
+def test_relisting_rule_leaves_verified_rows_and_blockers_alone():
+    from pr_reviewer.rounds import normalize_relisted_priors
+
+    prior_minor = finding(file="a.py", line=1, severity="minor", claim="dup")
+    prior_major = finding(file="b.py", line=2, severity="major", claim="bad")
+    verified_dup = {**prior_minor, "verdict": "confirmed"}  # the verifier ruled — not an echo
+    unverified_major = {"file": "b.py", "line": 2, "severity": "major", "claim": "bad", "evidence": "prose"}
+    history = [{"head": HEAD_1, "verdict": "FAIL", "findings": [prior_minor, prior_major]}]
+    out, relisted = normalize_relisted_priors([verified_dup, unverified_major], history)
+    assert relisted == []
+    assert out == [verified_dup, unverified_major]  # a blocker/major echo must still trip verification_ran
+
+
+def test_relisting_rule_ignores_refuted_priors_and_empty_history():
+    from pr_reviewer.rounds import normalize_relisted_priors
+
+    refuted = {**finding(file="a.py", line=1, severity="minor", claim="dup"), "verdict": "refuted"}
+    echo = {"file": "a.py", "line": 1, "severity": "minor", "claim": "dup", "evidence": "prose"}
+    out, relisted = normalize_relisted_priors([echo], _history_with(refuted))
+    assert relisted == [] and out == [echo]
+    assert normalize_relisted_priors([echo], []) == ([echo], [])
+    assert normalize_relisted_priors([], _history_with(refuted)) == ([], [])

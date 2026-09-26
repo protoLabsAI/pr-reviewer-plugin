@@ -43,13 +43,14 @@ from .grounding import (
     render_grounding_footnote,
     render_unreadable_footnote,
 )
-from .protopatch import STRUCTURAL_GAP_MARKERS, outage_reason
+from .protopatch import STRUCTURAL_GAP_MARKERS, classify_outage, outage_reason
 from .rounds import (
     DEFAULT_CONVERGENCE_ROUNDS,
     converge,
     delta_ranges,
     diff_identity,
     in_delta,
+    normalize_relisted_priors,
     panel_rounds,
     parse_dispositions,
     render_degraded_note,
@@ -1976,6 +1977,24 @@ class Dispatcher:
         # — see verdicts.py). `reported` is what the panel said this round and what the
         # body records; `findings` is the confined subset the verdict is computed from.
         reported = self._parse_findings(output)
+        # A re-listing of a prior minor/nit with no verdict and no fresh quote is the panel's
+        # memory leaking into its findings, not a finding (issue #204): it is normalized to a
+        # carried, `uncertain` row BEFORE grounding and the verified check see it, so the
+        # original quote is what gets grounded and a verdict-less echo does not read as a
+        # verifier gap. Applied to `reported` so the recorded body carries the same shape.
+        reported, relisted = normalize_relisted_priors(reported, history)
+        if relisted:
+            self.telemetry.emit(
+                "relisted_prior",
+                repo=repo,
+                pr=pr,
+                sha=head,
+                round=round_number,
+                findings=[
+                    {"file": str(f.get("file") or ""), "line": f.get("line"), "severity": str(f.get("severity") or "")}
+                    for f in relisted
+                ],
+            )
         # A verify step that handed nothing back on a CLEAN round (#151). With findings,
         # `verification_ran` already catches it; with none it cannot, and the round posted
         # "came back clean" above a report saying the verifier never ran. A gap, not a
@@ -2233,6 +2252,11 @@ class Dispatcher:
             incomplete_finders=incomplete_finders or None,
             complete=complete,
             structural_unavailable=structural_unavailable or None,
+            # WHY the structural lane was out, as a countable class (#205): a clawpatch
+            # per-request gateway timeout, our own budget SIGKILL, auth, a missing binary…
+            structural_reason=(classify_outage(outage_reason(structural_out)) or None)
+            if structural_unavailable
+            else None,
             verify_undelivered=verify_undelivered or None,
             # A clean PASS posted as WARN because a lane did not deliver a full pass (#117).
             coverage_capped=(verdict != finding_verdict) or None,
@@ -3303,8 +3327,34 @@ class Dispatcher:
         return count
 
 
-async def sweep_loop(dispatcher: Dispatcher, interval_s: int, stop_event: asyncio.Event) -> None:
-    """The background surface body — single-flight by construction (one loop)."""
+# How long the first sweep pass waits for the App token before going ahead without it.
+# Bounded: a mint that keeps failing must not stall the sweep forever — it enumerates with
+# whatever `gh` has (a PAT, or nothing) exactly as before, one log line later.
+AUTH_READY_WAIT_S = 20.0
+
+
+async def sweep_loop(
+    dispatcher: Dispatcher,
+    interval_s: int,
+    stop_event: asyncio.Event,
+    *,
+    auth_ready: asyncio.Event | None = None,
+    auth_ready_wait_s: float = AUTH_READY_WAIT_S,
+) -> None:
+    """The background surface body — single-flight by construction (one loop).
+
+    The first pass waits (bounded) for `auth_ready`, which the App-auth surface sets once
+    the installation token is published (issue #99). Without it the first enumeration ran
+    ~600 ms before the token existed, failed, and swept 0 repos for a whole interval on
+    every boot and every image roll."""
+    if auth_ready is not None and not auth_ready.is_set():
+        try:
+            await asyncio.wait_for(auth_ready.wait(), timeout=auth_ready_wait_s)
+        except asyncio.TimeoutError:
+            log.warning(
+                "[pr-reviewer] App token not ready after %.0fs; first sweep pass proceeds without it (issue #99)",
+                auth_ready_wait_s,
+            )
     while not stop_event.is_set():
         try:
             await dispatcher.sweep_once()

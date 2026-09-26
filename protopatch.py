@@ -94,6 +94,44 @@ def outage_reason(structural_output: str, limit: int = 180) -> str:
     return ""
 
 
+_EXIT_RE = re.compile(r"clawpatch exit (\d+)")
+
+
+def classify_outage(reason: str) -> str:
+    """A countable class for a structural outage reason — "" when there was none.
+
+    `outage_reason` is display text; this is the telemetry key (issue #205). Ten of the
+    eighteen incomplete rounds in one week were `find_structural` outages, and telling a
+    clawpatch per-request timeout (`exit 4 … no reply within the 270000ms gateway timeout`)
+    from an auth failure (`exit 4 … 401`) or a missing binary meant grepping the container
+    log, because the reviewed row only said `structural_unavailable: true`.
+
+    Classes: `budget-timeout` (our SIGKILL), `not-installed`, `no-credentials`, `checkout`,
+    `exit-N` for a clawpatch exit code, refined for exit 4 into `exit-4:gateway-timeout`
+    (clawpatch's own provider timeout) or `exit-4:provider` (anything else in that class),
+    and `other` for a reason this does not recognise.
+    """
+    text = (reason or "").strip()
+    if not text:
+        return ""
+    lowered = text.lower()
+    if lowered.startswith("timed out after"):
+        return "budget-timeout"
+    if "is not installed" in lowered or "command not found" in lowered:
+        return "not-installed"
+    if lowered.startswith("no gateway credentials"):
+        return "no-credentials"
+    if lowered.startswith("checkout failed"):
+        return "checkout"
+    m = _EXIT_RE.search(text)
+    if m:
+        code = int(m.group(1))
+        if code == 4:
+            return "exit-4:gateway-timeout" if "gateway timeout" in lowered else "exit-4:provider"
+        return f"exit-{code}"
+    return "other"
+
+
 def unavailable(reason: str) -> str:
     return (
         f"{UNAVAILABLE_PREFIX} — {reason}\n\n"

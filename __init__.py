@@ -130,11 +130,19 @@ def register(registry) -> None:
             from .app_auth import AppAuthConfig, token_refresh_loop
 
             app_cfg = AppAuthConfig(cfg)
+            # Ordering the surfaces was not enough (#99, reopened 2026-09-26): the token
+            # is fetched asynchronously, so the sweep's first pass now WAITS on this event,
+            # which the refresher sets after its first successful mint. None when App auth
+            # is not configured — then there is nothing to wait for.
+            auth_ready: asyncio.Event | None = None
             if app_cfg.configured:
                 auth_stop = asyncio.Event()
+                auth_ready = asyncio.Event()
 
                 def _auth_start():
-                    return asyncio.get_running_loop().create_task(token_refresh_loop(app_cfg, auth_stop))
+                    return asyncio.get_running_loop().create_task(
+                        token_refresh_loop(app_cfg, auth_stop, ready=auth_ready)
+                    )
 
                 def _auth_stop():
                     auth_stop.set()
@@ -153,7 +161,9 @@ def register(registry) -> None:
                     return running
                 stop_event = asyncio.Event()
                 shared["sweep_stop"] = stop_event
-                task = asyncio.get_running_loop().create_task(sweep_loop(dispatcher, interval, stop_event))
+                task = asyncio.get_running_loop().create_task(
+                    sweep_loop(dispatcher, interval, stop_event, auth_ready=auth_ready)
+                )
                 shared["sweep_task"] = task
                 return task
 

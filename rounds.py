@@ -36,6 +36,7 @@ import hashlib
 import json
 import re
 
+from .grounding import quoted_snippets
 from .verdicts import PASS, WARN, fenced_blocks, read_findings_record
 
 # From this round on, the convergence rule is eligible to fire. Rounds 1–2 are the
@@ -210,12 +211,31 @@ def render_prior_requests(rounds: list[dict]) -> str:
     # What became of each request (issue #131). The block is the WHOLE history, and without
     # this an item the verifier refuted three rounds ago, or one fixed and dropped since,
     # reads exactly like an open one — so a brief listed a fixed, refuted note among
-    # "standing items from round 1" (mythxengine#827). "Open" is what the LATEST round with
-    # findings still carries: an unaccounted blocker/major is re-recorded every round
-    # (`merge_carried_findings`), so one that is absent there was positively cleared.
+    # "standing items from round 1" (mythxengine#827). "Open" is what the LATEST round that
+    # RECORDED findings still carries: an unaccounted blocker/major is re-recorded every
+    # round (`merge_carried_findings`), so one that is absent there was positively cleared.
+    #
+    # "Recorded" includes an explicit empty record (issue #204). The latest round used to be
+    # the latest with a NON-EMPTY record, which made a clean round invisible to the request
+    # history: on terminal-plugin#10 a minor was re-listed (unverified, paraphrased) in the
+    # round after the fix, then two rounds recorded `[]` — the panel looked and raised
+    # nothing — yet the next round still read the request as `open` off the re-listing,
+    # raised it again, and held the PR. A round that recorded `[]` speaks for every request
+    # before it; only a round with NO readable record (`findings_recorded` absent or false,
+    # e.g. a malformed body) is skipped, fail-closed as before. Coverage of that clean round
+    # is not consulted here: an incomplete round already holds the gate on its own, and this
+    # block is the panel's memory, not its gate.
+    latest_round = next(
+        (
+            r
+            for r in reversed(rounds or [])
+            if isinstance(r, dict) and (r.get("findings") or r.get("findings_recorded") is True)
+        ),
+        numbered[-1][1],
+    )
     latest = {
         _anchor(f.get("file"), f.get("line"))
-        for f in numbered[-1][1]["findings"]
+        for f in (latest_round.get("findings") or [])
         if isinstance(f, dict) and str(f.get("verdict") or "").lower() != "refuted"
     }
     out = ["<prior_requests>"]
@@ -568,6 +588,81 @@ def unaccounted_priors(
         if anchor not in accounted and _norm(str(finding.get("file") or "")) not in accounted:
             missing.append(dict(finding))
     return missing
+
+
+RELISTED_NOTE = (
+    "re-listed from a prior round without fresh evidence or a verifier ruling — graded uncertain, "
+    "not re-confirmed (issue #204); it clears when a round records findings without it"
+)
+
+
+def normalize_relisted_priors(findings: list[dict], history: list[dict]) -> tuple[list[dict], list[dict]]:
+    """(findings, the ones normalized) — a synthesizer's re-listing of a prior minor/nit is
+    not a new finding (issue #204).
+
+    On terminal-plugin#10 the panel re-emitted a prior minor in its own findings array: no
+    verifier verdict, and `evidence` that paraphrased the original quote ("the function sets
+    os.environ['LANG'] …" for code that never touched `os.environ`). Two things followed.
+    `verification_ran` read the verdict-less row as a finding the verifier failed to reach,
+    so the round posted `verified=false` and the head sat at `hold:unverified` — even though
+    every finding the round actually raised was verified. And the paraphrase carried no
+    checkable quote, so grounding had nothing to test and #197's evidence-gone rule could not
+    fire: the row could be re-listed forever.
+
+    The rule: a minor/nit with NO verdict that matches a finding of the last substantive round
+    (same file:line, or the same defect at a moved line — `_same_defect`) is stamped
+    `carried: true`, `carried_by: "synthesizer"`, `verdict: uncertain`, keeps `since` from the
+    prior, and — when it quotes nothing of its own — inherits the prior's `evidence`, so
+    grounding checks the ORIGINAL quote at head rather than prose. `uncertain` is the honest
+    grade for a claim nobody re-verified: it still posts, still reads, cannot gate a merge,
+    and does not read as a verifier gap.
+
+    Scoped to minor/nit on purpose. A blocker/major is carried by `unaccounted_priors` +
+    `merge_carried_findings` with its own fail-closed rules, and an unverified re-listing of
+    one SHOULD still trip `verification_ran`: wrongly trusting it merges a defect.
+    """
+    from .verdicts import _same_defect  # history layer over the pure mapping
+
+    prior_round = next((r for r in reversed(history or []) if isinstance(r, dict) and r.get("findings")), None)
+    if prior_round is None or not findings:
+        return list(findings or []), []
+    origin = str(prior_round.get("head") or "")
+    priors = [f for f in prior_round["findings"] if isinstance(f, dict)]
+    out: list[dict] = []
+    relisted: list[dict] = []
+    for finding in findings or []:
+        if not isinstance(finding, dict):
+            continue
+        severity = str(finding.get("severity") or "").lower()
+        if severity not in ("minor", "nit") or str(finding.get("verdict") or "").strip():
+            out.append(finding)
+            continue
+        anchor = _anchor(finding.get("file"), finding.get("line"))
+        match = next(
+            (
+                p
+                for p in priors
+                if str(p.get("verdict") or "").lower() != "refuted"
+                and (_anchor(p.get("file"), p.get("line")) == anchor or _same_defect(finding, p))
+            ),
+            None,
+        )
+        if match is None:
+            out.append(finding)
+            continue
+        normalized = {
+            **finding,
+            "verdict": "uncertain",
+            "carried": True,
+            "carried_by": "synthesizer",
+            "since": str(match.get("since") or origin),
+            "note": RELISTED_NOTE,
+        }
+        if not quoted_snippets(finding) and quoted_snippets(match):
+            normalized["evidence"] = match.get("evidence")
+        out.append(normalized)
+        relisted.append(normalized)
+    return out, relisted
 
 
 def render_unaccounted_note(missing: list[dict]) -> str:
