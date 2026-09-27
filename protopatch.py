@@ -142,12 +142,15 @@ def unavailable(reason: str) -> str:
 
 
 # clawpatch's own gateway-request timeout (CLAWPATCH_GATEWAY_TIMEOUT_MS), sized PER ATTEMPT and
-# kept strictly inside the wall-clock budget (#209). A ~270s ceiling keeps one request inside the
-# ~300s socket window that was surfacing as `fetch failed`; because it is fixed per attempt rather
-# than scaled to the whole budget, a larger time_budget_s buys a second attempt (the retry below)
-# instead of one very long request.
-GATEWAY_TIMEOUT_CEILING_S = 270
+# kept strictly inside the attempt's slice of the wall-clock budget (#209). The DEFAULT still scales
+# with the budget — `budget - headroom`, floored at 30s — so an operator who raised time_budget_s
+# for a slow gateway review still gets the long request they asked for; an inherited value is
+# honoured but capped to that same window. Only a value allowed to outlive our SIGKILL dies as an
+# opaque `fetch failed` (~300s socket) instead of clawpatch's own clean, classifiable gateway
+# timeout. On the retry the attempt budget shrinks, so the second request's timeout tightens below
+# the ~300s socket window on its own — no fixed ceiling needed.
 GATEWAY_TIMEOUT_HEADROOM_S = 30  # keep the request this far under the wall-clock SIGKILL
+GATEWAY_TIMEOUT_FLOOR_MS = 30_000  # never below 30s, however small the attempt budget
 
 # A transient gateway failure gets ONE retry, but only when at least this much of the wall-clock
 # budget survives the first attempt — below it a second attempt cannot finish, so we degrade now.
@@ -155,18 +158,18 @@ RETRY_MIN_BUDGET_S = 90
 
 
 def gateway_timeout_ms(attempt_budget_s: int, inherited: str | None = None) -> int:
-    """CLAWPATCH_GATEWAY_TIMEOUT_MS for one attempt: the per-attempt ceiling, never above
-    `attempt_budget - headroom` so the request cannot outlive our SIGKILL, and an inherited value
-    honoured only up to that cap. An inherited value larger than the budget is exactly what let a
-    request run to ~300s and die as an opaque `fetch failed` instead of clawpatch's own clean,
-    classifiable gateway timeout (#209)."""
-    cap_ms = max((attempt_budget_s - GATEWAY_TIMEOUT_HEADROOM_S) * 1000, 1000)
-    ceiling_ms = min(GATEWAY_TIMEOUT_CEILING_S * 1000, cap_ms)
+    """CLAWPATCH_GATEWAY_TIMEOUT_MS for one attempt. The default SCALES with the attempt's budget
+    (`budget - headroom`, floored at 30s), so raising time_budget_s really does buy a longer gateway
+    request; an inherited value takes precedence but is capped at that same `budget - headroom` so
+    the request can never outlive our SIGKILL. An inherited value larger than the budget is exactly
+    what let a request run to ~300s and die as an opaque `fetch failed` instead of clawpatch's own
+    clean, classifiable gateway timeout (#209)."""
+    cap_ms = max((attempt_budget_s - GATEWAY_TIMEOUT_HEADROOM_S) * 1000, GATEWAY_TIMEOUT_FLOOR_MS)
     try:
-        desired = int(inherited) if inherited not in (None, "") else ceiling_ms
+        desired = int(inherited) if inherited not in (None, "") else cap_ms
     except (TypeError, ValueError):
-        desired = ceiling_ms
-    return max(min(desired, ceiling_ms), 1)
+        desired = cap_ms
+    return max(min(desired, cap_ms), 1)
 
 
 # The shape of a TRANSIENT gateway failure worth one retry: a dropped/blocked request, a socket or

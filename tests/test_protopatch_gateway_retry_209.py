@@ -197,17 +197,21 @@ async def test_gateway_timeout_capped_below_budget_even_when_inherited_larger(
 
 
 def test_gateway_timeout_ms_caps_inherited_and_defaults():
-    # No inherited value: the fixed per-attempt ceiling, inside the budget.
-    assert gateway_timeout_ms(300, None) == 270_000
-    # Fixed PER ATTEMPT — a larger budget does not stretch a single request (that room is a retry).
-    assert gateway_timeout_ms(600, None) == 270_000
+    # No inherited value: the default SCALES with the budget (budget - headroom), inside it.
+    assert gateway_timeout_ms(300, None) == (300 - GATEWAY_TIMEOUT_HEADROOM_S) * 1000  # 270_000
+    # A larger budget grants a longer request — the default is NOT hard-capped at 270s (the #209
+    # regression: operators who raised the budget had requests killed at 270s and retried to death).
+    assert gateway_timeout_ms(600, None) == (600 - GATEWAY_TIMEOUT_HEADROOM_S) * 1000  # 570_000
+    assert gateway_timeout_ms(600, None) < 600 * 1000  # still strictly inside the wall-clock
     # An inherited value above the budget is capped strictly below it (#209).
-    assert gateway_timeout_ms(300, str(10_000_000)) == 270_000
+    assert gateway_timeout_ms(300, str(10_000_000)) == (300 - GATEWAY_TIMEOUT_HEADROOM_S) * 1000
     assert gateway_timeout_ms(300, str(10_000_000)) < 300 * 1000
+    # An explicit inherited value that FITS a raised budget is honoured, not cut down to 270s.
+    assert gateway_timeout_ms(600, str(400_000)) == 400_000
     # A smaller inherited value is honoured.
     assert gateway_timeout_ms(300, str(50_000)) == 50_000
-    # Garbage falls back to the ceiling rather than raising.
-    assert gateway_timeout_ms(300, "not-a-number") == 270_000
+    # Garbage falls back to the scaled default rather than raising.
+    assert gateway_timeout_ms(300, "not-a-number") == (300 - GATEWAY_TIMEOUT_HEADROOM_S) * 1000
     # Even a tiny budget stays strictly inside the wall-clock.
     assert gateway_timeout_ms(40, None) < 40 * 1000
 

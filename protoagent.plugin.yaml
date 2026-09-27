@@ -72,11 +72,12 @@ config:
                                # it). Covers up to TWO clawpatch runs: a TRANSIENT gateway failure
                                # (dropped request / socket timeout / gateway 5xx — #209) is retried
                                # ONCE if enough budget remains (>= ~90s). Raised from 300 so the
-                               # retry actually fits after a first-attempt gateway timeout; a clean
-                               # run still returns in one attempt (~270s). The CLI's own gateway-
-                               # request timeout is derived from this and kept strictly inside it —
-                               # any inherited CLAWPATCH_GATEWAY_TIMEOUT_MS is capped, never honoured
-                               # above the budget.
+                               # retry actually fits after a ~300s first-attempt gateway failure; a
+                               # clean run still returns in one attempt. The CLI's own gateway-request
+                               # timeout is derived from this: the default SCALES with the budget
+                               # (budget-30s), so raising this really does grant a longer request,
+                               # and any inherited CLAWPATCH_GATEWAY_TIMEOUT_MS is honoured but capped
+                               # to that same window — never allowed to outlive the budget.
   model: ""                    # clawpatch --model override; "" = its default (protolabs/smart)
   gateway_base_url: ""         # exported as OPENAI_BASE_URL to clawpatch; "" = its default
   checkout_root: ""            # "" = ~/.protoagent/pr-reviewer/checkouts
