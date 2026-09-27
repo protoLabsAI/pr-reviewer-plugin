@@ -141,6 +141,58 @@ def unavailable(reason: str) -> str:
     )
 
 
+# clawpatch's own gateway-request timeout (CLAWPATCH_GATEWAY_TIMEOUT_MS), sized PER ATTEMPT and
+# kept strictly inside the wall-clock budget (#209). A ~270s ceiling keeps one request inside the
+# ~300s socket window that was surfacing as `fetch failed`; because it is fixed per attempt rather
+# than scaled to the whole budget, a larger time_budget_s buys a second attempt (the retry below)
+# instead of one very long request.
+GATEWAY_TIMEOUT_CEILING_S = 270
+GATEWAY_TIMEOUT_HEADROOM_S = 30  # keep the request this far under the wall-clock SIGKILL
+
+# A transient gateway failure gets ONE retry, but only when at least this much of the wall-clock
+# budget survives the first attempt — below it a second attempt cannot finish, so we degrade now.
+RETRY_MIN_BUDGET_S = 90
+
+
+def gateway_timeout_ms(attempt_budget_s: int, inherited: str | None = None) -> int:
+    """CLAWPATCH_GATEWAY_TIMEOUT_MS for one attempt: the per-attempt ceiling, never above
+    `attempt_budget - headroom` so the request cannot outlive our SIGKILL, and an inherited value
+    honoured only up to that cap. An inherited value larger than the budget is exactly what let a
+    request run to ~300s and die as an opaque `fetch failed` instead of clawpatch's own clean,
+    classifiable gateway timeout (#209)."""
+    cap_ms = max((attempt_budget_s - GATEWAY_TIMEOUT_HEADROOM_S) * 1000, 1000)
+    ceiling_ms = min(GATEWAY_TIMEOUT_CEILING_S * 1000, cap_ms)
+    try:
+        desired = int(inherited) if inherited not in (None, "") else ceiling_ms
+    except (TypeError, ValueError):
+        desired = ceiling_ms
+    return max(min(desired, ceiling_ms), 1)
+
+
+# The shape of a TRANSIENT gateway failure worth one retry: a dropped/blocked request, a socket or
+# provider timeout, or a gateway 5xx. clawpatch collapses its whole provider-failure class into
+# exit 4, so the stderr detail is the only separator (mirrors `classify_outage`).
+_TRANSIENT_GATEWAY_RE = re.compile(
+    r"fetch failed|request failed|gateway timeout|no reply within|socket hang ?up|"
+    r"econnreset|econnrefused|etimedout|network|timed out|\b50[234]\b",
+    re.IGNORECASE,
+)
+
+
+def is_transient_gateway_failure(rc: int, text: str) -> bool:
+    """True when a clawpatch exit is a transient gateway failure a single retry could clear — as
+    opposed to auth (401/403), a bad model reply, or quota, where the same call just fails again."""
+    if rc != 4:
+        return False
+    return bool(_TRANSIENT_GATEWAY_RE.search(text or ""))
+
+
+def _with_attempts(reason: str, attempts: int) -> str:
+    """Append the clawpatch attempt count to a degradation reason (#209): with a retry in play the
+    reason alone no longer tells the operator how many gateway runs were spent."""
+    return f"{reason} (after {attempts} attempt{'' if attempts == 1 else 's'})"
+
+
 async def resolve_pr_refs(repo: str, pr: int) -> tuple[str, str] | str:
     """(head_sha, base_sha) for the PR, resolved server-side; an error string on failure."""
     rc, out, err = await run_gh(
@@ -255,7 +307,7 @@ class ProtoPatchRunner:
         # Claims this repo's verifier already refuted (#190) — shared with the dispatcher,
         # which writes them when a round posts; the structural pass reads them here.
         self.refutations = RefutationStore.from_cfg(self.cfg)
-        self.budget_s = int(self.cfg.get("time_budget_s") or 300)
+        self.budget_s = int(self.cfg.get("time_budget_s") or 600)
         self.bin = str(self.cfg.get("clawpatch_bin") or "clawpatch")
         self.model = str(self.cfg.get("model") or "")
         self.gateway_base_url = str(self.cfg.get("gateway_base_url") or "")
@@ -394,20 +446,65 @@ class ProtoPatchRunner:
         env["GATEWAY_API_KEY"] = gateway_key
         if gateway_base:
             env["OPENAI_BASE_URL"] = gateway_base
-        # The CLI's own provider timeout must sit inside our wall-clock budget.
-        env.setdefault("CLAWPATCH_GATEWAY_TIMEOUT_MS", str(max((self.budget_s - 30) * 1000, 30_000)))
+        # The CLI's own gateway-request timeout must sit strictly inside our wall-clock budget, and
+        # an inherited CLAWPATCH_GATEWAY_TIMEOUT_MS must NOT override that (#209): a request allowed
+        # to outlive the budget dies by our SIGKILL as an opaque `fetch failed` (~300s) instead of
+        # clawpatch's own clean, classifiable gateway timeout. It is set per attempt below.
+        inherited_timeout = env.get("CLAWPATCH_GATEWAY_TIMEOUT_MS")
 
+        # One structural pass may run clawpatch twice: a TRANSIENT gateway failure (a dropped
+        # request / socket timeout / gateway 5xx — #209) gets a single retry when enough of the
+        # budget survives the first attempt. Any other exit degrades exactly as before, never raises.
         started = time.monotonic()
-        rc, stdout, stderr, timed_out = await self._run_clawpatch(args, checkout, env, self.budget_s)
-        elapsed = time.monotonic() - started
-        if timed_out:
-            return unavailable(f"timed out after {self.budget_s}s (budget exceeded; review proceeds without it)")
-        if rc == 127:
-            return unavailable(f"`{self.bin}` is not installed (npm: @protolabsai/protopatch)")
-        if rc != 0:
-            reason = _EXIT_REASONS.get(rc, "runtime failure")
+        deadline = started + self.budget_s
+        attempt = 0
+        while True:
+            attempt += 1
+            remaining_s = deadline - time.monotonic()
+            attempt_budget_s = self.budget_s if attempt == 1 else max(int(remaining_s), 1)
+            gateway_ms = gateway_timeout_ms(attempt_budget_s, inherited_timeout)
+            env["CLAWPATCH_GATEWAY_TIMEOUT_MS"] = str(gateway_ms)
+            log.debug(
+                "[pr-reviewer] clawpatch attempt %d: gateway timeout=%dms, wall-clock=%ds (budget=%ds, inherited=%s)",
+                attempt,
+                gateway_ms,
+                attempt_budget_s,
+                self.budget_s,
+                inherited_timeout,
+            )
+            rc, stdout, stderr, timed_out = await self._run_clawpatch(args, checkout, env, attempt_budget_s)
+            if timed_out:
+                return unavailable(
+                    _with_attempts(
+                        f"timed out after {self.budget_s}s (budget exceeded; review proceeds without it)", attempt
+                    )
+                )
+            if rc == 127:
+                return unavailable(
+                    _with_attempts(f"`{self.bin}` is not installed (npm: @protolabsai/protopatch)", attempt)
+                )
+            if rc == 0:
+                break
+            reason_name = _EXIT_REASONS.get(rc, "runtime failure")
             detail = redact(redact((stderr or stdout).strip()[-400:], token), gateway_key)
-            return unavailable(f"clawpatch exit {rc} ({reason}): {detail}")
+            reason = f"clawpatch exit {rc} ({reason_name}): {detail}"
+            remaining_s = deadline - time.monotonic()
+            if (
+                attempt == 1
+                and is_transient_gateway_failure(rc, stderr or stdout)
+                and remaining_s >= RETRY_MIN_BUDGET_S
+            ):
+                log.warning(
+                    "[pr-reviewer] clawpatch transient gateway failure (exit %d) on attempt %d; retrying "
+                    "once with %.0fs of the %ds budget left (#209)",
+                    rc,
+                    attempt,
+                    remaining_s,
+                    self.budget_s,
+                )
+                continue
+            return unavailable(_with_attempts(reason, attempt))
+        elapsed = time.monotonic() - started
 
         findings = read_findings(state_dir, changed)
         # A repeat of a claim this repo's verifier already refuted, at a spot this PR does
