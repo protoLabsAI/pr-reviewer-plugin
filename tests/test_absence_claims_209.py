@@ -185,6 +185,51 @@ def test_absence_kind_separates_the_two_families():
     assert absence_kind({"claim": "the retry loop never breaks", "evidence": ""}) is None
 
 
+def test_a_code_shape_absence_that_also_mentions_tests_is_still_code_shape():
+    # finding #1 (2026-09 #209 part-2 review): a real code-shape blocker that ALSO mentions tests
+    # must NOT be classed as a test absence. The five-word, comma-spanning gap let `without` reach
+    # past the nearer `validation` to a far `tests`; nearest-target binding keeps `without`
+    # bound to `validation`, so these stay "other" and a test file can never refute them.
+    assert (
+        absence_kind(
+            {"claim": "the fetched input is used without validation, and the tests never fire", "evidence": ""}
+        )
+        == "other"
+    )
+    assert absence_kind({"claim": "the timeout is not handled and not tested", "evidence": ""}) == "other"
+    # ...even when the test mention is ONLY in the evidence (both fields are read as one blob).
+    assert (
+        absence_kind({"claim": "the payload is used without validation", "evidence": "the tests send no bad payload"})
+        == "other"
+    )
+
+
+def test_absence_kind_binds_each_negation_to_its_nearest_target():
+    # The complement: "handling" as the OBJECT of a test-coverage absence does not make it a
+    # code-shape claim — `no` binds to the nearer `test coverage`, so this stays tree-groundable.
+    assert absence_kind({"claim": "no test coverage for the error handling", "evidence": ""}) == "test"
+
+
+A_CODE_SHAPE_MAJOR_THAT_MENTIONS_TESTS = {
+    "file": "pkg/fetch.py",
+    "line": 12,
+    "severity": "major",
+    "verdict": "confirmed",
+    "claim": "the fetched input is used without validation, and the tests never send a malformed payload",
+    "evidence": "`data = resp.json()` is indexed directly with no bounds check",
+}
+
+
+def test_a_code_shape_major_that_mentions_tests_keeps_gating_when_a_test_exists():
+    # finding #1, at the grounding boundary: the blocker keeps its FAIL even though a same-stem
+    # test file exists — it is not demoted, and no false "plausible test exists" footnote is added.
+    out, demoted = ground_absence_claims(
+        [A_CODE_SHAPE_MAJOR_THAT_MENTIONS_TESTS], {"pkg/fetch.py", "tests/test_fetch.py"}, truncated=False
+    )
+    assert verdict_for(out) == FAIL
+    assert demoted == [] and out[0].get("absence_demoted") is None
+
+
 def test_a_validation_absence_is_not_refuted_by_an_existing_test_file():
     # finding #1: a code-shape absence must NOT be demoted just because a test file exists. A
     # "without validation" major on fetch.py keeps gating even though tests/test_fetch.py exists.

@@ -403,25 +403,58 @@ def render_unreadable_footnote(unreadable: list[dict]) -> str:
 # validation", "missing error handling", "no docstring" — is about the FILE'S OWN code, and a
 # test file existing says NOTHING about it. Grounding the second family against
 # `plausible_test_in_tree` demoted real "without validation" / "not handled" majors on a module
-# merely because some test file existed, and mislabelled them "a plausible test exists" — so the
-# two families match separately and ONLY the test family is ever refuted by the tree.
+# merely because some test file existed, and mislabelled them "a plausible test exists".
+#
+# The bind between a negation and its target decides the family, and it must be the NEAREST
+# target — NOT the first family that happens to match anywhere in the blob. Two independent
+# `search`es (test-family first) let a single negation reach PAST a nearer code-shape target to a
+# far "test": "used without validation, and the tests never fire" was read as a test absence
+# because `without … (up to five words, commas included) … tests` matched, even though `without`
+# plainly negates `validation` one word away. So the negation→target bind is resolved in ONE scan
+# over both families (`_ABSENCE_NEG_TARGET_RE`), and a code-shape absence anywhere wins over a
+# test absence (see `absence_kind`) — this is the 2026-09 #209 part-2 review, finding #1.
 _TEST_ABSENCE_TARGET = r"(?:tests?|test[\s_.-]*files?|test[\s_.-]*cases?|test[\s_.-]*coverage|coverage)"
-_TEST_ABSENCE_RE = re.compile(
-    r"\b(?:no|missing|without|lacks?|lacking|absent|zero)\b\s+(?:[\w'\"()./,-]+\s+){0,5}?"
+_OTHER_ABSENCE_TARGET = r"(?:documentation|docs?|docstrings?|handling|validation)"
+
+# The negation vocabulary and the gap it may put before its target. Commas count as gap ("no X,
+# Y, or test") — which is exactly why a non-greedy gap over the COMBINED target set is required:
+# it binds each negation to the closest target, so the comma-spanning reach can no longer jump a
+# nearer code-shape target on its way to a distant "test".
+_ABSENCE_NEG = r"(?:no|missing|without|lacks?|lacking|absent|zero)"
+_ABSENCE_GAP = r"(?:[\w'\"()./,-]+\s+){0,5}?"
+
+# One scan, both families: each negation binds to whichever target — test OR code-shape — sits
+# NEAREST it (the gap is non-greedy), and the named group that captured names the family. So
+# `no` in "no test coverage for the error handling" binds to `test` (the `handling` is that
+# test's OBJECT, not an independently-negated gap), while `without` in "used without validation,
+# and the tests never fire" binds to `validation` and the un-negated "tests" is left alone.
+_ABSENCE_NEG_TARGET_RE = re.compile(
+    r"\b"
+    + _ABSENCE_NEG
+    + r"\b\s+"
+    + _ABSENCE_GAP
+    + r"(?:(?P<test>"
     + _TEST_ABSENCE_TARGET
-    + r"\b"
-    r"|\bun(?:tested|covered)\b"
+    + r")|(?P<other>"
+    + _OTHER_ABSENCE_TARGET
+    + r"))\b",
+    re.IGNORECASE,
+)
+
+# The ANCHORED forms, where the negation sits ON its target so there is no gap to mis-bind:
+# `untested`, `not … tested`, `exercises none`, `none of it … tested` for the test family;
+# `undocumented`, `not … handled`, `none of it … documented` for the code-shape family. The
+# `not …` forms of the two families legitimately co-occur ("not handled and not tested") — each
+# family matches its own, and `absence_kind` resolves the co-occurrence in favour of code-shape.
+_TEST_ABSENCE_ANCHORED_RE = re.compile(
+    r"\bun(?:tested|covered)\b"
     r"|\bnot\b(?:\s+\w+){0,3}?\s+(?:tested|covered|exercised)\b"
     r"|\b(?:exercise[sd]?|cover[sd]?|test[sd]?)\s+none\b"
     r"|\bnone\s+of\s+(?:it|them|this|these|the\s+\w+)\b(?:\s+\w+){0,4}?\s+(?:tested|covered|exercised)\b",
     re.IGNORECASE,
 )
-_OTHER_ABSENCE_TARGET = r"(?:documentation|docs?|docstrings?|handling|validation)"
-_OTHER_ABSENCE_RE = re.compile(
-    r"\b(?:no|missing|without|lacks?|lacking|absent|zero)\b\s+(?:[\w'\"()./,-]+\s+){0,5}?"
-    + _OTHER_ABSENCE_TARGET
-    + r"\b"
-    r"|\bun(?:documented|validated)\b"
+_OTHER_ABSENCE_ANCHORED_RE = re.compile(
+    r"\bun(?:documented|validated)\b"
     r"|\bnot\b(?:\s+\w+){0,3}?\s+(?:documented|handled|validated)\b"
     r"|\bnone\s+of\s+(?:it|them|this|these|the\s+\w+)\b(?:\s+\w+){0,4}?\s+documented\b",
     re.IGNORECASE,
@@ -434,16 +467,30 @@ _TEST_DIR_RE = re.compile(r"(?:^|/)(?:tests?|__tests__|specs?)(?:/|$)", re.IGNOR
 
 
 def absence_kind(finding: dict) -> str | None:
-    """`"test"` (a test/coverage absence, groundable against the head tree), `"other"` (a
+    """`"test"` (a PURE test/coverage absence, groundable against the head tree), `"other"` (a
     code-shape absence — missing validation/handling/docs, groundable only against whether the
     faulted file itself was seen), or `None` (not an absence claim). Read from `claim` +
-    `evidence`, the same blob `quoted_snippets` grounds. The test family wins when a claim reads
-    as both, so a "no test file" that also mentions handling is still tree-groundable."""
+    `evidence`, the same blob `quoted_snippets` grounds.
+
+    A code-shape absence anywhere in the claim WINS over a test absence: a test file can never
+    refute "used without validation", so a claim that faults the file's OWN code must not be
+    tree-demoted just because it ALSO mentions tests ("used without validation, and the tests
+    never fire", "not handled and not tested" — the 2026-09 #209 part-2 review, finding #1). Only
+    a claim that is PURELY a test/coverage absence is groundable against the tree. Each negation
+    binds to its NEAREST target, so "no test coverage for the error handling" stays a test absence
+    — the `handling` there is the test's object, not an independently-negated code-shape gap."""
     blob = f"{finding.get('claim') or ''}\n{finding.get('evidence') or ''}"
-    if _TEST_ABSENCE_RE.search(blob):
-        return "test"
-    if _OTHER_ABSENCE_RE.search(blob):
+    has_test = bool(_TEST_ABSENCE_ANCHORED_RE.search(blob))
+    has_other = bool(_OTHER_ABSENCE_ANCHORED_RE.search(blob))
+    for m in _ABSENCE_NEG_TARGET_RE.finditer(blob):
+        if m.group("test"):
+            has_test = True
+        else:
+            has_other = True
+    if has_other:
         return "other"
+    if has_test:
+        return "test"
     return None
 
 
