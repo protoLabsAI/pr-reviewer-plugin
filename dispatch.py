@@ -1579,7 +1579,7 @@ class Dispatcher:
         try:
             return await self._bounded_review(repo, pr, push_triggered=True)
         finally:
-            self.chokepoint.done(repo, pr)
+            self.chokepoint.done(repo, pr, head_sha)
 
     async def handle_summon(self, repo: str, pr: int, actor: str) -> str:
         """An operator asked for a review (issue #28). Same panel, two differences.
@@ -1607,7 +1607,7 @@ class Dispatcher:
         try:
             return await self._bounded_review(repo, pr, force=True)
         finally:
-            self.chokepoint.done(repo, pr)
+            self.chokepoint.done(repo, pr, f"summon-{pr}")
 
     async def _review(self, repo: str, pr: int, *, force: bool = False, push_triggered: bool = False) -> str:
         started = time.monotonic()
@@ -2334,8 +2334,15 @@ class Dispatcher:
         commits = payload.get("commits")
         return delta_ranges(payload["files"]), (commits if isinstance(commits, int) and commits >= 0 else 0)
 
-    async def _stale_head_guard(self, repo: str, pr: int, head: str, findings: list[dict]) -> tuple[list[dict], str]:
-        """Re-resolve the PR's head at POST time → (findings, synthesis header or "").
+    async def _stale_head_guard(
+        self, repo: str, pr: int, head: str, findings: list[dict]
+    ) -> tuple[list[dict], str, bool]:
+        """Re-resolve the PR's head at POST time → (findings, synthesis header, superseded).
+
+        `superseded` is True when the PR head has MOVED past the one this round pinned — the
+        verdict was verified against a commit the PR no longer has, so it must not post as a
+        blocking CHANGES_REQUESTED on the new head (#209). False on the common unmoved case
+        and when the current head is unreadable (degrade: post as-is rather than guess).
 
         The panel runs for minutes and the round pins `head` at dispatch, so a fix
         commit pushed while the finders run leaves the verdict verified against a head
@@ -2356,30 +2363,42 @@ class Dispatcher:
         current = str(facts.get("head") or "") if facts else ""
         if not current:
             self.telemetry.emit("stale_head", repo=repo, pr=pr, sha=head, current=None, demoted=0)
-            return findings, (
-                f"The PR's current head could not be resolved at post time — this review was "
-                f"verified against `{head[:12]}` and may not reflect later pushes."
+            return (
+                findings,
+                (
+                    f"The PR's current head could not be resolved at post time — this review was "
+                    f"verified against `{head[:12]}` and may not reflect later pushes."
+                ),
+                False,
             )
         if current == head:
-            return findings, ""  # the common case: byte-identical body, no note, no event
+            return findings, "", False  # the common case: byte-identical body, no note, no event
         delta = await self._stale_head_delta(repo, head, current)
         if delta is None:
             self.telemetry.emit(
                 "stale_head", repo=repo, pr=pr, sha=head, current=current, demoted=0, delta="unreadable"
             )
-            return findings, (
-                f"PR advanced during this round (`{head[:12]}` → `{current[:12]}`) and the delta "
-                f"could not be read — findings were verified against the older head and some may "
-                f"already be addressed."
+            return (
+                findings,
+                (
+                    f"PR advanced during this round (`{head[:12]}` → `{current[:12]}`) and the delta "
+                    f"could not be read — findings were verified against the older head and some may "
+                    f"already be addressed."
+                ),
+                True,
             )
         ranges, commits = delta
         demoted = 0
         if isinstance(findings, list):
             findings, demoted = demote_stale_findings(findings, ranges)
         self.telemetry.emit("stale_head", repo=repo, pr=pr, sha=head, current=current, commits=commits, demoted=demoted)
-        return findings, (
-            f"PR advanced {commits} commit(s) during this round (`{head[:12]}` → `{current[:12]}`); "
-            f"{demoted} finding(s) in the delta were demoted to *possibly addressed*."
+        return (
+            findings,
+            (
+                f"PR advanced {commits} commit(s) during this round (`{head[:12]}` → `{current[:12]}`); "
+                f"{demoted} finding(s) in the delta were demoted to *possibly addressed*."
+            ),
+            True,
         )
 
     async def _post_verdict(
@@ -2408,7 +2427,17 @@ class Dispatcher:
         # Immediately before posting — the last moment a mid-round push can be caught.
         # The marker keeps the PINNED head on purpose: the round ran against it, and
         # rewriting it would tell the promotion gate the verdict covers code it never saw.
-        findings, stale_note = await self._stale_head_guard(repo, pr, head, findings)
+        findings, stale_note, superseded = await self._stale_head_guard(repo, pr, head, findings)
+        if superseded:
+            # The head this round pinned is not the one that will merge (#209). A blocking
+            # CHANGES_REQUESTED here lands on the NEW head — code this panel never saw — so
+            # the verdict posts as a non-blocking comment, and the current head is left with
+            # no verdict of ours so `needs_backfill`/the sweep queue it for its own round.
+            stale_note += (
+                " This verdict is posted as a non-blocking comment against the superseded head; "
+                "the current head is queued for its own review."
+            )
+            self.telemetry.emit("superseded", repo=repo, pr=pr, sha=head, verdict=verdict)
         body = render_verdict_body(
             repo=repo,
             pr=pr,
@@ -2432,9 +2461,11 @@ class Dispatcher:
             reaffirmed_from=reaffirmed_from,
         )
         event = "COMMENT"
-        if not self.shadow and verdict == FAIL:
+        if not self.shadow and verdict == FAIL and not superseded:
             # A blocking verdict only against terminal CI (#863) — else comment now;
-            # the next push/sweep re-evaluates.
+            # the next push/sweep re-evaluates. `superseded` (#209) forces a comment
+            # regardless: a FAIL verified against a head the PR moved past must never block
+            # the new head; that head is reviewed on its own round.
             checks = await self._checks_state(repo, head)
             event = "REQUEST_CHANGES" if checks in ("green", "failed", "no-checks") else "COMMENT"
         rc, err, attempts = await self._post_review_with_retry(repo, pr, head, event, body)
@@ -3231,7 +3262,11 @@ class Dispatcher:
         `build_routers` injected a `panel_sem`, the backfill queues behind the SAME
         cross-PR bound (#96); with none injected it runs unbounded, as before.
         """
-        decision = self.chokepoint.admit(repo, pr, head)
+        # `supersede_stale`: a round in flight for a head the PR has since moved PAST must
+        # not suppress a first review of the CURRENT head (#209). The same-head guard still
+        # holds — a round already running on THIS head drops as in-flight, so a superseded
+        # round never blocks the head that will actually merge from being reviewed.
+        decision = self.chokepoint.admit(repo, pr, head, supersede_stale=True)
         if decision != "accept":
             self.telemetry.emit("drop", repo=repo, pr=pr, sha=head, reason=decision, action=BACKFILL_ACTION)
             return f"drop:{decision}"
@@ -3245,7 +3280,7 @@ class Dispatcher:
             async with slot:
                 return await self._bounded_review(repo, pr)
         finally:
-            self.chokepoint.done(repo, pr)
+            self.chokepoint.done(repo, pr, head)
 
     def _detach_backfill(self, repo: str, pr: int, head: str) -> str:
         """Start a backfill panel WITHOUT waiting for it, so the sweep pass moves on.
