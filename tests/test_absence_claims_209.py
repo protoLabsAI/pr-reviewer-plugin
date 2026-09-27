@@ -22,6 +22,7 @@ import json
 from urllib.parse import unquote
 
 from pr_reviewer.grounding import (
+    absence_kind,
     diff_truncation,
     ground_absence_claims,
     is_absence_claim,
@@ -109,14 +110,29 @@ def test_a_no_test_major_is_demoted_when_a_test_exists_in_the_tree():
 
 
 def test_an_ungroundable_absence_on_a_truncated_diff_is_nonblocking():
-    # No plausible test in the tree, but the diff was truncated — the panel did not see the
-    # whole change, so the absence cannot be established. Non-blocking with a truncation note.
+    # No name-matching test in the tree, but the diff was truncated and the alphabetically-late
+    # test file was among the DROPPED paths — the panel's view of the test suite was incomplete,
+    # so the absence cannot be established. Non-blocking with a truncation note.
     siteprobe = {**FETCH_MAJOR, "file": "pkg/siteprobe.py"}
-    out, demoted = ground_absence_claims([siteprobe], {"tests/test_site_audit.py"}, truncated=True)
+    out, demoted = ground_absence_claims(
+        [siteprobe], {"tests/test_site_audit.py"}, truncated=True, dropped_paths=["tests/test_site_audit.py"]
+    )
     assert verdict_for(out) == WARN
     assert out[0]["absence_demoted"] == "diff-truncated"
     assert demoted[0]["kind"] == "diff-truncated"
     assert "truncated" in render_absence_footnote(demoted)
+
+
+def test_a_test_absence_is_not_demoted_when_truncation_dropped_no_test_file():
+    # The diff was truncated, but only a non-test source file fell off — the panel saw every test
+    # that changed, so a "no test" claim it could not name-match in the tree still stands (finding
+    # #2: truncation elsewhere does not blanket-demote).
+    siteprobe = {**FETCH_MAJOR, "file": "pkg/siteprobe.py"}
+    out, demoted = ground_absence_claims(
+        [siteprobe], {"pkg/siteprobe.py"}, truncated=True, dropped_paths=["src/big_generated.py"]
+    )
+    assert verdict_for(out) == FAIL
+    assert demoted == [] and out[0].get("absence_demoted") is None
 
 
 def test_a_genuine_absence_still_gates():
@@ -143,6 +159,59 @@ def test_a_non_absence_finding_is_never_touched():
     }
     out, demoted = ground_absence_claims([real], {"tests/test_fetch.py"}, truncated=True)
     assert demoted == [] and out[0] == real
+
+
+# ── code-shape absence: about the file's own code, NOT refuted by a test file (review of #209 p2) ──
+
+# A real blocker/major that reads like an absence but is about the module's OWN behaviour — the
+# fetched input is trusted without validating it. The `_OTHER_ABSENCE_RE` family. A test file
+# existing says nothing about whether fetch.py validates its input.
+VALIDATION_MAJOR = {
+    "file": "pkg/fetch.py",
+    "line": 12,
+    "severity": "major",
+    "verdict": "confirmed",
+    "claim": "the fetched input is used without validation",
+    "evidence": "`data = resp.json()` is indexed directly with no bounds or type check",
+}
+
+
+def test_absence_kind_separates_the_two_families():
+    assert absence_kind(FETCH_MAJOR) == "test"
+    assert absence_kind(VALIDATION_MAJOR) == "other"
+    assert absence_kind({"claim": "missing error handling for the timeout case", "evidence": ""}) == "other"
+    assert absence_kind({"claim": "the change adds no documentation", "evidence": ""}) == "other"
+    assert absence_kind({"claim": "the module has no tests", "evidence": ""}) == "test"
+    assert absence_kind({"claim": "the retry loop never breaks", "evidence": ""}) is None
+
+
+def test_a_validation_absence_is_not_refuted_by_an_existing_test_file():
+    # finding #1: a code-shape absence must NOT be demoted just because a test file exists. A
+    # "without validation" major on fetch.py keeps gating even though tests/test_fetch.py exists.
+    out, demoted = ground_absence_claims([VALIDATION_MAJOR], {"pkg/fetch.py", "tests/test_fetch.py"}, truncated=False)
+    assert verdict_for(out) == FAIL
+    assert demoted == [] and out[0].get("absence_demoted") is None
+
+
+def test_a_code_shape_absence_on_a_visible_file_keeps_gating_despite_truncation_elsewhere():
+    # finding #2: the diff was truncated, but the faulted file was NOT among the dropped paths —
+    # the panel saw the code it quotes, so the flaw in a visible hunk still blocks.
+    out, demoted = ground_absence_claims(
+        [VALIDATION_MAJOR], {"pkg/fetch.py"}, truncated=True, dropped_paths=["src/big_generated.py"]
+    )
+    assert verdict_for(out) == FAIL
+    assert demoted == [] and out[0].get("absence_demoted") is None
+
+
+def test_a_code_shape_absence_on_a_dropped_file_is_demoted_by_truncation():
+    # The complement: when the faulted file WAS dropped, the panel could not see the code it
+    # faults, so the absence is unestablished and demoted to non-blocking.
+    out, demoted = ground_absence_claims(
+        [VALIDATION_MAJOR], {"pkg/fetch.py"}, truncated=True, dropped_paths=["pkg/fetch.py"]
+    )
+    assert verdict_for(out) == WARN
+    assert out[0]["absence_demoted"] == "diff-truncated"
+    assert demoted[0]["kind"] == "diff-truncated"
 
 
 # ── unit: diff truncation detection (r4 — the truncation itself lives in the engine) ──
@@ -174,7 +243,7 @@ def test_render_absence_footnote_is_empty_when_nothing_demoted():
 # ── end-to-end through the dispatcher ─────────────────────────────────────────
 
 
-def absence_report(file, claim, severity="major"):
+def absence_report(file, claim, severity="major", evidence="There is no test for this module."):
     return (
         "<!-- brief -->\nBrief.\n<!-- /brief -->\n\n```json\n"
         + json.dumps(
@@ -185,7 +254,7 @@ def absence_report(file, claim, severity="major"):
                     "severity": severity,
                     "category": "testing",
                     "claim": claim,
-                    "evidence": "There is no test for this module.",
+                    "evidence": evidence,
                     "verdict": "confirmed",
                 }
             ]
@@ -283,6 +352,34 @@ async def test_a_genuine_absence_still_requests_changes(tmp_path):
 
     async def runner(name, inputs):
         return {"output": absence_report("pkg/fetch.py", "pkg/fetch.py is added with no test file."), "failed": []}
+
+    d = make(tmp_path, cfg={"shadow_mode": False}, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "reviewed:FAIL"
+    body = gh.reviews_posted[0]["body"]
+    assert gh.posted[0]["event"] == "REQUEST_CHANGES"
+    assert "downgraded to **uncertain**" not in body
+
+
+async def test_code_shape_absence_still_requests_changes_when_a_test_exists(tmp_path):
+    # finding #1, end-to-end: "used without validation" on fetch.py is about the file's own code,
+    # not its tests — a plausible test file existing must not demote it. The major still gates.
+    gh = AbsenceGH(
+        tree={"pkg/fetch.py", "tests/test_fetch.py"},
+        file_patches={"pkg/fetch.py": "diff" * 5},
+        checks=[{"status": "completed", "conclusion": "failure"}],  # so a FAIL arms REQUEST_CHANGES
+    )
+
+    async def runner(name, inputs):
+        # Prose evidence with no checkable code quote, so the #25 quote-grounding pass fails open
+        # and the finding reaches absence-grounding unchanged — where it must NOT be demoted.
+        return {
+            "output": absence_report(
+                "pkg/fetch.py",
+                "the fetched input is used without validation.",
+                evidence="The response is trusted and indexed directly, with no bounds check on the payload.",
+            ),
+            "failed": [],
+        }
 
     d = make(tmp_path, cfg={"shadow_mode": False}, gh=gh, runner=runner)
     assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "reviewed:FAIL"

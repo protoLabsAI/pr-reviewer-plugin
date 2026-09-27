@@ -2141,12 +2141,14 @@ class Dispatcher:
                 "source_unavailable", repo=repo, pr=pr, sha=head, round=round_number, findings=unreadable
             )
         # Absence grounding (issue #209): a blocking "no test file" / "missing docs" /
-        # "exercises none of it" is checked against the head TREE and against whether the diff
-        # the panel read was truncated. A plausible test in the tree refutes it; a truncated
-        # diff means the panel never saw the whole change, so it could not establish the
-        # absence — either way it is demoted to `uncertain` and cannot gate. A genuine,
-        # established absence still stands. Only fetched when a GATING absence claim survived
-        # grounding, so the tree/size reads cost nothing on an ordinary review.
+        # "exercises none of it" is checked against the head TREE and against what the panel's
+        # (possibly truncated) diff dropped. A test/coverage absence is refuted by a plausible
+        # test in the tree, or left unestablished when truncation dropped a test file; a
+        # code-shape absence ("without validation", "not handled") is demoted only when its own
+        # file was among the dropped paths — a flaw the panel quoted from a file it fully saw
+        # keeps gating even on a truncated diff. A genuine, established absence still stands. Only
+        # fetched when a GATING absence claim survived grounding, so the tree/size reads cost
+        # nothing on an ordinary review.
         absence_demoted: list[dict] = []
         diff_truncated: bool | None = None
         if self.grounding_enabled and any(
@@ -2154,7 +2156,9 @@ class Dispatcher:
         ):
             tree = await self._head_tree(repo, head)
             diff_truncated, dropped_paths = await self._diff_truncation(repo, pr)
-            findings, absence_demoted = ground_absence_claims(findings, tree, truncated=diff_truncated)
+            findings, absence_demoted = ground_absence_claims(
+                findings, tree, truncated=diff_truncated, dropped_paths=dropped_paths
+            )
             if absence_demoted:
                 self.telemetry.emit(
                     "absence_grounded",

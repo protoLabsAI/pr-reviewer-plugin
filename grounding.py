@@ -383,26 +383,47 @@ def render_unreadable_footnote(unreadable: list[dict]) -> str:
 # claim, because there was nothing in the (truncated) diff to refute it — the same
 # discounting-evidence-already-absent failure #25 and #109 are about, one level up.
 #
-# Two fail-open demotions, mirroring `apply_grounding`: an absence claim positively refuted by
-# the head TREE (a plausible test file exists), and an absence claim on a TRUNCATED diff that
-# cannot be positively grounded (the panel did not see the whole change, so it could not
-# establish the absence). A GENUINE absence — no plausible test in a tree we could read, on a
-# diff that was not truncated — is left to stand exactly as the panel raised it.
+# Demotion is fail-open and mirrors `apply_grounding`, but grounds the two absence FAMILIES
+# differently (see `absence_kind`). A TEST/coverage absence ("no test file", "untested") is
+# refuted by a plausible test in the head TREE; failing that, on a TRUNCATED diff whose dropped
+# paths included a test file, it is left unestablished, because the panel's view of the test
+# suite was incomplete. A code-shape absence ("used without validation", "missing error
+# handling", "no docstring") is about the FILE'S OWN code, so a test file NEVER refutes it — it
+# is unestablished only when truncation dropped THE FILE IT FAULTS, so a real flaw the panel
+# quoted from a file it fully saw keeps gating even on a truncated diff. A GENUINE, established
+# absence — a tree we could read with no plausible test, on a diff that showed the relevant
+# files — stands exactly as the panel raised it.
 
 # The negation-plus-target phrasings the panel uses for an absence. The negation carries the
-# weight; the target is deliberately broad (tests / docs / handling / coverage) so a "missing
-# error handling" or "exercises none of it" reads the same as "no test file". Anchored on a
-# negation so an ordinary mention ("the test asserts X", "adds handling for Y") does not match.
-_ABSENCE_TARGET = (
-    r"(?:tests?|test[\s_.-]*files?|test[\s_.-]*cases?|test[\s_.-]*coverage|coverage|"
-    r"documentation|docs?|docstrings?|handling|validation)"
-)
-_ABSENCE_RE = re.compile(
-    r"\b(?:no|missing|without|lacks?|lacking|absent|zero)\b\s+(?:[\w'\"()./,-]+\s+){0,5}?" + _ABSENCE_TARGET + r"\b"
-    r"|\bun(?:tested|documented|covered|validated)\b"
-    r"|\bnot\b(?:\s+\w+){0,3}?\s+(?:tested|covered|documented|handled|exercised|validated)\b"
+# weight; an ordinary mention ("the test asserts X", "adds handling for Y") does not match.
+#
+# Two FAMILIES, kept apart deliberately (the 2026-09 review of #209 part 2). A TEST/coverage
+# absence — "no test file", "untested", "exercises none of it" — is groundable against the head
+# TREE: a plausible test file existing refutes it. A code-shape absence — "used without
+# validation", "missing error handling", "no docstring" — is about the FILE'S OWN code, and a
+# test file existing says NOTHING about it. Grounding the second family against
+# `plausible_test_in_tree` demoted real "without validation" / "not handled" majors on a module
+# merely because some test file existed, and mislabelled them "a plausible test exists" — so the
+# two families match separately and ONLY the test family is ever refuted by the tree.
+_TEST_ABSENCE_TARGET = r"(?:tests?|test[\s_.-]*files?|test[\s_.-]*cases?|test[\s_.-]*coverage|coverage)"
+_TEST_ABSENCE_RE = re.compile(
+    r"\b(?:no|missing|without|lacks?|lacking|absent|zero)\b\s+(?:[\w'\"()./,-]+\s+){0,5}?"
+    + _TEST_ABSENCE_TARGET
+    + r"\b"
+    r"|\bun(?:tested|covered)\b"
+    r"|\bnot\b(?:\s+\w+){0,3}?\s+(?:tested|covered|exercised)\b"
     r"|\b(?:exercise[sd]?|cover[sd]?|test[sd]?)\s+none\b"
-    r"|\bnone\s+of\s+(?:it|them|this|these|the\s+\w+)\b(?:\s+\w+){0,4}?\s+(?:tested|covered|exercised|documented)\b",
+    r"|\bnone\s+of\s+(?:it|them|this|these|the\s+\w+)\b(?:\s+\w+){0,4}?\s+(?:tested|covered|exercised)\b",
+    re.IGNORECASE,
+)
+_OTHER_ABSENCE_TARGET = r"(?:documentation|docs?|docstrings?|handling|validation)"
+_OTHER_ABSENCE_RE = re.compile(
+    r"\b(?:no|missing|without|lacks?|lacking|absent|zero)\b\s+(?:[\w'\"()./,-]+\s+){0,5}?"
+    + _OTHER_ABSENCE_TARGET
+    + r"\b"
+    r"|\bun(?:documented|validated)\b"
+    r"|\bnot\b(?:\s+\w+){0,3}?\s+(?:documented|handled|validated)\b"
+    r"|\bnone\s+of\s+(?:it|them|this|these|the\s+\w+)\b(?:\s+\w+){0,4}?\s+documented\b",
     re.IGNORECASE,
 )
 
@@ -412,11 +433,25 @@ _ABSENCE_RE = re.compile(
 _TEST_DIR_RE = re.compile(r"(?:^|/)(?:tests?|__tests__|specs?)(?:/|$)", re.IGNORECASE)
 
 
+def absence_kind(finding: dict) -> str | None:
+    """`"test"` (a test/coverage absence, groundable against the head tree), `"other"` (a
+    code-shape absence — missing validation/handling/docs, groundable only against whether the
+    faulted file itself was seen), or `None` (not an absence claim). Read from `claim` +
+    `evidence`, the same blob `quoted_snippets` grounds. The test family wins when a claim reads
+    as both, so a "no test file" that also mentions handling is still tree-groundable."""
+    blob = f"{finding.get('claim') or ''}\n{finding.get('evidence') or ''}"
+    if _TEST_ABSENCE_RE.search(blob):
+        return "test"
+    if _OTHER_ABSENCE_RE.search(blob):
+        return "other"
+    return None
+
+
 def is_absence_claim(finding: dict) -> bool:
     """Does this finding assert that something ISN'T there (no test, missing docs, unhandled
-    case)? Read from `claim` + `evidence`, the same blob `quoted_snippets` grounds."""
-    blob = f"{finding.get('claim') or ''}\n{finding.get('evidence') or ''}"
-    return bool(_ABSENCE_RE.search(blob))
+    case)? True for either absence family — see `absence_kind` for the distinction that decides
+    how each is grounded. Read from `claim` + `evidence`, the same blob `quoted_snippets` grounds."""
+    return absence_kind(finding) is not None
 
 
 def _module_stem(path: str) -> str:
@@ -471,39 +506,60 @@ ABSENCE_TRUNCATED_NOTE = (
 
 
 def ground_absence_claims(
-    findings: list[dict], tree: set[str] | None, *, truncated: bool
+    findings: list[dict],
+    tree: set[str] | None,
+    *,
+    truncated: bool,
+    dropped_paths: list[str] | None = None,
 ) -> tuple[list[dict], list[dict]]:
-    """(findings, demoted). Demote an absence claim that the head TREE refutes (a plausible
-    test exists) or that a TRUNCATED diff leaves unestablished. Only a blocker/major is
-    touched — a minor/nit never gates — and a genuine, established absence stands untouched.
+    """(findings, demoted). Demote a blocking/major absence claim that grounding refutes or
+    leaves unestablished. Only a blocker/major is touched — a minor/nit never gates — and a
+    genuine, established absence stands untouched. Grounds the two families separately (see
+    `absence_kind`):
+
+    * a TEST/coverage absence is refuted by a plausible test in the head `tree`; failing that, if
+      the diff was TRUNCATED and a test file was among the `dropped_paths` (so the panel's view of
+      the test suite was incomplete), it is left unestablished. Either way it is demoted;
+    * a code-shape absence (missing validation/handling/docs) is about the FILE'S OWN code, so a
+      test file NEVER refutes it. It is demoted only when the diff was truncated AND the finding's
+      own file was among the `dropped_paths` — i.e. the panel did not see the code it faults. A
+      code-shape absence on a file the panel fully saw keeps gating, even on a truncated diff.
 
     Demotion sets `verdict: uncertain` (which `verdict_for` refuses to turn into a FAIL) and
-    `ungrounded: True` (so the prior-finding ledger excludes it, exactly like
-    `apply_grounding`); the finding still posts and still reads for a human to judge."""
+    `ungrounded: True` (so the prior-finding ledger excludes it, exactly like `apply_grounding`);
+    the finding still posts and still reads for a human to judge."""
+    dropped = set(dropped_paths or [])
+    dropped_a_test = truncated and any(_is_test_path(p) for p in dropped)
     out: list[dict] = []
     demoted: list[dict] = []
     for finding in findings:
         sev = str(finding.get("severity") or "").lower()
-        if sev not in ("blocker", "major") or not is_absence_claim(finding):
+        kind = absence_kind(finding)
+        if sev not in ("blocker", "major") or kind is None:
             out.append(finding)
             continue
         file = str(finding.get("file") or "")
-        match = plausible_test_in_tree(file, tree)
-        if match:
-            kind, reason = "test-exists", ABSENCE_TEST_EXISTS_NOTE
-        elif truncated:
-            kind, reason = "diff-truncated", ABSENCE_TRUNCATED_NOTE
-        else:
-            out.append(finding)  # no plausible test in a tree we read, diff intact → it stands
+        disposition = reason = detail = None
+        if kind == "test":
+            match = plausible_test_in_tree(file, tree)
+            if match:
+                disposition, reason, detail = "test-exists", ABSENCE_TEST_EXISTS_NOTE, match
+            elif truncated and (dropped_a_test or file in dropped):
+                disposition, reason = "diff-truncated", ABSENCE_TRUNCATED_NOTE
+                detail = plausible_test_in_tree(file, dropped) or file
+        elif truncated and file in dropped:  # code-shape: only unestablished if the file was unseen
+            disposition, reason, detail = "diff-truncated", ABSENCE_TRUNCATED_NOTE, file
+        if disposition is None:
+            out.append(finding)  # positively established (or established enough) → it stands
             continue
         annotated = dict(finding)
         annotated["verdict"] = "uncertain"
         annotated["ungrounded"] = True
-        annotated["absence_demoted"] = kind
+        annotated["absence_demoted"] = disposition
         note = str(annotated.get("note") or "").strip()
         annotated["note"] = f"{note} — {reason}" if note else reason
         out.append(annotated)
-        demoted.append({"file": file, "severity": sev, "kind": kind, "detail": match or ""})
+        demoted.append({"file": file, "severity": sev, "kind": disposition, "detail": detail or ""})
     return out, demoted
 
 
