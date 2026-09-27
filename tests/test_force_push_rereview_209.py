@@ -19,12 +19,15 @@ Three seams close it:
 
 from __future__ import annotations
 
+import asyncio
+
 from pr_reviewer.chokepoint import DROP_IN_FLIGHT, Chokepoint
 from pr_reviewer.verdicts import parse_verdict_marker
 
 from tests.test_dispatch import (
     HEAD,
     OLD_HEAD,
+    REPORT,
     MidRoundPushGH,
     RoutedGH,
     _telemetry_events,
@@ -161,6 +164,31 @@ async def test_sweep_still_holds_off_when_a_round_for_the_current_head_is_in_fli
 
     assert gh.reviews_posted == []  # no second panel on the head already under review
     assert [e for e in _telemetry_events(tmp_path, "drop") if e.get("reason") == "in-flight"]
+
+
+async def test_a_summon_in_flight_blocks_a_backfill_of_the_same_head(tmp_path):
+    # The `supersede_stale` backfill only tolerates an in-flight round at a DIFFERENT sha.
+    # A summon holds its slot under the head it actually reviews (resolved server-side), so a
+    # backfill of that SAME head still drops as in-flight — two panels on one head is exactly
+    # what the summon's in-flight guard forbids. (Regression: a `summon-{pr}` placeholder key
+    # matched no real head, so the backfill read the summon's head as superseded and ran.)
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def runner(name, inputs):
+        started.set()
+        await release.wait()
+        return {"output": REPORT, "failed": []}
+
+    gh = RoutedGH(pr_facts=facts(head=HEAD), reviews=[], checks=GREEN)
+    d = make(tmp_path, gh=gh, runner=runner)
+
+    summon = asyncio.create_task(d.handle_summon("o/r", 1, "operator"))
+    await asyncio.wait_for(started.wait(), 3)  # the summon's panel is live — its slot is held at HEAD
+
+    assert (await d.backfill_review("o/r", 1, HEAD)) == "drop:in-flight"
+
+    release.set()
+    assert (await asyncio.wait_for(summon, 3)) == "reviewed:FAIL"
 
 
 # ── r3: the current head's round concludes its own protoReview check with its verdict ──

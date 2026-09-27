@@ -1596,7 +1596,17 @@ class Dispatcher:
         if bad_repo(repo) or (self.repos and repo not in self.repos):
             self.telemetry.emit("drop", repo=repo, pr=pr, reason="unlisted-repo", summon=actor)
             return "drop:unlisted-repo"
-        decision = self.chokepoint.admit(repo, pr, f"summon-{pr}", bypass_cooldown=True)
+        # Key the in-flight slot by the head the summon actually reviews, resolved
+        # server-side (ADR 0078 — never a model ref). The slot map is keyed by commit now
+        # (#209): a placeholder like `summon-{pr}` matches no real head, so a `supersede_stale`
+        # backfill would read the summon's head as SUPERSEDED and run a second panel on it —
+        # which the in-flight guard exists to forbid. `_review` re-resolves the head for the
+        # panel; the same webhook-vs-resolved skew already lives in `handle_pr_event`. Falls
+        # back to the sentinel only when the head is unreadable, in which case `_review` drops
+        # on eligibility and no real panel runs against a resolvable head anyway.
+        facts = await self._pr_facts(repo, pr)
+        slot_sha = (str(facts.get("head") or "") if facts else "") or f"summon-{pr}"
+        decision = self.chokepoint.admit(repo, pr, slot_sha, bypass_cooldown=True)
         if decision != "accept":
             self.telemetry.emit("drop", repo=repo, pr=pr, reason=decision, summon=actor)
             return f"drop:{decision}"
@@ -1607,7 +1617,7 @@ class Dispatcher:
         try:
             return await self._bounded_review(repo, pr, force=True)
         finally:
-            self.chokepoint.done(repo, pr, f"summon-{pr}")
+            self.chokepoint.done(repo, pr, slot_sha)
 
     async def _review(self, repo: str, pr: int, *, force: bool = False, push_triggered: bool = False) -> str:
         started = time.monotonic()
