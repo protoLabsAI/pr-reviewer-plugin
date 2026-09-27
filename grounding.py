@@ -366,3 +366,188 @@ def render_unreadable_footnote(unreadable: list[dict]) -> str:
         f"and the finding was neither confirmed nor refuted on its merits (issue #109). A human should confirm "
         f"it against the PR head._\n{lines}"
     )
+
+
+# ── absence claims: an "it isn't there" finding is grounded against the TREE (issue #209) ──
+#
+# The fabricated-quote guard above (issue #25) checks a POSITIVE claim — "the file contains
+# X" — against the file's own text. An ABSENCE claim is the opposite shape — "there is no
+# test for this module", "missing docs", "the PR exercises none of it" — and it cannot be
+# grounded the same way: the code it says is missing is, by definition, not in the diff.
+#
+# The 2026-09 false positives (design-system-plugin#19): two blocking majors — "fetch.py …
+# with no test file" and "siteprobe.py … has no test file" — when `tests/test_fetch.py` and
+# `tests/test_site_audit.py` existed at the head and CI ran them. The 309 KB diff overran the
+# panel's ~200K-char budget and the truncation dropped the alphabetically-late `tests/` files,
+# so the panel never saw them and asserted their absence. The verify pass then CONFIRMED the
+# claim, because there was nothing in the (truncated) diff to refute it — the same
+# discounting-evidence-already-absent failure #25 and #109 are about, one level up.
+#
+# Two fail-open demotions, mirroring `apply_grounding`: an absence claim positively refuted by
+# the head TREE (a plausible test file exists), and an absence claim on a TRUNCATED diff that
+# cannot be positively grounded (the panel did not see the whole change, so it could not
+# establish the absence). A GENUINE absence — no plausible test in a tree we could read, on a
+# diff that was not truncated — is left to stand exactly as the panel raised it.
+
+# The negation-plus-target phrasings the panel uses for an absence. The negation carries the
+# weight; the target is deliberately broad (tests / docs / handling / coverage) so a "missing
+# error handling" or "exercises none of it" reads the same as "no test file". Anchored on a
+# negation so an ordinary mention ("the test asserts X", "adds handling for Y") does not match.
+_ABSENCE_TARGET = (
+    r"(?:tests?|test[\s_.-]*files?|test[\s_.-]*cases?|test[\s_.-]*coverage|coverage|"
+    r"documentation|docs?|docstrings?|handling|validation)"
+)
+_ABSENCE_RE = re.compile(
+    r"\b(?:no|missing|without|lacks?|lacking|absent|zero)\b\s+(?:[\w'\"()./,-]+\s+){0,5}?" + _ABSENCE_TARGET + r"\b"
+    r"|\bun(?:tested|documented|covered|validated)\b"
+    r"|\bnot\b(?:\s+\w+){0,3}?\s+(?:tested|covered|documented|handled|exercised|validated)\b"
+    r"|\b(?:exercise[sd]?|cover[sd]?|test[sd]?)\s+none\b"
+    r"|\bnone\s+of\s+(?:it|them|this|these|the\s+\w+)\b(?:\s+\w+){0,4}?\s+(?:tested|covered|exercised|documented)\b",
+    re.IGNORECASE,
+)
+
+# What a test file looks like across ecosystems — a `tests/`/`__tests__/`/`spec/` directory,
+# or a filename carrying a `test`/`spec` affix. Used both to recognise a test path in the tree
+# and to refuse an absence-of-test claim raised against a file that IS itself a test.
+_TEST_DIR_RE = re.compile(r"(?:^|/)(?:tests?|__tests__|specs?)(?:/|$)", re.IGNORECASE)
+
+
+def is_absence_claim(finding: dict) -> bool:
+    """Does this finding assert that something ISN'T there (no test, missing docs, unhandled
+    case)? Read from `claim` + `evidence`, the same blob `quoted_snippets` grounds."""
+    blob = f"{finding.get('claim') or ''}\n{finding.get('evidence') or ''}"
+    return bool(_ABSENCE_RE.search(blob))
+
+
+def _module_stem(path: str) -> str:
+    """`pkg/sub/fetch.py` → `fetch`: the filename with its directory and last extension gone."""
+    name = path.rsplit("/", 1)[-1]
+    return name.rsplit(".", 1)[0] if "." in name else name
+
+
+def _is_test_path(path: str) -> bool:
+    base = path.rsplit("/", 1)[-1].lower()
+    if _TEST_DIR_RE.search(path):
+        return True
+    return bool(base.startswith(("test_", "test.")) or re.search(r"[._](test|spec)\.", base))
+
+
+def _test_subject(path: str) -> str:
+    """The module a test path appears to cover: `test_fetch.py` → `fetch`, `fetch_test.go` →
+    `fetch`, `Fetch.test.tsx` → `fetch`. Filename-convention only (the tree gives paths, not
+    contents), so it is deliberately conservative: an exact subject match, never a substring."""
+    base = path.rsplit("/", 1)[-1].lower()
+    stem = re.sub(r"\.(py|js|jsx|ts|tsx|mjs|cjs|go|rb|java|rs|php|cs|kt|swift)$", "", base)
+    stem = re.sub(r"^test[_.]", "", stem)
+    stem = re.sub(r"[_.](test|spec)$", "", stem)
+    return stem
+
+
+def plausible_test_in_tree(file: str, tree: set[str] | None) -> str | None:
+    """A path in the head `tree` that plausibly TESTS `file`, or None. Matches
+    `tests/test_<stem>.py`, `<stem>_test.*`, `<stem>.test.*`, `<stem>.spec.*` and the like by
+    filename convention — an exact subject match, so a genuine absence is not masked by a
+    same-named test for a different module. `None` tree (unreadable) grounds nothing."""
+    if not tree:
+        return None
+    stem = _module_stem(file).lower()
+    if not stem or _is_test_path(file):
+        return None  # an absence-of-test claim about a test file itself is not groundable here
+    for path in tree:
+        if _is_test_path(path) and _test_subject(path) == stem:
+            return path
+    return None
+
+
+ABSENCE_TEST_EXISTS_NOTE = (
+    "a plausible test for this module exists at the reviewed head — the absence claim is not "
+    "grounded, downgraded to uncertain and cannot gate a merge (issue #209)"
+)
+ABSENCE_TRUNCATED_NOTE = (
+    "the reviewed diff was truncated to the panel's char budget, so the whole change was not "
+    "seen and an absence cannot be established — downgraded to uncertain and cannot gate a "
+    "merge (issue #209)"
+)
+
+
+def ground_absence_claims(
+    findings: list[dict], tree: set[str] | None, *, truncated: bool
+) -> tuple[list[dict], list[dict]]:
+    """(findings, demoted). Demote an absence claim that the head TREE refutes (a plausible
+    test exists) or that a TRUNCATED diff leaves unestablished. Only a blocker/major is
+    touched — a minor/nit never gates — and a genuine, established absence stands untouched.
+
+    Demotion sets `verdict: uncertain` (which `verdict_for` refuses to turn into a FAIL) and
+    `ungrounded: True` (so the prior-finding ledger excludes it, exactly like
+    `apply_grounding`); the finding still posts and still reads for a human to judge."""
+    out: list[dict] = []
+    demoted: list[dict] = []
+    for finding in findings:
+        sev = str(finding.get("severity") or "").lower()
+        if sev not in ("blocker", "major") or not is_absence_claim(finding):
+            out.append(finding)
+            continue
+        file = str(finding.get("file") or "")
+        match = plausible_test_in_tree(file, tree)
+        if match:
+            kind, reason = "test-exists", ABSENCE_TEST_EXISTS_NOTE
+        elif truncated:
+            kind, reason = "diff-truncated", ABSENCE_TRUNCATED_NOTE
+        else:
+            out.append(finding)  # no plausible test in a tree we read, diff intact → it stands
+            continue
+        annotated = dict(finding)
+        annotated["verdict"] = "uncertain"
+        annotated["ungrounded"] = True
+        annotated["absence_demoted"] = kind
+        note = str(annotated.get("note") or "").strip()
+        annotated["note"] = f"{note} — {reason}" if note else reason
+        out.append(annotated)
+        demoted.append({"file": file, "severity": sev, "kind": kind, "detail": match or ""})
+    return out, demoted
+
+
+def diff_truncation(diff_sizes: list[tuple[str, int]], budget: int) -> tuple[bool, list[str]]:
+    """Replicate the review engine's char-budget truncation to learn what the panel did NOT
+    see: (truncated?, dropped paths). The engine concatenates per-file patches in path order
+    and trims the running total to `budget`, so alphabetically-late files fall off a large diff
+    first — and `tests/` sorts near the end, which is how a real test file got dropped and its
+    absence then asserted (issue #209). Once the budget is hit the drop LATCHES: every later
+    path is dropped even if it would have fit, matching a single running concatenation. A
+    non-positive budget means no limit (never truncated)."""
+    if budget <= 0:
+        return False, []
+    kept = 0
+    truncated = False
+    dropped: list[str] = []
+    for path, size in sorted(diff_sizes):
+        if truncated or kept + max(0, size) > budget:
+            truncated = True
+            dropped.append(path)
+        else:
+            kept += max(0, size)
+    return truncated, dropped
+
+
+def render_absence_footnote(demoted: list[dict]) -> str:
+    """The posted-body note for demoted absence claims — the verdict must never silently
+    disagree with the report, the same contract `render_grounding_footnote` keeps. A dedicated
+    renderer rather than that one because its wording ("quoted evidence not found") describes a
+    fabricated positive quote, which would misdescribe an absence demotion."""
+    if not demoted:
+        return ""
+    lines = []
+    for d in demoted:
+        if d.get("kind") == "test-exists":
+            detail = d.get("detail") or ""
+            why = f"a plausible test exists at this head{f': `{detail}`' if detail else ''}"
+        else:
+            why = "the reviewed diff was truncated to the panel's char budget — the whole change was not seen"
+        lines.append(f"- `{d['file'] or '(no file)'}` ({d['severity'] or '?'}) — {why}")
+    body = "\n".join(lines)
+    return (
+        f"\n\n---\n_{len(demoted)} absence finding(s) (“no test” / “missing” / “exercises none”) "
+        f"downgraded to **uncertain**: an absence cannot be established against a source the panel "
+        f"did not fully see. A finding that cannot be grounded does not gate a merge (issue #209) — "
+        f"it still stands for a human to judge._\n{body}"
+    )

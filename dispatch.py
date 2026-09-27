@@ -39,7 +39,11 @@ from .grounding import (
     UNREADABLE,
     apply_grounding,
     correct_line_numbers,
+    diff_truncation,
+    ground_absence_claims,
     ground_finding,
+    is_absence_claim,
+    render_absence_footnote,
     render_grounding_footnote,
     render_unreadable_footnote,
 )
@@ -169,6 +173,13 @@ STATUS_LINE_RECIPES = frozenset({"code-review-structural"})
 # Compare calls one round may spend re-proving carried findings against the heads they
 # were raised at (`_since_ranges`). Carried findings of one PR share a handful of heads.
 SINCE_RANGES_LIMIT = 4
+
+# The review panel's default per-review diff char budget (issue #209). The workflow engine
+# trims the base↔head diff to this before the finders read it; a 309 KB diff over this budget
+# dropped the alphabetically-late `tests/` files, and their absence was then asserted as a
+# blocking "no test file" major. Used only to DETECT that the panel's diff was truncated so an
+# ungroundable absence claim never gates — the truncation itself lives in the engine.
+DIFF_CHAR_BUDGET = 200_000
 
 
 def ineligible_reason(facts: dict | None) -> str | None:
@@ -851,6 +862,19 @@ class Dispatcher:
         )
 
     @property
+    def diff_char_budget(self) -> int:
+        """The review panel's per-review diff char budget — the size past which the workflow
+        engine truncates the base↔head diff (issue #209). Read here only to detect that the
+        panel's diff WAS truncated; the truncation itself lives in the engine. Operator-tunable
+        so this tracks the deployment's real budget; non-positive disables the check."""
+        cfg = self.cfg
+        return (
+            int(cfg["diff_char_budget"])
+            if "diff_char_budget" in cfg
+            else _env_int("PR_REVIEWER_DIFF_CHAR_BUDGET", DIFF_CHAR_BUDGET)
+        )
+
+    @property
     def max_rounds(self) -> int:
         """Maximum push-triggered panel reviews before the cap suppresses further pushes.
         Zero disables the cap."""
@@ -1359,6 +1383,57 @@ class Dispatcher:
             combined: str | object = f"{blob}\n{patches.get(file, '')}" if read_ok else UNREADABLE
             sources[file] = (blob, combined)
         return sources
+
+    async def _head_tree(self, repo: str, head: str) -> set[str] | None:
+        """The blob paths in the head commit's tree, or None (unreadable). Read PINNED to the
+        resolved head SHA (never a model ref, ADR 0078) via its tree SHA, in ONE recursive
+        read — immune to the `/pulls/{n}/files` 3,000-file truncation. Grounds an absence claim
+        against what actually exists at head (issue #209).
+
+        Fails OPEN to None: a tree we could not read grounds NO absence claim, so a genuine
+        finding is never silently demoted for a read we couldn't make."""
+        tree_sha = await self._commit_tree(repo, head)
+        if tree_sha is None:
+            return None
+        rc, out, _err = await self._run_gh(
+            [
+                "api",
+                f"repos/{repo}/git/trees/{quote(tree_sha, safe='')}?recursive=1",
+                "--jq",
+                '.tree[]? | select(.type == "blob") | .path',
+            ]
+        )
+        if rc != 0:
+            return None
+        paths = {line.strip() for line in out.splitlines() if line.strip()}
+        return paths or None
+
+    async def _diff_truncation(self, repo: str, pr: int) -> tuple[bool, list[str]]:
+        """Did the reviewed diff exceed the panel's char budget, and which paths did that drop?
+
+        The truncation itself lives in the protoAgent workflow engine (the recipe fetches
+        base↔head and trims it to `diff_char_budget`); this replicates the same path-ordered
+        budget against the PR's own per-file patch sizes so a round KNOWS what the panel could
+        not see. Alphabetically-late files (notably `tests/`) fall off a large diff first
+        (issue #209). Fails OPEN to (False, []): an unreadable file list claims no truncation,
+        so an absence claim is judged on the tree alone rather than demoted on a guess."""
+        rc, out, _err = await self._run_gh(
+            [
+                "api",
+                f"repos/{repo}/pulls/{pr}/files",
+                "--paginate",
+                "--jq",
+                '.[] | {f: .filename, n: ((.patch // "") | length)}',
+            ]
+        )
+        if rc != 0:
+            return False, []
+        sizes = [
+            (str(row["f"]), int(row.get("n") or 0))
+            for row in (gh_json_rows(out) or [])
+            if isinstance(row, dict) and row.get("f")
+        ]
+        return diff_truncation(sizes, self.diff_char_budget)
 
     async def _clear_by_evidence(
         self,
@@ -2065,6 +2140,32 @@ class Dispatcher:
             self.telemetry.emit(
                 "source_unavailable", repo=repo, pr=pr, sha=head, round=round_number, findings=unreadable
             )
+        # Absence grounding (issue #209): a blocking "no test file" / "missing docs" /
+        # "exercises none of it" is checked against the head TREE and against whether the diff
+        # the panel read was truncated. A plausible test in the tree refutes it; a truncated
+        # diff means the panel never saw the whole change, so it could not establish the
+        # absence — either way it is demoted to `uncertain` and cannot gate. A genuine,
+        # established absence still stands. Only fetched when a GATING absence claim survived
+        # grounding, so the tree/size reads cost nothing on an ordinary review.
+        absence_demoted: list[dict] = []
+        diff_truncated: bool | None = None
+        if self.grounding_enabled and any(
+            is_absence_claim(f) and str(f.get("severity") or "").lower() in ("blocker", "major") for f in findings
+        ):
+            tree = await self._head_tree(repo, head)
+            diff_truncated, dropped_paths = await self._diff_truncation(repo, pr)
+            findings, absence_demoted = ground_absence_claims(findings, tree, truncated=diff_truncated)
+            if absence_demoted:
+                self.telemetry.emit(
+                    "absence_grounded",
+                    repo=repo,
+                    pr=pr,
+                    sha=head,
+                    round=round_number,
+                    diff_truncated=diff_truncated or None,
+                    dropped_paths=dropped_paths[:20] or None,
+                    demoted=absence_demoted,
+                )
         verdict = verdict_for(findings)
         # Convergence (issue #23) sits AFTER the pure mapping, never inside it: ADR
         # 0078 C's rule is that findings decide the verdict, and that still holds —
@@ -2141,7 +2242,10 @@ class Dispatcher:
         finding_verdict = verdict
         verdict = coverage_verdict(verdict, gaps)
         trailer = (
-            render_notes_section(notes) + render_grounding_footnote(ungrounded) + render_unreadable_footnote(unreadable)
+            render_notes_section(notes)
+            + render_grounding_footnote(ungrounded)
+            + render_unreadable_footnote(unreadable)
+            + render_absence_footnote(absence_demoted)
         )
         if degraded:
             trailer += render_degraded_note(degraded)
@@ -2243,6 +2347,11 @@ class Dispatcher:
             grounding_checked=grounding_checked,
             grounding_downgraded=len(ungrounded),
             grounding_unreadable=len(unreadable),
+            # Absence grounding (issue #209): how many blocking "no test"/"missing" claims were
+            # demoted, and whether the panel's diff was truncated past the char budget. `None`
+            # when no gating absence claim was raised, so the two reads were never spent.
+            absence_demoted=len(absence_demoted) or None,
+            diff_truncated=diff_truncated,
             dispositions=len(dispositions),
             unaccounted=len(unaccounted),
             latency_s=round(elapsed, 1),
