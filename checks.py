@@ -41,6 +41,7 @@ without a GitHub.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 from .approve import (
@@ -61,6 +62,7 @@ from .verdicts import FAIL
 # "Expected" forever), so it is a constant, not config.
 CHECK_NAME = "QA panel"
 
+QUEUED = "queued"
 IN_PROGRESS = "in_progress"
 COMPLETED = "completed"
 SUCCESS = "success"
@@ -204,6 +206,40 @@ def check_for(
         None,
         "Not cleared yet",
         f"The panel has not cleared this head ({decision}).",
+    )
+
+
+def queued_run(ahead: int, eta_s: float | None) -> CheckRun:
+    """What the check says while this head WAITS for a panel slot (issue #209).
+
+    Before this, a queued head showed NOTHING on GitHub — `Review at head` read "no QA panel
+    verdict for <head>", so an operator could not tell a queued review from a dead one. This
+    posts as GitHub check-status `queued` (not `in_progress`): the panel has not started, it
+    is parked behind others.
+
+    `ahead` is how many panels are in front of this one in line for a slot. We compute it at
+    the call site as *(queue position − 1) + the panels currently running* — every panel that
+    must free or take a slot before this one starts. That reads truer than the raw queue
+    position once more than one panel runs at a time (a position-1 waiter behind two running
+    panels is "behind 2", not "behind 1").
+
+    `eta_s` is PanelQueue's estimated seconds-until-start (`eta_start_s`), rounded UP to whole
+    minutes; it is omitted when there is no duration data yet to estimate from.
+
+    Concluded by nothing here: once the slot is acquired the normal in_progress/completed
+    flow (`check_for`) takes over on the SAME check run and PATCHes it forward.
+    """
+    n = max(0, int(ahead))
+    minutes = math.ceil(eta_s / 60) if (eta_s is not None and eta_s > 0) else None
+    eta_title = f" (ETA ~{minutes} min)" if minutes else ""
+    eta_summary = f" It should start in about {minutes} min." if minutes else ""
+    return CheckRun(
+        QUEUED,
+        None,
+        f"Queued behind {n}{eta_title}",
+        f"The panel is at capacity, so this head is waiting for a slot — {n} panel"
+        f"{'s' if n != 1 else ''} ahead of it in line.{eta_summary} It starts automatically "
+        "when a slot frees; nothing to do.",
     )
 
 

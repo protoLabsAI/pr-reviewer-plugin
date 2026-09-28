@@ -22,7 +22,7 @@ from pr_reviewer.approve import (
     HOLD_THREADS_UNRESOLVED,
     PROMOTE,
 )
-from pr_reviewer.checks import CHECK_NAME, check_for
+from pr_reviewer.checks import CHECK_NAME, check_for, queued_run
 
 from tests.test_dispatch import HEAD, RoutedGH, facts, make, review_row, thread_node
 
@@ -133,6 +133,28 @@ def test_an_incomplete_pass_concludes_neutral_and_says_so():
     assert (run.status, run.conclusion) == ("completed", "neutral")
     assert "not blocking" in run.title.lower()
     assert "auto-approve is withheld" in run.summary.lower()
+
+
+# ── the queued run: what a waiting head shows (#209) ────────────────────────────
+
+
+def test_queued_run_reports_how_many_are_ahead_and_an_eta():
+    """r5: the queued-check builder — status `queued`, "queued behind N", ETA rounded UP."""
+    run = queued_run(2, 130.0)  # 130s → ceil to 3 whole minutes
+    assert (run.status, run.conclusion) == ("queued", None)
+    assert "queued behind 2" in run.title.lower()
+    assert "3 min" in run.title  # 130s rounds UP, never down
+    assert "3 min" in run.summary
+
+
+def test_queued_run_omits_the_eta_when_there_is_no_data():
+    """r5: no duration data yet → the count still shows, the ETA is simply dropped."""
+    run = queued_run(1, None)
+    assert run.status == "queued"
+    assert "queued behind 1" in run.title.lower()
+    assert "min" not in run.title.lower() and "eta" not in run.title.lower()
+    # a non-positive estimate is treated the same as absent, never "~0 min"
+    assert "min" not in queued_run(1, 0.0).title.lower()
 
 
 # ── the writes ────────────────────────────────────────────────────────────────
@@ -271,6 +293,68 @@ async def test_the_knob_turns_the_check_off_without_touching_promotion(tmp_path)
     assert (await d.evaluate_promotion("o/r", 1)) == "promote"
     assert gh.writes == []
     assert gh.reviews_posted[0]["event"] == "APPROVE"
+
+
+# ── a waiting head shows a `queued` check (#209) ───────────────────────────────
+
+
+async def test_a_waiting_head_publishes_a_queued_check_with_the_count_and_eta(tmp_path):
+    """r1: `publish_queued_check` posts the QA-panel check as `queued` on the waiting head,
+    naming how many are ahead and the ETA — so GitHub shows the wait instead of nothing."""
+    gh = ChecksGH(pr_facts=facts(), existing=None)
+    d = owned(tmp_path, gh)
+    await d.publish_queued_check("o/r", HEAD, 1, 120.0)
+    (write,) = gh.writes
+    assert write["method"] == "POST" and write["url"] == "repos/o/r/check-runs"
+    assert write["name"] == CHECK_NAME and write["head_sha"] == HEAD
+    assert write["status"] == "queued" and "conclusion" not in write  # queued has no conclusion
+    assert "queued behind 1" in write["output[title]"].lower() and "2 min" in write["output[title]"]
+
+
+async def test_the_queued_check_becomes_the_in_progress_run_once_the_round_starts(tmp_path):
+    """r4: the `queued` run IS the same QA-panel check, so the normal flow PATCHes it forward
+    (queued → in_progress) once the slot is acquired — no second, dangling run."""
+    gh = ChecksGH(
+        pr_facts=facts(),
+        existing={"id": 55, "status": "queued", "conclusion": None, "title": "Queued behind 1 (ETA ~2 min)"},
+    )
+    d = owned(tmp_path, gh)
+    # "Waiting for the panel" — the state the check moves to as the round begins.
+    await d._publish_qa_check("o/r", HEAD, check_for(HOLD_NO_CLEAR_VERDICT, verdict=None))
+    (write,) = gh.writes
+    assert write["method"] == "PATCH" and write["url"] == "repos/o/r/check-runs/55"
+    assert write["status"] == "in_progress"
+
+
+async def test_a_queued_check_publish_failure_is_swallowed(tmp_path):
+    """r3: a failing publish degrades (logged, not raised) so the round it precedes still runs."""
+
+    class BoomGH(ChecksGH):
+        async def __call__(self, args, timeout=30):
+            if "/check-runs" in " ".join(args) and "-X" in args:
+                self.calls.append(args)
+                return 1, "", "403 Resource not accessible by integration"
+            return await super().__call__(args, timeout)
+
+    gh = BoomGH(pr_facts=facts(), existing=None)
+    d = owned(tmp_path, gh)
+    await d.publish_queued_check("o/r", HEAD, 1, None)  # must not raise
+
+
+async def test_shadow_mode_publishes_no_queued_check(tmp_path):
+    """A `queued` REQUIRED check in a repo we do not drive would block every merge forever,
+    so the queued check rides the same promotion-owner gate — no ownership, no GitHub call."""
+    gh = ChecksGH(pr_facts=facts(), existing=None)
+    d = make(tmp_path, cfg={"shadow_mode": True, "promotion_owner": True}, gh=gh)
+    await d.publish_queued_check("o/r", HEAD, 1, 60.0)
+    assert gh.writes == [] and gh.calls == []
+
+
+async def test_the_qa_check_knob_turns_the_queued_check_off_too(tmp_path):
+    gh = ChecksGH(pr_facts=facts(), existing=None)
+    d = make(tmp_path, cfg={"shadow_mode": False, "promotion_owner": True, "qa_check": False}, gh=gh)
+    await d.publish_queued_check("o/r", HEAD, 1, 60.0)
+    assert gh.writes == [] and gh.calls == []
 
 
 # ── a closed PR ends the wait (#153) ──────────────────────────────────────────

@@ -121,9 +121,21 @@ def build_routers(dispatcher, telemetry, get_secret, run_gh_fn=None):
         """The slot to hold across a dispatch. A PanelQueue registers the waiter/running
         entry for GET /queue and emits its own `queued` telemetry; a plain semaphore (only a
         pre-injected test double reaches here) keeps the best-effort queued signal and
-        acquires directly. Racy by nature — a slot may free before `acquire` — and harmless."""
+        acquires directly. Racy by nature — a slot may free before `acquire` — and harmless.
+
+        When the round has a head and must WAIT for a slot, the PanelQueue path also publishes
+        a `queued` protoReview/QA-panel check on that head so GitHub shows the wait instead of
+        nothing (#209). The publish runs outside the queue lock and is best-effort — a failure
+        is logged in the dispatcher and never blocks the round."""
+        publish = getattr(dispatcher, "publish_queued_check", None)
+        on_wait = None
+        if head and callable(publish):
+
+            async def on_wait(ahead: int, eta_s):
+                await publish(repo, head, ahead, eta_s)
+
         if isinstance(_panel_queue, PanelQueue):
-            return _panel_queue.slot(repo=repo, pr=pr, head=head, kind=kind)
+            return _panel_queue.slot(repo=repo, pr=pr, head=head, kind=kind, on_wait=on_wait)
         if isinstance(_panel_queue, asyncio.Semaphore):
             if _panel_queue.locked():
                 telemetry.emit("queued", kind=kind, repo=repo, pr=pr, limit=panel_limit)

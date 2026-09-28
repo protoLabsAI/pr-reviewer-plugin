@@ -1116,3 +1116,106 @@ async def test_queue_endpoint_reports_running_and_queued_without_touching_github
 
         dispatcher.release.set()
         await _yield_until(lambda: dispatcher.completed >= 3)
+
+
+# ── a queued head shows a `queued` check while it waits for a slot (#209) ──────────
+#
+# While a head waited for a panel slot GitHub showed nothing, so an operator could not tell
+# a queued review from a dead one. The webhook now publishes a `queued` check on the waiting
+# head the moment `PanelQueue` has to park it — best-effort, outside the queue lock.
+
+
+class QueuedCheckDispatcher(GatedDispatcher):
+    """A GatedDispatcher that also records the queued-check publishes the webhook makes while
+    a head waits for a slot (#209). `fail_publish` makes the publish raise, to prove a failing
+    check-write never blocks the round it precedes."""
+
+    def __init__(self, max_concurrent_panels=1, fail_publish=False):
+        super().__init__(max_concurrent_panels=max_concurrent_panels)
+        self.queued_checks: list[dict] = []
+        self.fail_publish = fail_publish
+
+    async def publish_queued_check(self, repo, head, ahead, eta_s):
+        if self.fail_publish:
+            raise RuntimeError("check publish 403")
+        self.queued_checks.append({"repo": repo, "head": head, "ahead": ahead, "eta_s": eta_s})
+
+
+async def test_a_waiting_head_gets_a_queued_check_and_an_immediate_one_does_not(tmp_path):
+    """r1/r2: with limit=1 the first PR takes the slot at once (NO queued check); the second
+    must WAIT, so the webhook publishes exactly one `queued` check — on PR2's head, naming the
+    1 panel ahead of it."""
+    dispatcher = QueuedCheckDispatcher(max_concurrent_panels=1)
+    app, _telemetry = _gated_app(tmp_path, dispatcher)
+
+    async with httpx.AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as client:
+        for pr in (1, 2):
+            body = pr_payload(pr)
+            r = await client.post("/plugins/pr-reviewer/webhook", content=body, headers=signed(body))
+            assert r.json()["dispatched"] is True
+
+        await _yield_until(lambda: dispatcher.running >= 1)  # PR1 holds the only slot
+        await _yield_until(lambda: dispatcher.queued_checks)  # PR2 parked → its queued check went out
+
+        assert len(dispatcher.queued_checks) == 1  # only the waiter, published once
+        qc = dispatcher.queued_checks[0]
+        assert qc["head"] == f"{2:040x}"  # PR2's head — the one that waited
+        assert qc["ahead"] == 1  # 0 ahead in the queue + the 1 running panel
+        assert qc["eta_s"] is None  # no completed-round durations yet → no ETA data
+
+        dispatcher.release.set()
+        await _yield_until(lambda: dispatcher.completed >= 2)
+
+    # PR1 acquired immediately, so no queued check was ever published for its head (r2).
+    assert all(qc["head"] != f"{1:040x}" for qc in dispatcher.queued_checks)
+
+
+async def test_a_queued_check_publish_failure_does_not_block_the_round(tmp_path):
+    """r3: if publishing the queued check raises, the waiting round is unaffected — it still
+    parks, then acquires the slot and runs once the first frees."""
+    dispatcher = QueuedCheckDispatcher(max_concurrent_panels=1, fail_publish=True)
+    app, _telemetry = _gated_app(tmp_path, dispatcher)
+
+    async with httpx.AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as client:
+        for pr in (1, 2):
+            body = pr_payload(pr)
+            r = await client.post("/plugins/pr-reviewer/webhook", content=body, headers=signed(body))
+            assert r.json()["dispatched"] is True
+
+        await _yield_until(lambda: dispatcher.running >= 1)
+        for _ in range(10):  # let PR2 reach (and park on) the full queue despite the failing publish
+            await asyncio.sleep(0)
+        assert dispatcher.running == 1  # bounded — PR2 is parked, not crashed
+
+        dispatcher.release.set()
+        await _yield_until(lambda: dispatcher.completed >= 2)
+        assert dispatcher.completed == 2  # both ran; the publish failure was swallowed
+
+
+async def test_slot_on_wait_fires_once_with_the_ahead_count_and_eta(tmp_path):
+    """r1: PanelQueue.slot invokes `on_wait` exactly once — only when the round must WAIT —
+    with the panels-ahead count and the eta_start seconds; a slot acquired at once never fires
+    it. The count/ETA are snapshotted synchronously, so the callback is free to do network I/O."""
+    calls: list[tuple[int, float | None]] = []
+
+    async def on_wait(ahead, eta_s):
+        calls.append((ahead, eta_s))
+
+    clock = _Clock(1000.0)
+    q = PanelQueue(1, telemetry=Telemetry(tmp_path), clock=clock, wall=clock, durations=[100.0])
+    release = asyncio.Event()
+
+    async def hold(pr, head, cb=None):
+        async with q.slot(repo="o/r", pr=pr, head=head, kind="webhook", on_wait=cb):
+            await release.wait()
+
+    runner = asyncio.create_task(hold(1, "h1", cb=on_wait))  # acquires at once → must NOT fire
+    await _yield_until(lambda: q.status()["running"])
+    assert calls == []  # the immediate acquire fired nothing
+    waiter = asyncio.create_task(hold(2, "h2", cb=on_wait))
+    await _yield_until(lambda: calls)  # PR2 parked → on_wait fired
+
+    assert calls == [(1, 100.0)]  # 0 queued ahead + 1 running; eta_start = p50(100) − 0 elapsed
+
+    release.set()
+    await asyncio.gather(runner, waiter)
