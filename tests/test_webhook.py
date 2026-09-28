@@ -630,10 +630,10 @@ def _gated_app(tmp_path, dispatcher, *, run_gh_fn=None):
     return app, telemetry
 
 
-def pr_payload(pr: int) -> bytes:
+def pr_payload(pr: int, action: str = "opened") -> bytes:
     return json.dumps(
         {
-            "action": "opened",
+            "action": action,
             "repository": {"full_name": "o/r"},
             "pull_request": {"number": pr, "head": {"sha": f"{pr:040x}"}},
         }
@@ -1168,6 +1168,41 @@ async def test_a_waiting_head_gets_a_queued_check_and_an_immediate_one_does_not(
 
     # PR1 acquired immediately, so no queued check was ever published for its head (r2).
     assert all(qc["head"] != f"{1:040x}" for qc in dispatcher.queued_checks)
+
+
+async def test_a_non_dispatch_action_that_waits_publishes_no_queued_check(tmp_path):
+    """The rejected-review fix: `_safe_handle` takes the panel slot for EVERY pull_request
+    action, BEFORE `handle_pr_event` drops the non-dispatch ones. A `labeled`/`edited`/
+    `review_requested`/`closed` event that has to WAIT must NOT rewrite the head's required
+    check to "Queued behind N" — that action moves no round forward, so the check would
+    dangle. Only a `DISPATCH_ACTIONS` event engages the queued publish."""
+    dispatcher = QueuedCheckDispatcher(max_concurrent_panels=1)
+    app, _telemetry = _gated_app(tmp_path, dispatcher)
+
+    async with httpx.AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as client:
+        # PR1 (opened) takes the only slot and holds it.
+        body = pr_payload(1)
+        assert (await client.post("/plugins/pr-reviewer/webhook", content=body, headers=signed(body))).json()[
+            "dispatched"
+        ] is True
+        await _yield_until(lambda: dispatcher.running >= 1)
+
+        # PR2 arrives as a NON-dispatch `labeled` event — it still parks on the full queue…
+        body = pr_payload(2, action="labeled")
+        assert (await client.post("/plugins/pr-reviewer/webhook", content=body, headers=signed(body))).json()[
+            "dispatched"
+        ] is True
+        for _ in range(10):  # give the labeled waiter time to reach and park on the queue
+            await asyncio.sleep(0)
+        assert dispatcher.running == 1  # PR2 is genuinely parked behind PR1
+
+        # …but nothing published a `queued` check for it: a non-dispatch action never engages
+        # `on_wait`, so no live check is rewritten by an event that moves no round.
+        assert dispatcher.queued_checks == []
+
+        dispatcher.release.set()
+        await _yield_until(lambda: dispatcher.completed >= 2)
+    assert dispatcher.queued_checks == []  # still nothing, even after both drained
 
 
 async def test_a_queued_check_publish_failure_does_not_block_the_round(tmp_path):

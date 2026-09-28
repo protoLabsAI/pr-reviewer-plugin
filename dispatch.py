@@ -3708,16 +3708,29 @@ class Dispatcher:
         Rides the SAME gate as the rest of the QA-panel check: a `queued` REQUIRED status in a
         repo we do not drive would block every merge there forever, so it publishes only when
         we own the gate (`qa_check` on, promotion-owner, not shadow) — the same posture
-        `evaluate_promotion` takes before it ever writes this check. Publishes through the SAME
-        idempotent-by-state path (`_publish_qa_check`), which degrades rather than raising, so
-        a publish failure is logged and never blocks or fails the round (r3). Once the slot is
-        acquired the normal in_progress/completed flow PATCHes this same run forward (r4).
+        `evaluate_promotion` takes before it ever writes this check. It also holds the allowlist
+        rail `handle_pr_event` holds before it ever looks a PR up: the webhook takes the panel
+        slot for EVERY pull_request event — unmanaged repos included — before that gate has run,
+        so without this an unmanaged repo would get a GitHub write on our credentials (#209).
+
+        Publishes through the SAME idempotent-by-state path (`_publish_qa_check`), which degrades
+        rather than raising, so a publish failure is logged and never blocks or fails the round
+        (r3). `only_if_unstarted` is the second half of the fix: a redelivery of a dispatch
+        action can wait behind the queue while the head's own panel is already `in_progress` (or
+        has concluded), and a bare publish would rewrite that live check BACKWARDS to "Queued
+        behind N" that no round then moves forward — so the queued write is refused once the
+        check has started. Once the slot is acquired the normal in_progress/completed flow PATCHes
+        this same run forward (r4).
         """
         if not head or not (self.qa_check and self.promotion_owner and not self.shadow):
             return
-        await self._publish_qa_check(repo, head, queued_run(ahead, eta_s))
+        if bad_repo(repo) or (self.repos and repo not in self.repos):
+            return
+        await self._publish_qa_check(repo, head, queued_run(ahead, eta_s), only_if_unstarted=True)
 
-    async def _publish_qa_check(self, repo: str, sha: str, run: CheckRun, *, only_if_open: bool = False) -> None:
+    async def _publish_qa_check(
+        self, repo: str, sha: str, run: CheckRun, *, only_if_open: bool = False, only_if_unstarted: bool = False
+    ) -> None:
         """Publish (or update) this head's `QA panel` check run. Degrades, never raises.
 
         Idempotent by state, not by call: the sweep re-evaluates every open PR every few
@@ -3728,6 +3741,11 @@ class Dispatcher:
 
         `only_if_open` is for the close path: it may finish a run that is still waiting,
         and must never create one or overwrite a verdict that already concluded.
+
+        `only_if_unstarted` is for the `queued` publish (#209): it may create or refresh a run
+        that has not started, but must NEVER move one BACKWARDS — once the panel opened this
+        head's check `in_progress` (or concluded it), a late/duplicate queued write would rewrite
+        a live check to "Queued behind N" that no round then advances.
         """
         if not self.qa_check:
             return
@@ -3750,6 +3768,10 @@ class Dispatcher:
             # create one, rather than subscripting whatever came back.
             existing = parsed if isinstance(parsed, dict) else {}
         if only_if_open and (not existing.get("id") or existing.get("status") == COMPLETED):
+            return
+        if only_if_unstarted and existing.get("id") and existing.get("status") in (IN_PROGRESS, COMPLETED):
+            # The head's panel has already opened (or concluded) this check; a `queued` write
+            # here would move it backwards to "Queued behind N" and dangle (#209). Leave it.
             return
         if (
             existing.get("status") == run.status

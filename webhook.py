@@ -24,7 +24,7 @@ import json
 import logging
 import time
 
-from .chokepoint import verify_signature
+from .chokepoint import DISPATCH_ACTIONS, verify_signature
 
 log = logging.getLogger("protoagent.plugins.pr_reviewer")
 
@@ -117,19 +117,29 @@ def build_routers(dispatcher, telemetry, get_secret, run_gh_fn=None):
         _panel_queue = PanelQueue(panel_limit, telemetry=telemetry)
         dispatcher.panel_sem = _panel_queue
 
-    def _panel_slot(kind: str, repo: str, pr: int, head: str = ""):
+    def _panel_slot(kind: str, repo: str, pr: int, head: str = "", action: str = ""):
         """The slot to hold across a dispatch. A PanelQueue registers the waiter/running
         entry for GET /queue and emits its own `queued` telemetry; a plain semaphore (only a
         pre-injected test double reaches here) keeps the best-effort queued signal and
         acquires directly. Racy by nature — a slot may free before `acquire` — and harmless.
 
         When the round has a head and must WAIT for a slot, the PanelQueue path also publishes
-        a `queued` protoReview/QA-panel check on that head so GitHub shows the wait instead of
-        nothing (#209). The publish runs outside the queue lock and is best-effort — a failure
-        is logged in the dispatcher and never blocks the round."""
+        a `queued` QA-panel check on that head so GitHub shows the wait instead of nothing
+        (#209). The publish runs outside the queue lock and is best-effort — a failure is
+        logged in the dispatcher and never blocks the round.
+
+        It fires ONLY for a `DISPATCH_ACTIONS` event, though: `_safe_handle` takes this slot for
+        EVERY pull_request action, BEFORE `handle_pr_event` applies the DISPATCH_ACTIONS /
+        in-flight / cooldown / allowlist filters. Left ungated, a non-dispatch action (labeled,
+        review_requested, edited, closed) or a redelivery that has to wait would rewrite the
+        head's required check to "Queued behind N" and then be dropped with no round to move it
+        forward — even over a panel already `in_progress` for that head. Gating here keeps the
+        non-dispatch actions from ever engaging `on_wait`; the dispatcher's `publish_queued_check`
+        adds the second rail (allowlist + never clobber an already-started check) for a
+        redelivery of a dispatch action whose head is already under review."""
         publish = getattr(dispatcher, "publish_queued_check", None)
         on_wait = None
-        if head and callable(publish):
+        if head and callable(publish) and action in DISPATCH_ACTIONS:
 
             async def on_wait(ahead: int, eta_s):
                 await publish(repo, head, ahead, eta_s)
@@ -342,7 +352,7 @@ def build_routers(dispatcher, telemetry, get_secret, run_gh_fn=None):
         # Hold a panel slot across the dispatch; a burst beyond the cap queues here
         # rather than launching every panel at once (#96).
         try:
-            async with _panel_slot("webhook", repo, pr, head):
+            async with _panel_slot("webhook", repo, pr, head, action):
                 outcome = await dispatcher.handle_pr_event(repo, pr, head, action)
             log.info("[pr-reviewer] %s#%s @%s (%s) -> %s", repo, pr, head[:7], action, outcome)
         except Exception:  # noqa: BLE001

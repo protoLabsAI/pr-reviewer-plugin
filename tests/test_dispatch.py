@@ -881,6 +881,89 @@ async def test_our_review_check_is_not_a_check_we_wait_on(tmp_path):
     assert (await d._checks_state("o/r", HEAD)) == "green"
 
 
+# ── the `queued` check while a head waits for a panel slot (#209) ─────────────
+
+
+class QueuedCheckGH(FakeGH):
+    """Serves a configurable existing `QA panel` run and captures the check writes, so the
+    queued-check publish path can be exercised without a real GitHub. `existing` is the jq'd
+    `{id,status,conclusion,title}` the read returns (None → no run yet)."""
+
+    def __init__(self, existing=None):
+        super().__init__()
+        self.existing = existing
+        self.check_writes: list[dict] = []
+
+    async def __call__(self, args, timeout=30):
+        self.calls.append(args)
+        joined = " ".join(args)
+        if "/check-runs" in joined and "-X" not in args:  # the existing-run read (GET)
+            return 0, (json.dumps(self.existing) if self.existing is not None else "null"), ""
+        if "/check-runs" in joined and "-X" in args:  # our POST/PATCH
+            fields = {a.split("=", 1)[0]: a.split("=", 1)[1] for a in args if "=" in a}
+            self.check_writes.append({"method": "PATCH" if "PATCH" in args else "POST", "url": args[1], **fields})
+            return 0, "{}", ""
+        return 0, "", ""
+
+
+def _owner(tmp_path, gh):
+    """A dispatcher that OWNS the gate (promotion-owner, not shadow) — the only posture that
+    publishes the `QA panel` check at all."""
+    return make(tmp_path, cfg={"promotion_owner": True, "shadow_mode": False}, gh=gh)
+
+
+async def test_publish_queued_check_creates_a_queued_run_on_a_fresh_head(tmp_path):
+    """r1: a head with no run yet gets a `queued` check naming the panels ahead and the ETA."""
+    gh = QueuedCheckGH(existing=None)
+    await _owner(tmp_path, gh).publish_queued_check("o/r", HEAD, 2, 130.0)
+    posts = [w for w in gh.check_writes if w["method"] == "POST"]
+    assert len(posts) == 1
+    assert posts[0]["name"] == "QA panel" and posts[0]["status"] == "queued" and posts[0]["head_sha"] == HEAD
+    assert "Queued behind 2" in posts[0]["output[title]"] and "3 min" in posts[0]["output[title]"]  # 130s → ceil 3
+
+
+async def test_publish_queued_check_never_moves_a_started_check_backwards(tmp_path):
+    """The rejected-review fix, dispatcher half: a redelivery of a dispatch action can wait
+    behind the queue while the head's OWN panel is already running (or has concluded). A bare
+    queued publish would rewrite that live check to "Queued behind N" that no round then
+    advances — so an `in_progress`/`completed` run is left exactly as it is."""
+    for state in (
+        {"id": 555, "status": "in_progress", "conclusion": None, "title": "Waiting for the panel"},
+        {"id": 9, "status": "completed", "conclusion": "success", "title": "Cleared by the QA panel"},
+    ):
+        gh = QueuedCheckGH(existing=state)
+        await _owner(tmp_path, gh).publish_queued_check("o/r", HEAD, 1, None)
+        assert gh.check_writes == []  # read it, wrote nothing — the started check stands
+
+
+async def test_publish_queued_check_still_refreshes_an_already_queued_run(tmp_path):
+    """The guard is surgical: it blocks only a BACKWARDS move. A run still `queued` (a later
+    event with a changed position) may be updated — that is not moving the check backwards."""
+    gh = QueuedCheckGH(existing={"id": 7, "status": "queued", "conclusion": None, "title": "Queued behind 3"})
+    await _owner(tmp_path, gh).publish_queued_check("o/r", HEAD, 1, None)
+    patches = [w for w in gh.check_writes if w["method"] == "PATCH"]
+    assert len(patches) == 1 and patches[0]["url"] == "repos/o/r/check-runs/7"
+    assert "Queued behind 1" in patches[0]["output[title]"]
+
+
+async def test_publish_queued_check_skips_an_unmanaged_repo(tmp_path):
+    """The allowlist rail: the webhook takes the panel slot for every event, unmanaged repos
+    included, BEFORE `handle_pr_event`'s allowlist gate runs — so this holds the same gate and
+    makes no GitHub call (read or write) on a repo we do not drive."""
+    gh = QueuedCheckGH(existing=None)
+    await _owner(tmp_path, gh).publish_queued_check("evil/repo", HEAD, 1, None)
+    assert gh.calls == []
+
+
+async def test_publish_queued_check_is_silent_without_gate_ownership(tmp_path):
+    """A `queued` REQUIRED status in a repo we do not drive blocks every merge forever, so —
+    like the rest of the QA-panel check — it publishes nothing in shadow / non-owner mode."""
+    for cfg in ({}, {"promotion_owner": True}, {"shadow_mode": False}):  # shadow default / owner-but-shadow / owner-off
+        gh = QueuedCheckGH(existing=None)
+        await make(tmp_path, cfg=cfg, gh=gh).publish_queued_check("o/r", HEAD, 1, None)
+        assert gh.calls == []
+
+
 # ── a PR GitHub will not accept a review on (issue #78) ──────────────────────
 
 
