@@ -1219,3 +1219,38 @@ async def test_slot_on_wait_fires_once_with_the_ahead_count_and_eta(tmp_path):
 
     release.set()
     await asyncio.gather(runner, waiter)
+
+
+async def test_slot_cancelled_during_on_wait_leaves_no_phantom_waiter(tmp_path):
+    """Regression: the `on_wait` publish is a real network call, so a CancelledError can land
+    while it is in flight. That BaseException must still remove the waiter from `_pending` — the
+    inner `except Exception` swallows only ordinary publish failures — or a phantom lingers,
+    corrupting GET /queue and adding one to every later ahead-count/ETA (#209)."""
+    entered = asyncio.Event()
+
+    async def on_wait(ahead, eta_s):
+        entered.set()
+        await asyncio.Event().wait()  # park inside the publish so the cancel lands here
+
+    q = PanelQueue(1, telemetry=Telemetry(tmp_path))
+    release = asyncio.Event()
+
+    async def hold(pr, head, cb=None):
+        async with q.slot(repo="o/r", pr=pr, head=head, kind="webhook", on_wait=cb):
+            await release.wait()
+
+    runner = asyncio.create_task(hold(1, "h1"))  # takes the only slot at once
+    await _yield_until(lambda: q.status()["running"])
+    waiter = asyncio.create_task(hold(2, "h2", cb=on_wait))  # parks → enters on_wait
+    await entered.wait()
+    assert q.status()["depth"] == 1  # the waiter is enqueued while the publish is in flight
+
+    waiter.cancel()  # cancel mid-publish: a BaseException escaping __aenter__
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+
+    assert q.status()["depth"] == 0  # no phantom waiter left behind
+    assert q._pending == []
+
+    release.set()
+    await runner

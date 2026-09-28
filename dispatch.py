@@ -779,28 +779,35 @@ class _PanelSlot:
         )
         will_wait = q.locked()  # racy by nature, like the telemetry it drives — harmless
         q._pending.append(waiter)
-        if will_wait:
-            if q.telemetry is not None:
-                q.telemetry.emit(
-                    "queued", kind=self._kind, repo=self._repo, pr=self._pr, head=self._head, limit=q.limit
-                )
-            if self._on_wait is not None:
-                # Snapshot the ahead-count/ETA synchronously (no lock held), then publish the
-                # `queued` check BEFORE parking on acquire — never inside the queue's
-                # bookkeeping (#209). Best-effort: a failing publish must never block the round.
-                ahead, eta_s = q._queued_estimate(waiter)
-                try:
-                    await self._on_wait(ahead, eta_s)
-                except Exception:  # noqa: BLE001 — a queued-check publish must never break dispatch
-                    log.warning(
-                        "[pr-reviewer] publishing the queued check failed for %s#%s",
-                        self._repo,
-                        self._pr,
-                        exc_info=True,
-                    )
+        # From the append to the acquire, ONE BaseException guard owns the waiter: the instant it
+        # is in `_pending`, any exit before we park on acquire must remove it. That now includes a
+        # CancelledError raised *during* the `queued`-check publish (the `on_wait` await is a
+        # network call) — an escape there would otherwise leave a phantom waiter that corrupts
+        # GET /queue and inflates every later ahead-count/ETA (#209). The inner `except Exception`
+        # still swallows a plain publish failure so the round proceeds; only a BaseException
+        # (cancellation) unwinds through here and removes the waiter.
         try:
+            if will_wait:
+                if q.telemetry is not None:
+                    q.telemetry.emit(
+                        "queued", kind=self._kind, repo=self._repo, pr=self._pr, head=self._head, limit=q.limit
+                    )
+                if self._on_wait is not None:
+                    # Snapshot the ahead-count/ETA synchronously (no lock held), then publish the
+                    # `queued` check BEFORE parking on acquire — never inside the queue's
+                    # bookkeeping (#209). Best-effort: a failing publish must never block the round.
+                    ahead, eta_s = q._queued_estimate(waiter)
+                    try:
+                        await self._on_wait(ahead, eta_s)
+                    except Exception:  # noqa: BLE001 — a queued-check publish must never break dispatch
+                        log.warning(
+                            "[pr-reviewer] publishing the queued check failed for %s#%s",
+                            self._repo,
+                            self._pr,
+                            exc_info=True,
+                        )
             await q.acquire()
-        except BaseException:  # cancelled (or failed) while waiting — the waiter disappears
+        except BaseException:  # cancelled (or failed) while publishing or waiting — the waiter disappears
             if waiter in q._pending:
                 q._pending.remove(waiter)
             raise
