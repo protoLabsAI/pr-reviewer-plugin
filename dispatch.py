@@ -524,6 +524,16 @@ def _env_int(name: str, default: int) -> int:
 # phase report is a no-op.
 _CURRENT_PANEL: contextvars.ContextVar = contextvars.ContextVar("pr_reviewer_current_panel", default=None)
 
+# The retry tally of the round a task is running under (issue #209). `_bounded_review` sets it
+# when a round starts; the gateway-retry log handler reads it to attribute a model/SDK retry to
+# the round in flight, and `Dispatcher._round_retries` reads it for the telemetry field. asyncio
+# tasks copy the context, so a finder subagent the runner spawns shares this SAME counter object
+# by reference and its retries land on the round that spawned it. Unset (a retry logged outside
+# any round) ⇒ the retry only joins the process-wide window, never a round.
+_CURRENT_ROUND_RETRIES: contextvars.ContextVar = contextvars.ContextVar(
+    "pr_reviewer_current_round_retries", default=None
+)
+
 # The panel phases the /queue endpoint reports, in run order. `posting` is the dispatcher's
 # own step (it posts the verdict after the runner returns); the rest name recipe steps.
 PANEL_PHASES = ("finders", "structural", "verify", "synthesize", "posting")
@@ -583,8 +593,8 @@ class _Waiter:
 
 class _Running:
     """One panel holding a slot — what the endpoint reads as `running`. `phase` is updated
-    by the dispatcher's step callback; `model_retries` stays 0 until the gateway-telemetry
-    card (#209) fills it. `ran` flips true the first time a phase is reported (i.e. the
+    by the dispatcher's step callback; `model_retries` is incremented live by the gateway
+    retry handler (#209) as the round's model/SDK calls retry. `ran` flips true the first time a phase is reported (i.e. the
     round reached the runner) — a slot that exits without ever running a panel (an early
     `drop:`/`reaffirmed:` return still holding the slot) leaves it false and so contributes
     NO duration to the rolling window (that near-zero would drag p50/p90 and every ETA
@@ -850,6 +860,171 @@ class _PanelSlot:
         return False
 
 
+# ── gateway-degraded telemetry (issue #209) ──────────────────────────────────────
+#
+# During the #209 stall Vera's log was mostly `openai._base_client Retrying request …`
+# bursts — the OpenAI SDK retrying on a per-request timeout against a saturated gateway.
+# Nothing counted them, so a slow gate looked identical to a dead one in both telemetry
+# and the /queue endpoint. We count those retries host-free: a logging.Handler on the SDK's
+# own logger matches the retry record and attributes it to the round in flight, plus a
+# process-wide rolling window that drives the rate and the degraded flag.
+
+GATEWAY_DEGRADED_RETRIES_5M = 6  # retries in 5 min ABOVE which the gateway reads as degraded
+GATEWAY_DEGRADED_ESCALATE_S = 900  # sustained-degraded seconds before ONE WARNING is logged (15 min)
+_GATEWAY_WINDOW_S = 300.0  # the rolling retry window (5 min)
+
+# The loggers the retry handler attaches to. The OpenAI SDK is the confirmed source (it logs one
+# INFO record per retry via `openai._base_client`). The host's stream-reconnect warning is a
+# second, best-effort source: its message markers are matched below, but a fresh worktree has no
+# host checkout so its logger name is not asserted here — add it to this tuple when it is stable.
+_GATEWAY_RETRY_LOGGERS = ("openai._base_client",)
+# Substrings (lowercased) that mark a model/SDK retry or a stream reconnect. Matched against the
+# rendered message so we never reach into SDK/host internals.
+_GATEWAY_RETRY_MARKERS = ("retrying request",)
+_STREAM_RECONNECT_MARKERS = ("reconnecting stream", "stream disconnected", "stream reconnect")
+
+
+class _RoundRetries:
+    """One round's model/SDK retry tally. Shared by reference between the round's task and any
+    finder subagent tasks it spawns (asyncio copies the context, not the object), so a retry
+    logged from any of them increments the same count (issue #209)."""
+
+    __slots__ = ("count",)
+
+    def __init__(self) -> None:
+        self.count = 0
+
+
+class _GatewayRetryMonitor:
+    """Process-wide model/SDK retry accounting behind the gateway_degraded signal (issue #209).
+
+    Every counted retry joins a rolling `window_s` window (the rate and the degraded flag read
+    from it) and, when a round is in flight, that round's `_RoundRetries` counter and the running
+    `PanelQueue` entry — both reached via contextvars, so a finder subagent's retry lands on the
+    round that spawned it and shows live on GET /queue. A retry with no round in context only
+    touches the window. The clock is injectable for tests."""
+
+    def __init__(self, *, clock=None, window_s: float = _GATEWAY_WINDOW_S) -> None:
+        self._clock = clock or time.monotonic
+        self._window_s = float(window_s) or _GATEWAY_WINDOW_S
+        self._events: deque[float] = deque()
+
+    def _prune(self, now: float) -> None:
+        cutoff = now - self._window_s
+        while self._events and self._events[0] < cutoff:
+            self._events.popleft()
+
+    def note_retry(self, n: int = 1) -> None:
+        n = max(1, int(n))
+        now = self._clock()
+        self._events.extend([now] * n)
+        self._prune(now)
+        counter = _CURRENT_ROUND_RETRIES.get()
+        if counter is not None:
+            counter.count += n
+        entry = _CURRENT_PANEL.get()
+        if entry is not None:
+            entry.model_retries += n
+
+    def retries_5m(self, *, now: float | None = None) -> int:
+        now = self._clock() if now is None else now
+        self._prune(now)
+        return len(self._events)
+
+    def rate_per_min(self, *, now: float | None = None) -> float:
+        """Retries per minute averaged over the trailing window — the /queue rate."""
+        minutes = self._window_s / 60.0
+        return self.retries_5m(now=now) / minutes if minutes else 0.0
+
+    def reset(self) -> None:
+        self._events.clear()
+
+
+# One process-wide monitor: the rolling window has to outlive any single round/dispatcher.
+_GATEWAY = _GatewayRetryMonitor()
+
+
+class _GatewayRetryHandler(logging.Handler):
+    """Counts model/SDK retry log records against `monitor`. Installed on the SDK retry logger;
+    it NEVER raises — observability must not break logging or a review."""
+
+    def __init__(self, monitor: _GatewayRetryMonitor) -> None:
+        super().__init__()
+        self.monitor = monitor
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = record.getMessage().lower()
+            if any(m in msg for m in _GATEWAY_RETRY_MARKERS) or any(m in msg for m in _STREAM_RECONNECT_MARKERS):
+                self.monitor.note_retry()
+        except Exception:  # noqa: BLE001 — a telemetry handler must never raise into logging
+            pass
+
+
+def _ensure_gateway_retry_handler(monitor: _GatewayRetryMonitor = _GATEWAY) -> None:
+    """Install the retry-counting handler on the SDK retry logger(s) IDEMPOTENTLY (issue #209).
+
+    A second call re-points the existing handler at `monitor` instead of adding a duplicate, so
+    re-registration (or a second dispatcher) never double-counts a single retry (r7). The SDK
+    logs retries at INFO, so the logger's effective level is lowered to INFO when it is stricter
+    — never raised, so an operator's DEBUG survives."""
+    for name in _GATEWAY_RETRY_LOGGERS:
+        logger = logging.getLogger(name)
+        existing = next((h for h in logger.handlers if isinstance(h, _GatewayRetryHandler)), None)
+        if existing is not None:
+            existing.monitor = monitor
+            continue
+        logger.addHandler(_GatewayRetryHandler(monitor))
+        if logger.getEffectiveLevel() > logging.INFO:
+            logger.setLevel(logging.INFO)
+
+
+class GatewayDegradeState:
+    """The degraded state machine over the retry window (issue #209).
+
+    `evaluate(count, now, threshold, escalate_after_s)` compares the trailing-window retry
+    `count` to `threshold` and:
+
+      - emits ONE `gateway_degraded` event on each TRANSITION (false→true, true→false), carrying
+        the count — never one per retry (r3);
+      - once the degraded state has been sustained `escalate_after_s`, logs ONE WARNING per
+        episode, re-armed only when it drops back healthy (r4).
+
+    The clock is passed in (never read here), so the transitions and the escalation test with an
+    injected clock. Config-live: threshold/escalate are arguments, so the caller can pass this
+    round's config without the state machine caching a stale knob."""
+
+    def __init__(self, telemetry, *, logger=log) -> None:
+        self._telemetry = telemetry
+        self._log = logger
+        self.degraded = False
+        self._since: float | None = None
+        self._escalated = False
+
+    def evaluate(self, count: int, *, now: float, threshold: int, escalate_after_s: float) -> bool:
+        over = count > threshold
+        if over and not self.degraded:
+            self.degraded = True
+            self._since = now
+            self._escalated = False
+            self._telemetry.emit("gateway_degraded", degraded=True, retries_5m=count, threshold=threshold)
+        elif not over and self.degraded:
+            self.degraded = False
+            self._since = None
+            self._escalated = False
+            self._telemetry.emit("gateway_degraded", degraded=False, retries_5m=count, threshold=threshold)
+        if self.degraded and not self._escalated and self._since is not None and now - self._since >= escalate_after_s:
+            self._escalated = True
+            self._log.warning(
+                "[pr-reviewer] gateway DEGRADED for %.0fs — %d model/SDK retries in the last 5 min "
+                "(threshold %d); the model gateway is likely saturated and reviews will be slow",
+                now - self._since,
+                count,
+                threshold,
+            )
+        return self.degraded
+
+
 class Dispatcher:
     def __init__(
         self,
@@ -870,6 +1045,11 @@ class Dispatcher:
         self._cfg = cfg or {}
         self._cfg_provider = cfg_provider
         self.telemetry = telemetry
+        # Gateway-degraded telemetry (issue #209): count model/SDK retries process-wide and
+        # drive the degraded flag. Installing the log handler is idempotent, so a second
+        # dispatcher (or a re-registration) shares the one handler and never double-counts.
+        self._gateway_state = GatewayDegradeState(telemetry)
+        _ensure_gateway_retry_handler(_GATEWAY)
         # Refuted structural claims, remembered per repo (#190) — written here when a round
         # posts, read by the structural pass; one constructor so root and TTL cannot drift.
         from .refutations import RefutationStore
@@ -1207,6 +1387,12 @@ class Dispatcher:
         """``_review`` under ``round_timeout_s``. The callers hold the chokepoint slot and
         release it in their ``finally``; bounding the round here is what guarantees they
         get there."""
+        # A fresh per-round retry tally, set BEFORE the round runs so `_review`'s telemetry and
+        # any finder subagent the runner spawns (asyncio copies this context) attribute their
+        # model/SDK gateway retries here (issue #209). Reset in `finally`, where the round's end
+        # is also the point we re-check the degraded state.
+        retries = _RoundRetries()
+        token = _CURRENT_ROUND_RETRIES.set(retries)
         bound = asyncio.timeout(self.round_timeout_s)
         try:
             async with bound:
@@ -1215,7 +1401,14 @@ class Dispatcher:
             if not bound.expired():
                 raise  # a TimeoutError from inside the round is not the round's own bound
             log.warning("[pr-reviewer] %s#%s: round exceeded %gs — cancelled", repo, pr, self.round_timeout_s)
-            self.telemetry.emit("drop", repo=repo, pr=pr, reason=DROP_ROUND_TIMEOUT, timeout_s=self.round_timeout_s)
+            self.telemetry.emit(
+                "drop",
+                repo=repo,
+                pr=pr,
+                reason=DROP_ROUND_TIMEOUT,
+                timeout_s=self.round_timeout_s,
+                model_retries=retries.count,
+            )
             # Tell the operator, not just the log: a round this long means something the
             # panel depends on has stopped answering, and every later round will likely
             # hang the same way. The incident this bound came from went unnoticed for
@@ -1227,6 +1420,11 @@ class Dispatcher:
                 dedup_key=f"pr-reviewer-round-timeout:{repo}#{pr}",
             )
             return f"drop:{DROP_ROUND_TIMEOUT}"
+        finally:
+            _CURRENT_ROUND_RETRIES.reset(token)
+            # The round's end (any outcome) is when we re-check the degraded state, so a
+            # transition/escalation is caught even on a round that posted nothing (issue #209).
+            self._evaluate_gateway()
 
     @property
     def backfill_per_pass(self) -> int:
@@ -1319,6 +1517,66 @@ class Dispatcher:
             if "max_rounds_cooldown" in cfg
             else _env_int("PR_REVIEWER_MAX_ROUNDS_COOLDOWN", 7200)
         )
+
+    @property
+    def gateway_degraded_retries_5m(self) -> int:
+        """Model/SDK retries in the last 5 min ABOVE which the gateway reads as degraded
+        (issue #209). Config-first, env fallback, like every other knob here."""
+        cfg = self.cfg
+        return (
+            int(cfg["gateway_degraded_retries_5m"])
+            if "gateway_degraded_retries_5m" in cfg
+            else _env_int("PR_REVIEWER_GATEWAY_DEGRADED_RETRIES_5M", GATEWAY_DEGRADED_RETRIES_5M)
+        )
+
+    @property
+    def gateway_degraded_escalate_s(self) -> int:
+        """Seconds the gateway must stay degraded before ONE WARNING is logged (issue #209).
+        Default 15 min — long enough that a brief burst does not page, short enough that a
+        genuine saturation is surfaced while it is still happening."""
+        cfg = self.cfg
+        return (
+            int(cfg["gateway_degraded_escalate_s"])
+            if "gateway_degraded_escalate_s" in cfg
+            else _env_int("PR_REVIEWER_GATEWAY_DEGRADED_ESCALATE", GATEWAY_DEGRADED_ESCALATE_S)
+        )
+
+    def _evaluate_gateway(self) -> bool:
+        """Run the degraded state machine against the live retry window: emit a transition event
+        on a flip and escalate a sustained episode once (issue #209). Called at each round's end
+        and on a /queue read, so a transition is caught promptly; the state machine dedups, so
+        neither path spams. Fail-safe to the last known state — gateway telemetry never breaks a
+        round."""
+        try:
+            now = _GATEWAY._clock()
+            count = _GATEWAY.retries_5m(now=now)
+            return self._gateway_state.evaluate(
+                count,
+                now=now,
+                threshold=self.gateway_degraded_retries_5m,
+                escalate_after_s=self.gateway_degraded_escalate_s,
+            )
+        except Exception:  # noqa: BLE001 — gateway telemetry must never break a round
+            log.exception("[pr-reviewer] gateway-degraded evaluation failed")
+            return self._gateway_state.degraded
+
+    @property
+    def gateway_degraded(self) -> bool:
+        """Live gateway-degraded truth for GET /queue (issue #209) — evaluated on read so a
+        transition/escalation is caught even between rounds."""
+        return self._evaluate_gateway()
+
+    @property
+    def gateway_retry_rate_5m(self) -> float:
+        """Model/SDK retries per minute over the trailing 5 min — the /queue rate (issue #209)."""
+        return round(_GATEWAY.rate_per_min(), 3)
+
+    @staticmethod
+    def _round_retries() -> int:
+        """This round's model/SDK retry count so far, for the telemetry field (issue #209).
+        Zero outside a round (the contextvar is unset)."""
+        counter = _CURRENT_ROUND_RETRIES.get()
+        return counter.count if counter is not None else 0
 
     # ── plumbing ──────────────────────────────────────────────────────────────
 
@@ -2151,7 +2409,9 @@ class Dispatcher:
             # `why` alongside the reason: four different conditions used to arrive here
             # as one opaque `pr-not-eligible`, so a PR being skipped told you nothing
             # about whether that was correct.
-            self.telemetry.emit("drop", repo=repo, pr=pr, reason=DROP_PR_NOT_ELIGIBLE, why=why)
+            self.telemetry.emit(
+                "drop", repo=repo, pr=pr, reason=DROP_PR_NOT_ELIGIBLE, why=why, model_retries=self._round_retries()
+            )
             return f"drop:{DROP_PR_NOT_ELIGIBLE}"
         viewer = await self._viewer_login()
         author = str(facts.get("author") or "").lower()
@@ -2169,7 +2429,9 @@ class Dispatcher:
                 repo,
                 pr,
             )
-            self.telemetry.emit("drop", repo=repo, pr=pr, reason=DROP_VIEWER_UNKNOWN)
+            self.telemetry.emit(
+                "drop", repo=repo, pr=pr, reason=DROP_VIEWER_UNKNOWN, model_retries=self._round_retries()
+            )
             return f"drop:{DROP_VIEWER_UNKNOWN}"
         if (
             viewer
@@ -2179,7 +2441,9 @@ class Dispatcher:
             # narrower match could let a misconfigured login review its own PR.
             and (author == viewer or author.removesuffix("[bot]") == viewer.removesuffix("[bot]"))
         ):
-            self.telemetry.emit("drop", repo=repo, pr=pr, reason=DROP_SELF_AUTHORED, author=author)
+            self.telemetry.emit(
+                "drop", repo=repo, pr=pr, reason=DROP_SELF_AUTHORED, author=author, model_retries=self._round_retries()
+            )
             return f"drop:{DROP_SELF_AUTHORED}"
 
         head = str(facts["head"])
@@ -2188,7 +2452,9 @@ class Dispatcher:
         # verdict with nowhere to go. `force` (an operator summon) overrides — asking
         # explicitly is a reason to try once more.
         if not force and self._post_failures.get(f"{repo}#{pr}@{head}", 0) >= POST_MAX_FAILURES:
-            self.telemetry.emit("drop", repo=repo, pr=pr, sha=head, reason=DROP_POST_REFUSED)
+            self.telemetry.emit(
+                "drop", repo=repo, pr=pr, sha=head, reason=DROP_POST_REFUSED, model_retries=self._round_retries()
+            )
             return f"drop:{DROP_POST_REFUSED}"
         if not force and self.summon_enabled:
             # An operator asked for quiet (issue #28). Push-triggered review stops; an
@@ -2197,7 +2463,9 @@ class Dispatcher:
             from .summon import is_paused
 
             if is_paused(await self._pr_comments(repo, pr)):
-                self.telemetry.emit("drop", repo=repo, pr=pr, sha=head, reason=DROP_PAUSED)
+                self.telemetry.emit(
+                    "drop", repo=repo, pr=pr, sha=head, reason=DROP_PAUSED, model_retries=self._round_retries()
+                )
                 return f"drop:{DROP_PAUSED}"
         paths = await self._changed_paths(repo, pr)
         # The PR's size rides on the dispatch / reviewed / exhaustion rows: a PR too large for
@@ -2218,7 +2486,9 @@ class Dispatcher:
             # the convergence rule both disarm. That combination is what posted ten
             # CHANGES_REQUESTED on one static head (issue #71). Drop instead — the
             # sweep's backfill re-reaches this PR once the read recovers.
-            self.telemetry.emit("drop", repo=repo, pr=pr, sha=head, reason=DROP_REVIEWS_UNREADABLE)
+            self.telemetry.emit(
+                "drop", repo=repo, pr=pr, sha=head, reason=DROP_REVIEWS_UNREADABLE, model_retries=self._round_retries()
+            )
             return f"drop:{DROP_REVIEWS_UNREADABLE}"
         # ROUNDS, not reviews (issue #23): promotion bodies carry our marker and no
         # findings, so `ours[-1]` after an approve-on-green was an empty recall — the
@@ -2261,14 +2531,22 @@ class Dispatcher:
             if len(self._round_cap) > 1024:
                 self._round_cap = dict(list(self._round_cap.items())[-512:])
             await self._post_max_rounds_comment(repo, pr)
-            self.telemetry.emit("drop", repo=repo, pr=pr, sha=head, reason="max-rounds-capped", round=round_number)
+            self.telemetry.emit(
+                "drop",
+                repo=repo,
+                pr=pr,
+                sha=head,
+                reason="max-rounds-capped",
+                round=round_number,
+                model_retries=self._round_retries(),
+            )
             return "drop:max-rounds-capped"
         prior_findings = json.dumps(prior["findings"]) if prior and prior["findings"] else ""
         prior_requests = render_prior_requests(history)
 
         runner = self._runner()
         if runner is None:
-            self.telemetry.emit("drop", repo=repo, pr=pr, reason=DROP_NO_RUNNER)
+            self.telemetry.emit("drop", repo=repo, pr=pr, reason=DROP_NO_RUNNER, model_retries=self._round_retries())
             return f"drop:{DROP_NO_RUNNER}"
         self.telemetry.emit(
             "dispatch",
@@ -2350,6 +2628,7 @@ class Dispatcher:
                         sha=head,
                         attempt=attempt,
                         crashed="timeout" if timed_out else type(exc).__name__,
+                        model_retries=self._round_retries(),
                     )
                     continue
                 await self._conclude_review_check(
@@ -2411,7 +2690,15 @@ class Dispatcher:
                 break
             if not last:
                 retry_why = {"failed": failed} if failed else {"undelivered": undelivered}
-                self.telemetry.emit("panel_retry", repo=repo, pr=pr, sha=head, attempt=attempt, **retry_why)
+                self.telemetry.emit(
+                    "panel_retry",
+                    repo=repo,
+                    pr=pr,
+                    sha=head,
+                    attempt=attempt,
+                    model_retries=self._round_retries(),
+                    **retry_why,
+                )
         if failed:
             # Retries spent: D3's other branch. No verdict, operator escalation — and
             # the sweep's backfill will try again on a later pass (issue #17), so an
@@ -2840,6 +3127,10 @@ class Dispatcher:
             dispositions=len(dispositions),
             unaccounted=len(unaccounted),
             latency_s=round(elapsed, 1),
+            # Model/SDK gateway retries this round (issue #209): a slow gate looked identical to
+            # a dead one until this was counted. A finder subagent's retries land here through the
+            # round contextvar, so the count spans the whole panel, not just the dispatcher.
+            model_retries=self._round_retries(),
             step_s=timings or None,
             slowest_step=(max(timings, key=timings.get) if timings else None),
             degraded=degraded or None,

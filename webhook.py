@@ -482,13 +482,15 @@ def build_routers(dispatcher, telemetry, get_secret, run_gh_fn=None):
 
         No args: the whole board — `limit`, the `running` panels (with `elapsed_s`, `phase`,
         `attempt`, `model_retries`), the `queued` panels (FIFO `position` + `eta_start_s`),
-        `depth`, rolling `p50_panel_s`/`p90_panel_s`, `oldest_queued_s`, and the gateway
-        placeholders the telemetry card will fill. `?repo=owner/name&pr=N` narrows to one PR:
+        `depth`, rolling `p50_panel_s`/`p90_panel_s`, `oldest_queued_s`, and the live gateway
+        signal (`gateway_degraded`, `gateway_retry_rate_5m`). `?repo=owner/name&pr=N` narrows to one PR:
         `{state: running|queued|idle, position, eta_start_s, eta_verdict_s, head}`.
 
-        ETAs are null until there is duration data; they use p90 when the gateway is degraded
-        (always p50 for now — `gateway_degraded` is a placeholder until the telemetry card)."""
-        degraded = False  # until the gateway-telemetry card (#209) supplies the signal
+        ETAs are null until there is duration data; they use p90 when the gateway is degraded.
+        `gateway_degraded` / `gateway_retry_rate_5m` are the live model/SDK retry signal (#209),
+        read from the dispatcher; a dispatcher that predates the field degrades to False/None."""
+        degraded = bool(getattr(dispatcher, "gateway_degraded", False))
+        retry_rate = getattr(dispatcher, "gateway_retry_rate_5m", None)
         if not isinstance(_panel_queue, PanelQueue):
             # A plain semaphore (only a pre-injected test double) carries no tracking.
             if repo and pr is not None:
@@ -502,7 +504,7 @@ def build_routers(dispatcher, telemetry, get_secret, run_gh_fn=None):
                 "p50_panel_s": None,
                 "p90_panel_s": None,
                 "gateway_degraded": degraded,
-                "gateway_retry_rate_5m": None,
+                "gateway_retry_rate_5m": retry_rate,
                 "oldest_queued_s": None,
             }
         if repo and pr is not None:
@@ -510,7 +512,7 @@ def build_routers(dispatcher, telemetry, get_secret, run_gh_fn=None):
         return {
             "generated_at": time.time(),
             "gateway_degraded": degraded,
-            "gateway_retry_rate_5m": None,  # null until the telemetry card
+            "gateway_retry_rate_5m": retry_rate,
             **_panel_queue.status(degraded=degraded),
         }
 
