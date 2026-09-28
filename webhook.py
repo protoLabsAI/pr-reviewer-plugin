@@ -19,8 +19,10 @@ a body field and every delivery 422s.
 """
 
 import asyncio
+import contextlib
 import json
 import logging
+import time
 
 from .chokepoint import verify_signature
 
@@ -79,38 +81,54 @@ def build_routers(dispatcher, telemetry, get_secret, run_gh_fn=None):
     if run_gh_fn is None:
         from .gh_cli import run_gh as run_gh_fn
 
+    from .dispatch import PanelQueue
+
     public = APIRouter()
     api = APIRouter()
 
     # The CROSS-PR panel bound (#96). The webhook fires one background panel per eligible
     # event with no ceiling, so a burst of N PRs launched N panels at once, each fanning
     # to ~5 finders — a 14-PR burst measured 70 concurrent LLM calls, 7× latency, and 5
-    # panels exhausted mid-run. This caps concurrent panels; excess dispatches QUEUE on the
-    # semaphore rather than drop, so every PR still gets reviewed, just not all at once. The
+    # panels exhausted mid-run. This caps concurrent panels; excess dispatches QUEUE
+    # rather than drop, so every PR still gets reviewed, just not all at once. The
     # Dispatcher's chokepoint already stops the SAME PR running twice — this bounds DIFFERENT
     # PRs. Built here (a webhook-layer concern), then injected into the dispatcher so the
     # sweep's backfill panels honour the same bound instead of stacking on a live burst.
     #
-    # Constructed with no running loop (register-time): on Python ≥3.10 asyncio.Semaphore
-    # binds to the loop lazily at first `acquire`, which is inside the async handlers.
-    # A re-registered dispatcher (issue #198) keeps the semaphore its in-flight handlers
-    # already hold: a fresh one here would let the new routes start `panel_limit` MORE
-    # panels on top of those still draining the old one (review on #199, round 1).
+    # A `PanelQueue` IS an asyncio.Semaphore (same acquire/release/limit), so it still binds
+    # to the loop lazily at register-time and the sweep's plain-semaphore test path is
+    # untouched; on top it tracks depth/positions/phase for GET /queue (#209).
+    #
+    # A re-registered dispatcher (issue #198) keeps the queue its in-flight handlers already
+    # hold: a fresh one would let the new routes start `panel_limit` MORE panels on top of
+    # those still draining the old one (review on #199, round 1). On reuse we only re-point
+    # the queue's telemetry sink at THIS registration's, so the `queued` event still lands.
     panel_limit = max(1, int(getattr(dispatcher, "max_concurrent_panels", 3)))
     existing = getattr(dispatcher, "panel_sem", None)
-    if isinstance(existing, asyncio.Semaphore):
-        _panel_sem = existing
+    if isinstance(existing, PanelQueue):
+        _panel_queue = existing
+        _panel_queue.telemetry = telemetry
+    elif isinstance(existing, asyncio.Semaphore):
+        # A plain semaphore an in-flight handler already holds (only ever a test injection
+        # on this path) — do not swap it out from under those handlers; keep it, and the
+        # /queue endpoint degrades to reporting the limit alone.
+        _panel_queue = existing
     else:
-        _panel_sem = asyncio.Semaphore(panel_limit)
-        dispatcher.panel_sem = _panel_sem
+        _panel_queue = PanelQueue(panel_limit, telemetry=telemetry)
+        dispatcher.panel_sem = _panel_queue
 
-    def _note_if_queued(kind: str, repo: str, pr: int) -> None:
-        """Emit a `queued` event when the semaphore is full and this dispatch must wait —
-        the queue depth the operator sees in the panel stats. Best-effort: the check is
-        racy by nature (a slot may free before `acquire`), and a missed/spurious signal
-        is harmless."""
-        if _panel_sem.locked():
-            telemetry.emit("queued", kind=kind, repo=repo, pr=pr, limit=panel_limit)
+    def _panel_slot(kind: str, repo: str, pr: int, head: str = ""):
+        """The slot to hold across a dispatch. A PanelQueue registers the waiter/running
+        entry for GET /queue and emits its own `queued` telemetry; a plain semaphore (only a
+        pre-injected test double reaches here) keeps the best-effort queued signal and
+        acquires directly. Racy by nature — a slot may free before `acquire` — and harmless."""
+        if isinstance(_panel_queue, PanelQueue):
+            return _panel_queue.slot(repo=repo, pr=pr, head=head, kind=kind)
+        if isinstance(_panel_queue, asyncio.Semaphore):
+            if _panel_queue.locked():
+                telemetry.emit("queued", kind=kind, repo=repo, pr=pr, limit=panel_limit)
+            return _panel_queue
+        return contextlib.nullcontext()
 
     @public.post("/webhook")
     async def _webhook(request: Request):
@@ -298,8 +316,7 @@ def build_routers(dispatcher, telemetry, get_secret, run_gh_fn=None):
     async def _safe_summon(repo: str, pr: int, actor: str) -> None:
         # A summon is still a panel — bound it by the same cross-PR cap (#96).
         try:
-            _note_if_queued("summon", repo, pr)
-            async with _panel_sem:
+            async with _panel_slot("summon", repo, pr):
                 outcome = await dispatcher.handle_summon(repo, pr, actor)
             log.info("[pr-reviewer] summon %s#%s by @%s -> %s", repo, pr, actor, outcome)
             if outcome.startswith("drop:"):
@@ -313,8 +330,7 @@ def build_routers(dispatcher, telemetry, get_secret, run_gh_fn=None):
         # Hold a panel slot across the dispatch; a burst beyond the cap queues here
         # rather than launching every panel at once (#96).
         try:
-            _note_if_queued("webhook", repo, pr)
-            async with _panel_sem:
+            async with _panel_slot("webhook", repo, pr, head):
                 outcome = await dispatcher.handle_pr_event(repo, pr, head, action)
             log.info("[pr-reviewer] %s#%s @%s (%s) -> %s", repo, pr, head[:7], action, outcome)
         except Exception:  # noqa: BLE001
@@ -437,6 +453,44 @@ def build_routers(dispatcher, telemetry, get_secret, run_gh_fn=None):
                     )
                 )
         return {"runs": runs}
+
+    @api.get("/queue")
+    async def _queue(repo: str | None = None, pr: int | None = None):
+        """The panel queue, from IN-MEMORY state only — no GitHub, no network (#209).
+
+        No args: the whole board — `limit`, the `running` panels (with `elapsed_s`, `phase`,
+        `attempt`, `model_retries`), the `queued` panels (FIFO `position` + `eta_start_s`),
+        `depth`, rolling `p50_panel_s`/`p90_panel_s`, `oldest_queued_s`, and the gateway
+        placeholders the telemetry card will fill. `?repo=owner/name&pr=N` narrows to one PR:
+        `{state: running|queued|idle, position, eta_start_s, eta_verdict_s, head}`.
+
+        ETAs are null until there is duration data; they use p90 when the gateway is degraded
+        (always p50 for now — `gateway_degraded` is a placeholder until the telemetry card)."""
+        degraded = False  # until the gateway-telemetry card (#209) supplies the signal
+        if not isinstance(_panel_queue, PanelQueue):
+            # A plain semaphore (only a pre-injected test double) carries no tracking.
+            if repo and pr is not None:
+                return {"state": "idle", "position": None, "eta_start_s": None, "eta_verdict_s": None, "head": None}
+            return {
+                "generated_at": time.time(),
+                "limit": panel_limit,
+                "running": [],
+                "queued": [],
+                "depth": 0,
+                "p50_panel_s": None,
+                "p90_panel_s": None,
+                "gateway_degraded": degraded,
+                "gateway_retry_rate_5m": None,
+                "oldest_queued_s": None,
+            }
+        if repo and pr is not None:
+            return _panel_queue.lookup(str(repo), int(pr), degraded=degraded)
+        return {
+            "generated_at": time.time(),
+            "gateway_degraded": degraded,
+            "gateway_retry_rate_5m": None,  # null until the telemetry card
+            **_panel_queue.status(degraded=degraded),
+        }
 
     @api.get("/eval")
     async def _eval():

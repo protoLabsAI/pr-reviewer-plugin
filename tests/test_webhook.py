@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import hmac
 import json
 
 import httpx
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from httpx import ASGITransport
+from pr_reviewer.dispatch import Dispatcher, PanelQueue
 from pr_reviewer.telemetry import Telemetry
 from pr_reviewer.webhook import build_routers
 
@@ -838,3 +841,253 @@ async def test_replay_trials_are_bounded_and_an_empty_manifest_replays_nothing(t
     r = client.post("/api/plugins/pr-reviewer/replay", json={"manifest": "nope"})
     assert r.status_code == 400
     assert calls == []
+
+
+# ── PanelQueue + GET /queue: depth, positions, ETA, running phase (#209) ──────────
+#
+# The cross-PR cap (#96) became a `PanelQueue` (an asyncio.Semaphore subclass) that also
+# tracks who is running and who is waiting, so `GET /api/plugins/pr-reviewer/queue` can
+# report depth/positions/ETA/phase from IN-MEMORY state — no GitHub, no network. These
+# cover the queue unit behaviour and the endpoint.
+
+
+class _Clock:
+    """A hand-cranked clock so elapsed_s and the ETAs are deterministic, not wall-time."""
+
+    def __init__(self, t: float = 1000.0):
+        self.t = t
+
+    def __call__(self) -> float:
+        return self.t
+
+
+async def _held_slot(q, *, pr, head, kind, release):
+    """Hold one PanelQueue slot until `release` is set — the running/queued fixtures."""
+    async with q.slot(repo="o/r", pr=pr, head=head, kind=kind):
+        await release.wait()
+
+
+def test_build_routers_installs_a_panel_queue_reused_across_registration(tmp_path):
+    """r1: build_routers installs a PanelQueue sized from `max_concurrent_panels`, and a
+    re-registration reuses the SAME one (its in-flight handlers still hold it — #198)."""
+    dispatcher = SpyDispatcher()  # no max_concurrent_panels attr → the default of 3
+    build_routers(dispatcher, Telemetry(tmp_path), lambda: SECRET)
+    q = dispatcher.panel_sem
+    assert isinstance(q, PanelQueue) and q.limit == 3
+    assert isinstance(q, asyncio.Semaphore)  # still a semaphore: the sweep's raw-sem path is untouched
+    build_routers(dispatcher, Telemetry(tmp_path), lambda: SECRET)
+    assert dispatcher.panel_sem is q
+
+
+async def test_panel_queue_fifo_positions_and_advance_on_release(tmp_path):
+    """r2: with limit=1 and three panels, one runs and two queue at positions 1 and 2 in
+    FIFO order (depth=2); releasing the runner advances the queue."""
+    q = PanelQueue(1, telemetry=Telemetry(tmp_path))
+    releases = {pr: asyncio.Event() for pr in (1, 2, 3)}
+    held: list[int] = []
+
+    async def hold(pr):
+        async with q.slot(repo="o/r", pr=pr, head=f"h{pr}", kind="webhook"):
+            held.append(pr)
+            await releases[pr].wait()
+
+    tasks = [asyncio.create_task(hold(1))]
+    await _yield_until(lambda: held == [1])  # PR1 has the only slot
+    tasks += [asyncio.create_task(hold(2)), asyncio.create_task(hold(3))]
+    await _yield_until(lambda: q.status()["depth"] == 2)
+
+    snap = q.status()
+    assert [r["pr"] for r in snap["running"]] == [1]
+    assert [(x["pr"], x["position"]) for x in snap["queued"]] == [(2, 1), (3, 2)]
+    assert snap["depth"] == 2
+
+    releases[1].set()  # PR1 done → PR2 takes the slot, PR3 advances to position 1
+    await _yield_until(lambda: held == [1, 2])
+    snap = q.status()
+    assert [r["pr"] for r in snap["running"]] == [2]
+    assert [(x["pr"], x["position"]) for x in snap["queued"]] == [(3, 1)]
+    assert snap["depth"] == 1
+
+    for e in releases.values():
+        e.set()
+    await asyncio.gather(*tasks)
+
+
+async def test_cancelled_waiter_disappears_from_queued(tmp_path):
+    """r3: a panel cancelled while waiting drops out of `queued` and never runs."""
+    q = PanelQueue(1, telemetry=Telemetry(tmp_path))
+    release = asyncio.Event()
+    holder = asyncio.create_task(_held_slot(q, pr=1, head="h1", kind="webhook", release=release))
+    await _yield_until(lambda: q.status()["running"])
+
+    waiter = asyncio.create_task(_held_slot(q, pr=2, head="h2", kind="webhook", release=release))
+    await _yield_until(lambda: q.status()["depth"] == 1)
+    waiter.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await waiter
+
+    assert q.status()["depth"] == 0  # the cancelled waiter is gone
+    assert [r["pr"] for r in q.status()["running"]] == [1]  # PR1 still holds the slot
+    release.set()
+    await holder
+
+
+async def test_exception_in_a_round_releases_the_slot_and_clears_running(tmp_path):
+    """r3: an exception inside the slot still frees it and clears the running entry — and a
+    crashed round contributes no duration to the rolling p50/p90."""
+    q = PanelQueue(1, telemetry=Telemetry(tmp_path))
+    with pytest.raises(RuntimeError):
+        async with q.slot(repo="o/r", pr=1, head="h1", kind="webhook"):
+            assert [r["pr"] for r in q.status()["running"]] == [1]
+            raise RuntimeError("boom")
+
+    assert q.status()["running"] == [] and q.status()["depth"] == 0  # cleared
+    async with q.slot(repo="o/r", pr=2, head="h2", kind="webhook"):  # slot freed → acquires at once
+        assert [r["pr"] for r in q.status()["running"]] == [2]
+    assert list(q._durations) == [pytest.approx(0.0, abs=1)]  # only the clean PR2 round recorded
+
+
+async def test_phase_updates_as_the_dispatcher_reports_steps(tmp_path):
+    """r4: the dispatcher's phase reports land on the running entry the endpoint reads."""
+    d = Dispatcher({}, Telemetry(tmp_path))
+    q = PanelQueue(1, telemetry=Telemetry(tmp_path))
+    async with q.slot(repo="o/r", pr=1, head="h1", kind="webhook") as running:
+        assert running.phase == "finders"  # the opening phase
+        d.report_phase("verify")
+        assert q.status()["running"][0]["phase"] == "verify"
+        d._on_panel_step("synthesize")  # a recipe step name → phase
+        assert q.status()["running"][0]["phase"] == "synthesize"
+        d._on_panel_step("find_structural")
+        assert q.status()["running"][0]["phase"] == "structural"
+    # Outside the slot there is no running panel, so a report is a harmless no-op.
+    d.report_phase("posting")
+    assert q.status()["running"] == []
+
+
+async def test_backfill_acquires_the_same_panel_queue(tmp_path):
+    """r1: the sweep's backfill queues on the injected PanelQueue (not a private one) and
+    shows up in `queued` as `sweep-backfill`, with the queued telemetry preserved."""
+    d = Dispatcher({}, Telemetry(tmp_path))
+    q = PanelQueue(1, telemetry=d.telemetry)
+    d.panel_sem = q
+    release = asyncio.Event()
+    holder = asyncio.create_task(_held_slot(q, pr=99, head="x", kind="webhook", release=release))
+    await _yield_until(lambda: q.status()["running"])
+
+    task = asyncio.create_task(d.backfill_review("o/r", 1, "head1"))
+    await _yield_until(lambda: q.status()["depth"] == 1)
+    queued = q.status()["queued"]
+    assert queued[0]["kind"] == "sweep-backfill" and queued[0]["pr"] == 1
+    emitted = [e for e in d.telemetry.read_all() if e["event"] == "queued" and e.get("kind") == "sweep-backfill"]
+    assert emitted  # the existing queued signal is kept
+
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+    release.set()
+    await holder
+
+
+def test_queue_lookup_states_and_eta_formula(tmp_path):
+    """r5: per-PR lookup returns running/queued/idle with the position and the ETA formula —
+    eta_start for position k on limit=1 is max(0, p50−elapsed) + (k−1)·p50."""
+
+    async def _run():
+        clock = _Clock(1000.0)
+        q = PanelQueue(1, telemetry=Telemetry(tmp_path), clock=clock, wall=clock, durations=[100.0])
+        assert q.lookup("o/r", 7)["state"] == "idle"  # nothing anywhere
+
+        release = asyncio.Event()
+        running = asyncio.create_task(_held_slot(q, pr=1, head="h1", kind="webhook", release=release))
+        await _yield_until(lambda: q.status()["running"])
+        waiters = [
+            asyncio.create_task(_held_slot(q, pr=2, head="h2", kind="webhook", release=release)),
+            asyncio.create_task(_held_slot(q, pr=3, head="h3", kind="backfill", release=release)),
+        ]
+        await _yield_until(lambda: q.status()["depth"] == 2)
+
+        clock.t = 1030.0  # PR1 has now run 30s; p50 is 100s → 70s of estimated work left
+        r1 = q.lookup("o/r", 1)
+        assert r1 == {"state": "running", "position": None, "eta_start_s": 0.0, "eta_verdict_s": 70.0, "head": "h1"}
+        r2 = q.lookup("o/r", 2)
+        assert r2 == {"state": "queued", "position": 1, "eta_start_s": 70.0, "eta_verdict_s": 170.0, "head": "h2"}
+        r3 = q.lookup("o/r", 3)  # a second wave: +1·p50
+        assert r3 == {"state": "queued", "position": 2, "eta_start_s": 170.0, "eta_verdict_s": 270.0, "head": "h3"}
+
+        release.set()
+        await asyncio.gather(running, *waiters)
+
+    asyncio.run(_run())
+
+
+def test_queue_etas_are_null_without_duration_data(tmp_path):
+    """r5: with no completed-round durations yet, every ETA is null (running and queued)."""
+
+    async def _run():
+        q = PanelQueue(1, telemetry=Telemetry(tmp_path))  # no durations
+        release = asyncio.Event()
+        running = asyncio.create_task(_held_slot(q, pr=1, head="h1", kind="webhook", release=release))
+        await _yield_until(lambda: q.status()["running"])
+        waiter = asyncio.create_task(_held_slot(q, pr=2, head="h2", kind="webhook", release=release))
+        await _yield_until(lambda: q.status()["depth"] == 1)
+
+        snap = q.status()
+        assert snap["p50_panel_s"] is None and snap["p90_panel_s"] is None
+        assert snap["queued"][0]["eta_start_s"] is None
+        assert q.lookup("o/r", 1)["eta_verdict_s"] is None
+        assert q.lookup("o/r", 2) == {
+            "state": "queued",
+            "position": 1,
+            "eta_start_s": None,
+            "eta_verdict_s": None,
+            "head": "h2",
+        }
+
+        release.set()
+        await asyncio.gather(running, waiter)
+
+    asyncio.run(_run())
+
+
+async def test_queue_endpoint_reports_running_and_queued_without_touching_github(tmp_path):
+    """r2/r6: over the real router, GET /queue shows 1 running + 2 queued (positions 1,2,
+    depth 2) while three panels are in flight — and makes no GitHub/network call (the gh
+    fake raises if reached)."""
+
+    async def boom_gh(args, timeout=30):
+        raise AssertionError("the queue endpoint must not call gh")
+
+    dispatcher = GatedDispatcher(max_concurrent_panels=1)
+    telemetry = Telemetry(tmp_path)
+    public, api = build_routers(dispatcher, telemetry, lambda: SECRET, run_gh_fn=boom_gh)
+    app = FastAPI()
+    app.include_router(public, prefix="/plugins/pr-reviewer")
+    app.include_router(api, prefix="/api/plugins/pr-reviewer")
+
+    async with httpx.AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as client:
+        for pr in (1, 2, 3):
+            body = pr_payload(pr)
+            r = await client.post("/plugins/pr-reviewer/webhook", content=body, headers=signed(body))
+            assert r.json()["dispatched"] is True
+        await _yield_until(lambda: dispatcher.running >= 1)
+        for _ in range(10):  # let the overflow park on the full queue
+            await asyncio.sleep(0)
+
+        data = (await client.get("/api/plugins/pr-reviewer/queue")).json()
+        assert data["limit"] == 1
+        assert [r["pr"] for r in data["running"]] == [1]
+        assert data["running"][0]["phase"] == "finders" and data["running"][0]["kind"] == "webhook"
+        assert [x["position"] for x in data["queued"]] == [1, 2]
+        assert data["depth"] == 2
+        assert data["gateway_degraded"] is False and data["gateway_retry_rate_5m"] is None
+        assert "generated_at" in data and data["oldest_queued_s"] is not None
+
+        one = (await client.get("/api/plugins/pr-reviewer/queue", params={"repo": "o/r", "pr": 1})).json()
+        assert one["state"] == "running" and one["head"] == f"{1:040x}"
+        two = (await client.get("/api/plugins/pr-reviewer/queue", params={"repo": "o/r", "pr": 2})).json()
+        assert two["state"] == "queued" and two["position"] == 1
+        idle = (await client.get("/api/plugins/pr-reviewer/queue", params={"repo": "o/r", "pr": 999})).json()
+        assert idle["state"] == "idle"
+
+        dispatcher.release.set()
+        await _yield_until(lambda: dispatcher.completed >= 3)
