@@ -384,6 +384,56 @@ Requires the App installation to carry **Checks: read & write**. Without it the 
 logs a warning naming that permission and the whole lifecycle no-ops — the review still
 posts as before (bookkeeping must never cost the verdict).
 
+### `GET /api/plugins/pr-reviewer/queue` — panel throughput, at a glance
+
+All three panel paths — webhook dispatch, `@vera` summons / check re-requests, and the
+sweep's backfill — share one **`PanelQueue`** (limit = `max_concurrent_panels`). When every
+slot is busy the overflow **queues** rather than dropping, but until now the only signal was
+a best-effort `queued` telemetry event, so a waiting PR's `Review at head` read *"no QA panel
+verdict"* with nothing saying it was in line. This gated GET route (same auth as `/eval` and
+`/summon/health`) reports the queue from **in-memory state only — no GitHub, no network:**
+
+```jsonc
+{
+  "generated_at": 1727470000.0,
+  "limit": 3,
+  "running": [
+    { "repo": "o/r", "pr": 12, "head": "abc123…", "kind": "webhook",
+      "started_at": 1727469900.0, "elapsed_s": 100.0,
+      "attempt": 1, "phase": "verify", "model_retries": 0 }
+  ],
+  "queued": [
+    { "repo": "o/r", "pr": 15, "head": "def456…", "kind": "summon",
+      "enqueued_at": 1727469990.0, "position": 1, "eta_start_s": 45.0 }
+  ],
+  "depth": 1,
+  "p50_panel_s": 180.0,          // rolling, from recent completed rounds; null until there is data
+  "p90_panel_s": 300.0,
+  "gateway_degraded": false,     // placeholder until the gateway-telemetry card
+  "gateway_retry_rate_5m": null, // idem
+  "oldest_queued_s": 10.0
+}
+```
+
+- **`kind`** is `webhook` | `summon` | `sweep-backfill`. **`phase`** is the running step —
+  `finders` | `structural` | `verify` | `synthesize` | `posting` — updated as the panel
+  progresses (`posting` is the dispatcher writing the verdict after the runner returns).
+- **`position`** is the FIFO place in line (1 = next to start); **`depth`** is `len(queued)`.
+- **ETA.** `eta_start_s` for position *k* is the *k*-th smallest of `max(0, p50 − elapsed_s)`
+  across running panels, plus `(⌈k/limit⌉ − 1) × p50` for each later wave; it uses **p90 when
+  `gateway_degraded`**. All ETAs are **null until there is duration data**.
+
+**Per-PR lookup:** `GET /api/plugins/pr-reviewer/queue?repo=owner/name&pr=N` →
+
+```jsonc
+{ "state": "running" | "queued" | "idle",
+  "position": 1, "eta_start_s": 45.0, "eta_verdict_s": 225.0, "head": "def456…" }
+```
+
+`eta_verdict_s = eta_start_s + p50` (and both null without data); a `running` PR reports
+`eta_start_s: 0` with `eta_verdict_s` its estimated time-to-verdict, and an `idle` PR (neither
+running nor queued) reports nulls.
+
 ### What the sweep does (every `sweep_interval_s`, default 180s)
 
 Each open PR in each managed repo is reconciled in this order — cheapest and most

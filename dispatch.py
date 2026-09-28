@@ -24,11 +24,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import json
 import logging
+import math
 import os
 import re
 import time
+from collections import deque
 from urllib.parse import quote
 
 from .approve import HOLD_NOT_OWNER, HOLD_THREADS_UNRESOLVED, PROMOTE, Observations, promotion_decision
@@ -501,6 +504,293 @@ def _env_int(name: str, default: int) -> int:
     except ValueError:
         return default
     return value if value >= 0 else default
+
+
+# The panel a task is running under, so `Dispatcher.report_phase` can update the RIGHT
+# `PanelQueue` running entry from deep inside `_review` without threading a handle through
+# every call. `PanelQueue.slot` sets it on acquire and resets it on release; each panel
+# runs in its own task, so the copied context keeps concurrent panels from crossing wires.
+# Off the PanelQueue path (a plain semaphore or nullcontext) it stays None and every
+# phase report is a no-op.
+_CURRENT_PANEL: contextvars.ContextVar = contextvars.ContextVar("pr_reviewer_current_panel", default=None)
+
+# The panel phases the /queue endpoint reports, in run order. `posting` is the dispatcher's
+# own step (it posts the verdict after the runner returns); the rest name recipe steps.
+PANEL_PHASES = ("finders", "structural", "verify", "synthesize", "posting")
+
+
+def _phase_for_step(step: str) -> str:
+    """A recipe step name → the coarse phase the operator sees. Unknown steps read as
+    `finders` (the panel's opening, and the safe default for a step we can't place)."""
+    s = str(step or "").lower()
+    if "structural" in s:
+        return "structural"
+    if "verify" in s:
+        return "verify"
+    if "synth" in s:
+        return "synthesize"
+    if "report" in s or "post" in s:
+        return "posting"
+    if s.startswith("find") or "finder" in s:
+        return "finders"
+    return "finders"
+
+
+def _percentile(data: list[float], pct: float) -> float | None:
+    """Nearest-rank percentile of `data` (0–100), or None when empty. Used for the rolling
+    p50/p90 panel durations behind the queue's ETAs."""
+    if not data:
+        return None
+    ordered = sorted(data)
+    rank = max(1, min(len(ordered), math.ceil(pct / 100 * len(ordered))))
+    return ordered[rank - 1]
+
+
+def _eta_start_for(position: int, rem_sorted: list[float], limit: int, eta_p: float | None) -> float | None:
+    """Seconds a panel at 1-based queue `position` waits before it STARTS.
+
+    The k-th smallest remaining time across running panels (`rem_sorted`) is when the k-th
+    slot frees; positions past `limit` wrap to a later wave, each wave adding one `eta_p`
+    (issue #209 §4). None when there is no duration data to estimate from."""
+    if eta_p is None:
+        return None
+    lanes = max(1, limit)
+    idx = (position - 1) % lanes
+    base = rem_sorted[idx] if idx < len(rem_sorted) else 0.0
+    wave = (position - 1) // lanes  # == ceil(position / limit) − 1
+    return base + wave * eta_p
+
+
+class _Waiter:
+    """One panel parked on the queue, in FIFO order — what the endpoint reads as `queued`."""
+
+    __slots__ = ("repo", "pr", "head", "kind", "enqueued_at", "mono")
+
+    def __init__(self, *, repo: str, pr: int, head: str, kind: str, enqueued_at: float, mono: float):
+        self.repo, self.pr, self.head, self.kind = repo, pr, head, kind
+        self.enqueued_at, self.mono = enqueued_at, mono
+
+
+class _Running:
+    """One panel holding a slot — what the endpoint reads as `running`. `phase` is updated
+    by the dispatcher's step callback; `model_retries` stays 0 until the gateway-telemetry
+    card (#209) fills it. `ran` flips true the first time a phase is reported (i.e. the
+    round reached the runner) — a slot that exits without ever running a panel (an early
+    `drop:`/`reaffirmed:` return still holding the slot) leaves it false and so contributes
+    NO duration to the rolling window (that near-zero would drag p50/p90 and every ETA
+    toward 0)."""
+
+    __slots__ = ("repo", "pr", "head", "kind", "started_at", "mono", "attempt", "phase", "model_retries", "ran")
+
+    def __init__(self, *, repo: str, pr: int, head: str, kind: str, started_at: float, mono: float):
+        self.repo, self.pr, self.head, self.kind = repo, pr, head, kind
+        self.started_at, self.mono = started_at, mono
+        self.attempt = 1
+        self.phase = "finders"
+        self.model_retries = 0
+        self.ran = False
+
+
+class PanelQueue(asyncio.Semaphore):
+    """The cross-PR panel cap (#96) with the depth/positions/ETA the `queued` telemetry
+    could only hint at (#209). It IS an `asyncio.Semaphore` — same acquire/release/`locked`
+    semantics, same lazy loop binding at register-time, and reused across re-registration
+    (#198) — so a caller that just does `async with queue` still works and the sweep's
+    injected-plain-semaphore path is untouched. On top it tracks, for `GET /queue`:
+
+      - an ordered waiter list (repo, pr, head, kind, enqueued_at) — FIFO, matching the
+        Semaphore's own grant order, so a position is the wait order;
+      - a running set (repo, pr, head, kind, started_at, attempt, phase, model_retries);
+      - a rolling window of recently completed-round durations for p50/p90 and the ETAs.
+
+    Acquire the tracked slot with `async with queue.slot(repo=…, pr=…, head=…, kind=…)`.
+    Cancellation while waiting drops the waiter; any exception in the body still releases
+    the slot and clears the running entry (both in `_PanelSlot.__aexit__`).
+    """
+
+    def __init__(
+        self,
+        limit: int,
+        *,
+        telemetry=None,
+        clock=None,
+        wall=None,
+        history: int = 200,
+        durations=None,
+    ):
+        n = max(1, int(limit))
+        super().__init__(n)
+        self.limit = n
+        self.telemetry = telemetry
+        self._clock = clock or time.monotonic  # monotonic, for elapsed/ETA math
+        self._wall = wall or time.time  # wall epoch, for the displayed timestamps
+        self._pending: list[_Waiter] = []  # NOT `_waiters`: that name is the Semaphore's own
+        self._active: list[_Running] = []
+        self._durations: deque[float] = deque(durations or (), maxlen=max(1, history))
+
+    def slot(self, *, repo: str, pr: int, head: str = "", kind: str = "webhook") -> _PanelSlot:
+        """The tracked acquire/release context manager. Emits the `queued` telemetry when it
+        must wait (kept from the raw-semaphore path), registers the running entry, and
+        records the round's duration on a clean exit."""
+        return _PanelSlot(self, repo=repo, pr=pr, head=head, kind=kind)
+
+    def record_duration(self, seconds: float) -> None:
+        """Remember one completed round's wall duration for the rolling p50/p90."""
+        if seconds >= 0:
+            self._durations.append(float(seconds))
+
+    def status(self, *, now: float | None = None, degraded: bool = False) -> dict:
+        """The in-memory snapshot behind `GET /queue` — no network, no GitHub. ETAs use p90
+        when `degraded`, else p50, and are null until there is duration data."""
+        now = self._clock() if now is None else now
+        p50 = _percentile(list(self._durations), 50)
+        p90 = _percentile(list(self._durations), 90)
+        eta_p = p90 if degraded else p50
+        running = []
+        rem = []
+        for r in sorted(self._active, key=lambda e: e.mono):
+            elapsed = max(0.0, now - r.mono)
+            running.append(
+                {
+                    "repo": r.repo,
+                    "pr": r.pr,
+                    "head": r.head,
+                    "kind": r.kind,
+                    "started_at": r.started_at,
+                    "elapsed_s": round(elapsed, 3),
+                    "attempt": r.attempt,
+                    "phase": r.phase,
+                    "model_retries": r.model_retries,
+                }
+            )
+            if eta_p is not None:
+                rem.append(max(0.0, eta_p - elapsed))
+        rem_sorted = sorted(rem)
+        queued = []
+        for position, w in enumerate(self._pending, start=1):
+            eta_start = _eta_start_for(position, rem_sorted, self.limit, eta_p)
+            queued.append(
+                {
+                    "repo": w.repo,
+                    "pr": w.pr,
+                    "head": w.head,
+                    "kind": w.kind,
+                    "enqueued_at": w.enqueued_at,
+                    "position": position,
+                    "eta_start_s": None if eta_start is None else round(eta_start, 3),
+                }
+            )
+        oldest = max((now - w.mono for w in self._pending), default=None)
+        return {
+            "limit": self.limit,
+            "running": running,
+            "queued": queued,
+            "depth": len(self._pending),
+            "p50_panel_s": None if p50 is None else round(p50, 3),
+            "p90_panel_s": None if p90 is None else round(p90, 3),
+            "oldest_queued_s": None if oldest is None else round(oldest, 3),
+        }
+
+    def lookup(self, repo: str, pr: int, *, now: float | None = None, degraded: bool = False) -> dict:
+        """Per-PR state for `GET /queue?repo=…&pr=…`: running / queued / idle, with the
+        position and the ETAs (`eta_verdict_s = eta_start_s + p50`, null without data)."""
+        now = self._clock() if now is None else now
+        eta_p = _percentile(list(self._durations), 90 if degraded else 50)
+        for r in self._active:
+            if r.repo == repo and r.pr == pr:
+                elapsed = max(0.0, now - r.mono)
+                remaining = None if eta_p is None else round(max(0.0, eta_p - elapsed), 3)
+                return {
+                    "state": "running",
+                    "position": None,
+                    "eta_start_s": None if eta_p is None else 0.0,
+                    "eta_verdict_s": remaining,
+                    "head": r.head,
+                }
+        rem_sorted = sorted(max(0.0, (eta_p or 0.0) - max(0.0, now - r.mono)) for r in self._active) if eta_p else []
+        for position, w in enumerate(self._pending, start=1):
+            if w.repo == repo and w.pr == pr:
+                eta_start = _eta_start_for(position, rem_sorted, self.limit, eta_p)
+                eta_verdict = None if eta_start is None else eta_start + eta_p
+                return {
+                    "state": "queued",
+                    "position": position,
+                    "eta_start_s": None if eta_start is None else round(eta_start, 3),
+                    "eta_verdict_s": None if eta_verdict is None else round(eta_verdict, 3),
+                    "head": w.head,
+                }
+        return {"state": "idle", "position": None, "eta_start_s": None, "eta_verdict_s": None, "head": None}
+
+
+class _PanelSlot:
+    """The `async with queue.slot(...)` context manager. Kept a class (not a
+    `@contextlib.asynccontextmanager`) so the waiter/running bookkeeping survives a
+    cancellation between acquire and the body, and so the current-panel contextvar is
+    reset on every exit."""
+
+    def __init__(self, queue: PanelQueue, *, repo: str, pr: int, head: str, kind: str):
+        self._q = queue
+        self._repo, self._pr, self._head, self._kind = repo, pr, head, kind
+        self._running: _Running | None = None
+        self._token = None
+
+    async def __aenter__(self) -> _Running:
+        q = self._q
+        waiter = _Waiter(
+            repo=self._repo,
+            pr=self._pr,
+            head=self._head,
+            kind=self._kind,
+            enqueued_at=q._wall(),
+            mono=q._clock(),
+        )
+        will_wait = q.locked()  # racy by nature, like the telemetry it drives — harmless
+        q._pending.append(waiter)
+        if will_wait and q.telemetry is not None:
+            q.telemetry.emit("queued", kind=self._kind, repo=self._repo, pr=self._pr, head=self._head, limit=q.limit)
+        try:
+            await q.acquire()
+        except BaseException:  # cancelled (or failed) while waiting — the waiter disappears
+            if waiter in q._pending:
+                q._pending.remove(waiter)
+            raise
+        if waiter in q._pending:
+            q._pending.remove(waiter)
+        running = _Running(
+            repo=self._repo,
+            pr=self._pr,
+            head=self._head,
+            kind=self._kind,
+            started_at=q._wall(),
+            mono=q._clock(),
+        )
+        q._active.append(running)
+        self._running = running
+        self._token = _CURRENT_PANEL.set(running)
+        return running
+
+    async def __aexit__(self, exc_type, exc, tb) -> bool:
+        q = self._q
+        if self._token is not None:
+            with contextlib.suppress(ValueError):
+                _CURRENT_PANEL.reset(self._token)
+        running = self._running
+        if running is not None:
+            if running in q._active:
+                q._active.remove(running)
+            # Only a round that actually RAN a panel feeds the rolling p50/p90 (issue #209).
+            # The webhook/summon paths hold the slot across `handle_pr_event`/`handle_summon`,
+            # which return early — `drop:not-a-dispatch-action`, `drop:unlisted-repo`,
+            # `drop:max-rounds-capped`, a chokepoint drop, or `_review`'s own `drop:`/
+            # `reaffirmed:` short-circuits — WITHOUT running a panel. Those exit cleanly in
+            # milliseconds; recording them would pull p50/p90 (and thus every ETA) toward 0,
+            # contradicting the "from recent completed rounds" contract. `ran` is set by the
+            # first `report_phase`, which fires only once the round reaches the runner, so an
+            # early drop leaves it false and contributes nothing.
+            if exc_type is None and running.ran:
+                q.record_duration(q._clock() - running.mono)
+            q.release()  # the slot always frees, exception or not
+        return False
 
 
 class Dispatcher:
@@ -984,6 +1274,30 @@ class Dispatcher:
             return STATE.workflow_run
         except Exception:  # noqa: BLE001 — host-free
             return None
+
+    def report_phase(self, phase: str) -> None:
+        """Update the phase of the panel this task is running (what `GET /queue` shows). A
+        no-op off the `PanelQueue` path — a raw semaphore or `nullcontext` slot has no
+        running entry, so the contextvar is None.
+
+        A phase report is also how the slot learns the round actually RAN a panel: the first
+        one (line ~2246, unconditional once `_review` clears every drop gate and reaches the
+        runner) flips `ran`, which is what lets `_PanelSlot.__aexit__` tell a completed round
+        from a slot-held early drop when recording the rolling p50/p90 (issue #209)."""
+        entry = _CURRENT_PANEL.get()
+        if entry is not None and phase:
+            entry.phase = phase
+            entry.ran = True
+
+    def _on_panel_step(self, step=None, *args, **kwargs) -> None:
+        """Runner step callback → panel phase. Passed to the runner only when its signature
+        accepts `on_step` (an older host, and every test fake, does not — so nothing changes
+        there). Tolerant of the host's calling convention and swallowing its own errors: this
+        is observability, never load-bearing, and must not turn a good panel into a retry."""
+        try:
+            self.report_phase(_phase_for_step(step))
+        except Exception:  # noqa: BLE001 — a phase report must never fail the round
+            pass
 
     async def _escalate(
         self,
@@ -1947,6 +2261,12 @@ class Dispatcher:
         # draw against whatever starved the failed step.
         result: dict = {}
         failed: list = []
+        # The opening phase the /queue endpoint shows for this panel; a cooperating host
+        # then narrows it per step via `on_step`, an older host stays on this.
+        self.report_phase("structural" if recipe == "code-review-structural" else "finders")
+        # Fine-grained phase reporting rides the runner ONLY when it declares `on_step`
+        # (protoAgent's engine does; a test fake / older host does not, so this stays {}).
+        step_kwargs = {"on_step": self._on_panel_step} if _accepts_keyword(runner, "on_step") else {}
         # Stage boundaries whose findings payload never arrived (#113). An ABSENT array is
         # not an empty one, and parsing it as `[]` is what posted a clean PASS beneath a
         # verify note saying the findings may have been lost. It is handled like a failed
@@ -1961,7 +2281,7 @@ class Dispatcher:
             attempt_bound = asyncio.timeout(self.panel_attempt_timeout_s)
             try:
                 async with attempt_bound:
-                    result = await runner(recipe, inputs)
+                    result = await runner(recipe, inputs, **step_kwargs)
             except Exception as exc:  # noqa: BLE001 — the attempt's own TimeoutError included
                 timed_out = isinstance(exc, TimeoutError) and attempt_bound.expired()
                 why = f"timed out after {self.panel_attempt_timeout_s:g}s" if timed_out else type(exc).__name__
@@ -2392,6 +2712,7 @@ class Dispatcher:
                 file=str(dropped_finding.get("file") or ""),
             )
         elapsed = time.monotonic() - started
+        self.report_phase("posting")  # runner done; posting the verdict is the dispatcher's step
         posted = await self._post_verdict(
             repo,
             pr,
@@ -2983,6 +3304,7 @@ class Dispatcher:
         # in any other shape reads fine. The re-run hands the verifier the SAME array,
         # restated — an explicit count first, no delegation banner, no prose brief.
         seeded["synthesize"] = restate_findings(synthesized)
+        self.report_phase("verify")  # the seeded re-run runs only verify + report
         for attempt in range(1, self.verify_reruns + 1):
             try:
                 async with asyncio.timeout(self.panel_attempt_timeout_s):
@@ -3452,12 +3774,19 @@ class Dispatcher:
             self.telemetry.emit("drop", repo=repo, pr=pr, sha=head, reason=decision, action=BACKFILL_ACTION)
             return f"drop:{decision}"
         self.telemetry.emit("backfill", repo=repo, pr=pr, sha=head)
-        # `locked()` is True exactly when no slot is free, i.e. this panel WILL wait —
-        # the queue-depth signal the operator reads out of the panel stats.
-        if self.panel_sem is not None and self.panel_sem.locked():
-            self.telemetry.emit("queued", kind=BACKFILL_ACTION, repo=repo, pr=pr, sha=head)
-        slot = self.panel_sem if self.panel_sem is not None else contextlib.nullcontext()
+        sem = self.panel_sem
         try:
+            if isinstance(sem, PanelQueue):
+                # The tracked slot registers this backfill in the queue's running/waiter
+                # view (so GET /queue sees it) and emits its own `queued` telemetry.
+                async with sem.slot(repo=repo, pr=pr, head=head, kind=BACKFILL_ACTION):
+                    return await self._bounded_review(repo, pr)
+            # A raw semaphore (a test injection) or None — the legacy path, unchanged:
+            # `locked()` is True exactly when no slot is free, i.e. this panel WILL wait —
+            # the queue-depth signal the operator reads out of the panel stats.
+            if sem is not None and sem.locked():
+                self.telemetry.emit("queued", kind=BACKFILL_ACTION, repo=repo, pr=pr, sha=head)
+            slot = sem if sem is not None else contextlib.nullcontext()
             async with slot:
                 return await self._bounded_review(repo, pr)
         finally:
