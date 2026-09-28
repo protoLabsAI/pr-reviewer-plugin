@@ -935,16 +935,41 @@ async def test_cancelled_waiter_disappears_from_queued(tmp_path):
 async def test_exception_in_a_round_releases_the_slot_and_clears_running(tmp_path):
     """r3: an exception inside the slot still frees it and clears the running entry — and a
     crashed round contributes no duration to the rolling p50/p90."""
+    d = Dispatcher({}, Telemetry(tmp_path))
     q = PanelQueue(1, telemetry=Telemetry(tmp_path))
     with pytest.raises(RuntimeError):
         async with q.slot(repo="o/r", pr=1, head="h1", kind="webhook"):
             assert [r["pr"] for r in q.status()["running"]] == [1]
-            raise RuntimeError("boom")
+            d.report_phase("finders")  # the round DID reach the runner...
+            raise RuntimeError("boom")  # ...then crashed, so its duration is not recorded
 
     assert q.status()["running"] == [] and q.status()["depth"] == 0  # cleared
     async with q.slot(repo="o/r", pr=2, head="h2", kind="webhook"):  # slot freed → acquires at once
         assert [r["pr"] for r in q.status()["running"]] == [2]
+        d.report_phase("finders")  # a real panel ran → this clean round feeds p50/p90
     assert list(q._durations) == [pytest.approx(0.0, abs=1)]  # only the clean PR2 round recorded
+
+
+async def test_a_slot_held_across_an_early_drop_records_no_duration(tmp_path):
+    """The regression the review caught (#209): the webhook/summon paths hold the slot ACROSS
+    `handle_pr_event`/`handle_summon`, which can return an early `drop:`/`reaffirmed:` outcome
+    WITHOUT ever running a panel. Such a clean exit takes milliseconds; recording it would drag
+    the rolling p50/p90 — and thus every eta_start_s/eta_verdict_s — toward 0, contradicting the
+    "from recent completed rounds" contract. Only a round that actually ran (reported a phase)
+    feeds the window."""
+    d = Dispatcher({}, Telemetry(tmp_path))
+    q = PanelQueue(1, telemetry=Telemetry(tmp_path))
+
+    # A slot held across an early drop: it exits cleanly, but no phase was ever reported.
+    async with q.slot(repo="o/r", pr=1, head="h1", kind="webhook"):
+        assert [r["pr"] for r in q.status()["running"]] == [1]  # visible while held
+        # handle_pr_event returned e.g. `drop:unlisted-repo` before any panel ran
+    assert list(q._durations) == []  # the near-zero drop is NOT recorded
+
+    # A genuine panel round on the same queue DOES feed the rolling window.
+    async with q.slot(repo="o/r", pr=2, head="h2", kind="webhook"):
+        d.report_phase("structural")
+    assert list(q._durations) == [pytest.approx(0.0, abs=1)]  # only the real round counts
 
 
 async def test_phase_updates_as_the_dispatcher_reports_steps(tmp_path):

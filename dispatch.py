@@ -574,9 +574,13 @@ class _Waiter:
 class _Running:
     """One panel holding a slot — what the endpoint reads as `running`. `phase` is updated
     by the dispatcher's step callback; `model_retries` stays 0 until the gateway-telemetry
-    card (#209) fills it."""
+    card (#209) fills it. `ran` flips true the first time a phase is reported (i.e. the
+    round reached the runner) — a slot that exits without ever running a panel (an early
+    `drop:`/`reaffirmed:` return still holding the slot) leaves it false and so contributes
+    NO duration to the rolling window (that near-zero would drag p50/p90 and every ETA
+    toward 0)."""
 
-    __slots__ = ("repo", "pr", "head", "kind", "started_at", "mono", "attempt", "phase", "model_retries")
+    __slots__ = ("repo", "pr", "head", "kind", "started_at", "mono", "attempt", "phase", "model_retries", "ran")
 
     def __init__(self, *, repo: str, pr: int, head: str, kind: str, started_at: float, mono: float):
         self.repo, self.pr, self.head, self.kind = repo, pr, head, kind
@@ -584,6 +588,7 @@ class _Running:
         self.attempt = 1
         self.phase = "finders"
         self.model_retries = 0
+        self.ran = False
 
 
 class PanelQueue(asyncio.Semaphore):
@@ -773,7 +778,16 @@ class _PanelSlot:
         if running is not None:
             if running in q._active:
                 q._active.remove(running)
-            if exc_type is None:  # a clean round contributes its duration to p50/p90
+            # Only a round that actually RAN a panel feeds the rolling p50/p90 (issue #209).
+            # The webhook/summon paths hold the slot across `handle_pr_event`/`handle_summon`,
+            # which return early — `drop:not-a-dispatch-action`, `drop:unlisted-repo`,
+            # `drop:max-rounds-capped`, a chokepoint drop, or `_review`'s own `drop:`/
+            # `reaffirmed:` short-circuits — WITHOUT running a panel. Those exit cleanly in
+            # milliseconds; recording them would pull p50/p90 (and thus every ETA) toward 0,
+            # contradicting the "from recent completed rounds" contract. `ran` is set by the
+            # first `report_phase`, which fires only once the round reaches the runner, so an
+            # early drop leaves it false and contributes nothing.
+            if exc_type is None and running.ran:
                 q.record_duration(q._clock() - running.mono)
             q.release()  # the slot always frees, exception or not
         return False
@@ -1264,10 +1278,16 @@ class Dispatcher:
     def report_phase(self, phase: str) -> None:
         """Update the phase of the panel this task is running (what `GET /queue` shows). A
         no-op off the `PanelQueue` path — a raw semaphore or `nullcontext` slot has no
-        running entry, so the contextvar is None."""
+        running entry, so the contextvar is None.
+
+        A phase report is also how the slot learns the round actually RAN a panel: the first
+        one (line ~2246, unconditional once `_review` clears every drop gate and reaches the
+        runner) flips `ran`, which is what lets `_PanelSlot.__aexit__` tell a completed round
+        from a slot-held early drop when recording the rolling p50/p90 (issue #209)."""
         entry = _CURRENT_PANEL.get()
         if entry is not None and phase:
             entry.phase = phase
+            entry.ran = True
 
     def _on_panel_step(self, step=None, *args, **kwargs) -> None:
         """Runner step callback → panel phase. Passed to the runner only when its signature
