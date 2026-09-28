@@ -35,7 +35,17 @@ from collections import deque
 from urllib.parse import quote
 
 from .approve import HOLD_NOT_OWNER, HOLD_THREADS_UNRESOLVED, PROMOTE, Observations, promotion_decision
-from .checks import CHECK_NAME, COMPLETED, FAILURE, IN_PROGRESS, SUCCESS, CheckRun, check_for, closed_run
+from .checks import (
+    CHECK_NAME,
+    COMPLETED,
+    FAILURE,
+    IN_PROGRESS,
+    SUCCESS,
+    CheckRun,
+    check_for,
+    closed_run,
+    queued_run,
+)
 from .chokepoint import DISPATCH_ACTIONS, Chokepoint
 from .gh_cli import bad_repo, run_gh
 from .grounding import (
@@ -628,11 +638,33 @@ class PanelQueue(asyncio.Semaphore):
         self._active: list[_Running] = []
         self._durations: deque[float] = deque(durations or (), maxlen=max(1, history))
 
-    def slot(self, *, repo: str, pr: int, head: str = "", kind: str = "webhook") -> _PanelSlot:
+    def slot(self, *, repo: str, pr: int, head: str = "", kind: str = "webhook", on_wait=None) -> _PanelSlot:
         """The tracked acquire/release context manager. Emits the `queued` telemetry when it
         must wait (kept from the raw-semaphore path), registers the running entry, and
-        records the round's duration on a clean exit."""
-        return _PanelSlot(self, repo=repo, pr=pr, head=head, kind=kind)
+        records the round's duration on a clean exit.
+
+        `on_wait(ahead, eta_s)` is an optional async callback fired ONCE, the moment this slot
+        has to wait — with the panels-ahead count and the estimated seconds-until-start. It
+        runs OUTSIDE any queue bookkeeping (the counts are snapshotted synchronously first),
+        so the callback is free to make a network call — the webhook uses it to publish the
+        `queued` check on the waiting head (#209). A slot acquired immediately never fires it."""
+        return _PanelSlot(self, repo=repo, pr=pr, head=head, kind=kind, on_wait=on_wait)
+
+    def _queued_estimate(
+        self, waiter: _Waiter, *, now: float | None = None, degraded: bool = False
+    ) -> tuple[int, float | None]:
+        """(panels-ahead, eta_start_s) for a JUST-ENQUEUED waiter — pure in-memory, no lock,
+        no network (#209). `ahead` = (position − 1) + the panels running; `eta_start_s` reuses
+        the queue's own ETA math and is None until there is duration data."""
+        now = self._clock() if now is None else now
+        eta_p = _percentile(list(self._durations), 90 if degraded else 50)
+        try:
+            position = self._pending.index(waiter) + 1
+        except ValueError:  # gone already (raced) — fall back to the tail
+            position = len(self._pending)
+        ahead = (position - 1) + len(self._active)
+        rem_sorted = sorted(max(0.0, eta_p - max(0.0, now - r.mono)) for r in self._active) if eta_p is not None else []
+        return ahead, _eta_start_for(position, rem_sorted, self.limit, eta_p)
 
     def record_duration(self, seconds: float) -> None:
         """Remember one completed round's wall duration for the rolling p50/p90."""
@@ -728,9 +760,10 @@ class _PanelSlot:
     cancellation between acquire and the body, and so the current-panel contextvar is
     reset on every exit."""
 
-    def __init__(self, queue: PanelQueue, *, repo: str, pr: int, head: str, kind: str):
+    def __init__(self, queue: PanelQueue, *, repo: str, pr: int, head: str, kind: str, on_wait=None):
         self._q = queue
         self._repo, self._pr, self._head, self._kind = repo, pr, head, kind
+        self._on_wait = on_wait
         self._running: _Running | None = None
         self._token = None
 
@@ -746,11 +779,35 @@ class _PanelSlot:
         )
         will_wait = q.locked()  # racy by nature, like the telemetry it drives — harmless
         q._pending.append(waiter)
-        if will_wait and q.telemetry is not None:
-            q.telemetry.emit("queued", kind=self._kind, repo=self._repo, pr=self._pr, head=self._head, limit=q.limit)
+        # From the append to the acquire, ONE BaseException guard owns the waiter: the instant it
+        # is in `_pending`, any exit before we park on acquire must remove it. That now includes a
+        # CancelledError raised *during* the `queued`-check publish (the `on_wait` await is a
+        # network call) — an escape there would otherwise leave a phantom waiter that corrupts
+        # GET /queue and inflates every later ahead-count/ETA (#209). The inner `except Exception`
+        # still swallows a plain publish failure so the round proceeds; only a BaseException
+        # (cancellation) unwinds through here and removes the waiter.
         try:
+            if will_wait:
+                if q.telemetry is not None:
+                    q.telemetry.emit(
+                        "queued", kind=self._kind, repo=self._repo, pr=self._pr, head=self._head, limit=q.limit
+                    )
+                if self._on_wait is not None:
+                    # Snapshot the ahead-count/ETA synchronously (no lock held), then publish the
+                    # `queued` check BEFORE parking on acquire — never inside the queue's
+                    # bookkeeping (#209). Best-effort: a failing publish must never block the round.
+                    ahead, eta_s = q._queued_estimate(waiter)
+                    try:
+                        await self._on_wait(ahead, eta_s)
+                    except Exception:  # noqa: BLE001 — a queued-check publish must never break dispatch
+                        log.warning(
+                            "[pr-reviewer] publishing the queued check failed for %s#%s",
+                            self._repo,
+                            self._pr,
+                            exc_info=True,
+                        )
             await q.acquire()
-        except BaseException:  # cancelled (or failed) while waiting — the waiter disappears
+        except BaseException:  # cancelled (or failed) while publishing or waiting — the waiter disappears
             if waiter in q._pending:
                 q._pending.remove(waiter)
             raise
@@ -3640,7 +3697,40 @@ class Dispatcher:
             )
         return f"The QA panel returned **{verdict}**{tail}. See the review for details.{coverage}"
 
-    async def _publish_qa_check(self, repo: str, sha: str, run: CheckRun, *, only_if_open: bool = False) -> None:
+    async def publish_queued_check(self, repo: str, head: str, ahead: int, eta_s: float | None) -> None:
+        """Publish the `QA panel` check as `queued` while this head waits for a panel slot (#209).
+
+        Called best-effort, from OUTSIDE the PanelQueue lock, the moment a round has to wait
+        (webhook `_PanelSlot.on_wait`). Without it GitHub shows nothing for a queued head and
+        `Review at head` reads "no QA panel verdict", so an operator cannot tell a queued
+        review from a dead one.
+
+        Rides the SAME gate as the rest of the QA-panel check: a `queued` REQUIRED status in a
+        repo we do not drive would block every merge there forever, so it publishes only when
+        we own the gate (`qa_check` on, promotion-owner, not shadow) — the same posture
+        `evaluate_promotion` takes before it ever writes this check. It also holds the allowlist
+        rail `handle_pr_event` holds before it ever looks a PR up: the webhook takes the panel
+        slot for EVERY pull_request event — unmanaged repos included — before that gate has run,
+        so without this an unmanaged repo would get a GitHub write on our credentials (#209).
+
+        Publishes through the SAME idempotent-by-state path (`_publish_qa_check`), which degrades
+        rather than raising, so a publish failure is logged and never blocks or fails the round
+        (r3). `only_if_unstarted` is the second half of the fix: a redelivery of a dispatch
+        action can wait behind the queue while the head's own panel is already `in_progress` (or
+        has concluded), and a bare publish would rewrite that live check BACKWARDS to "Queued
+        behind N" that no round then moves forward — so the queued write is refused once the
+        check has started. Once the slot is acquired the normal in_progress/completed flow PATCHes
+        this same run forward (r4).
+        """
+        if not head or not (self.qa_check and self.promotion_owner and not self.shadow):
+            return
+        if bad_repo(repo) or (self.repos and repo not in self.repos):
+            return
+        await self._publish_qa_check(repo, head, queued_run(ahead, eta_s), only_if_unstarted=True)
+
+    async def _publish_qa_check(
+        self, repo: str, sha: str, run: CheckRun, *, only_if_open: bool = False, only_if_unstarted: bool = False
+    ) -> None:
         """Publish (or update) this head's `QA panel` check run. Degrades, never raises.
 
         Idempotent by state, not by call: the sweep re-evaluates every open PR every few
@@ -3651,6 +3741,11 @@ class Dispatcher:
 
         `only_if_open` is for the close path: it may finish a run that is still waiting,
         and must never create one or overwrite a verdict that already concluded.
+
+        `only_if_unstarted` is for the `queued` publish (#209): it may create or refresh a run
+        that has not started, but must NEVER move one BACKWARDS — once the panel opened this
+        head's check `in_progress` (or concluded it), a late/duplicate queued write would rewrite
+        a live check to "Queued behind N" that no round then advances.
         """
         if not self.qa_check:
             return
@@ -3673,6 +3768,10 @@ class Dispatcher:
             # create one, rather than subscripting whatever came back.
             existing = parsed if isinstance(parsed, dict) else {}
         if only_if_open and (not existing.get("id") or existing.get("status") == COMPLETED):
+            return
+        if only_if_unstarted and existing.get("id") and existing.get("status") in (IN_PROGRESS, COMPLETED):
+            # The head's panel has already opened (or concluded) this check; a `queued` write
+            # here would move it backwards to "Queued behind N" and dangle (#209). Leave it.
             return
         if (
             existing.get("status") == run.status
