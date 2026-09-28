@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 
 from pr_reviewer.dispatch import POST_MAX_FAILURES, Dispatcher
@@ -4940,3 +4941,190 @@ async def test_sweep_without_app_auth_starts_immediately():
     assert d.passes == 1
     stop.set()
     await asyncio.wait_for(task, timeout=2)
+
+
+# ── gateway-degraded telemetry: model/SDK retries per round + degraded (#209) ─────
+#
+# During the #209 stall Vera's log was mostly `openai._base_client Retrying request …`
+# bursts — the SDK retrying against a saturated gateway. Nothing counted them, so a slow
+# gate looked identical to a dead one. These exercise the counting (round attribution vs
+# the global window), the idempotent handler install, the degraded state machine's
+# transitions/escalation with an injected clock, and the /queue + telemetry wiring.
+
+
+def _retry_record(msg: str = "Retrying request to /v1/chat/completions in 0.83 seconds") -> logging.LogRecord:
+    """A synthetic `openai._base_client` retry log record, as the SDK emits one per retry."""
+    return logging.LogRecord("openai._base_client", logging.INFO, __file__, 0, msg, (), None)
+
+
+def test_a_retry_inside_a_round_lands_on_that_round_one_outside_only_the_window(tmp_path):
+    """r1: a retry logged inside a round's context increments that round's counter AND the
+    process-wide window; one logged with no round in context touches only the window."""
+    from pr_reviewer.dispatch import (
+        _CURRENT_ROUND_RETRIES,
+        _ensure_gateway_retry_handler,
+        _GatewayRetryMonitor,
+        _RoundRetries,
+    )
+
+    monitor = _GatewayRetryMonitor()
+    _ensure_gateway_retry_handler(monitor)  # re-points the single handler at our monitor
+    sdk_log = logging.getLogger("openai._base_client")
+
+    counter = _RoundRetries()
+    token = _CURRENT_ROUND_RETRIES.set(counter)
+    try:
+        sdk_log.handle(_retry_record())
+    finally:
+        _CURRENT_ROUND_RETRIES.reset(token)
+    assert counter.count == 1
+    assert monitor.retries_5m() == 1
+
+    # Outside any round: the window still counts it, but no round does.
+    sdk_log.handle(_retry_record())
+    assert counter.count == 1
+    assert monitor.retries_5m() == 2
+
+    # An unrelated record on the same logger is ignored.
+    sdk_log.handle(logging.LogRecord("openai._base_client", logging.INFO, __file__, 0, "hello", (), None))
+    assert monitor.retries_5m() == 2
+
+
+def test_the_gateway_retry_handler_install_is_idempotent(tmp_path):
+    """r7: re-installing the handler re-points the existing one instead of adding a second,
+    so a single retry is counted once, not once per registration."""
+    from pr_reviewer.dispatch import _ensure_gateway_retry_handler, _GatewayRetryHandler, _GatewayRetryMonitor
+
+    monitor = _GatewayRetryMonitor()
+    _ensure_gateway_retry_handler(monitor)
+    _ensure_gateway_retry_handler(monitor)
+    _ensure_gateway_retry_handler(monitor)
+    sdk_log = logging.getLogger("openai._base_client")
+    handlers = [h for h in sdk_log.handlers if isinstance(h, _GatewayRetryHandler)]
+    assert len(handlers) == 1
+
+    sdk_log.handle(_retry_record())
+    assert monitor.retries_5m() == 1  # counted once despite three installs
+
+
+async def test_a_reviewed_event_carries_the_rounds_model_retries(tmp_path):
+    """r2: retries logged while the runner is in flight are attributed to the round and ride
+    the `reviewed` event."""
+
+    async def retrying_runner(name, inputs):
+        sdk_log = logging.getLogger("openai._base_client")
+        sdk_log.handle(_retry_record())
+        sdk_log.handle(_retry_record())
+        return {"output": REPORT, "steps": {}, "failed": []}
+
+    gh = RoutedGH(pr_facts=facts(), reviews=[])
+    d = make(tmp_path, gh=gh, runner=retrying_runner)
+    out = await d.handle_pr_event("o/r", 1, HEAD, "opened")
+    assert out.startswith("reviewed:")
+    reviewed = [e for e in d.telemetry.read_all() if e["event"] == "reviewed"]
+    assert reviewed and reviewed[0]["model_retries"] == 2
+
+
+async def test_a_drop_event_carries_model_retries(tmp_path):
+    """r2: a drop also carries the field (zero here — the PR is ineligible before the runner)."""
+    gh = RoutedGH(pr_facts=facts(state="closed"), reviews=[])
+    d = make(tmp_path, gh=gh)
+    out = await d.handle_pr_event("o/r", 1, HEAD, "opened")
+    assert out == "drop:pr-not-eligible"
+    drops = [e for e in d.telemetry.read_all() if e["event"] == "drop"]
+    assert drops and drops[0]["model_retries"] == 0
+
+
+def test_gateway_degraded_transitions_emit_once_each(tmp_path):
+    """r3: crossing the threshold emits one true event; dropping below emits one false event —
+    never one per retry. Driven by an injected clock/count, no wall time."""
+    from pr_reviewer.dispatch import GatewayDegradeState
+
+    tele = Telemetry(tmp_path)
+    st = GatewayDegradeState(tele)
+    st.evaluate(3, now=0.0, threshold=6, escalate_after_s=900)  # healthy
+    st.evaluate(6, now=1.0, threshold=6, escalate_after_s=900)  # == threshold, not "exceed"
+    st.evaluate(7, now=2.0, threshold=6, escalate_after_s=900)  # false → true
+    st.evaluate(9, now=3.0, threshold=6, escalate_after_s=900)  # stays true, no new event
+    st.evaluate(8, now=4.0, threshold=6, escalate_after_s=900)  # stays true, no new event
+    st.evaluate(2, now=5.0, threshold=6, escalate_after_s=900)  # true → false
+
+    events = [e for e in tele.read_all() if e["event"] == "gateway_degraded"]
+    assert [e["degraded"] for e in events] == [True, False]
+    assert events[0]["retries_5m"] == 7 and events[0]["threshold"] == 6
+    assert events[1]["retries_5m"] == 2
+
+
+def test_sustained_gateway_degraded_escalates_once_per_episode(tmp_path, caplog):
+    """r4: a degraded state sustained past the escalation window logs exactly one WARNING,
+    re-armed only after it clears."""
+    from pr_reviewer.dispatch import GatewayDegradeState
+
+    st = GatewayDegradeState(Telemetry(tmp_path))
+    with caplog.at_level(logging.WARNING, logger="protoagent.plugins.pr_reviewer"):
+        st.evaluate(7, now=0.0, threshold=6, escalate_after_s=900)  # degraded begins
+        st.evaluate(8, now=800.0, threshold=6, escalate_after_s=900)  # 800s < 900 — no WARNING yet
+        assert not [r for r in caplog.records if "gateway DEGRADED for" in r.getMessage()]
+        st.evaluate(8, now=1000.0, threshold=6, escalate_after_s=900)  # ≥900s — one WARNING
+        st.evaluate(9, now=1300.0, threshold=6, escalate_after_s=900)  # still degraded — no second
+    warnings = [r for r in caplog.records if "gateway DEGRADED for" in r.getMessage()]
+    assert len(warnings) == 1
+
+
+def test_build_report_aggregates_model_retries_and_tolerates_missing(tmp_path):
+    """r6: the eval sums/percentiles model_retries and counts degraded windows, and events
+    written before the field shipped still work."""
+    from pr_reviewer.eval import build_report
+
+    events = [
+        {"event": "dispatch", "repo": "o/r", "pr": 1},
+        {"event": "reviewed", "repo": "o/r", "pr": 1, "posted": True, "round": 1, "model_retries": 2},
+        {"event": "reviewed", "repo": "o/r", "pr": 1, "posted": True, "round": 2, "model_retries": 4},
+        {"event": "reviewed", "repo": "o/r", "pr": 2, "posted": True, "round": 1},  # pre-field event
+        {"event": "gateway_degraded", "degraded": True, "retries_5m": 7, "threshold": 6},
+        {"event": "gateway_degraded", "degraded": False, "retries_5m": 1, "threshold": 6},
+    ]
+    report = build_report(events)
+    assert report["model_retries"] == {"total": 6, "p50": 2, "p90": 4, "n": 2}
+    assert report["gateway_degraded_windows"] == 1
+    # The pre-field reviewed event neither crashes nor counts as a 0 retry.
+    assert report["reviews_posted"] == 3
+
+    empty = build_report([{"event": "reviewed", "posted": True}])
+    assert empty["model_retries"] == {"total": 0, "p50": None, "p90": None, "n": 0}
+    assert empty["gateway_degraded_windows"] == 0
+
+
+async def test_a_running_panel_entry_shows_live_model_retries(tmp_path):
+    """r5: a retry logged while a panel holds its slot bumps that running entry's counter, so
+    GET /queue shows it live."""
+    from pr_reviewer.dispatch import PanelQueue, _GatewayRetryMonitor
+
+    q = PanelQueue(1, telemetry=Telemetry(tmp_path))
+    monitor = _GatewayRetryMonitor()
+    async with q.slot(repo="o/r", pr=1, head=HEAD) as running:
+        monitor.note_retry()
+        monitor.note_retry()
+        assert running.model_retries == 2
+        assert q.status()["running"][0]["model_retries"] == 2
+
+
+def test_the_dispatcher_exposes_the_live_gateway_signal(tmp_path, monkeypatch):
+    """r5: the /queue payload reads `gateway_degraded` and `gateway_retry_rate_5m` off the
+    dispatcher — degraded once retries exceed the threshold, with the per-minute rate."""
+    import pr_reviewer.dispatch as dispatch_mod
+
+    monitor = dispatch_mod._GatewayRetryMonitor()
+    monkeypatch.setattr(dispatch_mod, "_GATEWAY", monitor)
+    d = make(tmp_path, cfg={"gateway_degraded_retries_5m": 6})
+    assert d.gateway_degraded is False
+    assert d.gateway_retry_rate_5m == 0.0
+
+    for _ in range(7):
+        monitor.note_retry()
+    assert d.gateway_degraded is True
+    assert d.gateway_retry_rate_5m == round(7 / 5, 3)
+
+    # The crossing emitted exactly one true `gateway_degraded` event (no spam per retry).
+    degraded_events = [e for e in d.telemetry.read_all() if e["event"] == "gateway_degraded"]
+    assert [e["degraded"] for e in degraded_events] == [True]

@@ -91,6 +91,12 @@ def build_report(events: list[dict]) -> dict:
     exhaustions = [e for e in events if e.get("event") == "exhaustion"]
     promotions = Counter(str(e.get("decision")) for e in events if e.get("event") == "promotion")
     latencies = [float(e["latency_s"]) for e in reviewed if e.get("latency_s") is not None]
+    # Gateway-degraded telemetry (issue #209). `model_retries` is per-round; events written
+    # before this field shipped simply lack it and are skipped (tolerated, never counted as 0,
+    # so they don't drag the percentiles). A `gateway_degraded` window is one true transition —
+    # the gate crossing from healthy to degraded.
+    retry_values = [int(e["model_retries"]) for e in reviewed if e.get("model_retries") is not None]
+    gateway_degraded_windows = sum(1 for e in events if e.get("event") == "gateway_degraded" and e.get("degraded"))
     rounds: dict[tuple[str, int], int] = {}
     for e in reviewed:
         key = (str(e.get("repo")), int(e.get("pr") or 0))
@@ -105,6 +111,15 @@ def build_report(events: list[dict]) -> dict:
         "verdict_mix": dict(Counter(str(e.get("verdict")) for e in reviewed)),
         "recipe_mix": dict(Counter(str(e.get("recipe")) for e in reviewed)),
         "latency_s": {"p50": _percentile(latencies, 0.5), "p90": _percentile(latencies, 0.9), "n": len(latencies)},
+        # Model/SDK gateway retries per round, and how many times the gateway crossed into a
+        # degraded window (issue #209). A slow gate and a dead one used to look identical here.
+        "model_retries": {
+            "total": sum(retry_values),
+            "p50": _percentile(retry_values, 0.5),
+            "p90": _percentile(retry_values, 0.9),
+            "n": len(retry_values),
+        },
+        "gateway_degraded_windows": gateway_degraded_windows,
         "findings_per_review": (
             round(sum(int(e.get("findings") or 0) for e in reviewed) / len(reviewed), 2) if reviewed else None
         ),
@@ -208,6 +223,10 @@ def render_report_markdown(summary: dict, rows: list[dict] | None = None) -> str
         f"- **Verdict mix:** {summary.get('verdict_mix') or {}} · **recipes:** {summary.get('recipe_mix') or {}}",
         f"- **Latency:** p50 {lat.get('p50')}s / p90 {lat.get('p90')}s over {lat.get('n', 0)} review(s) "
         f"(Quinn's floor: 44.7s median — the lite recipe is the lever)",
+        f"- **Gateway retries:** {(summary.get('model_retries') or {}).get('total', 0)} total, "
+        f"p50 {(summary.get('model_retries') or {}).get('p50')} / p90 {(summary.get('model_retries') or {}).get('p90')} "
+        f"per round · **degraded windows:** {summary.get('gateway_degraded_windows', 0)} — a slow gate "
+        f"and a dead one look identical without this (issue #209)",
         f"- **Reaffirmed (unchanged head):** {summary.get('reaffirmed', 0)} · **delta re-reviews:** "
         f"{summary.get('delta_reviews', 0)} · **findings/review:** {summary.get('findings_per_review')}",
         f"- **Guards:** grounding checked {(summary.get('grounding') or {}).get('findings_checked', 0)} finding(s), "
