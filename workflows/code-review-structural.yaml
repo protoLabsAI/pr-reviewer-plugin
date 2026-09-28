@@ -44,12 +44,34 @@ max_concurrency: 5
 # `pr_reviewer.finder_timeout_s` as `finder_timeout`; unset, the default below applies.
 # Needs protoAgent >= 0.170.0 (a step `timeout` that references an input, #3555) — hence
 # the manifest's `min_protoagent_version`.
+#
+# The synthesize/verify/report steps carry their own budgets too (issue #209): without one
+# a saturated gateway held those (non-parallel) steps until the whole attempt was cancelled
+# at `panel_attempt_timeout`, holding the PR's in-flight slot for as long as the round ran.
+# They are separate inputs because their safe budget differs from a finder's: unlike a
+# finder, a synthesize/verify/report step the engine times out degrades to EMPTY output,
+# which the dispatcher must never turn into a PASS — it voids the round instead.
 inputs:
   - name: finder_timeout
     description: >-
       Seconds each parallel finder may run before the engine degrades it to a Gap.
       Set by the dispatcher from `pr_reviewer.finder_timeout_s`.
     default: 900
+  - name: synth_timeout
+    description: >-
+      Seconds the synthesize and report steps may EACH run before the engine cuts
+      them off (issue #209). Set by the dispatcher from
+      `pr_reviewer.synthesize_timeout_s`; unset, the default below applies. A step
+      timed out degrades to empty output — which would post a clean-looking PASS —
+      so the dispatcher treats such a degradation as a voided round, never a verdict.
+    default: 300
+  - name: verify_timeout
+    description: >-
+      Seconds the verify step may run before the engine cuts it off (issue #209).
+      Set by the dispatcher from `pr_reviewer.verify_timeout_s`; unset, the default
+      below applies. A timed-out verify degrades to empty output — an unverified /
+      clean verdict — so the dispatcher voids the round rather than posting it.
+    default: 300
   - name: pr
     description: The pull-request number to review.
     required: true
@@ -366,6 +388,7 @@ steps:
 
   - id: synthesize
     subagent: review-synthesizer
+    timeout: "{{inputs.synth_timeout}}"
     depends_on: [find_correctness, find_removed_behavior, find_crossfile, find_conventions, find_structural]
     prompt: |
       Merge these five review-finder reports on PR #{{inputs.pr}} into one
@@ -390,6 +413,7 @@ steps:
 
   - id: verify
     subagent: verifier
+    timeout: "{{inputs.verify_timeout}}"
     depends_on: [synthesize]
     prompt: |
       Verify these code-review findings against PR #{{inputs.pr}} (repo:
@@ -521,6 +545,7 @@ steps:
 
   - id: report
     subagent: review-synthesizer
+    timeout: "{{inputs.synth_timeout}}"
     depends_on: [verify]
     prompt: |
       Final pass for the review of PR #{{inputs.pr}}: the verifier has

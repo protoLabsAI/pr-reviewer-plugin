@@ -35,8 +35,25 @@ config:
   verify_reruns: 1             # re-run a verifier that contradicted the synthesizer, alone (#167)
   finder_timeout_s: 0          # seconds each parallel finder may run (issue #93). 0 = the recipe's
                                # default (900). Calibrate to YOUR model: just above the slow finders'
-                               # p95 (telemetry `step_s`). Clamped below `panel_attempt_timeout`.
+                               # p95 (telemetry `step_s`). Clamped below the (clamped) panel_attempt_timeout.
                                # Env fallback: PR_REVIEWER_FINDER_TIMEOUT.
+  synthesize_timeout_s: 0      # seconds the synthesize AND report steps may each run (issue #209).
+                               # 0 = the recipe's default (300). A step the engine times out degrades
+                               # to EMPTY output, so a timed-out synthesize/report can never post a
+                               # clean PASS — the round is voided (no verdict), retried, then concluded
+                               # visibly. Clamped to 900. Env fallback: PR_REVIEWER_SYNTHESIZE_TIMEOUT.
+  verify_timeout_s: 0          # seconds the verify step may run (issue #209). 0 = the recipe's default
+                               # (300). A timed-out verify degrades to empty output — an unverified /
+                               # clean verdict — so it too voids the round rather than posting. Clamped
+                               # to 900. Env fallback: PR_REVIEWER_VERIFY_TIMEOUT.
+  # panel_attempt_timeout (overlay or PR_REVIEWER_PANEL_ATTEMPT_TIMEOUT env; default 1800) — budget for
+  # ONE panel attempt (one recipe run), the backstop for a hang outside the step timeouts above. HARD
+  # CEILING 1800s (issue #209): a configured value above it is clamped to it with a log.warning naming
+  # the key, so no overlay can make one attempt outlast 30 min.
+  # round_timeout (overlay or PR_REVIEWER_ROUND_TIMEOUT env; default (panel_retries+1)×panel_attempt+600)
+  # — a whole round's in-flight slot bound. HARD CEILING 4200s (issue #209), clamped with a log.warning.
+  # With the finder budget clamped a minute under the attempt and the attempt clamped to 1800, no round
+  # can hold a PR's slot past 4200s — the ~90-min holds from an unbounded overlay can no longer happen.
   repos: []                    # repos the DISPATCHER manages (owner/name) — NARROWS scope when set.
                                # empty HERE falls back to PR_REVIEWER_REPOS; empty in BOTH = every
                                # repo the GitHub App installation covers (webhook accepts any
