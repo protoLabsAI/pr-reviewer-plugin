@@ -18,6 +18,8 @@ def test_recipe_shape():
     assert RECIPE["name"] == "code-review-structural"
     assert {i["name"] for i in RECIPE["inputs"]} == {
         "finder_timeout",
+        "synth_timeout",
+        "verify_timeout",
         "pr",
         "repo",
         "prior_findings",
@@ -200,7 +202,24 @@ def test_the_finder_budget_is_an_input_with_the_calibrated_default():
     finders = [s for s in RECIPE["steps"] if s["id"].startswith("find_")]
     assert len(finders) == 5
     assert {s["timeout"] for s in finders} == {"{{inputs.finder_timeout}}"}
-    assert all("timeout" not in s for s in RECIPE["steps"] if not s["id"].startswith("find_"))
+
+
+def test_every_step_carries_a_timeout_driven_by_an_input():
+    # Issue #209: an un-timed synthesize/verify/report step held the PR's in-flight slot
+    # against a saturated gateway until the whole attempt was cancelled. Every step now
+    # carries a step `timeout`, each fed by a recipe input with a default — so a hung step
+    # frees the slot on its own budget, not the attempt's.
+    for step in RECIPE["steps"]:
+        assert "timeout" in step, step["id"]
+        assert step["timeout"].startswith("{{inputs.") and step["timeout"].endswith("}}"), step["id"]
+    # The non-finder steps take the two new budgets: synthesize and report share one, verify
+    # its own; both default to 300s (below the 900s step ceiling in the dispatcher).
+    assert STEPS["synthesize"]["timeout"] == "{{inputs.synth_timeout}}"
+    assert STEPS["report"]["timeout"] == "{{inputs.synth_timeout}}"
+    assert STEPS["verify"]["timeout"] == "{{inputs.verify_timeout}}"
+    declared = {i["name"]: i for i in RECIPE["inputs"]}
+    assert declared["synth_timeout"]["default"] == 300
+    assert declared["verify_timeout"]["default"] == 300
 
 
 def test_the_manifest_requires_a_core_that_accepts_an_input_timeout():

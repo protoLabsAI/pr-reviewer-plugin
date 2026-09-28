@@ -164,6 +164,27 @@ _TRANSIENT_GH_TEXT = (
 # narrower than "review the code and report."
 LLM_FINDER_STEPS = ("find_correctness", "find_removed_behavior", "find_crossfile", "find_conventions")
 
+# The non-finder panel steps (issue #209). A finder the engine times out degrades to a
+# one-lane Gap and the panel reviews with one fewer angle — fine. These three MUST NOT
+# degrade that way: an empty `synthesize`/`report` posts a clean-looking PASS and an empty
+# `verify` an unverified verdict — the exact silent outcomes their step timeouts exist to
+# prevent. When the engine times one out and hands it back as an empty `degraded` step, the
+# dispatcher promotes it to a FAILED step so the round is retried and, if it recurs,
+# concludes with NO verdict (D3 exhaustion) — the same visible end as an attempt timeout.
+CRITICAL_PANEL_STEPS = ("synthesize", "verify", "report")
+
+# Hard ceilings on the review's timeouts (issue #209). A saturated gateway held a panel's
+# in-flight slot for ~90 min because nothing bounded the config overlay: Vera's overlay set
+# finder 2100s / attempt 2400s, so one round could run (panel_retries+1)×2400+600 = 5400s,
+# and both the finder budget and the attempt budget were otherwise unbounded. A configured
+# value (config overlay OR env) above its ceiling is CLAMPED to it with a `log.warning`
+# naming the key — never silently. `MAX_ROUND_TIMEOUT_S` = (1 retry + 1) × the attempt
+# ceiling + 600, i.e. the shipped default round bound; the effective bound can no longer
+# exceed it.
+MAX_PANEL_ATTEMPT_TIMEOUT_S = 1800  # one attempt = one runner(recipe, inputs) call
+MAX_STEP_TIMEOUT_S = 900  # any single synthesize/verify/report step
+MAX_ROUND_TIMEOUT_S = 4200  # a whole round: (1 + 1) × 1800 + 600
+
 # Recipes whose finder prompts REQUIRE the `FINDER_STATUS` line (`finder_completed`). The
 # small-diff `code-review` recipe lives in protoAgent and asks for no such line, so its
 # finders are judged by what they delivered alone — reading a line nobody asked for as
@@ -665,20 +686,40 @@ class Dispatcher:
         cfg = self.cfg
         return int(cfg["panel_retries"]) if "panel_retries" in cfg else _env_int("PR_REVIEWER_PANEL_RETRIES", 1)
 
+    def _clamp_timeout(self, key: str, value: float, ceiling: int) -> float:
+        """Clamp a configured timeout to its hard ceiling, and say so — never silently.
+
+        A value above the ceiling is a config overlay or env knob nobody bounded (issue
+        #209); returning the ceiling with a `log.warning` naming the key, the requested
+        value and the value used mirrors the existing `finder_timeout_s` clamp message so
+        an operator can see WHICH knob was overridden and to what."""
+        if value > ceiling:
+            log.warning(
+                "[pr-reviewer] %s=%g exceeds its hard ceiling %ds; using %ds",
+                key,
+                value,
+                ceiling,
+                ceiling,
+            )
+            return float(ceiling)
+        return value
+
     @property
     def panel_attempt_timeout_s(self) -> float:
-        """Budget for ONE panel attempt (one `runner(recipe, inputs)` call). Only the
-        finders carry a step timeout; the verifier, synthesis and grounding steps don't,
-        so a hang in any of them used to hang the round — and, holding the PR's
-        in-flight slot, every later review of that PR. Past the budget the attempt is
+        """Budget for ONE panel attempt (one `runner(recipe, inputs)` call). The finders
+        and — since #209 — the synthesize/verify/report steps carry their own step
+        timeouts; this is the backstop for a hang anywhere else in the attempt, so it
+        never holds the PR's in-flight slot past the budget. Past it the attempt is
         cancelled and counts as a crashed attempt: retried, then concluded as "QA panel
-        crashed" on the PR, visibly. Default 30 min, above the finders' 15."""
+        crashed" on the PR, visibly. Default 30 min, above the finders' 15, and clamped to
+        `MAX_PANEL_ATTEMPT_TIMEOUT_S` so an overlay cannot make one round outlast it."""
         cfg = self.cfg
-        return (
+        raw = (
             float(cfg["panel_attempt_timeout"])
             if "panel_attempt_timeout" in cfg
             else _env_int("PR_REVIEWER_PANEL_ATTEMPT_TIMEOUT", 1800)
         )
+        return self._clamp_timeout("panel_attempt_timeout", raw, MAX_PANEL_ATTEMPT_TIMEOUT_S)
 
     @property
     def verify_reruns(self) -> int:
@@ -722,6 +763,9 @@ class Dispatcher:
             seconds = 0
         if seconds <= 0:
             return 0
+        # Measured against the CLAMPED attempt (panel_attempt_timeout_s clamps first): a
+        # finder budget at or above the attempt's own would let the attempt be cancelled
+        # first — a crashed panel instead of a one-lane Gap.
         ceiling = int(self.panel_attempt_timeout_s) - 60
         if ceiling > 0 and seconds > ceiling:
             log.warning(
@@ -733,16 +777,54 @@ class Dispatcher:
             return ceiling
         return seconds
 
+    def _step_timeout_s(self, cfg_key: str, env_key: str) -> int:
+        """A synthesize/verify step budget in seconds, or 0 to leave the recipe's default
+        (issue #209). Config-first, env fallback — the same posture as `finder_timeout_s`;
+        0 (or anything not a positive number) reads as unset, never "no timeout", and a
+        value above `MAX_STEP_TIMEOUT_S` is clamped to it with a warning."""
+        cfg = self.cfg
+        raw = cfg[cfg_key] if cfg_key in cfg else _env_int(env_key, 0)
+        try:
+            seconds = int(float(raw or 0))
+        except (TypeError, ValueError):
+            seconds = 0
+        if seconds <= 0:
+            return 0
+        return int(self._clamp_timeout(cfg_key, seconds, MAX_STEP_TIMEOUT_S))
+
+    @property
+    def synthesize_timeout_s(self) -> int:
+        """Seconds the synthesize (and report) step may run, or 0 for the recipe's default
+        (issue #209). Passed to the recipe as `synth_timeout`. A step the engine times out
+        degrades to EMPTY output, which the dispatcher voids into a no-verdict round rather
+        than let post a clean-looking PASS. Env fallback: PR_REVIEWER_SYNTHESIZE_TIMEOUT."""
+        return self._step_timeout_s("synthesize_timeout_s", "PR_REVIEWER_SYNTHESIZE_TIMEOUT")
+
+    @property
+    def verify_timeout_s(self) -> int:
+        """Seconds the verify step may run, or 0 for the recipe's default (issue #209).
+        Passed to the recipe as `verify_timeout`. A timed-out verify degrades to empty
+        output — an unverified/clean verdict — so the dispatcher voids the round instead.
+        Env fallback: PR_REVIEWER_VERIFY_TIMEOUT."""
+        return self._step_timeout_s("verify_timeout_s", "PR_REVIEWER_VERIFY_TIMEOUT")
+
     @property
     def round_timeout_s(self) -> float:
         """Backstop for a WHOLE round — every attempt plus the GitHub calls around them —
-        for a hang outside the panel runner. Defaults to every attempt's budget plus ten
-        minutes, so it can never cut a legitimate retry short."""
+        for a hang outside the panel runner. Defaults to every attempt's (clamped) budget
+        plus ten minutes, so it can never cut a legitimate retry short, and an explicit
+        overlay/env value is clamped to `MAX_ROUND_TIMEOUT_S` with a warning (issue #209).
+        The computed default is already at or below that ceiling for the shipped config;
+        it is capped as a silent backstop only if an operator raised `panel_retries`."""
         cfg = self.cfg
-        if "round_timeout" in cfg:
-            return float(cfg["round_timeout"])
         default = (self.panel_retries + 1) * self.panel_attempt_timeout_s + 600
-        return _env_int("PR_REVIEWER_ROUND_TIMEOUT", default)
+        if "round_timeout" in cfg:
+            return self._clamp_timeout("round_timeout", float(cfg["round_timeout"]), MAX_ROUND_TIMEOUT_S)
+        if "PR_REVIEWER_ROUND_TIMEOUT" in os.environ:
+            return self._clamp_timeout(
+                "round_timeout", float(_env_int("PR_REVIEWER_ROUND_TIMEOUT", int(default))), MAX_ROUND_TIMEOUT_S
+            )
+        return min(default, float(MAX_ROUND_TIMEOUT_S))
 
     def _on_in_flight_reclaimed(self, repo: str, pr: int, held_s: float) -> None:
         # Past the round bound, a still-held slot means a round that stopped making
@@ -1844,6 +1926,10 @@ class Dispatcher:
         }
         if self.finder_timeout_s:
             inputs["finder_timeout"] = self.finder_timeout_s  # else the recipe's default (#93)
+        if self.synthesize_timeout_s:
+            inputs["synth_timeout"] = self.synthesize_timeout_s  # else the recipe's default (#209)
+        if self.verify_timeout_s:
+            inputs["verify_timeout"] = self.verify_timeout_s  # else the recipe's default (#209)
         if prior_findings:
             inputs["prior_findings"] = prior_findings
         if prior_requests:
@@ -1920,6 +2006,23 @@ class Dispatcher:
                     "overran": overran,
                 }
                 self.telemetry.emit("finder_overran", repo=repo, pr=pr, sha=head, lanes=overran, attempt=attempt)
+            # A finder may degrade to a Gap; synthesize/verify/report may NOT (#209). If the
+            # engine timed one of them out and degraded it to empty output, that empty
+            # synthesize/report would post a clean-looking PASS and an empty verify an
+            # unverified verdict — the silent outcomes the step timeouts exist to prevent.
+            # Promote such a degradation to a FAILED step so this attempt retries and, if it
+            # recurs, the round ends with NO verdict (D3), the same visible end as a timeout.
+            step_timed_out = [s for s in (result.get("degraded") or []) if s in CRITICAL_PANEL_STEPS]
+            if step_timed_out:
+                failed = [*failed, *(s for s in step_timed_out if s not in failed)]
+                result = {
+                    **result,
+                    "failed": failed,
+                    "degraded": [s for s in (result.get("degraded") or []) if s not in step_timed_out],
+                }
+                self.telemetry.emit(
+                    "panel_step_timeout", repo=repo, pr=pr, sha=head, steps=step_timed_out, attempt=attempt
+                )
             undelivered = (
                 []
                 if failed

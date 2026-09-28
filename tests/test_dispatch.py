@@ -2882,6 +2882,104 @@ def test_finder_timeout_reads_env_clamps_and_never_means_unbounded(tmp_path, mon
     assert "finder_timeout_s=5000" in caplog.text
 
 
+# ── step timeouts + hard ceilings (issue #209) ────────────────────────────────
+
+
+async def test_step_timeouts_pass_to_the_recipe_only_when_set(tmp_path):
+    # r2: the dispatcher passes synth_timeout/verify_timeout from config only when set (>0);
+    # unset, the recipe's own 300s default applies (the input is simply omitted).
+    runner, seen = capturing_runner()
+    d = make(tmp_path / "unset", gh=RoutedGH(pr_facts=facts()), runner=runner)
+    await d.handle_pr_event("o/r", 1, HEAD, "opened")
+    assert "synth_timeout" not in seen["inputs"] and "verify_timeout" not in seen["inputs"]
+
+    runner, seen = capturing_runner()
+    d = make(
+        tmp_path / "set",
+        cfg={"synthesize_timeout_s": 240, "verify_timeout_s": 180},
+        gh=RoutedGH(pr_facts=facts()),
+        runner=runner,
+    )
+    await d.handle_pr_event("o/r", 1, HEAD, "opened")
+    assert seen["inputs"]["synth_timeout"] == 240
+    assert seen["inputs"]["verify_timeout"] == 180
+
+
+def test_step_timeouts_read_env_clamp_and_never_mean_unbounded(tmp_path, monkeypatch, caplog):
+    from pr_reviewer.dispatch import MAX_STEP_TIMEOUT_S
+
+    assert MAX_STEP_TIMEOUT_S == 900
+    assert make(tmp_path / "a").synthesize_timeout_s == 0  # 0 = the recipe's default
+    assert make(tmp_path / "b").verify_timeout_s == 0
+    for junk in ("soon", "", None, -5, 0):  # unset, never "no timeout"
+        assert make(tmp_path / f"s{junk}", cfg={"synthesize_timeout_s": junk}).synthesize_timeout_s == 0
+    assert make(tmp_path / "s", cfg={"synthesize_timeout_s": "240"}).synthesize_timeout_s == 240
+
+    monkeypatch.setenv("PR_REVIEWER_SYNTHESIZE_TIMEOUT", "200")
+    monkeypatch.setenv("PR_REVIEWER_VERIFY_TIMEOUT", "150")
+    assert make(tmp_path / "env").synthesize_timeout_s == 200
+    assert make(tmp_path / "env2").verify_timeout_s == 150
+    assert make(tmp_path / "cfg-wins", cfg={"synthesize_timeout_s": 260}).synthesize_timeout_s == 260
+
+    with caplog.at_level("WARNING"):
+        d = make(tmp_path / "big", cfg={"synthesize_timeout_s": 5000, "verify_timeout_s": 4000})
+        assert d.synthesize_timeout_s == 900 and d.verify_timeout_s == 900
+    assert "synthesize_timeout_s=5000" in caplog.text and "verify_timeout_s=4000" in caplog.text
+
+
+def test_the_hard_ceilings_clamp_veras_overlay_and_say_so(tmp_path, caplog):
+    # r4/r5: Vera's overlay set finder_timeout_s=2100 / panel_attempt_timeout=2400, so one
+    # round could hold a PR's in-flight slot for (1+1)*2400+600 = 5400s ≈ 90 min, and
+    # nothing bounded the overlay. Every configured value above its ceiling is now clamped,
+    # each with a warning naming the key, the requested value, and the value used.
+    with caplog.at_level("WARNING"):
+        d = make(tmp_path, cfg={"finder_timeout_s": 2100, "panel_attempt_timeout": 2400})
+        assert d.panel_attempt_timeout_s == 1800  # clamped from 2400
+        assert d.finder_timeout_s == 1740  # a minute under the CLAMPED attempt
+        assert d.round_timeout_s == 4200  # (1+1)*1800 + 600 — at the ceiling, not 5400
+    assert "panel_attempt_timeout=2400" in caplog.text and "using 1800s" in caplog.text
+    assert "finder_timeout_s=2100" in caplog.text and "using 1740s" in caplog.text
+    # The overlay can no longer reach the old 5400s slot hold.
+    assert (d.panel_retries + 1) * d.panel_attempt_timeout_s + 600 <= 4200
+
+
+def test_the_default_round_bound_is_at_or_below_the_old_default(tmp_path, caplog):
+    # r5: with the shipped defaults (1 retry, 1800s attempt) the round bound is 4200s — the
+    # old default — and an explicit oversized round_timeout is clamped to that ceiling.
+    assert make(tmp_path / "default").round_timeout_s <= 4200
+    with caplog.at_level("WARNING"):
+        assert make(tmp_path / "big", cfg={"round_timeout": 9000}).round_timeout_s == 4200
+    assert "round_timeout=9000" in caplog.text and "using 4200s" in caplog.text
+
+
+async def test_a_timed_out_critical_step_voids_the_round_and_posts_no_verdict(tmp_path):
+    # r3: the engine degrades a timed-out step to EMPTY output. For a finder that is a
+    # one-lane Gap (WARN), but an empty synthesize/report would post a clean-looking PASS
+    # and an empty verify an unverified verdict. Each must instead conclude with NO verdict,
+    # the same visible end as an attempt timeout: retried, then exhausted, nothing posted.
+    for step in ("synthesize", "verify", "report"):
+        gh = RoutedGH(pr_facts=facts(), reviews=[])
+        escalations: list[str] = []
+        calls: list[str] = []
+
+        async def runner(name, inputs, _step=step):
+            calls.append(name)
+            # a clean-LOOKING report, but the step under test was cut off (degraded, empty)
+            return {"output": _clean_report(), "steps": {_step: ""}, "degraded": [_step], "failed": []}
+
+        d = make(
+            tmp_path / step,
+            cfg={"panel_retries": 1},
+            gh=gh,
+            runner=runner,
+            inbox=lambda text, _s=step, **kw: escalations.append(text),
+        )
+        assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "error:panel-exhausted", step
+        assert len(calls) == 2, step  # promoted to a failed step → retried once → exhausted
+        assert all("event" not in p for p in gh.posted), step  # D3: no verdict review posted
+        assert escalations and "UNREVIEWED" in escalations[-1], step
+
+
 async def test_a_promotion_no_longer_shadows_the_prior_findings_recall(tmp_path):
     # #23's root cause: with the promotion review newest, recall used to read a body
     # with no findings JSON — `prior_findings` came through empty and the delta
