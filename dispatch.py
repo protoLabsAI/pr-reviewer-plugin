@@ -191,12 +191,18 @@ CRITICAL_PANEL_STEPS = ("synthesize", "verify", "report")
 # finder 2100s / attempt 2400s, so one round could run (panel_retries+1)×2400+600 = 5400s,
 # and both the finder budget and the attempt budget were otherwise unbounded. A configured
 # value (config overlay OR env) above its ceiling is CLAMPED to it with a `log.warning`
-# naming the key — never silently. `MAX_ROUND_TIMEOUT_S` = (1 retry + 1) × the attempt
-# ceiling + 600, i.e. the shipped default round bound; the effective bound can no longer
-# exceed it.
-MAX_PANEL_ATTEMPT_TIMEOUT_S = 1800  # one attempt = one runner(recipe, inputs) call
+# naming the key — never silently. `MAX_ROUND_TIMEOUT_S` is derived from the attempt ceiling
+# ((1 retry + 1) attempts + 600) so the two can never drift apart.
+#
+# The attempt ceiling is 3000s = a 2100s finder + the three tail steps at their 300s default
+# (synthesize, verify, report — 900s worst case). The first cut, 1800s, sat BELOW a
+# deployment's legitimate finder budget: on large Rust/protoAgent diffs a healthy round is
+# 1200–2300s (Vera, 2026-09: p90 1167s, max 2262s, all complete), so the clamp turned
+# finders that finish into finders cut mid-work — the failure `finder_timeout_s` exists to
+# avoid. The SHIPPED default stays 1800s; only the ceiling an operator may raise it to moves.
+MAX_PANEL_ATTEMPT_TIMEOUT_S = 3000  # one attempt = one runner(recipe, inputs) call
 MAX_STEP_TIMEOUT_S = 900  # any single synthesize/verify/report step
-MAX_ROUND_TIMEOUT_S = 4200  # a whole round: (1 + 1) × 1800 + 600
+MAX_ROUND_TIMEOUT_S = 2 * MAX_PANEL_ATTEMPT_TIMEOUT_S + 600  # a whole round: (1 + 1) attempts + 600
 
 # Recipes whose finder prompts REQUIRE the `FINDER_STATUS` line (`finder_completed`). The
 # small-diff `code-review` recipe lives in protoAgent and asks for no such line, so its

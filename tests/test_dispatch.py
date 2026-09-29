@@ -3011,29 +3011,41 @@ def test_step_timeouts_read_env_clamp_and_never_mean_unbounded(tmp_path, monkeyp
     assert "synthesize_timeout_s=5000" in caplog.text and "verify_timeout_s=4000" in caplog.text
 
 
-def test_the_hard_ceilings_clamp_veras_overlay_and_say_so(tmp_path, caplog):
-    # r4/r5: Vera's overlay set finder_timeout_s=2100 / panel_attempt_timeout=2400, so one
-    # round could hold a PR's in-flight slot for (1+1)*2400+600 = 5400s ≈ 90 min, and
-    # nothing bounded the overlay. Every configured value above its ceiling is now clamped,
-    # each with a warning naming the key, the requested value, and the value used.
+def test_a_deployment_budget_inside_the_ceilings_is_not_clamped(tmp_path, caplog):
+    # qaEngineer#94: Vera's overlay (finder 2100s / attempt 2400s) is a measured need — healthy
+    # rounds on large diffs reach ~2300s — and must pass through untouched.
     with caplog.at_level("WARNING"):
         d = make(tmp_path, cfg={"finder_timeout_s": 2100, "panel_attempt_timeout": 2400})
-        assert d.panel_attempt_timeout_s == 1800  # clamped from 2400
-        assert d.finder_timeout_s == 1740  # a minute under the CLAMPED attempt
-        assert d.round_timeout_s == 4200  # (1+1)*1800 + 600 — at the ceiling, not 5400
-    assert "panel_attempt_timeout=2400" in caplog.text and "using 1800s" in caplog.text
-    assert "finder_timeout_s=2100" in caplog.text and "using 1740s" in caplog.text
-    # The overlay can no longer reach the old 5400s slot hold.
-    assert (d.panel_retries + 1) * d.panel_attempt_timeout_s + 600 <= 4200
+        assert d.panel_attempt_timeout_s == 2400
+        assert d.finder_timeout_s == 2100
+        assert d.round_timeout_s == 5400  # (1+1)*2400 + 600
+    assert "hard ceiling" not in caplog.text and "not below panel_attempt_timeout" not in caplog.text
 
 
-def test_the_default_round_bound_is_at_or_below_the_old_default(tmp_path, caplog):
-    # r5: with the shipped defaults (1 retry, 1800s attempt) the round bound is 4200s — the
-    # old default — and an explicit oversized round_timeout is clamped to that ceiling.
-    assert make(tmp_path / "default").round_timeout_s <= 4200
+def test_the_hard_ceilings_still_clamp_an_unbounded_overlay_and_say_so(tmp_path, caplog):
+    # #209: the ceilings remain a bound — a value beyond them is clamped, each time with a
+    # warning naming the key, the requested value and the value used.
+    from pr_reviewer.dispatch import MAX_PANEL_ATTEMPT_TIMEOUT_S, MAX_ROUND_TIMEOUT_S
+
+    assert MAX_PANEL_ATTEMPT_TIMEOUT_S == 3000
+    assert MAX_ROUND_TIMEOUT_S == 6600  # derived: (1+1)*3000 + 600
     with caplog.at_level("WARNING"):
-        assert make(tmp_path / "big", cfg={"round_timeout": 9000}).round_timeout_s == 4200
-    assert "round_timeout=9000" in caplog.text and "using 4200s" in caplog.text
+        d = make(tmp_path, cfg={"finder_timeout_s": 9000, "panel_attempt_timeout": 7200})
+        assert d.panel_attempt_timeout_s == 3000
+        assert d.finder_timeout_s == 2940  # a minute under the CLAMPED attempt
+        assert d.round_timeout_s == 6600
+    assert "panel_attempt_timeout=7200" in caplog.text and "using 3000s" in caplog.text
+    assert "finder_timeout_s=9000" in caplog.text and "using 2940s" in caplog.text
+    assert (d.panel_retries + 1) * d.panel_attempt_timeout_s + 600 <= MAX_ROUND_TIMEOUT_S
+
+
+def test_the_default_round_bound_is_unchanged_and_an_oversized_round_timeout_is_clamped(tmp_path, caplog):
+    # The shipped defaults (1 retry, 1800s attempt) still bound a round at 4200s — raising the
+    # CEILING must not move the default — and an explicit oversized round_timeout is clamped.
+    assert make(tmp_path / "default").round_timeout_s == 4200
+    with caplog.at_level("WARNING"):
+        assert make(tmp_path / "big", cfg={"round_timeout": 20000}).round_timeout_s == 6600
+    assert "round_timeout=20000" in caplog.text and "using 6600s" in caplog.text
 
 
 async def test_a_timed_out_critical_step_voids_the_round_and_posts_no_verdict(tmp_path):
