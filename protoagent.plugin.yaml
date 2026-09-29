@@ -48,12 +48,13 @@ config:
                                # to 900. Env fallback: PR_REVIEWER_VERIFY_TIMEOUT.
   # panel_attempt_timeout (overlay or PR_REVIEWER_PANEL_ATTEMPT_TIMEOUT env; default 1800) — budget for
   # ONE panel attempt (one recipe run), the backstop for a hang outside the step timeouts above. HARD
-  # CEILING 1800s (issue #209): a configured value above it is clamped to it with a log.warning naming
-  # the key, so no overlay can make one attempt outlast 30 min.
+  # CEILING 3000s (issue #209) = a 2100s finder + 900s of tail steps: a configured value above it is
+  # clamped to it with a log.warning naming the key, so no overlay can make one attempt outlast 50 min.
   # round_timeout (overlay or PR_REVIEWER_ROUND_TIMEOUT env; default (panel_retries+1)×panel_attempt+600)
-  # — a whole round's in-flight slot bound. HARD CEILING 4200s (issue #209), clamped with a log.warning.
-  # With the finder budget clamped a minute under the attempt and the attempt clamped to 1800, no round
-  # can hold a PR's slot past 4200s — the ~90-min holds from an unbounded overlay can no longer happen.
+  # — a whole round's in-flight slot bound. HARD CEILING 6600s (= 2×3000+600), clamped with a log.warning.
+  # The finder budget is clamped a minute under the attempt. Size the attempt as finder_timeout_s + 900
+  # (the three tail steps at their 300s default) or a slow finder leaves the tail no room and the
+  # attempt is cancelled mid-verify (qaEngineer#94). The shipped defaults are unchanged.
   repos: []                    # repos the DISPATCHER manages (owner/name) — NARROWS scope when set.
                                # empty HERE falls back to PR_REVIEWER_REPOS; empty in BOTH = every
                                # repo the GitHub App installation covers (webhook accepts any
