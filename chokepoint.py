@@ -68,48 +68,80 @@ class Chokepoint:
         self._on_reclaim = on_reclaim
         self._now = now
         self._last: dict[str, float] = {}  # key -> last accept time
-        self._in_flight: dict[str, float] = {}  # repo#pr -> when its slot was taken
+        # repo#pr -> {sha: when its slot was taken}. A PR normally holds ONE slot, but a
+        # backfill of the CURRENT head is admitted alongside an in-flight round for a head
+        # the PR has moved PAST (`supersede_stale`), so the map is keyed by the reviewed sha
+        # and each round frees only its own slot (protoLabsAI/pr-reviewer-plugin#209).
+        self._in_flight: dict[str, dict[str, float]] = {}
 
     @staticmethod
     def _key(repo: str, pr: int, sha: str) -> str:
         return f"{repo}#{pr}@{sha}"
 
-    def admit(self, repo: str, pr: int, sha: str, *, bypass_cooldown: bool = False) -> str:
-        """'accept' or a typed drop reason. An accept marks the PR in-flight —
-        the caller MUST call `done()` when the review run finishes (however it ends).
+    def admit(
+        self, repo: str, pr: int, sha: str, *, bypass_cooldown: bool = False, supersede_stale: bool = False
+    ) -> str:
+        """'accept' or a typed drop reason. An accept marks the PR in-flight AT `sha` —
+        the caller MUST call `done(repo, pr, sha)` when the review run finishes.
 
         `bypass_cooldown` is for an operator summon (issue #28). The cooldown exists to
         eat webhook bursts — a synchronize storm, a redelivery — and a human who typed a
         command is neither. The IN-FLIGHT guard still applies: it protects against two
         panels running on one PR, which a summon must not do either.
+
+        `supersede_stale` is for the sweep's backfill (#209): a round already in flight for
+        a head the PR has since moved PAST must not suppress a first review of the CURRENT
+        head. With it set, an in-flight round at a DIFFERENT sha is not a bar — only one at
+        the SAME sha (two panels on one head) still is. The default caller keeps the old
+        one-panel-per-PR posture.
         """
         flight_key = f"{repo}#{pr}"
         now = self._now()
-        taken = self._in_flight.get(flight_key)
-        if taken is not None:
-            held = now - taken
-            if held < self.in_flight_ttl_s:
-                return DROP_IN_FLIGHT
-            # Abandoned: its round never called done(). Reclaim rather than refuse
-            # forever — the TTL sits above the dispatcher's own round bound, so this
+        slots = self._in_flight.get(flight_key)
+        if slots:
+            # Abandoned holds — a round that never called done() — are reclaimed rather than
+            # refused forever; the TTL sits above the dispatcher's own round bound, so this
             # only ever fires for a round that has stopped making progress.
-            del self._in_flight[flight_key]
-            if self._on_reclaim is not None:
-                try:
-                    self._on_reclaim(repo, pr, held)
-                except Exception:  # noqa: BLE001 — observability must not block the gate
-                    pass
+            for held_sha, taken in list(slots.items()):
+                held = now - taken
+                if held >= self.in_flight_ttl_s:
+                    del slots[held_sha]
+                    if self._on_reclaim is not None:
+                        try:
+                            self._on_reclaim(repo, pr, held)
+                        except Exception:  # noqa: BLE001 — observability must not block the gate
+                            pass
+            if not slots:
+                del self._in_flight[flight_key]
+                slots = None
+        if slots:
+            if sha in slots:
+                return DROP_IN_FLIGHT  # the SAME head is already under review
+            if not supersede_stale:
+                return DROP_IN_FLIGHT  # a different head is in flight — one panel per PR
+            # else: the in-flight round is for a superseded head; the current head proceeds.
         key = self._key(repo, pr, sha)
         last = self._last.get(key)
         if last is not None and not bypass_cooldown and now - last < self.cooldown_s:
             return DROP_COOLDOWN
         self._last[key] = now
-        self._in_flight[flight_key] = now
+        self._in_flight.setdefault(flight_key, {})[sha] = now
         # Bounded memory: drop cooldown entries past 10× the window.
         if len(self._last) > 4096:
             cutoff = now - 10 * self.cooldown_s
             self._last = {k: t for k, t in self._last.items() if t >= cutoff}
         return "accept"
 
-    def done(self, repo: str, pr: int) -> None:
-        self._in_flight.pop(f"{repo}#{pr}", None)
+    def done(self, repo: str, pr: int, sha: str | None = None) -> None:
+        """Release the in-flight slot the matching `admit` took. `sha=None` clears every
+        slot for the PR — the legacy behaviour, safe when only one round is ever in flight."""
+        flight_key = f"{repo}#{pr}"
+        if sha is None:
+            self._in_flight.pop(flight_key, None)
+            return
+        slots = self._in_flight.get(flight_key)
+        if not slots:
+            return
+        slots.pop(sha, None)
+        if not slots:
+            self._in_flight.pop(flight_key, None)
