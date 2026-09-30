@@ -199,7 +199,7 @@ async def test_success_emits_header_and_sourced_findings(tmp_path, gateway_env, 
     r = runner(tmp_path, cfg={"model": "protolabs/smart"}, run_clawpatch=make_clawpatch(on_run=on_run))
     out = await r.review(12, "octo/repo")
 
-    # The invocation contract: ci, gateway provider, per-repo state dir, server-resolved base.
+    # The invocation contract: ci, gateway provider, per-review state dir, server-resolved base.
     assert seen["args"][:5] == ["clawpatch", "ci", "--provider", "gateway", "--json"]
     assert ["--since", SHA_BASE] == seen["args"][seen["args"].index("--since") :][:2]
     # The state dir is this review's OWN, under the repo's persistent one (#223).
