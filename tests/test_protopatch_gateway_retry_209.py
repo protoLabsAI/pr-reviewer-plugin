@@ -18,6 +18,7 @@ Two guards, both here:
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pr_reviewer.protopatch as pp
 import pytest
@@ -101,7 +102,7 @@ def runner(tmp_path, cfg=None, **kw):
 
 def _seed_findings(tmp_path):
     def seed(args, cwd, env, budget_s):
-        state = tmp_path / "st" / "octo-repo" / "findings"
+        state = Path(args[args.index("--state-dir") + 1]) / "findings"
         state.mkdir(parents=True, exist_ok=True)
         (state / "f1.json").write_text(json.dumps(RECORD))
 
