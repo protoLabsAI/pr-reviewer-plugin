@@ -6,13 +6,14 @@ owns the deterministic machinery:
 
   - `resolve_pr_refs` — head+base SHAs from the PR via `gh`, SERVER-SIDE (the model
     never supplies a ref; a model-picked SHA is how you review the wrong code).
-  - `run_clawpatch` — `clawpatch ci --provider gateway --json --state-dir <per-repo>
+  - `run_clawpatch` — `clawpatch ci --provider gateway --json --state-dir <per-review>
     --since <baseSha>` in the cached checkout, under a hard wall-clock budget
-    (SIGKILL past it; the CLI has no timeout flag of its own).
+    (SIGKILL past it; the CLI has no timeout flag of its own). The state dir is this
+    pass's OWN scratch dir under the repo's (#223), never one shared between reviews.
   - `read_findings` / `map_finding` — `ci --json` emits COUNTS only, so the finding
     objects are read from `<state>/findings/*.json`, filtered to open items whose
-    evidence touches this PR's changed files (the per-repo state dir accumulates
-    across PRs), and mapped into the ADR 0077 contract with `source: "protopatch"`.
+    evidence touches this PR's changed files, and mapped into the ADR 0077 contract
+    with `source: "protopatch"`.
 
 Failure posture (ADR 0078 D3): every failure — timeout, missing binary, missing
 gateway credentials, clone failure, non-zero exit — degrades to a typed
@@ -31,7 +32,9 @@ import json
 import logging
 import os
 import re
+import shutil
 import time
+import uuid
 from pathlib import Path
 
 from .checkout_cache import CheckoutCache, CheckoutError, redact
@@ -270,9 +273,9 @@ def map_finding(record: dict) -> dict | None:
 def read_findings(state_dir: Path, changed_files: set[str] | None) -> list[dict]:
     """Open findings from `<state>/findings/*.json`, confined to this PR.
 
-    The state dir is per-REPO and persistent (protoPatch's cross-run memory), so
-    records from other PRs accumulate; when `changed_files` is known, only findings
-    whose evidence touches one of them report. Deduped by protoPatch `signature`.
+    The state dir is per REVIEW (#223): it holds only this pass's findings, so another PR's
+    findings on a shared file can never leak in. `changed_files`, when known, still confines the
+    report to the diff. Deduped by protoPatch `signature`.
     """
     findings_dir = state_dir / "findings"
     if not findings_dir.is_dir():
@@ -299,15 +302,14 @@ def read_findings(state_dir: Path, changed_files: set[str] | None) -> list[dict]
     return out
 
 
-# State dirs whose orphaned clawpatch locks this PROCESS has already swept (#221). Module-level on
-# purpose: a config reload re-registers the plugin and builds a new runner, and the sweep must not
-# run again per instance — once per process per dir is the cost bound.
-_LOCK_SWEEPS_DONE: set[str] = set()
-# A foreign-host lock is stale once it is older than this. protoPatch reads `<= 0` as "unset" (its 2 h
-# default), so the smallest usable value is 1 ms: every lock another host wrote is then stale, while a
-# lock this host wrote is still judged by its pid alone (a live run keeps it however old).
-_ORPHAN_LOCK_STALE_MS = "1"
-_LOCK_SWEEP_BUDGET_S = 60
+# One structural pass gets its OWN clawpatch state dir, under the repo's persistent one (#223).
+# A per-repo dir shared by concurrent reviews made them fail each other's feature claims with
+# `exit 7` (`feature locked`), let one PR pick up another's findings on a shared file, and kept a
+# lock forever when a redeploy killed a run. The repo dir stays the home of what SHOULD persist
+# (refuted claims, provider-failure captures); the working state is per review.
+SCRATCH_DIRNAME = "scratch"
+# A scratch dir kept for a postmortem (its run failed) is dropped once it is this old.
+SCRATCH_KEEP_FAILED_S = 6 * 3600
 
 
 class ProtoPatchRunner:
@@ -405,51 +407,25 @@ class ProtoPatchRunner:
             log.info("[pr-reviewer] pruned %d stale checkout(s) from the cache", removed)
         return removed
 
-    async def _clear_orphaned_locks(self, state_dir: Path, checkout: Path, base_env: dict) -> None:
-        """Reclaim clawpatch feature locks left by a previous container (#221).
-
-        A roll SIGKILLs running panels and the recreated container gets a new hostname, so the locks
-        the killed runs held are foreign-host locks nothing releases; protoPatch reclaims one only
-        past its 2 h age, so the very PRs the roll killed — the ones re-reviewed next — failed their
-        structural lane with `exit 7` (`feature locked`). `clean-locks --stale-only` with the stale age
-        forced to 1 ms clears every foreign-host lock (file AND the feature record's own copy, both of
-        which a claim checks) and leaves any lock a live pid on THIS host holds, so a concurrent
-        panel, a reload, or an operator replay is not affected. Runs once per state dir per process,
-        ahead of the first `ci`; best-effort, a failure never voids the review."""
-        key = str(state_dir)
-        if key in _LOCK_SWEEPS_DONE:
-            return
-        _LOCK_SWEEPS_DONE.add(key)
-        if not (state_dir / "locks").is_dir():
-            return  # nothing has ever been claimed here
-        env = dict(base_env)
-        env["CLAWPATCH_LOCK_STALE_MS"] = _ORPHAN_LOCK_STALE_MS
-        args = [self.bin, "clean-locks", "--stale-only", "--json", "--state-dir", key]
+    def _prune_scratch(self, repo_dir: Path | None = None) -> int:
+        """Drop scratch state dirs kept for a postmortem once they are `SCRATCH_KEEP_FAILED_S`
+        old — for one repo, or (at startup) every repo, which also clears dirs a redeploy
+        orphaned mid-run. Best-effort, never raises."""
+        removed = 0
         try:
-            rc, stdout, stderr, timed_out = await self._run_clawpatch(args, checkout, env, _LOCK_SWEEP_BUDGET_S)
+            dirs = [repo_dir] if repo_dir is not None else [d for d in self.state_root.glob("*") if d.is_dir()]
+            now = time.time()
+            for d in dirs:
+                for scratch in (d / SCRATCH_DIRNAME).glob("*"):
+                    try:
+                        if now - scratch.stat().st_mtime > SCRATCH_KEEP_FAILED_S:
+                            shutil.rmtree(scratch, ignore_errors=True)
+                            removed += 1
+                    except OSError:
+                        continue
         except Exception:  # noqa: BLE001 — maintenance is best-effort, never fatal
-            log.exception("[pr-reviewer] orphaned-lock sweep failed for %s", key)
-            return
-        if timed_out or rc != 0:
-            log.warning(
-                "[pr-reviewer] orphaned-lock sweep did not complete for %s (rc=%s, timed_out=%s): %s",
-                key,
-                rc,
-                timed_out,
-                (stderr or stdout or "").strip()[-200:],
-            )
-            return
-        try:
-            cleared = json.loads(stdout)
-        except ValueError:
-            return
-        if isinstance(cleared, dict) and (cleared.get("cleared") or cleared.get("lockFilesCleared")):
-            log.info(
-                "[pr-reviewer] reclaimed orphaned clawpatch locks in %s: %s feature record(s), %s lock file(s)",
-                key,
-                cleared.get("cleared", 0),
-                cleared.get("lockFilesCleared", 0),
-            )
+            log.exception("[pr-reviewer] scratch state prune failed")
+        return removed
 
     async def review(self, pr: int, repo: str) -> str:
         """The full structural pass → prose header + fenced ADR 0077 findings JSON,
@@ -462,8 +438,15 @@ class ProtoPatchRunner:
         if not self._startup_pruned:
             self._startup_pruned = True
             self._prune()  # first use: sweep pre-fix accumulation before anything runs
+            self._prune_scratch()  # and scratch dirs a redeploy orphaned mid-run
+        scratch: list[Path] = []
         try:
-            result = await self._run_review(pr, repo)
+            result = await self._run_review(pr, repo, scratch)
+            if not result.startswith(UNAVAILABLE_PREFIX):
+                # A pass that produced findings has nothing left to inspect: drop its state dir
+                # (each holds a full report set). A failed pass keeps its dir for a postmortem.
+                for d in scratch:
+                    shutil.rmtree(d, ignore_errors=True)
             if result.startswith(UNAVAILABLE_PREFIX):
                 # The ONLY place the reason is kept (#140). It goes to the relay subagent,
                 # which paraphrases it, and a synthesizer that guessed "gateway auth error"
@@ -474,7 +457,7 @@ class ProtoPatchRunner:
         finally:
             self._prune()  # after each use — success or degradation alike
 
-    async def _run_review(self, pr: int, repo: str) -> str:
+    async def _run_review(self, pr: int, repo: str, scratch: list[Path] | None = None) -> str:
         if err := bad_repo(repo):
             return unavailable(err)
         gateway_key, gateway_base = self._gateway_creds()
@@ -496,8 +479,18 @@ class ProtoPatchRunner:
 
         changed = await self._changed_files(checkout, base_sha)
 
-        state_dir = self.state_root / repo.replace("/", "-")
-        state_dir.mkdir(parents=True, exist_ok=True)
+        repo_dir = self.state_root / repo.replace("/", "-")
+        repo_dir.mkdir(parents=True, exist_ok=True)
+        self._prune_scratch(repo_dir)
+        state_dir = repo_dir / SCRATCH_DIRNAME / f"{head_sha[:12]}-{uuid.uuid4().hex[:8]}"
+        state_dir.mkdir(parents=True)
+        if scratch is not None:
+            scratch.append(state_dir)  # review() drops it on success, keeps it on failure
+        # Provider-failure captures are diagnostics that must outlive the scratch dir: point the
+        # dir clawpatch writes them into at the repo's persistent one.
+        captures = repo_dir / "provider-failures"
+        captures.mkdir(exist_ok=True)
+        (state_dir / "provider-failures").symlink_to(captures, target_is_directory=True)
 
         args = [self.bin, "ci", "--provider", "gateway", "--json", "--state-dir", str(state_dir), "--since", base_sha]
         if self.model:
@@ -511,7 +504,6 @@ class ProtoPatchRunner:
         # to outlive the budget dies by our SIGKILL as an opaque `fetch failed` (~300s) instead of
         # clawpatch's own clean, classifiable gateway timeout. It is set per attempt below.
         inherited_timeout = env.get("CLAWPATCH_GATEWAY_TIMEOUT_MS")
-        await self._clear_orphaned_locks(state_dir, checkout, env)
 
         # One structural pass may run clawpatch twice: a TRANSIENT gateway failure (a dropped
         # request / socket timeout / gateway 5xx — #209) gets a single retry when enough of the

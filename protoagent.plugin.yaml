@@ -99,7 +99,7 @@ config:
   model: ""                    # clawpatch --model override; "" = its default (protolabs/smart)
   gateway_base_url: ""         # exported as OPENAI_BASE_URL to clawpatch; "" = its default
   checkout_root: ""            # "" = ~/.protoagent/pr-reviewer/checkouts
-  state_root: ""               # "" = ~/.protoagent/pr-reviewer/clawpatch (per-repo state dirs)
+  state_root: ""               # "" = ~/.protoagent/pr-reviewer/clawpatch (per-repo dirs: refuted.json, provider-failures/; each review works in <repo>/scratch/)
   refutation_ttl_days: 14      # how long a verifier-refuted protoPatch claim stays remembered per repo (#190)
   checkout_ttl_s: 3600         # cache entry freshness window (Quinn's model: ~token lifetime)
   checkout_max_entries: 50     # LRU prune caps (enforced on prune())

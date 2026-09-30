@@ -8,6 +8,7 @@ panel review, and a starved structural pass must degrade it to four finders inst
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pr_reviewer.protopatch as pp
 import pytest
@@ -191,17 +192,19 @@ async def test_success_emits_header_and_sourced_findings(tmp_path, gateway_env, 
 
     def on_run(args, cwd, env, budget_s):
         seen.update(args=args, cwd=cwd, env=env, budget=budget_s)
-        state = tmp_path / "st" / "octo-repo" / "findings"
+        state = Path(args[args.index("--state-dir") + 1]) / "findings"
         state.mkdir(parents=True, exist_ok=True)
         (state / "f1.json").write_text(json.dumps(RECORD))
 
     r = runner(tmp_path, cfg={"model": "protolabs/smart"}, run_clawpatch=make_clawpatch(on_run=on_run))
     out = await r.review(12, "octo/repo")
 
-    # The invocation contract: ci, gateway provider, per-repo state dir, server-resolved base.
+    # The invocation contract: ci, gateway provider, per-review state dir, server-resolved base.
     assert seen["args"][:5] == ["clawpatch", "ci", "--provider", "gateway", "--json"]
     assert ["--since", SHA_BASE] == seen["args"][seen["args"].index("--since") :][:2]
-    assert str(tmp_path / "st" / "octo-repo") in seen["args"]
+    # The state dir is this review's OWN, under the repo's persistent one (#223).
+    state_dir = Path(seen["args"][seen["args"].index("--state-dir") + 1])
+    assert state_dir.parent == tmp_path / "st" / "octo-repo" / "scratch"
     assert ["--model", "protolabs/smart"] == seen["args"][-2:]
     assert seen["cwd"] == tmp_path / "co" / "octo-repo" / SHA_HEAD
     assert "CLAWPATCH_GATEWAY_TIMEOUT_MS" in seen["env"]
@@ -340,7 +343,7 @@ async def test_a_claim_this_repo_already_refuted_is_pre_marked_unless_the_pr_tou
     from pr_reviewer.refutations import RefutationStore
 
     def seed(args, cwd, env, budget_s):
-        state = tmp_path / "st" / "octo-repo" / "findings"
+        state = Path(args[args.index("--state-dir") + 1]) / "findings"
         state.mkdir(parents=True, exist_ok=True)
         (state / "f1.json").write_text(json.dumps(RECORD))
 

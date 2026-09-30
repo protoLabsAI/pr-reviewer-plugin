@@ -11,16 +11,16 @@ The deterministic half of protoAgent's PR-review QA tier
   - Head/base SHAs resolved **server-side** from the PR (never model-supplied refs).
   - A content-addressed checkout cache: blobless partial clones (`--filter=blob:none`)
     keyed on `repo@headSha`, 1h TTL, LRU `prune()` under entry/byte caps.
-  - `clawpatch ci --provider gateway --json --state-dir <per-repo> --since <baseSha>`
+  - `clawpatch ci --provider gateway --json --state-dir <per-review> --since <baseSha>`
     under a hard wall-clock budget (default 300s, SIGKILL past it).
-  - **Orphaned locks are swept first (#221).** A redeploy SIGKILLs running panels and the new
-    container has a new hostname, so the clawpatch feature locks those runs held would block the
-    same PRs' re-review (`exit 7`, `feature locked`) for protoPatch's 2 h stale age. Before the
-    first `ci` in each repo state dir per process, `clawpatch clean-locks --stale-only` runs with
-    `CLAWPATCH_LOCK_STALE_MS=1`: every foreign-host lock is reclaimed, while a lock a live pid on
-    this host holds is kept. Best-effort — a failed sweep never voids the review. Assumes one
-    container owns the state volume.
-  - Findings read from the per-repo state dir, confined to the PR's changed files,
+  - **One state dir per review (#223).** Each pass runs clawpatch with its own state dir under
+    the repo's (`<state_root>/<owner-name>/scratch/<head>-<id>`), so concurrent reviews of one repo
+    can no longer fail each other's feature claims (`exit 7`, `feature locked`), one PR's findings
+    can no longer surface on another that touches the same file, and a redeploy that kills a run
+    leaves no lock behind. A successful pass deletes its dir; a failed one keeps it for a
+    postmortem and it is pruned after 6 h (and at startup). What should persist stays in the repo's
+    own dir: `refuted.json` and `provider-failures/` (captures of unusable model replies).
+  - Findings read from that state dir, confined to the PR's changed files,
     severity mapped (critical/high/medium/low → blocker/major/minor/nit), category
     preserved verbatim.
   - **Every failure degrades** (`PROTOPATCH UNAVAILABLE` + a prescribed Gap line) —
