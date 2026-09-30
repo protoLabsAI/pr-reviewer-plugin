@@ -96,6 +96,13 @@ config:
                                # (budget-30s), so raising this really does grant a longer request,
                                # and any inherited CLAWPATCH_GATEWAY_TIMEOUT_MS is honoured but capped
                                # to that same window — never allowed to outlive the budget.
+  structural_jobs: 4           # concurrent feature reviews per structural pass (clawpatch --jobs). Unset,
+                               # clawpatch runs ~half the CPU cores of them (max 10) — each a 50-115k-token
+                               # prompt, so one big PR floods the smart lane's KV cache and everything on it
+                               # times out (#221, homelab-iac#284). 95% of passes have <= 3 features and are
+                               # untouched by 4. A pass takes ceil(features/jobs) waves, so if you LOWER this
+                               # also raise time_budget_s (the wall clock is fixed). 0 = clawpatch's own
+                               # default (no --jobs): the rollback switch. Clamped to 10.
   model: ""                    # clawpatch --model override; "" = its default (protolabs/smart)
   gateway_base_url: ""         # exported as OPENAI_BASE_URL to clawpatch; "" = its default
   checkout_root: ""            # "" = ~/.protoagent/pr-reviewer/checkouts
@@ -120,6 +127,7 @@ settings:
   - {key: default_repo, label: "Default repo (owner/name)", type: string}
   - {key: viewer_login, label: "Our own login (required on App auth, e.g. myapp[bot])", type: string}
   - {key: time_budget_s, label: "protoPatch time budget (seconds)", type: int}
+  - {key: structural_jobs, label: "protoPatch concurrent feature reviews (0 = engine default)", type: int}
   - {key: model, label: "protoPatch model override", type: string}
 
 # The webhook page-load can't carry a bearer — the HMAC inside the handler is the

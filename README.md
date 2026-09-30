@@ -11,8 +11,15 @@ The deterministic half of protoAgent's PR-review QA tier
   - Head/base SHAs resolved **server-side** from the PR (never model-supplied refs).
   - A content-addressed checkout cache: blobless partial clones (`--filter=blob:none`)
     keyed on `repo@headSha`, 1h TTL, LRU `prune()` under entry/byte caps.
-  - `clawpatch ci --provider gateway --json --state-dir <per-review> --since <baseSha>`
+  - `clawpatch ci --provider gateway --json --state-dir <per-review> --since <baseSha> --jobs <n>`
     under a hard wall-clock budget (default 300s, SIGKILL past it).
+  - **Concurrency is capped (#221).** `structural_jobs` (default 4) is clawpatch's `--jobs`. Left
+    alone clawpatch reviews about half the host's cores of features at once (max 10) — each a
+    50-115k-token prompt — so one big PR floods the model lane's KV cache and everything on it
+    times out. 95% of passes have ≤ 3 features and are untouched by 4. A pass takes
+    `ceil(features / jobs)` waves, so if you lower it raise `time_budget_s` too. `0` = no `--jobs`
+    (clawpatch's own default): the rollback switch. Values above 10 are clamped; a mistyped value
+    falls back to the default with a warning.
   - **One state dir per review (#223).** Each pass runs clawpatch with its own state dir under
     the repo's (`<state_root>/<owner-name>/scratch/<head>-<id>`), so concurrent reviews of one repo
     can no longer fail each other's feature claims (`exit 7`, `feature locked`), one PR's findings
