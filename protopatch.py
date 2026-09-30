@@ -299,6 +299,17 @@ def read_findings(state_dir: Path, changed_files: set[str] | None) -> list[dict]
     return out
 
 
+# State dirs whose orphaned clawpatch locks this PROCESS has already swept (#221). Module-level on
+# purpose: a config reload re-registers the plugin and builds a new runner, and the sweep must not
+# run again per instance — once per process per dir is the cost bound.
+_LOCK_SWEEPS_DONE: set[str] = set()
+# A foreign-host lock is stale once it is older than this. protoPatch reads `<= 0` as "unset" (its 2 h
+# default), so the smallest usable value is 1 ms: every lock another host wrote is then stale, while a
+# lock this host wrote is still judged by its pid alone (a live run keeps it however old).
+_ORPHAN_LOCK_STALE_MS = "1"
+_LOCK_SWEEP_BUDGET_S = 60
+
+
 class ProtoPatchRunner:
     """The orchestration the tool calls — every step degrades to `unavailable(...)`."""
 
@@ -394,6 +405,52 @@ class ProtoPatchRunner:
             log.info("[pr-reviewer] pruned %d stale checkout(s) from the cache", removed)
         return removed
 
+    async def _clear_orphaned_locks(self, state_dir: Path, checkout: Path, base_env: dict) -> None:
+        """Reclaim clawpatch feature locks left by a previous container (#221).
+
+        A roll SIGKILLs running panels and the recreated container gets a new hostname, so the locks
+        the killed runs held are foreign-host locks nothing releases; protoPatch reclaims one only
+        past its 2 h age, so the very PRs the roll killed — the ones re-reviewed next — failed their
+        structural lane with `exit 7` (`feature locked`). `clean-locks --stale-only` with the stale age
+        forced to 1 ms clears every foreign-host lock (file AND the feature record's own copy, both of
+        which a claim checks) and leaves any lock a live pid on THIS host holds, so a concurrent
+        panel, a reload, or an operator replay is not affected. Runs once per state dir per process,
+        ahead of the first `ci`; best-effort, a failure never voids the review."""
+        key = str(state_dir)
+        if key in _LOCK_SWEEPS_DONE:
+            return
+        _LOCK_SWEEPS_DONE.add(key)
+        if not (state_dir / "locks").is_dir():
+            return  # nothing has ever been claimed here
+        env = dict(base_env)
+        env["CLAWPATCH_LOCK_STALE_MS"] = _ORPHAN_LOCK_STALE_MS
+        args = [self.bin, "clean-locks", "--stale-only", "--json", "--state-dir", key]
+        try:
+            rc, stdout, stderr, timed_out = await self._run_clawpatch(args, checkout, env, _LOCK_SWEEP_BUDGET_S)
+        except Exception:  # noqa: BLE001 — maintenance is best-effort, never fatal
+            log.exception("[pr-reviewer] orphaned-lock sweep failed for %s", key)
+            return
+        if timed_out or rc != 0:
+            log.warning(
+                "[pr-reviewer] orphaned-lock sweep did not complete for %s (rc=%s, timed_out=%s): %s",
+                key,
+                rc,
+                timed_out,
+                (stderr or stdout or "").strip()[-200:],
+            )
+            return
+        try:
+            cleared = json.loads(stdout)
+        except ValueError:
+            return
+        if isinstance(cleared, dict) and (cleared.get("cleared") or cleared.get("lockFilesCleared")):
+            log.info(
+                "[pr-reviewer] reclaimed orphaned clawpatch locks in %s: %s feature record(s), %s lock file(s)",
+                key,
+                cleared.get("cleared", 0),
+                cleared.get("lockFilesCleared", 0),
+            )
+
     async def review(self, pr: int, repo: str) -> str:
         """The full structural pass → prose header + fenced ADR 0077 findings JSON,
         or an `unavailable(...)` degradation message. Never raises.
@@ -454,6 +511,7 @@ class ProtoPatchRunner:
         # to outlive the budget dies by our SIGKILL as an opaque `fetch failed` (~300s) instead of
         # clawpatch's own clean, classifiable gateway timeout. It is set per attempt below.
         inherited_timeout = env.get("CLAWPATCH_GATEWAY_TIMEOUT_MS")
+        await self._clear_orphaned_locks(state_dir, checkout, env)
 
         # One structural pass may run clawpatch twice: a TRANSIENT gateway failure (a dropped
         # request / socket timeout / gateway 5xx — #209) gets a single retry when enough of the
