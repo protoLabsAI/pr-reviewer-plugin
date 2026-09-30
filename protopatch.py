@@ -159,6 +159,44 @@ GATEWAY_TIMEOUT_FLOOR_MS = 30_000  # never below 30s, however small the attempt 
 # budget survives the first attempt — below it a second attempt cannot finish, so we degrade now.
 RETRY_MIN_BUDGET_S = 90
 
+# Concurrent feature reviews per structural pass (#221). Left alone, clawpatch runs about half the
+# host's CPU cores of them at once, capped at 10 (Vera's host has 24 cores, so 10) — each a
+# 50-115k-token prompt. One big PR (5+ features, ~5% of passes, median 9) then puts 0.3-0.7M tokens
+# of KV cache into the smart lane in seconds; the lane holds ~0.8M per replica, saturates, and every
+# request on it crawls until the 600s gateway timeout kills it (homelab-iac#284). Typical passes
+# have 1-3 features (95%), so a cap of 4 leaves them untouched and only trims the rare burst.
+DEFAULT_STRUCTURAL_JOBS = 4
+MAX_STRUCTURAL_JOBS = 10  # clawpatch's own ceiling for its default; a higher setting is clamped
+
+
+def structural_jobs(value) -> int | None:
+    """The `--jobs` value for one structural pass, from the `structural_jobs` setting.
+
+    Unset / blank -> DEFAULT_STRUCTURAL_JOBS. `0` -> None: pass no `--jobs`, so clawpatch picks its
+    own default (the pre-#221 behaviour, and the rollback switch). Above MAX_STRUCTURAL_JOBS it is
+    clamped. Anything that is not a whole number >= 0 (a bool, a float, text, a negative) falls back
+    to the default with a warning rather than raising: a typo in one setting must not stop the
+    structural pass, and must not silently turn the cap off either."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return DEFAULT_STRUCTURAL_JOBS
+    parsed: int | None = None
+    if isinstance(value, bool):
+        parsed = None
+    elif isinstance(value, int):
+        parsed = value
+    elif isinstance(value, str) and re.fullmatch(r"\s*\d+\s*", value):
+        parsed = int(value)
+    if parsed is None or parsed < 0:
+        log.warning(
+            "[pr-reviewer] ignoring structural_jobs=%r (expected a whole number >= 0); using %d",
+            value,
+            DEFAULT_STRUCTURAL_JOBS,
+        )
+        return DEFAULT_STRUCTURAL_JOBS
+    if parsed == 0:
+        return None
+    return min(parsed, MAX_STRUCTURAL_JOBS)
+
 
 def gateway_timeout_ms(attempt_budget_s: int, inherited: str | None = None) -> int:
     """CLAWPATCH_GATEWAY_TIMEOUT_MS for one attempt. The default SCALES with the attempt's budget
@@ -324,6 +362,7 @@ class ProtoPatchRunner:
         # which writes them when a round posts; the structural pass reads them here.
         self.refutations = RefutationStore.from_cfg(self.cfg)
         self.budget_s = int(self.cfg.get("time_budget_s") or 600)
+        self.jobs = structural_jobs(self.cfg.get("structural_jobs"))  # None = clawpatch's own default
         self.bin = str(self.cfg.get("clawpatch_bin") or "clawpatch")
         self.model = str(self.cfg.get("model") or "")
         self.gateway_base_url = str(self.cfg.get("gateway_base_url") or "")
@@ -493,6 +532,8 @@ class ProtoPatchRunner:
         (state_dir / "provider-failures").symlink_to(captures, target_is_directory=True)
 
         args = [self.bin, "ci", "--provider", "gateway", "--json", "--state-dir", str(state_dir), "--since", base_sha]
+        if self.jobs is not None:
+            args += ["--jobs", str(self.jobs)]  # cap the burst one big PR puts on the lane (#221)
         if self.model:
             args += ["--model", self.model]
         env = os.environ.copy()
