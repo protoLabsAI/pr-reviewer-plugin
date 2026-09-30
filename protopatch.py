@@ -6,13 +6,14 @@ owns the deterministic machinery:
 
   - `resolve_pr_refs` — head+base SHAs from the PR via `gh`, SERVER-SIDE (the model
     never supplies a ref; a model-picked SHA is how you review the wrong code).
-  - `run_clawpatch` — `clawpatch ci --provider gateway --json --state-dir <per-repo>
+  - `run_clawpatch` — `clawpatch ci --provider gateway --json --state-dir <per-review>
     --since <baseSha>` in the cached checkout, under a hard wall-clock budget
-    (SIGKILL past it; the CLI has no timeout flag of its own).
+    (SIGKILL past it; the CLI has no timeout flag of its own). The state dir is this
+    pass's OWN scratch dir under the repo's (#223), never one shared between reviews.
   - `read_findings` / `map_finding` — `ci --json` emits COUNTS only, so the finding
     objects are read from `<state>/findings/*.json`, filtered to open items whose
-    evidence touches this PR's changed files (the per-repo state dir accumulates
-    across PRs), and mapped into the ADR 0077 contract with `source: "protopatch"`.
+    evidence touches this PR's changed files, and mapped into the ADR 0077 contract
+    with `source: "protopatch"`.
 
 Failure posture (ADR 0078 D3): every failure — timeout, missing binary, missing
 gateway credentials, clone failure, non-zero exit — degrades to a typed
