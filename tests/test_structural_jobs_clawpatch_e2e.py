@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import threading
@@ -28,23 +29,29 @@ import pr_reviewer.protopatch as pp
 import pytest
 from pr_reviewer.protopatch import DEFAULT_STRUCTURAL_JOBS, ProtoPatchRunner
 
+MIN_CLAWPATCH = (0, 8, 0)  # these tests encode 0.8-era mapping (one feature per workflow file)
+
 
 def _usable_clawpatch() -> str | None:
-    """A clawpatch that actually RUNS — one that is merely on PATH (a pnpm shim with no `node`
-    behind it, say) must skip these tests, not fail them."""
+    """A clawpatch that actually RUNS and is new enough — one that is merely on PATH (a pnpm shim
+    with no `node` behind it, or an older build that maps features differently) must skip these
+    tests, not fail them."""
     found = os.environ.get("CLAWPATCH_BIN") or shutil.which("clawpatch")
     if not found:
         return None
     try:
-        ok = subprocess.run([found, "--version"], capture_output=True, timeout=30).returncode == 0
+        run = subprocess.run([found, "--version"], capture_output=True, text=True, timeout=30)
     except (OSError, subprocess.SubprocessError):
-        ok = False
-    return found if ok else None
+        return None
+    m = re.search(r"(\d+)\.(\d+)\.(\d+)", run.stdout)
+    if run.returncode != 0 or not m or tuple(int(g) for g in m.groups()) < MIN_CLAWPATCH:
+        return None
+    return found
 
 
 CLAWPATCH = _usable_clawpatch()
 pytestmark = pytest.mark.skipif(
-    not CLAWPATCH or not shutil.which("git"), reason="needs a working clawpatch CLI (CLAWPATCH_BIN) and git"
+    not CLAWPATCH or not shutil.which("git"), reason="needs a working clawpatch >= 0.8.0 (CLAWPATCH_BIN) and git"
 )
 
 FEATURES = 8  # one per workflow file

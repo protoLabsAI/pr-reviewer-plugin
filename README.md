@@ -32,6 +32,15 @@ The deterministic half of protoAgent's PR-review QA tier
     preserved verbatim.
   - **Every failure degrades** (`PROTOPATCH UNAVAILABLE` + a prescribed Gap line) —
     a starved structural pass must never void the panel review (ADR 0078 D3).
+  - **A cut-short pass keeps what finished (#205).** When the budget kills the pass or a feature
+    errors, but at least one claimed feature had already finished, the findings those features wrote
+    come back as a **partial** result (`PROTOPATCH PARTIAL`, header `protoPatch structural pass partial
+    on …`, and a `Gap: structural pass partial — N of M features reviewed — <reason>` line) instead of
+    being thrown away with the whole pass. It is still a lane gap: the round is incomplete and the
+    verdict stays capped at WARN, so a pass that covered less never reads as a clean PASS; the
+    telemetry row carries `structural_partial: true` (and the usual `structural_reason`). With nothing
+    finished it is the outage it always was. The scratch state dir of a partial pass is kept for a
+    postmortem like any failed pass.
 - **`structural-finder`** — the subagent seat: calls the tool once, relays the findings
   verbatim, reports the Gap on unavailability. A relay, not a reviewer.
 - **`workflows/code-review-structural.yaml`** — the five-finder panel recipe: the four

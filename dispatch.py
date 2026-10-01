@@ -60,7 +60,7 @@ from .grounding import (
     render_grounding_footnote,
     render_unreadable_footnote,
 )
-from .protopatch import STRUCTURAL_GAP_MARKERS, classify_outage, outage_reason
+from .protopatch import STRUCTURAL_GAP_MARKERS, classify_outage, is_partial_output, outage_reason
 from .rounds import (
     DEFAULT_CONVERGENCE_ROUNDS,
     converge,
@@ -3158,6 +3158,9 @@ class Dispatcher:
             structural_reason=(classify_outage(outage_reason(structural_out)) or None)
             if structural_unavailable
             else None,
+            # The lane was cut short but its finished features' findings are IN the round (#205):
+            # still a gap (complete=False, WARN cap), so a partial pass is countable apart from an outage.
+            structural_partial=(structural_unavailable and is_partial_output(structural_out)) or None,
             verify_undelivered=verify_undelivered or None,
             # A clean PASS posted as WARN because a lane did not deliver a full pass (#117).
             coverage_capped=(verdict != finding_verdict) or None,

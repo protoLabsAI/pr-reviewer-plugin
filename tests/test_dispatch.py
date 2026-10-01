@@ -8,7 +8,9 @@ import json
 import logging
 import time
 
+import pytest
 from pr_reviewer.dispatch import POST_MAX_FAILURES, Dispatcher
+from pr_reviewer.protopatch import PARTIAL_HEADER, STRUCTURAL_GAP_MARKERS
 from pr_reviewer.telemetry import Telemetry
 from pr_reviewer.verdicts import extract_findings_json, parse_verdict_marker, render_verdict_body, verdict_for
 
@@ -1841,6 +1843,119 @@ async def test_the_outage_reason_reaches_the_coverage_banner(tmp_path):
     assert "/sandbox/" not in body and "(path)" in body  # never the reviewer's filesystem layout
 
 
+# ── a structural pass cut short keeps its findings but is still a gap (#205) ──────────────────
+
+_PARTIAL_FINDING = {
+    "file": "x.py",
+    "line": 3,
+    "severity": "major",
+    "category": "correctness",
+    "claim": "Race in prune().",
+    "evidence": "rmSync(...)",
+    "source": "protopatch",
+}
+_PARTIAL_REASON = "timed out after 900s (budget exceeded; findings from the finished features kept)"
+_PARTIAL_COVERAGE = "33 of 36 features reviewed"
+
+
+def _partial_tool_text() -> str:
+    from pr_reviewer.protopatch import partial_result
+
+    header = f"{PARTIAL_HEADER} o/r#1 — head {HEAD[:12]}, base bbbbbbbbbbbb, 905s, 1 reportable finding(s)"
+    return partial_result(_PARTIAL_COVERAGE, _PARTIAL_REASON, header, [_PARTIAL_FINDING])
+
+
+# What the relay model actually hands the panel: the tool's text echoed whole, the Gap line + the
+# array (what it is told to write), or — the case that must still be seen — only the run header.
+_RELAY_REPLIES = {
+    "echoes the tool's text": _partial_tool_text,
+    "states the Gap line and relays the array": lambda: (
+        f"Gap: structural pass partial — {_PARTIAL_COVERAGE} — {_PARTIAL_REASON}\n\n"
+        f"```json\n{json.dumps([_PARTIAL_FINDING])}\n```"
+    ),
+    "echoes only the run header": lambda: (
+        f"{PARTIAL_HEADER} o/r#1 — head {HEAD[:12]}, base bbbbbbbbbbbb, 905s, 1 reportable finding(s)\n\n"
+        f"```json\n{json.dumps([_PARTIAL_FINDING])}\n```"
+    ),
+}
+
+
+@pytest.mark.parametrize("how", list(_RELAY_REPLIES))
+async def test_a_partial_structural_lane_is_a_gap_not_a_clean_pass(tmp_path, how):
+    """The findings of the features that finished are in the lane, but the pass covered less: the
+    round is incomplete (so the promotion gate will not auto-approve), the verdict is capped at WARN,
+    and it is counted apart from an outage. Held for every shape of relay reply."""
+    gh = _structural_gh()
+    lane = _lane("find_structural", _RELAY_REPLIES[how]())
+
+    async def runner(name, inputs):
+        return {"output": CLEAN_REPORT, "failed": [], "steps": _panel_steps(find_structural=lane)}
+
+    d = make(tmp_path, cfg={"shadow_mode": False}, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "reviewed:WARN"  # never a clean PASS
+    body = gh.reviews_posted[0]["body"]
+    assert "complete=false" in body and "came back clean" not in body
+    assert "`find_structural` (structural pass unavailable or cut short" in body
+    (row,) = _telemetry_events(tmp_path, "reviewed")
+    assert row["complete"] is False and row["structural_unavailable"] is True
+    assert row["structural_partial"] is True  # countable apart from a lane that never ran
+    assert _telemetry_events(tmp_path, "panel_retry") == []  # a partial lane is delivered, not re-run
+
+
+async def test_a_partial_lanes_coverage_and_reason_reach_the_banner(tmp_path):
+    gh = _structural_gh()
+    lane = _lane("find_structural", _RELAY_REPLIES["states the Gap line and relays the array"]())
+
+    async def runner(name, inputs):
+        return {"output": CLEAN_REPORT, "failed": [], "steps": _panel_steps(find_structural=lane)}
+
+    d = make(tmp_path, cfg={"shadow_mode": False}, gh=gh, runner=runner)
+    await d.handle_pr_event("o/r", 1, HEAD, "opened")
+    body = gh.reviews_posted[0]["body"]
+    assert _PARTIAL_COVERAGE in body  # how far it got is in front of the reason, so it survives the clip
+    (row,) = _telemetry_events(tmp_path, "reviewed")
+    assert row["structural_reason"] == "budget-timeout"  # the coverage lead did not hide the class
+
+
+async def test_a_complete_structural_lane_is_not_marked_partial(tmp_path):
+    gh = _structural_gh()
+
+    async def runner(name, inputs):
+        return {"output": CLEAN_REPORT, "failed": [], "steps": _panel_steps()}
+
+    d = make(tmp_path, cfg={"shadow_mode": False}, gh=gh, runner=runner)
+    await d.handle_pr_event("o/r", 1, HEAD, "opened")
+    (row,) = _telemetry_events(tmp_path, "reviewed")
+    assert row["complete"] is True and row.get("structural_partial") is None
+
+
+async def test_an_outage_is_not_mistaken_for_partial(tmp_path):
+    gh = _structural_gh()
+    outage = _lane(
+        "find_structural",
+        "Gap: structural pass unavailable — clawpatch exit 4 (gateway provider failure)\n\n```json\n[]\n```",
+    )
+
+    async def runner(name, inputs):
+        return {"output": CLEAN_REPORT, "failed": [], "steps": _panel_steps(find_structural=outage)}
+
+    d = make(tmp_path, cfg={"shadow_mode": False}, gh=gh, runner=runner)
+    await d.handle_pr_event("o/r", 1, HEAD, "opened")
+    (row,) = _telemetry_events(tmp_path, "reviewed")
+    assert row["structural_unavailable"] is True and row.get("structural_partial") is None
+
+
+def test_a_partial_result_keeps_the_coverage_cap_in_the_pure_helpers():
+    from pr_reviewer.protopatch import outage_reason
+    from pr_reviewer.verdicts import PASS, WARN, coverage_gaps, coverage_verdict, mentions_any, structural_relay_ok
+
+    lane = _partial_tool_text()
+    assert mentions_any(lane, STRUCTURAL_GAP_MARKERS) and structural_relay_ok(lane, STRUCTURAL_GAP_MARKERS)
+    gaps = coverage_gaps([], [], True, outage_reason(lane))
+    assert _PARTIAL_COVERAGE in gaps["find_structural"]
+    assert coverage_verdict(PASS, gaps) == WARN  # findings kept, cap kept
+
+
 def test_outage_reason_is_display_safe():
     from pr_reviewer.protopatch import outage_reason
 
@@ -1855,11 +1970,31 @@ def test_outage_reason_is_display_safe():
 
 def test_the_gap_line_the_tool_prescribes_is_the_one_the_gate_recognises():
     # One constant on both sides, so the instruction and the detector cannot drift apart.
-    from pr_reviewer.protopatch import GAP_LINE_PREFIX, STRUCTURAL_GAP_MARKERS, UNAVAILABLE_PREFIX, unavailable
+    from pr_reviewer.protopatch import (
+        GAP_LINE_PREFIX,
+        GAP_PARTIAL_PREFIX,
+        PARTIAL_HEADER,
+        PARTIAL_PREFIX,
+        STRUCTURAL_GAP_MARKERS,
+        UNAVAILABLE_PREFIX,
+        partial_result,
+        unavailable,
+    )
 
     text = unavailable("clone failed")
     assert f"`{GAP_LINE_PREFIX} — clone failed`" in text and text.startswith(UNAVAILABLE_PREFIX)
-    assert set(STRUCTURAL_GAP_MARKERS) == {UNAVAILABLE_PREFIX, GAP_LINE_PREFIX}
+    # A PARTIAL result is held to the same rule: the Gap line it tells the relay to write is the
+    # one the detector looks for, and the tool's own prefix is a second marker.
+    partial = partial_result("3 of 4 features reviewed", "timed out after 1s", "header", [])
+    assert f"`{GAP_PARTIAL_PREFIX} — 3 of 4 features reviewed — timed out after 1s`" in partial
+    assert partial.startswith(PARTIAL_PREFIX)
+    assert set(STRUCTURAL_GAP_MARKERS) == {
+        UNAVAILABLE_PREFIX,
+        GAP_LINE_PREFIX,
+        PARTIAL_PREFIX,
+        GAP_PARTIAL_PREFIX,
+        PARTIAL_HEADER,
+    }
 
 
 # ── a lane that did not run is visible, and is not a clean PASS (#117) ─────────
