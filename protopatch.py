@@ -66,8 +66,22 @@ UNAVAILABLE_PREFIX = "PROTOPATCH UNAVAILABLE"
 # its reply — so an outage check that knows only the prefix reads a faithful relay of an
 # outage as a clean, delivered, empty structural pass.
 GAP_LINE_PREFIX = "Gap: structural pass unavailable"
-# Either one in the structural lane's output means the structural pass did not run.
-STRUCTURAL_GAP_MARKERS = (UNAVAILABLE_PREFIX, GAP_LINE_PREFIX)
+# A pass that was CUT SHORT (budget SIGKILL, or a feature failed) after some features had already
+# finished is not an outage: those features' findings are real and used to be thrown away with the
+# whole pass (#205). `partial_result()` returns them under this prefix with an explicit Gap line,
+# so the lane is still flagged incomplete (verdict capped at WARN) while its findings flow through.
+PARTIAL_PREFIX = "PROTOPATCH PARTIAL"
+GAP_PARTIAL_PREFIX = "Gap: structural pass partial"
+# A third chance to be seen: the run header a partial result opens with. The relay is a model, and the
+# failure that matters is one that drops BOTH markers above and reads as a clean, complete pass (the
+# #138 fail-open class) — but it reliably echoes the header it is told to relay. Detection only: it
+# carries no reason (see `_NO_REASON_MARKERS`).
+PARTIAL_HEADER = "protoPatch structural pass partial on"
+# Any one in the structural lane's output means the structural pass did not run in full.
+STRUCTURAL_GAP_MARKERS = (UNAVAILABLE_PREFIX, GAP_LINE_PREFIX, PARTIAL_PREFIX, GAP_PARTIAL_PREFIX, PARTIAL_HEADER)
+_NO_REASON_MARKERS = (PARTIAL_HEADER,)
+# Feature statuses (clawpatch `featureStatuses`) that mean a review of the feature FINISHED.
+COMPLETED_FEATURE_STATUSES = frozenset({"reviewed", "needs-fix"})
 
 
 _URL_RE = re.compile(r"\b[a-z][a-z0-9+.-]*://\S+")
@@ -86,6 +100,8 @@ def outage_reason(structural_output: str, limit: int = 180) -> str:
     """
     text = structural_output or ""
     for marker in STRUCTURAL_GAP_MARKERS:
+        if marker in _NO_REASON_MARKERS:
+            continue  # detection-only: what follows is a repo#pr, not a reason
         _before, found, after = text.partition(marker)
         if not found:
             continue
@@ -98,6 +114,9 @@ def outage_reason(structural_output: str, limit: int = 180) -> str:
 
 
 _EXIT_RE = re.compile(r"clawpatch exit (\d+)")
+# The coverage a partial result puts at the FRONT of its Gap line, so the display clip in
+# `outage_reason` can never drop it and `classify_outage` can strip it before matching.
+_PARTIAL_LEAD_RE = re.compile(r"^\s*\d+ of \d+ features? reviewed\s*[—-]\s*", re.IGNORECASE)
 
 
 def classify_outage(reason: str) -> str:
@@ -114,7 +133,7 @@ def classify_outage(reason: str) -> str:
     (clawpatch's own provider timeout) or `exit-4:provider` (anything else in that class),
     and `other` for a reason this does not recognise.
     """
-    text = (reason or "").strip()
+    text = _PARTIAL_LEAD_RE.sub("", (reason or "").strip(), count=1)  # "33 of 36 features reviewed — "
     if not text:
         return ""
     lowered = text.lower()
@@ -142,6 +161,58 @@ def unavailable(reason: str) -> str:
         f"`{GAP_LINE_PREFIX} — {reason}` — and emit an empty findings "
         "array (```json\n[]\n```). Do not retry, do not invent findings."
     )
+
+
+def partial_result(coverage: str, reason: str, header: str, findings: list[dict]) -> str:
+    """The tool's answer for a pass that was cut short AFTER some features finished (#205).
+
+    Same shape as a normal result — a header and the fenced findings array — plus the Gap line
+    the relay must state, so the lane is flagged incomplete (WARN cap) without losing the findings
+    the completed features produced. `coverage` ("33 of 36 features reviewed") leads the reason
+    on purpose: see `_PARTIAL_LEAD_RE`."""
+    gap = f"{GAP_PARTIAL_PREFIX} — {coverage} — {reason}"
+    return (
+        f"{PARTIAL_PREFIX} — {coverage} — {reason}\n\n"
+        f"{header}\n\n"
+        "The pass was cut short, but the features that finished produced the findings below. In your "
+        f"reply, state exactly one Gap line — `{gap}` — then relay the fenced findings array below "
+        "EXACTLY as given: same items, nothing added, edited, re-graded or dropped. Do not call the "
+        "tool again.\n\n"
+        f"```json\n{json.dumps(findings, indent=2)}\n```"
+    )
+
+
+def is_partial_output(text: str) -> bool:
+    """Did the structural lane's output come from a partial pass (either marker)?"""
+    out = text or ""
+    return PARTIAL_PREFIX in out or GAP_PARTIAL_PREFIX in out or PARTIAL_HEADER in out
+
+
+def pass_coverage(state_dir: Path) -> tuple[int, int] | None:
+    """(features finished, features claimed) for THIS pass, from clawpatch's own state dir.
+
+    The latest run record that claimed features names them; each feature's record says whether its
+    review finished. None when nothing readable was claimed — callers then treat the pass as having
+    produced nothing. Never raises: a half-written file (the pass was SIGKILLed) is just skipped."""
+    claimed: list[str] = []
+    for run in sorted((state_dir / "runs").glob("*.json"), reverse=True):
+        try:
+            ids = json.loads(run.read_text()).get("claimedFeatureIds")
+        except (OSError, ValueError, AttributeError):
+            continue
+        if isinstance(ids, list) and ids:
+            claimed = [str(i) for i in ids]
+            break
+    if not claimed:
+        return None
+    done = 0
+    for fid in claimed:
+        try:
+            status = json.loads((state_dir / "features" / f"{fid}.json").read_text()).get("status")
+        except (OSError, ValueError, AttributeError):
+            continue
+        done += status in COMPLETED_FEATURE_STATUSES
+    return done, len(claimed)
 
 
 # clawpatch's own gateway-request timeout (CLAWPATCH_GATEWAY_TIMEOUT_MS), sized PER ATTEMPT and
@@ -481,7 +552,7 @@ class ProtoPatchRunner:
         scratch: list[Path] = []
         try:
             result = await self._run_review(pr, repo, scratch)
-            if not result.startswith(UNAVAILABLE_PREFIX):
+            if not result.startswith((UNAVAILABLE_PREFIX, PARTIAL_PREFIX)):
                 # A pass that produced findings has nothing left to inspect: drop its state dir
                 # (each holds a full report set). A failed pass keeps its dir for a postmortem.
                 for d in scratch:
@@ -492,6 +563,8 @@ class ProtoPatchRunner:
                 # one round and "provider error" the next for the same fault; nothing logged
                 # it, so the operator who could fix a route or a key never saw which it was.
                 log.warning("[pr-reviewer] structural pass unavailable on %s#%s: %s", repo, pr, result.splitlines()[0])
+            elif result.startswith(PARTIAL_PREFIX):
+                log.warning("[pr-reviewer] structural pass PARTIAL on %s#%s: %s", repo, pr, result.splitlines()[0])
             return result
         finally:
             self._prune()  # after each use — success or degradation alike
@@ -568,10 +641,18 @@ class ProtoPatchRunner:
             )
             rc, stdout, stderr, timed_out = await self._run_clawpatch(args, checkout, env, attempt_budget_s)
             if timed_out:
-                return unavailable(
-                    _with_attempts(
-                        f"timed out after {self.budget_s}s (budget exceeded; review proceeds without it)", attempt
-                    )
+                return await self._cut_short(
+                    f"timed out after {self.budget_s}s (budget exceeded; review proceeds without it)",
+                    f"timed out after {self.budget_s}s (budget exceeded; findings from the finished features kept)",
+                    attempt,
+                    pr=pr,
+                    repo=repo,
+                    head_sha=head_sha,
+                    base_sha=base_sha,
+                    checkout=checkout,
+                    changed=changed,
+                    state_dir=state_dir,
+                    elapsed=time.monotonic() - started,
                 )
             if rc == 127:
                 return unavailable(
@@ -597,9 +678,67 @@ class ProtoPatchRunner:
                     self.budget_s,
                 )
                 continue
-            return unavailable(_with_attempts(reason, attempt))
-        elapsed = time.monotonic() - started
+            return await self._cut_short(
+                reason,
+                reason,
+                attempt,
+                pr=pr,
+                repo=repo,
+                head_sha=head_sha,
+                base_sha=base_sha,
+                checkout=checkout,
+                changed=changed,
+                state_dir=state_dir,
+                elapsed=time.monotonic() - started,
+            )
+        return await self._render_findings(
+            pr=pr,
+            repo=repo,
+            head_sha=head_sha,
+            base_sha=base_sha,
+            checkout=checkout,
+            changed=changed,
+            state_dir=state_dir,
+            elapsed=time.monotonic() - started,
+        )
 
+    async def _cut_short(self, reason: str, partial_reason: str, attempt: int, **render) -> str:
+        """The answer for a pass that did not finish: its findings so far, or an outage (#205).
+
+        Any non-zero exit or budget kill used to return `unavailable()` and drop everything — including
+        the findings features that HAD finished had already written (49 of them across three
+        budget-killed passes on one night). When at least one claimed feature finished, those findings
+        are returned as a PARTIAL result: still a lane gap (the verdict stays capped at WARN), but the
+        findings are not lost. With nothing finished it is the outage it always was. Never raises."""
+        try:
+            coverage = pass_coverage(render["state_dir"])
+            if coverage is not None and coverage[0] > 0:
+                return await self._render_findings(
+                    **render,
+                    partial=(
+                        f"{coverage[0]} of {coverage[1]} features reviewed",
+                        _with_attempts(partial_reason, attempt),
+                    ),
+                )
+        except Exception:  # noqa: BLE001 — salvage is best-effort; the outage below is the safe answer
+            log.exception("[pr-reviewer] could not salvage a cut-short structural pass")
+        return unavailable(_with_attempts(reason, attempt))
+
+    async def _render_findings(
+        self,
+        *,
+        pr: int,
+        repo: str,
+        head_sha: str,
+        base_sha: str,
+        checkout: Path,
+        changed: set[str] | None,
+        state_dir: Path,
+        elapsed: float,
+        partial: tuple[str, str] | None = None,
+    ) -> str:
+        """The header + fenced findings array for a pass, complete — or partial when `partial` is
+        (coverage, reason). The one place findings are read, confined and pre-marked."""
         findings = read_findings(state_dir, changed)
         # A repeat of a claim this repo's verifier already refuted, at a spot this PR does
         # not touch, goes to the synthesizer already marked (#190) — it is dropped there
@@ -608,9 +747,12 @@ class ProtoPatchRunner:
         confinement = f"{len(changed)} changed file(s)" if changed is not None else "unconfined (diff unavailable)"
         repeats = f", {premarked} refuted before (pre-marked)" if premarked else ""
         header = (
-            f"protoPatch structural pass on {repo}#{pr} — head {head_sha[:12]}, base {base_sha[:12]}, "
-            f"{elapsed:.0f}s, {len(findings)} reportable finding(s){repeats}, scope: {confinement}."
+            f"{PARTIAL_HEADER if partial else 'protoPatch structural pass on'} {repo}#{pr} — "
+            f"head {head_sha[:12]}, base {base_sha[:12]}, {elapsed:.0f}s, {len(findings)} reportable finding(s)"
+            f"{' from the features that finished' if partial else ''}{repeats}, scope: {confinement}."
         )
+        if partial:
+            return partial_result(partial[0], partial[1], header, findings)
         return f"{header}\n\n```json\n{json.dumps(findings, indent=2)}\n```"
 
 

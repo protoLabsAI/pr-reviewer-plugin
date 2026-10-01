@@ -44,8 +44,8 @@ def _completion_contract(config_cls) -> dict:
         "completion_check": relay_delivered,
         "completion_contract": (
             "the fenced ```json array exactly as protopatch_review returned it (or the Gap line and an "
-            "empty ```json [] array if it was unavailable) — relay it verbatim; do not summarise, "
-            "re-format or re-grade the findings"
+            "empty ```json [] array if it was unavailable; for a PARTIAL result the Gap line AND the "
+            "findings array) — relay it verbatim; do not summarise, re-format or re-grade the findings"
         ),
     }
 
@@ -77,6 +77,12 @@ code yourself; the engine does. Your entire job:
    []
    ```
    Do NOT call the tool again. Do NOT invent findings.
+4. If it reports PROTOPATCH PARTIAL (the pass was cut short but some features finished):
+   output the single Gap line it prescribes (`Gap: structural pass partial — <coverage and
+   reason>`), then relay the fenced ```json findings array EXACTLY as given — the same
+   rule as step 2: nothing added, edited, re-graded, or dropped. The Gap line is what keeps
+   the panel from reading a cut-short pass as a complete one, so never omit it, and never
+   turn a partial result into an empty array.
 
 Judging the findings is the synthesizer's and verifier's job, not yours — a relay
 that edits its payload corrupts the panel. A clean (empty) result is a good result.""",
