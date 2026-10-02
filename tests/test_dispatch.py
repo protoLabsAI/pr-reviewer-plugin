@@ -4777,7 +4777,9 @@ async def test_a_hung_round_gives_the_prs_slot_back_so_a_summon_gets_through(tmp
     escalations: list[str] = []
     d = make(
         tmp_path,
-        cfg={"round_timeout": 0.2},
+        # No summon grace (#217): the grace would outlast this 0.2s round and admit the
+        # summon after it, which is not the moment this test is about.
+        cfg={"round_timeout": 0.2, "summon_in_flight_grace_s": 0},
         gh=HangOnceGH(pr_facts=facts()),
         inbox=lambda text, **_kw: escalations.append(text),
     )

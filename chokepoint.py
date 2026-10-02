@@ -132,6 +132,24 @@ class Chokepoint:
             self._last = {k: t for k, t in self._last.items() if t >= cutoff}
         return "accept"
 
+    def in_flight(self, repo: str, pr: int) -> bool:
+        """Does any round for this PR hold a live slot right now? A pure read — it never
+        reclaims or takes anything.
+
+        For the promotion gate (issue #217): a PR whose round is dispatched and unfinished
+        must not be approved on an older verdict. Deliberately PR-wide, not sha-exact: the
+        webhook path keys its slot by the event's sha while the round reviews the head it
+        resolves server-side, so a sha-exact match could miss the very round that is about
+        to post on the current head. A slot past the TTL is the abandoned kind `admit`
+        reclaims, and is not counted — otherwise a round that can never finish would hold
+        promotion as well as review until the next admit happened to reach this PR.
+        """
+        slots = self._in_flight.get(f"{repo}#{pr}")
+        if not slots:
+            return False
+        now = self._now()
+        return any(now - taken < self.in_flight_ttl_s for taken in slots.values())
+
     def done(self, repo: str, pr: int, sha: str | None = None) -> None:
         """Release the in-flight slot the matching `admit` took. `sha=None` clears every
         slot for the PR — the legacy behaviour, safe when only one round is ever in flight."""

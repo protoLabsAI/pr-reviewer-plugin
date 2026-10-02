@@ -341,10 +341,11 @@ def build_routers(dispatcher, telemetry, get_secret, run_gh_fn=None):
             async with _panel_slot("summon", repo, pr):
                 outcome = await dispatcher.handle_summon(repo, pr, actor)
             log.info("[pr-reviewer] summon %s#%s by @%s -> %s", repo, pr, actor, outcome)
-            if outcome.startswith("drop:"):
-                await _reply(
-                    repo, pr, f"@{actor} — {outcome[5:]}: nothing ran. Try again once the current review finishes."
-                )
+            from .summon import outcome_reply
+
+            reply = outcome_reply(actor, outcome)
+            if reply:
+                await _reply(repo, pr, reply)
         except Exception:  # noqa: BLE001
             log.exception("[pr-reviewer] summon crashed for %s#%s", repo, pr)
 

@@ -163,8 +163,28 @@ structural-trigger dispatch, approve-on-green + sweep, and the review eval.
     bound + 10 min is reclaimed as abandoned — logged, and `in_flight_reclaimed` in
     telemetry. Before that, one hung round answered every `@vera review` with "in-flight"
     until the process restarted.
-  - **Never silent.** Refusals, unknown verbs and drops all reply. `@vera help` lists the
-    verbs. `@vera` alone is treated as asking what this thing does.
+    A summon that lands while the slot is held only briefly — a concurrent
+    `ready_for_review` / `synchronize` that reaffirms or drops in under a second — waits up
+    to `summon_in_flight_grace_s` (default 10s, max 120s) for it rather than dropping
+    (#217: marking a PR ready and typing `@vera review` used to race exactly that way).
+  - **Never silent.** Refusals, unknown verbs and drops all reply, and each reply says what
+    happened: `in-flight` means a round for the PR really is running and its verdict will
+    post; `pr-not-eligible` means draft/closed/locked. `@vera help` lists the verbs.
+    `@vera` alone is treated as asking what this thing does.
+  - **Re-reviewing an unchanged head with new counter-evidence.** `@vera review` (or
+    **Re-run** on the `protoReview` check) is the supported path: it bypasses the reaffirm
+    short-circuit and runs the full panel on the same head. Two limits, stated plainly:
+    1. *Where the evidence must live.* The panel reads the PR's **review threads**
+       (inline comments, from anyone) and its own prior findings. It does **not** read
+       top-level PR comments, so counter-evidence posted there never reaches it — put it in
+       an inline review comment on the cited line.
+    2. *A FAIL is sticky per head.* The gate takes the **strictest** verdict among the
+       panel rounds for a head (#89: FAIL > WARN > PASS, so a co-landed PASS can never
+       shadow a FAIL). A re-review that PASSes an unchanged head therefore posts its PASS
+       and concludes `protoReview` green — but `QA panel` and approve-on-green keep reading
+       the head's FAIL. It clears with a new commit (a new head starts fresh) or a
+       maintainer merging past the gate. There is no bypass verb; one would have to decide
+       *which* of two contradictory rounds on one head is right, and that is a human's call.
   - Handle is `summon_handle` (default `vera`) *plus* the reviewer's own login, and it never
     answers itself — its own verdict bodies mention the handle.
   - **`pause` / `resume` (v0.17.0)** — stop reviewing a PR on push while it is being
@@ -257,6 +277,13 @@ panel, and a PASS is not a skeleton key past any of these:
   verdict for a superseded head is **stale** and holds (`hold:stale-head`), so a PASS
   never lands a commit the panel never saw;
 - that verdict has **not already been promoted** (per-head dedup);
+- **no panel round for the PR is still running or queued** (`hold:round-in-flight`,
+  #217) — the clear verdict is the newest *finished* round, and a round still running on
+  the same head (a summon, a check re-run) may FAIL it. The `QA panel` check reads
+  *"Re-review in progress"* meanwhile. The converse is handled when that round posts: a
+  FAIL withdraws (dismisses) our earlier approval and writes `QA panel` red at once, rather
+  than leaving an APPROVED review and a green check standing beside the FAIL until the
+  next sweep (which skips a PR that has gone back to draft);
 - the pass was **verified** (the verify pass ran) over **complete** coverage (every
   finder lane delivered a full pass — none timed out, came back blocked or without its
   status line, or found its structural engine down) — an incomplete pass is "nobody
@@ -314,6 +341,7 @@ compose env (re-applied every roll) to keep the config volume disposable:
 | `PR_REVIEWER_PANEL_ATTEMPT_TIMEOUT` | `pr_reviewer.panel_attempt_timeout` | `1800` | Seconds one panel attempt may run (hard ceiling **3000** — size it as `finder_timeout_s` + 900 for the tail steps). Only the finders carry a step timeout, so a hung verifier/synthesis step used to hang the round. Past the budget the attempt is cancelled and counts as failed: retried, then concluded on the PR as **"QA panel timed out"**. |
 | `PR_REVIEWER_ROUND_TIMEOUT` | `pr_reviewer.round_timeout` | every attempt + 600 | Backstop for a whole round (every attempt plus the GitHub calls around them). Defaults to `(panel_retries + 1) × panel_attempt_timeout + 600`, so it never cuts a legitimate retry short. |
 | `PR_REVIEWER_BACKFILL_PER_PASS` | `pr_reviewer.backfill_per_pass` | `2` | Reviews the sweep may backfill per pass, across all repos. `0` disables backfill. |
+| `PR_REVIEWER_SUMMON_IN_FLIGHT_GRACE_S` | `pr_reviewer.summon_in_flight_grace_s` | `10` | Seconds a summon waits for the PR's in-flight slot before answering `in-flight` (clamped 0–120). Covers a concurrent webhook that reaffirms/drops in under a second; a running round still drops the summon. |
 | `PR_REVIEWER_SUMMON` | `pr_reviewer.summon` | `true` | The comment-command surface (`@vera review` / `pause` / `resume` / `help`) **and** the pause check on the automated path. `false` costs nothing for a repo that never wants comment-driven behaviour. |
 | `PR_REVIEWER_EVIDENCE_GROUNDING` | `pr_reviewer.evidence_grounding` | `true` | A finding whose quoted code appears nowhere in the cited file at the reviewed head (nor in this PR's patch for it) is annotated `uncertain` — it still posts, it just can't carry a FAIL. Fails open on an unreadable blob or unquotable evidence. |
 | `PR_REVIEWER_HOLD_UNEXPLAINED_CLEARANCE` | `pr_reviewer.hold_unexplained_clearance` | `true` | A zero-finding PASS does not dismiss our standing block when a prior round confirmed a blocker/major it neither reports nor explains. A second consecutive clean PASS lifts it. `false` restores the old always-dismiss behaviour. |
