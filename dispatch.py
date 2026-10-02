@@ -34,7 +34,14 @@ import time
 from collections import deque
 from urllib.parse import quote
 
-from .approve import HOLD_NOT_OWNER, HOLD_THREADS_UNRESOLVED, PROMOTE, Observations, promotion_decision
+from .approve import (
+    HOLD_NO_CLEAR_VERDICT,
+    HOLD_NOT_OWNER,
+    HOLD_THREADS_UNRESOLVED,
+    PROMOTE,
+    Observations,
+    promotion_decision,
+)
 from .checks import (
     CHECK_NAME,
     COMPLETED,
@@ -46,7 +53,7 @@ from .checks import (
     closed_run,
     queued_run,
 )
-from .chokepoint import DISPATCH_ACTIONS, Chokepoint
+from .chokepoint import DISPATCH_ACTIONS, DROP_IN_FLIGHT, Chokepoint
 from .gh_cli import bad_repo, run_gh
 from .grounding import (
     UNREADABLE,
@@ -738,6 +745,13 @@ class PanelQueue(asyncio.Semaphore):
             "p90_panel_s": None if p90 is None else round(p90, 3),
             "oldest_queued_s": None if oldest is None else round(oldest, 3),
         }
+
+    def has_round_for(self, repo: str, pr: int, *, exclude_kinds: tuple[str, ...] = ()) -> bool:
+        """Is a slot for this PR running or waiting, other than of `exclude_kinds`? A pure
+        in-memory read for the promotion gate (issue #217)."""
+        return any(
+            e.repo == repo and e.pr == pr and e.kind not in exclude_kinds for e in (*self._active, *self._pending)
+        )
 
     def lookup(self, repo: str, pr: int, *, now: float | None = None, degraded: bool = False) -> dict:
         """Per-PR state for `GET /queue?repo=…&pr=…`: running / queued / idle, with the
@@ -1431,6 +1445,20 @@ class Dispatcher:
             # The round's end (any outcome) is when we re-check the degraded state, so a
             # transition/escalation is caught even on a round that posted nothing (issue #209).
             self._evaluate_gateway()
+
+    @property
+    def summon_in_flight_grace_s(self) -> float:
+        """How long a summon waits for the PR's in-flight slot before dropping (issue #217).
+
+        Covers the sub-second holds — a concurrent webhook that reaffirms or drops — not a
+        running round, which takes minutes and still drops the summon. Clamped to 0..120: a
+        summon waits while holding a cross-PR panel slot, so this must stay short."""
+        raw = self.cfg.get("summon_in_flight_grace_s", os.environ.get("PR_REVIEWER_SUMMON_IN_FLIGHT_GRACE_S", 10))
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            value = 10.0
+        return min(120.0, max(0.0, value))
 
     @property
     def backfill_per_pass(self) -> int:
@@ -2399,6 +2427,18 @@ class Dispatcher:
         facts = await self._pr_facts(repo, pr)
         slot_sha = (str(facts.get("head") or "") if facts else "") or f"summon-{pr}"
         decision = self.chokepoint.admit(repo, pr, slot_sha, bypass_cooldown=True)
+        # A short grace on `in-flight` (issue #217). The slot is taken by every path that
+        # passes the chokepoint, including the ones that hold it for under a second and
+        # never run a panel: a `ready_for_review` / `synchronize` that reaffirms or drops.
+        # Marking a PR ready and then typing `@vera review` delivers both events together,
+        # and on mythxengine-sdk#409 the webhook's reaffirm held the slot for the 0.3s the
+        # summon needed — the summon dropped as `in-flight` with no round running, nine
+        # minutes after the last one finished. A slot that frees within the grace was one
+        # of those; a real round still holds it after, and the summon drops as before.
+        deadline = time.monotonic() + self.summon_in_flight_grace_s
+        while decision == DROP_IN_FLIGHT and time.monotonic() < deadline:
+            await asyncio.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
+            decision = self.chokepoint.admit(repo, pr, slot_sha, bypass_cooldown=True)
         if decision != "accept":
             self.telemetry.emit("drop", repo=repo, pr=pr, reason=decision, summon=actor)
             return f"drop:{decision}"
@@ -3436,6 +3476,10 @@ class Dispatcher:
             # `hold_blocks` is the one exception — a clean PASS that silently dropped a
             # prior blocker/major has not earned the dismissal yet (issue #26).
             await self._dismiss_stale_blocks(repo, pr)
+        if not self.shadow and verdict == FAIL and not superseded:
+            # The mirror image of the dismissal above: a FAIL on the head must take back an
+            # approve-on-green that an earlier clear round earned (issue #217).
+            await self._retract_promotion(repo, pr, head)
         # The verdict landed — conclude the check with it (r2/r3). PASS/WARN clear the
         # gate; a FAIL holds it. This runs AFTER the post, so a check-write failure can
         # never cost the verdict (r7). The verdict text rides in the summary (r6).
@@ -3581,6 +3625,50 @@ class Dispatcher:
             if rc != 0:
                 log.warning("[pr-reviewer] dismissing stale block on %s#%s failed: %s", repo, pr, err[-300:])
             self.telemetry.emit("dismissal", repo=repo, pr=pr, review_id=review["id"], ok=rc == 0)
+
+    async def _retract_promotion(self, repo: str, pr: int, head: str) -> None:
+        """A FAIL just landed on `head`: withdraw our approvals and fail the `QA panel` check.
+
+        Approve-on-green can stand on a head whose later round FAILs: the gate approved
+        the earlier clear round, then a re-review (a summon, a check re-run) found blocking
+        defects on the SAME head. Before this, the PR carried an APPROVED review, a green
+        `QA panel` check and a CHANGES_REQUESTED all at once (mythxengine-sdk#409, issue
+        #217). The FAIL review itself does not fix either: posted as a comment (CI still
+        pending) it leaves our approval as the reviewer's effective state, and the check is
+        only rewritten by the sweep's promotion pass, which skips a PR that went draft — so
+        the stale green stood for as long as the PR stayed in draft.
+
+        Every non-dismissed APPROVED review of ours is dismissed, not only this head's:
+        GitHub falls back to the reviewer's previous state when the latest is dismissed,
+        which would be an older approval (the same reasoning as `_dismiss_stale_blocks`).
+        Then the check is written as the gate's next pass would write it — strictest
+        verdict for the head is FAIL, so `hold:no-clear-verdict` with a FAIL. Best-effort
+        throughout, like every other write here: a failure is logged, and the next pass
+        rewrites the check anyway.
+        """
+        for review in await self._our_reviews(repo, pr) or []:
+            if review.get("state") != "APPROVED" or not review.get("id"):
+                continue
+            rc, _out, err = await self._run_gh(
+                [
+                    "api",
+                    f"repos/{repo}/pulls/{pr}/reviews/{review['id']}/dismissals",
+                    "-X",
+                    "PUT",
+                    "-f",
+                    "message=Withdrawn — a later QA panel round FAILed this PR (see the newest verdict).",
+                    "-f",
+                    "event=DISMISS",
+                ],
+                timeout=60,
+            )
+            if rc != 0:
+                log.warning("[pr-reviewer] withdrawing approval on %s#%s failed: %s", repo, pr, err[-300:])
+            self.telemetry.emit(
+                "dismissal", repo=repo, pr=pr, sha=head, review_id=review["id"], kind="approval", ok=rc == 0
+            )
+        if self.promotion_owner:
+            await self._publish_qa_check(repo, head, check_for(HOLD_NO_CLEAR_VERDICT, verdict=FAIL))
 
     # ── re-gate: arm a block the CI clock beat us to (issue #16) ──────────────
 
@@ -3776,6 +3864,29 @@ class Dispatcher:
         # contradicted round's — whichever way its verifier went, it is the newer evidence.
         return fresh
 
+    def _round_in_flight(self, repo: str, pr: int) -> bool:
+        """Is a panel round for this PR dispatched and unfinished, or queued to run?
+
+        Two in-memory sources, no GitHub read. The chokepoint slot is the one every round
+        takes (push, backfill, summon) and frees only when the round ends, however it ends.
+        The panel queue adds a summon or backfill still WAITING for a cross-PR slot: it has
+        not taken the chokepoint slot yet, but it will run a panel on this PR, and approving
+        in the gap is the same race (issue #217). Webhook entries are left to the chokepoint:
+        the webhook takes a queue slot for EVERY pull_request action (labeled, edited, ...)
+        before filtering, so counting its waiters would hold promotion behind events that
+        never run a panel; a webhook round that does run takes the chokepoint slot.
+
+        Both sources are per-process, which is the scope the reviewer runs in (one machinery
+        per state home, issue #198); a restart forgets them, and also kills the round they
+        describe.
+        """
+        if self.chokepoint.in_flight(repo, pr):
+            return True
+        queue = self.panel_sem
+        if isinstance(queue, PanelQueue):
+            return queue.has_round_for(repo, pr, exclude_kinds=("webhook",))
+        return False
+
     async def evaluate_promotion(self, repo: str, pr: int) -> str:
         """One PR through the approve-on-green pure function; applies only when we own
         promotion AND not shadow. Every hold is telemetered (the dry-run evidence)."""
@@ -3835,6 +3946,9 @@ class Dispatcher:
             # incomplete pass (a finder was down) holds until a full pass clears the head.
             complete=bool(clear.get("complete", True)) if clear else True,
             verified=bool(clear.get("verified", True)) if clear else True,
+            # A round dispatched and unfinished has not spoken yet — `clear` is the newest
+            # COMPLETE round, and the running one may FAIL it (issue #217).
+            round_in_flight=self._round_in_flight(repo, pr),
         )
         backoff_key = f"{repo}#{pr}@{head}"
         if self._promote_failures.get(backoff_key, 0) >= PROMOTE_MAX_FAILURES:

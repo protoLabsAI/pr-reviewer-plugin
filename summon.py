@@ -147,8 +147,47 @@ def help_text(handles: list[str]) -> str:
         f"| `@{handle} resume` | Resume automated review |\n"
         f"| `@{handle} help` | This message |\n\n"
         f"A summon spends a full panel (five finders, ~5–9 min), which is why it is "
-        f"admin-gated. Inline thread replies are not built yet (pr-reviewer-plugin#28)."
+        f"admin-gated. Inline thread replies are not built yet (pr-reviewer-plugin#28).\n\n"
+        f"**Disputing a finding on an unchanged head:** put the counter-evidence in an inline "
+        f"review comment on the cited line (the panel reads review threads, not top-level PR "
+        f"comments), then `@{handle} review`. The re-review runs in full, but a FAIL already "
+        f"posted for this head keeps gating it even if the re-review passes (strictest verdict "
+        f"per head wins) until a new commit, or a maintainer merges past it."
     )
+
+
+def outcome_reply(login: str, outcome: str) -> str | None:
+    """The reply to a summon that did not post a verdict of its own, or None when the
+    outcome speaks for itself (a posted review is the answer).
+
+    Before issue #217 every `drop:` answered "<reason>: nothing ran. Try again once the
+    current review finishes." — which is wrong for most reasons. A draft PR has no review to
+    wait for; and on mythxengine-sdk#409 the operator read "in-flight" as "a round is stuck"
+    when the standing answer was a FAIL from nine minutes earlier. Each outcome says what
+    actually happened and what to do next.
+    """
+    kind, _, detail = str(outcome or "").partition(":")
+    if kind == "reaffirmed":
+        # A summon re-runs the panel (it bypasses the reaffirm), so this is defensive —
+        # but if it ever happens the honest answer is "verdict unchanged", not "nothing ran".
+        return (
+            f"@{login} — the panel's verdict for this head is unchanged: **{detail}** "
+            f"(reaffirmed; no new panel ran, the head has not changed)."
+        )
+    if kind != "drop":
+        return None
+    if detail == "in-flight":
+        return (
+            f"@{login} — a review round for this PR is already running, so this summon did not "
+            f"start a second panel on top of it. Its verdict posts here when it finishes; if you "
+            f"still dispute that verdict, summon again then."
+        )
+    if detail == "pr-not-eligible":
+        return (
+            f"@{login} — this PR can't be reviewed right now (draft, closed or locked), so "
+            f"nothing ran. Mark it ready for review (or reopen / unlock it), then summon again."
+        )
+    return f"@{login} — `{detail}`: nothing ran."
 
 
 def refusal_text(login: str, verb: str) -> str:

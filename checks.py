@@ -51,6 +51,7 @@ from .approve import (
     HOLD_CHECKS_UNKNOWN,
     HOLD_INCOMPLETE,
     HOLD_NO_CLEAR_VERDICT,
+    HOLD_ROUND_IN_FLIGHT,
     HOLD_STALE_HEAD,
     HOLD_THREADS_UNRESOLVED,
     PROMOTE,
@@ -172,6 +173,17 @@ def check_for(
             None,
             "Re-reviewing the new head",
             "The panel's verdict is for an earlier commit; this head has not been reviewed yet.",
+        )
+    if decision == HOLD_ROUND_IN_FLIGHT:
+        # A clear verdict exists, but a newer round for this PR is still running (issue
+        # #217). Not cleared until it lands — that round may FAIL — and not failed either:
+        # nothing has been found yet. It concludes on the next pass after the round posts.
+        return CheckRun(
+            IN_PROGRESS,
+            None,
+            "Re-review in progress",
+            "A panel round for this PR is still running. The head is cleared only once that "
+            "round's verdict lands; an earlier clear verdict does not stand in for it.",
         )
     if decision == HOLD_INCOMPLETE:
         # A clear verdict on incomplete coverage: the panel found nothing blocking in what

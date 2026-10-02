@@ -10,6 +10,7 @@ when
   ∧ zero unresolved review threads
   ∧ our posted PASS verdict is for the PR's CURRENT head SHA
   ∧ that verdict hasn't already been promoted (per-head-SHA dedup)
+  ∧ no panel round for the PR is dispatched and unfinished (issue #217)
 
 and EVERY unknown — checks unreadable, threads unreadable, no verdict found, verdict
 for a stale head — falls through to a typed no-promote. The model is never in this
@@ -35,6 +36,7 @@ HOLD_ALREADY_PROMOTED = "hold:already-promoted"
 HOLD_NOT_OWNER = "hold:not-promotion-owner"
 HOLD_INCOMPLETE = "hold:incomplete-coverage"
 HOLD_UNVERIFIED = "hold:unverified"
+HOLD_ROUND_IN_FLIGHT = "hold:round-in-flight"
 
 
 @dataclass(frozen=True)
@@ -61,6 +63,14 @@ class Observations:
     # False when findings existed but none carry a verdict — the verify pass did not
     # run. Defaults True so a marker from before this field is not retroactively held.
     verified: bool = True
+    # Is a panel round for this PR dispatched and not yet finished (or queued to run)?
+    # The clear verdict above is the newest COMPLETE round; a round still running on the
+    # same head has not spoken yet, and it may FAIL. Promoting now approves the older
+    # answer to a question that is being asked again (issue #217: mythxengine-sdk#409
+    # approved round 1's PASS 6.5 min into round 2, which then FAILed). None = could not
+    # tell, which holds like every other unknown. Defaults False so a caller that does not
+    # track rounds keeps its old behaviour.
+    round_in_flight: bool | None = False
 
 
 def promotion_decision(obs: Observations) -> str:
@@ -74,6 +84,12 @@ def promotion_decision(obs: Observations) -> str:
         return HOLD_STALE_HEAD
     if obs.verdict_promoted:
         return HOLD_ALREADY_PROMOTED
+    if obs.round_in_flight is not False:
+        # After the dedup on purpose: this gate stops a NEW approval racing a round that
+        # has not finished. An approval that already stands is corrected by the round
+        # itself when it FAILs (`Dispatcher._retract_promotion`), not by flapping the
+        # check every time a quick drop/reaffirm briefly holds the PR's slot.
+        return HOLD_ROUND_IN_FLIGHT
     if not obs.verified:
         # A PASS nobody verified has not earned approve-on-green. This is the same
         # argument as incomplete coverage one step later in the pipeline: there, a

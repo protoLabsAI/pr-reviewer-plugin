@@ -242,6 +242,30 @@ def test_an_admin_summon_dispatches_a_review(tmp_path):
     assert dispatcher.summons == [("o/r", 7, "someone")]
 
 
+def test_an_in_flight_summon_reply_says_what_happened_not_nothing_ran(tmp_path):
+    # Issue #217: every drop used to answer "<reason>: nothing ran. Try again once the
+    # current review finishes." — on mythxengine-sdk#409 that read as "a round is stuck".
+    app, dispatcher, posted = summon_app(tmp_path)
+    dispatcher.summon_outcome = "drop:in-flight"
+    post_comment(app, comment_payload("@vera review"))
+    assert posted and "already running" in posted[0]["body"]
+    assert "nothing ran" not in posted[0]["body"]
+
+
+def test_a_draft_summon_reply_says_draft(tmp_path):
+    app, dispatcher, posted = summon_app(tmp_path)
+    dispatcher.summon_outcome = "drop:pr-not-eligible"
+    post_comment(app, comment_payload("@vera review"))
+    assert posted and "draft" in posted[0]["body"]
+    assert "current review finishes" not in posted[0]["body"]
+
+
+def test_a_summon_that_posted_a_verdict_adds_no_reply(tmp_path):
+    app, _dispatcher, posted = summon_app(tmp_path)  # outcome: reviewed:FAIL
+    post_comment(app, comment_payload("@vera review"))
+    assert posted == []
+
+
 def test_a_non_admin_is_refused_with_a_reply_not_silence(tmp_path):
     app, dispatcher, posted = summon_app(tmp_path, permission="write")
     r = post_comment(app, comment_payload("@vera review"))
