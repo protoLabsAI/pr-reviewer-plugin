@@ -281,7 +281,8 @@ panel, and a PASS is not a skeleton key past any of these:
   #217) — the clear verdict is the newest *finished* round, and a round still running on
   the same head (a summon, a check re-run) may FAIL it. The `QA panel` check reads
   *"Re-review in progress"* meanwhile. The converse is handled when that round posts: a
-  FAIL withdraws (dismisses) our earlier approval and writes `QA panel` red at once, rather
+  FAIL withdraws (dismisses) our earlier approval, writes `QA panel` red and turns off
+  GitHub auto-merge on the PR (#235, escalated if GitHub refuses) at once, rather
   than leaving an APPROVED review and a green check standing beside the FAIL until the
   next sweep (which skips a PR that has gone back to draft);
 - the pass was **verified** (the verify pass ran) over **complete** coverage (every
