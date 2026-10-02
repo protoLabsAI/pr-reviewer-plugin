@@ -55,6 +55,7 @@ from .approve import (
     HOLD_ROUND_IN_FLIGHT,
     HOLD_STALE_HEAD,
     HOLD_THREADS_UNRESOLVED,
+    HOLD_UNVERIFIED,
     PROMOTE,
 )
 from .verdicts import FAIL
@@ -94,6 +95,7 @@ def check_for(
     verdict: str | None = None,
     unresolved: int | None = None,
     panel_unresolved: int | None = None,
+    verify_retry: str = "",
 ) -> CheckRun:
     """Map an approve-on-green decision to the check run to publish.
 
@@ -102,7 +104,32 @@ def check_for(
     `unresolved` is the TOTAL unresolved-thread count (every reviewer's), for messaging.
     `panel_unresolved` is how many of those threads the PANEL itself owns — the only ones
     that may fail this check — or None when that ownership could not be read server-side.
+    `verify_retry` is `rounds.verify_retry_state` for a `hold:unverified` head (#220).
+
+    Every hold names its `hold:*` reason in the SUMMARY as well (#220): a consumer reading
+    the check through `gh` sees the summary but not always the title, and "Not cleared yet"
+    alone left the board guessing why a PR sat for ten hours.
     """
+    run = _check_for(
+        decision,
+        verdict=verdict,
+        unresolved=unresolved,
+        panel_unresolved=panel_unresolved,
+        verify_retry=verify_retry,
+    )
+    if decision.startswith("hold:") and decision not in run.summary:
+        run = CheckRun(run.status, run.conclusion, run.title, f"{run.summary}\n\nHold: `{decision}`.")
+    return run
+
+
+def _check_for(
+    decision: str,
+    *,
+    verdict: str | None,
+    unresolved: int | None,
+    panel_unresolved: int | None,
+    verify_retry: str,
+) -> CheckRun:
     if decision in (PROMOTE, HOLD_ALREADY_PROMOTED):
         return CheckRun(
             COMPLETED,
@@ -181,6 +208,28 @@ def check_for(
             "confirmed is still carried on the record — the review body lists it. Push a fix "
             "(the next round proves it against the delta), or comment `@vera review` if it is "
             "already fixed: the next round re-verifies carried findings at the new head.",
+        )
+    if decision == HOLD_UNVERIFIED:
+        # A clear verdict nobody verified (a verifier flake, #167): not a defect, not
+        # cleared. The sweep schedules ONE fresh round for the head on its own (#220); if
+        # that one is unverified too it stops, and the title says what a human must do.
+        if verify_retry == "exhausted":
+            return CheckRun(
+                IN_PROGRESS,
+                None,
+                "Verifier failed twice — summon @vera review or push",
+                "The panel's verdict for this head was posted without a completed verification "
+                "pass (`hold:unverified`), and the automatic re-run came back unverified too, "
+                "so the panel stopped retrying this head. Comment `@vera review` to run it "
+                "again, or push a new commit.",
+            )
+        return CheckRun(
+            IN_PROGRESS,
+            None,
+            "Unverified — re-running the panel",
+            "The panel's verdict for this head was posted without a completed verification "
+            "pass (`hold:unverified`) — a verifier flake, not a finding. One fresh round is "
+            "scheduled for this head automatically; nothing to do unless it fails too.",
         )
     if decision == HOLD_STALE_HEAD:
         return CheckRun(

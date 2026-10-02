@@ -38,6 +38,7 @@ from .approve import (
     HOLD_NO_CLEAR_VERDICT,
     HOLD_NOT_OWNER,
     HOLD_THREADS_UNRESOLVED,
+    HOLD_UNVERIFIED,
     PROMOTE,
     Observations,
     promotion_decision,
@@ -80,6 +81,8 @@ from .refutations import (
 from .rounds import (
     DEFAULT_CONVERGENCE_ROUNDS,
     MAX_PRIOR_RECHECK,
+    VERIFY_RETRY_DUE,
+    VERIFY_RETRY_EXHAUSTED,
     align_recheck,
     carried_debt,
     converge,
@@ -108,6 +111,7 @@ from .rounds import (
     spent_rounds,
     unaccounted_priors,
     unexplained_clearance,
+    verify_retry_state,
 )
 from .telemetry import REAFFIRM_DIFF, REAFFIRM_HEAD, REAFFIRM_MISS, REAFFIRM_RECORDED, VERIFY_CONTRADICTED, Telemetry
 from .trigger import structural_trigger
@@ -467,6 +471,11 @@ BACKFILL_ACTION = "sweep-backfill"
 # `reconcile_pr` outcomes for a backfill the sweep did not wait for (`_detach_backfill`).
 BACKFILL_STARTED = "backfill:started"
 BACKFILL_DEFERRED = "backfill:deferred"  # the per-pass cap of outstanding backfills is full
+# The automatic re-run of a head held at `hold:unverified` (#220) — `_retry_unverified`.
+VERIFY_RETRY_ACTION = "verify-retry"
+VERIFY_RETRY_STARTED = "verify-retry:started"
+VERIFY_RETRY_RAN = "verify-retry:ran"
+VERIFY_RETRY_GAVE_UP = "verify-retry:exhausted"
 
 # How long an enumerated GitHub App installation scope is reused before re-reading it.
 # The sweep ticks every ~3 min and installation membership changes rarely, so this
@@ -1137,6 +1146,11 @@ class Dispatcher:
         # `backfill_per_pass` so successive passes cannot pile an unbounded queue onto the
         # panel semaphore.
         self._backfills: set[asyncio.Task] = set()
+        # repo#pr@head keys whose one automatic unverified re-run (#220) this process has
+        # started / whose exhaustion it has escalated — so a re-run that crashes without
+        # posting cannot be re-scheduled every sweep tick, and an escalation fires once.
+        self._verify_retried: set[str] = set()
+        self._verify_escalated: set[str] = set()
         self._installation_repos: list[str] = []  # last good App-installation scope
         self._installation_repos_at: float = 0.0
         # The cross-PR panel cap (#96) is a WEBHOOK-LAYER concern: build_routers sizes an
@@ -4517,6 +4531,8 @@ class Dispatcher:
                 verdict=(latest["verdict"] if latest and latest["head"] == head else None),
                 unresolved=obs.unresolved_threads,
                 panel_unresolved=panel_unresolved,
+                # Whether the automatic re-run for an unverified head is still to come (#220).
+                verify_retry=verify_retry_state(ours, head) if decision == HOLD_UNVERIFIED else "",
             ),
         )
         if decision != PROMOTE:
@@ -4945,7 +4961,95 @@ class Dispatcher:
         if regated == REGATE:
             # A block just went up; promotion on the same pass would be incoherent.
             return regated, backfill_budget
-        return await self.evaluate_promotion(repo, pr), backfill_budget
+        decision = await self.evaluate_promotion(repo, pr)
+        if decision == HOLD_UNVERIFIED:
+            # A verifier flake holds the head and nothing else would ever re-run it (#220).
+            # Spends the backfill budget like a backfill — it is a panel. With none left this
+            # pass, the next tick tries again.
+            retried = await self._retry_unverified(repo, pr, detach=detach_backfill, budget=backfill_budget)
+            if retried in (VERIFY_RETRY_STARTED, VERIFY_RETRY_RAN):
+                return decision, backfill_budget - 1
+        return decision, backfill_budget
+
+    async def _retry_unverified(self, repo: str, pr: int, *, detach: bool, budget: int) -> str | None:
+        """The bounded automatic re-run for a head held at `hold:unverified` (#220).
+
+        protoContent#565 and #568 sat ~10 hours "Not cleared yet": the round's verifier
+        flaked, only a verified round posted AFTER it lifts that hold (#170), and nothing
+        scheduled one — the head waited for a human to notice and type `@vera review`, or
+        for a commit. This is that summon, without the human: one fresh panel per head,
+        through the same path a summon takes (cooldown and reaffirm bypassed, the in-flight
+        guard and the panel queue kept). A paused PR is not re-run — "stop reviewing this"
+        outranks a retry nobody asked for. Bounded twice: `verify_retry_state` counts the
+        head's unverified rounds on GitHub (one re-run, ever), and `_verify_retried` stops a
+        re-run that crashed without posting from being re-scheduled every tick. When the
+        re-run is unverified too, the operator is told once and the check title says so.
+        """
+        facts = await self._pr_facts(repo, pr)
+        if ineligible_reason(facts):
+            return None
+        head = str(facts["head"])
+        ours = await self._our_reviews(repo, pr)
+        if ours is None:
+            return None  # blind on our own history — no retry on a guess
+        state = verify_retry_state(ours, head)
+        key = f"{repo}#{pr}@{head}"
+        if state == VERIFY_RETRY_EXHAUSTED:
+            if key not in self._verify_escalated:
+                self._verify_escalated.add(key)
+                if len(self._verify_escalated) > 1024:
+                    self._verify_escalated = set(list(self._verify_escalated)[-512:])
+                self.telemetry.emit("verify_retry", repo=repo, pr=pr, sha=head, outcome="exhausted")
+                await self._escalate(
+                    f"pr-reviewer: the verifier failed twice on {repo}#{pr} @{head[:7]} — the head holds at "
+                    "hold:unverified and the panel will not re-run it on its own. Summon `@vera review` or push.",
+                    dedup_key=f"pr-reviewer-unverified-twice:{repo}#{pr}@{head[:7]}",
+                )
+            return VERIFY_RETRY_GAVE_UP
+        if state != VERIFY_RETRY_DUE or key in self._verify_retried or budget <= 0:
+            return None
+        if self.summon_enabled:
+            from .summon import is_paused
+
+            if is_paused(await self._pr_comments(repo, pr)):
+                self.telemetry.emit("verify_retry", repo=repo, pr=pr, sha=head, outcome="paused")
+                return None
+        if detach and len(self._backfills) >= max(1, self.backfill_per_pass):
+            return None  # the detached-panel cap is full; the next tick tries again
+        self._verify_retried.add(key)
+        if len(self._verify_retried) > 1024:  # bounded, like the other per-head maps
+            self._verify_retried = set(list(self._verify_retried)[-512:])
+        self.telemetry.emit("verify_retry", repo=repo, pr=pr, sha=head, outcome="scheduled")
+        if not detach:
+            await self._run_verify_retry(repo, pr, head)
+            return VERIFY_RETRY_RAN
+        task = asyncio.ensure_future(self._run_verify_retry(repo, pr, head))
+        self._backfills.add(task)
+
+        def _settled(t: asyncio.Task) -> None:
+            self._backfills.discard(t)
+            if not t.cancelled() and t.exception() is not None:
+                log.error("[pr-reviewer] unverified re-run of %s#%s failed", repo, pr, exc_info=t.exception())
+
+        task.add_done_callback(_settled)
+        return VERIFY_RETRY_STARTED
+
+    async def _run_verify_retry(self, repo: str, pr: int, head: str) -> str:
+        """One fresh panel on `head`, admitted and queued exactly like a summon (#220)."""
+        decision = self.chokepoint.admit(repo, pr, head, bypass_cooldown=True)
+        if decision != "accept":
+            self.telemetry.emit("drop", repo=repo, pr=pr, sha=head, reason=decision, action=VERIFY_RETRY_ACTION)
+            return f"drop:{decision}"
+        sem = self.panel_sem
+        try:
+            if isinstance(sem, PanelQueue):
+                async with sem.slot(repo=repo, pr=pr, head=head, kind=VERIFY_RETRY_ACTION):
+                    return await self._bounded_review(repo, pr, force=True)
+            slot = sem if sem is not None else contextlib.nullcontext()
+            async with slot:
+                return await self._bounded_review(repo, pr, force=True)
+        finally:
+            self.chokepoint.done(repo, pr, head)
 
     async def sweep_once(self) -> int:
         """The 3-minute level pass: every open PR in every managed repo reconciled

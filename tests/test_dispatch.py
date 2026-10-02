@@ -5751,3 +5751,124 @@ def test_the_dispatcher_exposes_the_live_gateway_signal(tmp_path, monkeypatch):
     # The crossing emitted exactly one true `gateway_degraded` event (no spam per retry).
     degraded_events = [e for e in d.telemetry.read_all() if e["event"] == "gateway_degraded"]
     assert [e["degraded"] for e in degraded_events] == [True]
+
+
+# ── a verifier flake gets one automatic fresh round, then escalates (issue #220) ───
+
+
+def _unverified_row(head, verdict="PASS", id=None):
+    row = review_row(head, verdict, id=id)
+    row["body"] = row["body"].replace(" -->", " verified=false -->", 1)
+    return row
+
+
+GREEN = [{"status": "completed", "conclusion": "success"}]
+
+
+def _qa_check_titles(gh) -> list[str]:
+    return [p.get("output[title]", "") for p in gh.posted if "/check-runs" in p.get("url", "")]
+
+
+async def test_an_unverified_head_gets_one_fresh_round_without_a_human(tmp_path):
+    # protoContent#565/#568: PASS, all CI green, zero threads, `hold:unverified` — and nothing
+    # ever scheduled the verified round that lifts it. ~10 hours until a human summoned one.
+    ran: list[str] = []
+
+    async def runner(name, inputs):
+        ran.append(name)
+        return {"output": CLEAN_PASS_REPORT, "failed": []}
+
+    gh = RoutedGH(pr_facts=facts(), reviews=[_unverified_row(HEAD, id=70)], checks=GREEN)
+    d = make(tmp_path, cfg={"shadow_mode": False, "promotion_owner": True}, gh=gh, runner=runner)
+    outcome, budget = await d.reconcile_pr("o/r", 1, backfill_budget=1)
+    assert outcome == "hold:unverified" and budget == 0  # a panel spends the backfill budget
+    assert len(ran) == 1  # the head's verdict exists; the re-run bypassed the reaffirm, like a summon
+    assert [r for r in gh.reviews_posted if "verdict=PASS" in r["body"]]
+    assert "Unverified — re-running the panel" in _qa_check_titles(gh)
+    assert [e["outcome"] for e in _events(tmp_path, "verify_retry")] == ["scheduled"]
+    # Bounded in-process too: a re-run that posted nothing GitHub can count is not re-scheduled.
+    await d.reconcile_pr("o/r", 1, backfill_budget=1)
+    assert len(ran) == 1
+
+
+async def test_the_re_run_is_detached_from_the_sweep_like_a_backfill(tmp_path):
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def runner(name, inputs):
+        started.set()
+        await release.wait()
+        return {"output": CLEAN_PASS_REPORT, "failed": []}
+
+    gh = RoutedGH(pr_facts=facts(), reviews=[_unverified_row(HEAD, id=70)], checks=GREEN)
+    d = make(tmp_path, cfg={"shadow_mode": False, "promotion_owner": True}, gh=gh, runner=runner)
+    outcome, _ = await d.reconcile_pr("o/r", 1, backfill_budget=1, detach_backfill=True)
+    assert outcome == "hold:unverified"  # the pass moved on without waiting for the panel
+    await asyncio.wait_for(started.wait(), 1)
+    release.set()
+    await d.drain_backfills()
+    assert [r for r in gh.reviews_posted if "verdict=PASS" in r["body"]]
+
+
+async def test_a_second_unverified_round_escalates_once_and_says_so_on_the_check(tmp_path):
+    ran: list[str] = []
+
+    async def runner(name, inputs):
+        ran.append(name)
+        return {"output": CLEAN_PASS_REPORT, "failed": []}
+
+    gh = RoutedGH(pr_facts=facts(), reviews=[_unverified_row(HEAD, id=70), _unverified_row(HEAD, id=71)], checks=GREEN)
+    inbox: list[tuple] = []
+    d = make(
+        tmp_path,
+        cfg={"shadow_mode": False, "promotion_owner": True},
+        gh=gh,
+        runner=runner,
+        inbox=lambda text, **kw: inbox.append((text, kw)),
+    )
+    await d.reconcile_pr("o/r", 1, backfill_budget=1)
+    await d.reconcile_pr("o/r", 1, backfill_budget=1)
+    assert ran == []  # no third round
+    assert "Verifier failed twice — summon @vera review or push" in _qa_check_titles(gh)
+    summary = next(p["output[summary]"] for p in gh.posted if "/check-runs" in p.get("url", ""))
+    assert "hold:unverified" in summary  # the reason rides in the summary too
+    assert len(inbox) == 1 and "verifier failed twice" in inbox[0][0]
+    assert [e["outcome"] for e in _events(tmp_path, "verify_retry")] == ["exhausted"]
+
+
+async def test_a_verified_round_after_the_flake_needs_no_re_run(tmp_path):
+    ran: list[str] = []
+
+    async def runner(name, inputs):
+        ran.append(name)
+        return {"output": CLEAN_PASS_REPORT, "failed": []}
+
+    gh = RoutedGH(pr_facts=facts(), reviews=[_unverified_row(HEAD, id=70), review_row(HEAD, "PASS", id=71)])
+    gh.checks = GREEN
+    d = make(tmp_path, cfg={"shadow_mode": False, "promotion_owner": True}, gh=gh, runner=runner)
+    assert (await d.reconcile_pr("o/r", 1, backfill_budget=1))[0] == "promote"
+    assert ran == []
+
+
+async def test_a_paused_pr_or_an_empty_budget_is_not_re_run(tmp_path):
+    ran: list[str] = []
+
+    async def runner(name, inputs):
+        ran.append(name)
+        return {"output": CLEAN_PASS_REPORT, "failed": []}
+
+    class PausedGH(RoutedGH):
+        async def __call__(self, args, timeout=30):
+            joined = " ".join(args)
+            if "/issues/1/comments" in joined and "-X" not in args:
+                return 0, json.dumps("<!-- protoagent-qa-paused -->"), ""
+            return await super().__call__(args, timeout=timeout)
+
+    paused = PausedGH(pr_facts=facts(), reviews=[_unverified_row(HEAD, id=70)], checks=GREEN)
+    d = make(tmp_path / "p", cfg={"shadow_mode": False, "promotion_owner": True}, gh=paused, runner=runner)
+    assert (await d.reconcile_pr("o/r", 1, backfill_budget=1)) == ("hold:unverified", 1)
+    assert [e["outcome"] for e in _events(tmp_path / "p", "verify_retry")] == ["paused"]
+    gh = RoutedGH(pr_facts=facts(), reviews=[_unverified_row(HEAD, id=70)], checks=GREEN)
+    d = make(tmp_path / "b", cfg={"shadow_mode": False, "promotion_owner": True}, gh=gh, runner=runner)
+    assert (await d.reconcile_pr("o/r", 1, backfill_budget=0)) == ("hold:unverified", 0)
+    assert ran == []

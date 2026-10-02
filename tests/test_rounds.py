@@ -1017,3 +1017,38 @@ def test_relisting_rule_ignores_refuted_priors_and_empty_history():
     assert relisted == [] and out == [echo]
     assert normalize_relisted_priors([echo], []) == ([echo], [])
     assert normalize_relisted_priors([], _history_with(refuted)) == ([], [])
+
+
+# ── the bounded automatic re-run of an unverified head (issue #220) ─────────────
+
+
+def _rev(head, *, id, verified=True, promoted=False, reaffirmed=""):
+    body = render_verdict_body(
+        repo="o/r",
+        pr=1,
+        head_sha=head,
+        verdict="PASS",
+        findings=[],
+        shadow=True,
+        recipe="code-review",
+        verified=verified,
+        reaffirmed_from=reaffirmed,
+    )
+    marker = parse_verdict_marker(body)
+    return {**marker, "promoted": promoted, "body": body, "id": id}
+
+
+def test_one_unverified_round_is_due_one_re_run_and_two_are_exhausted():
+    from pr_reviewer.rounds import verify_retry_state
+
+    h = "a" * 40
+    assert verify_retry_state([_rev(h, id=1, verified=False)], h) == "retry"
+    assert verify_retry_state([_rev(h, id=1, verified=False), _rev(h, id=2, verified=False)], h) == "exhausted"
+    # A verified round AFTER the flake lifts the hold (#170) — nothing to re-run.
+    assert verify_retry_state([_rev(h, id=1, verified=False), _rev(h, id=2)], h) == ""
+    # …but one BEFORE it proves nothing about the flaky round's claims.
+    assert verify_retry_state([_rev(h, id=1), _rev(h, id=2, verified=False)], h) == "retry"
+    # Other heads, promotions and reaffirmed verdicts are not this head's rounds.
+    assert verify_retry_state([_rev("b" * 40, id=1, verified=False)], h) == ""
+    assert verify_retry_state([_rev(h, id=1, verified=False, reaffirmed="c" * 40)], h) == ""
+    assert verify_retry_state([], h) == ""

@@ -180,6 +180,44 @@ def _review_id(value) -> int:
         return 0
 
 
+# One automatic re-run per head for a round whose verifier flaked (#220): the same fresh
+# round a manual `@vera review` buys, without waiting for a human to notice.
+VERIFY_RETRIES_PER_HEAD = 1
+VERIFY_RETRY_DUE = "retry"
+VERIFY_RETRY_EXHAUSTED = "exhausted"
+
+
+def verify_retry_state(reviews: list[dict], head: str) -> str:
+    """Should the sweep re-run the panel on `head` because its verdict is unverified? (#220)
+
+    `reviews` is our posted reviews, raw — NOT folded by `panel_rounds`, which keeps one
+    round per head and so cannot count how often this head's verifier failed. Promotions and
+    reaffirmed verdicts are not rounds and do not count.
+
+      ""            no unverified round at this head, or a VERIFIED round came after the
+                    newest unverified one (that lifts the hold, #170) — nothing to do.
+      "retry"       unverified rounds ≤ `VERIFY_RETRIES_PER_HEAD`: schedule a fresh round.
+      "exhausted"   the automatic re-run was spent and came back unverified too — stop,
+                    and tell a human.
+
+    Counted from GitHub, so the bound survives a restart: a crash-looping container cannot
+    turn one flaky verifier into a panel per sweep tick."""
+    rounds = [
+        r
+        for rev in reviews or []
+        if isinstance(rev, dict) and not rev.get("promoted") and str(rev.get("head") or "") == head
+        for r in panel_rounds([rev])
+        if not r.get("reaffirmed")
+    ]
+    unverified = [r for r in rounds if not r.get("verified", True)]
+    if not unverified:
+        return ""
+    newest = max(r.get("id", 0) for r in unverified)
+    if any(r.get("verified", True) and r.get("id", 0) > newest for r in rounds):
+        return ""
+    return VERIFY_RETRY_DUE if len(unverified) <= VERIFY_RETRIES_PER_HEAD else VERIFY_RETRY_EXHAUSTED
+
+
 def spent_rounds(history: list[dict]) -> list[dict]:
     """The rounds a panel was actually SPENT on — `history` without reaffirmed verdicts.
 

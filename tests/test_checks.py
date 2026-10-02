@@ -401,3 +401,23 @@ async def test_other_non_dispatch_actions_still_touch_nothing(tmp_path):
     gh = ChecksGH(pr_facts=facts(), existing=WAITING_ON_CI)
     await owned(tmp_path, gh).handle_pr_event("o/r", 1, HEAD, "labeled")
     assert gh.calls == [] and gh.writes == []
+
+
+def test_an_unverified_hold_says_a_re_run_is_coming_then_what_to_do_when_it_failed():
+    from pr_reviewer.approve import HOLD_UNVERIFIED
+
+    pending = check_for(HOLD_UNVERIFIED, verdict="PASS", verify_retry="retry")
+    assert pending.status == "in_progress" and "re-running" in pending.title
+    assert "hold:unverified" in pending.summary
+    gave_up = check_for(HOLD_UNVERIFIED, verdict="PASS", verify_retry="exhausted")
+    assert gave_up.title == "Verifier failed twice — summon @vera review or push"
+    assert gave_up.status == "in_progress" and "hold:unverified" in gave_up.summary
+
+
+def test_every_hold_names_its_reason_in_the_summary():
+    # #220: the board reads the check through `gh`, which does not always carry the title.
+    from pr_reviewer.approve import HOLD_CHECKS_PENDING, HOLD_INCOMPLETE, HOLD_STALE_HEAD
+
+    for decision in (HOLD_STALE_HEAD, HOLD_INCOMPLETE, HOLD_CHECKS_PENDING, "hold:promote-backoff"):
+        assert decision in check_for(decision).summary
+    assert "hold:" not in check_for("promote").summary
