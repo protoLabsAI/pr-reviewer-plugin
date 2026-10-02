@@ -70,13 +70,21 @@ from .grounding import (
 from .protopatch import STRUCTURAL_GAP_MARKERS, classify_outage, is_partial_output, outage_reason
 from .rounds import (
     DEFAULT_CONVERGENCE_ROUNDS,
+    MAX_PRIOR_RECHECK,
+    align_recheck,
+    carried_debt,
     converge,
     delta_ranges,
     diff_identity,
     in_delta,
+    needs_recheck,
     normalize_relisted_priors,
     panel_rounds,
     parse_dispositions,
+    recheck_clears,
+    recheck_payload,
+    relisted_blocking_priors,
+    render_deferred_note,
     render_degraded_note,
     render_evidence_gone_note,
     render_held_note,
@@ -84,7 +92,9 @@ from .rounds import (
     render_notes_section,
     render_prior_requests,
     render_promotion_findings,
+    render_recheck_cleared_note,
     render_unaccounted_note,
+    resolve_relisting,
     round_cap_reached,
     spent_rounds,
     unaccounted_priors,
@@ -308,6 +318,13 @@ def _accepts_keyword(fn, name: str) -> bool:
     except (TypeError, ValueError):
         return False
     return name in params or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
+def _carry_anchor(finding: dict) -> str:
+    """`file:line` (or the bare file) — how a prior is matched across the re-check lists."""
+    path = str(finding.get("file") or "").strip().removeprefix("./")
+    line = finding.get("line")
+    return f"{path}:{line}" if isinstance(line, int) else path
 
 
 def strictest_head_round(reviews: list[dict], head: str) -> dict | None:
@@ -1284,6 +1301,15 @@ class Dispatcher:
         return max(0, int(cfg["verify_reruns"])) if "verify_reruns" in cfg else _env_int("PR_REVIEWER_VERIFY_RERUNS", 1)
 
     @property
+    def prior_recheck(self) -> bool:
+        """Re-verify carried and re-listed prior blocker/majors at the new head, alone, before
+        they are re-asserted (#218, #220, #232 ask 5). One seeded verify step per round, only
+        when a prior is undispositioned or re-listed without a verdict; needs a host whose
+        runner takes `seed_outputs` (protoAgent#3571). Off ⇒ priors are carried as before."""
+        cfg = self.cfg
+        return bool(cfg["prior_recheck"]) if "prior_recheck" in cfg else _env_bool("PR_REVIEWER_PRIOR_RECHECK", True)
+
+    @property
     def verify_fallback_panel(self) -> bool:
         """After a RESTATED verify re-run is still contradicted, run one fresh panel before
         posting a held PASS (#189). Every observed fresh round on this shape has verified;
@@ -1898,8 +1924,16 @@ class Dispatcher:
         # re-runs the full panel", and reaffirming it made that promise false — the only way
         # left to earn a complete pass was to change the content hash on purpose. An
         # identical diff earns the identical verdict only when that verdict was earned.
-        if not prior.get("complete", True) or not prior.get("verified", True):
-            reason = "prior-incomplete" if not prior.get("complete", True) else "prior-unverified"
+        # Nor is one still carrying a prior blocker/major (#220): a fresh round re-verifies that
+        # debt at the new head, and an identical diff would only re-post it unexamined.
+        if not prior.get("complete", True) or not prior.get("verified", True) or carried_debt(prior):
+            reason = (
+                "prior-incomplete"
+                if not prior.get("complete", True)
+                else "prior-unverified"
+                if not prior.get("verified", True)
+                else "prior-carried-debt"
+            )
             self.telemetry.emit(REAFFIRM_MISS, repo=repo, pr=pr, sha=head, reason=reason)
             return None
         self.telemetry.emit(
@@ -2954,6 +2988,70 @@ class Dispatcher:
                 brief, brief_found = extract_brief(synthesized)
                 brief_source = "synthesize" if brief_found else ""
         truncated = report_hard_stopped(output)
+        # What became of the PRIOR round's blocker/majors (#26) — and, since #218/#220/#232,
+        # a re-verification of the ones still in question. Computed BEFORE the verdict now:
+        # a verdict-less re-listing of a prior is the panel re-asserting a claim no verifier
+        # saw this round, and whether it may block depends on that re-check.
+        reported, relistings = relisted_blocking_priors(reported, history)
+        # #26 in its general form: a prior blocker/major must be DISPOSITIONED
+        # (fixed / open / refuted), whatever this round's verdict is. `unexplained_clearance`
+        # could only guard a clean PASS, because silence there is unambiguous; with an
+        # explicit dispositions block the same debt is visible at any verdict. A recipe
+        # that emits no block falls back to the narrower rule rather than losing the guard.
+        dispositions = parse_dispositions(output) if self.hold_unexplained else []
+        # A `fixed` disposition is only honoured if the flagged line actually moved
+        # (issue: protoAgent#2208 shipped a major to main on a hallucinated "fixed" that
+        # left the line byte-identical). We need the delta prior-head→head to verify that.
+        # Fail-closed: an unreadable delta means `fixed` can't be verified, so it isn't trusted.
+        ranges = None
+        since_ranges = None
+        if (dispositions or relistings) and prior:
+            ranges = await self._delta_ranges(repo, prior["head"], head)
+            since_ranges = await self._since_ranges(repo, history, head)
+        unaccounted = unaccounted_priors(history, dispositions, ranges=ranges, since_ranges=since_ranges, paths=paths)
+        # A carried prior whose quoted evidence is GONE at head, on a line the delta since
+        # it was raised actually touched, was fixed — that is the same read `ground_finding`
+        # applies to a fresh finding, and it is stronger than a model's `fixed` claim. Without
+        # it a fixed major carries round after round with "no evidence of fix", because the
+        # fresh diff gives the panel nothing to disposition (issue #196, plugin#193 r4–r5).
+        evidence_gone: list[dict] = []
+        if unaccounted and self.grounding_enabled:
+            unaccounted, evidence_gone = await self._clear_by_evidence(
+                repo, pr, head, unaccounted, ranges=ranges, since_ranges=since_ranges
+            )
+            if evidence_gone:
+                self.telemetry.emit(
+                    "carried_prior_cleared",
+                    repo=repo,
+                    pr=pr,
+                    sha=head,
+                    round=round_number,
+                    reason="evidence-gone",
+                    findings=[
+                        {
+                            "file": str(m.get("file") or ""),
+                            "line": m.get("line"),
+                            "severity": str(m.get("severity") or ""),
+                        }
+                        for m in evidence_gone
+                    ],
+                )
+        reported, unaccounted, rechecked_cleared, deferred = await self._recheck_priors(
+            runner,
+            recipe,
+            inputs,
+            steps_out,
+            output,
+            reported,
+            relistings,
+            unaccounted,
+            ranges=ranges,
+            since_ranges=since_ranges,
+            repo=repo,
+            pr=pr,
+            head=head,
+            round_number=round_number,
+        )
         findings, confined = confine_findings(reported, paths)
         if confined:
             # Server-side in-diff enforcement — prompt discipline made a promise,
@@ -3050,8 +3148,13 @@ class Dispatcher:
         # Convergence (issue #23) sits AFTER the pure mapping, never inside it: ADR
         # 0078 C's rule is that findings decide the verdict, and that still holds —
         # this only asks whether a non-blocking verdict is still worth another round.
-        ranges = None
-        if prior and self.convergence_rounds and verdict == WARN and round_number >= self.convergence_rounds:
+        if (
+            ranges is None
+            and prior
+            and self.convergence_rounds
+            and verdict == WARN
+            and round_number >= self.convergence_rounds
+        ):
             ranges = await self._delta_ranges(repo, prior["head"], head)
         verdict, notes, reason = converge(
             verdict, findings, round_number=round_number, ranges=ranges, threshold=self.convergence_rounds
@@ -3063,50 +3166,8 @@ class Dispatcher:
         # An unexplained clearance (issue #26): this clean PASS would dismiss our own
         # standing block, but a prior round of this same panel confirmed a blocker/major
         # that this round neither reports nor explains. Hold the block; the verdict still
-        # posts, and a second consecutive clean PASS lifts it.
-        # #26 in its general form: a prior blocker/major must be DISPOSITIONED
-        # (fixed / open / refuted), whatever this round's verdict is. `unexplained_clearance`
-        # could only guard a clean PASS, because silence there is unambiguous; with an
-        # explicit dispositions block the same debt is visible at any verdict. A recipe
-        # that emits no block falls back to the narrower rule rather than losing the guard.
-        dispositions = parse_dispositions(output) if self.hold_unexplained else []
-        # A `fixed` disposition is only honoured if the flagged line actually moved
-        # (issue: protoAgent#2208 shipped a major to main on a hallucinated "fixed" that
-        # left the line byte-identical). We need the delta prior-head→head to verify that;
-        # compute it here when there are dispositions and it wasn't already computed for
-        # convergence. Fail-closed: an unreadable delta means `fixed` can't be verified,
-        # so it isn't trusted.
-        if dispositions and ranges is None and prior:
-            ranges = await self._delta_ranges(repo, prior["head"], head)
-        since_ranges = await self._since_ranges(repo, history, head) if dispositions and prior else None
-        unaccounted = unaccounted_priors(history, dispositions, ranges=ranges, since_ranges=since_ranges)
-        # A carried prior whose quoted evidence is GONE at head, on a line the delta since
-        # it was raised actually touched, was fixed — that is the same read `ground_finding`
-        # applies to a fresh finding, and it is stronger than a model's `fixed` claim. Without
-        # it a fixed major carries round after round with "no evidence of fix", because the
-        # fresh diff gives the panel nothing to disposition (issue #196, plugin#193 r4–r5).
-        evidence_gone: list[dict] = []
-        if unaccounted and self.grounding_enabled:
-            unaccounted, evidence_gone = await self._clear_by_evidence(
-                repo, pr, head, unaccounted, ranges=ranges, since_ranges=since_ranges
-            )
-            if evidence_gone:
-                self.telemetry.emit(
-                    "carried_prior_cleared",
-                    repo=repo,
-                    pr=pr,
-                    sha=head,
-                    round=round_number,
-                    reason="evidence-gone",
-                    findings=[
-                        {
-                            "file": str(m.get("file") or ""),
-                            "line": m.get("line"),
-                            "severity": str(m.get("severity") or ""),
-                        }
-                        for m in evidence_gone
-                    ],
-                )
+        # posts, and a second consecutive clean PASS lifts it. (The dispositions contract
+        # that generalizes it is computed above, before the verdict.)
         # The two guards are a fallback chain, not a belt-and-braces pair. When the panel
         # HAS dispositioned its priors, that statement is the authority — re-applying the
         # clean-PASS heuristic on top would hold a block the panel just explained, making
@@ -3134,6 +3195,13 @@ class Dispatcher:
             trailer += render_incomplete_note(incomplete_finders)
         if evidence_gone:
             trailer += render_evidence_gone_note(evidence_gone)
+        if rechecked_cleared:
+            trailer += render_recheck_cleared_note(rechecked_cleared)
+        if deferred:
+            trailer += render_deferred_note(deferred)
+            # Recorded as carried debt, like an unaccounted prior: not blocking THIS verdict
+            # (nobody verified it against this head), not cleared either (#232).
+            reported = merge_carried_findings(reported, deferred)
         if unaccounted:
             trailer += render_unaccounted_note(unaccounted)
             # Write the recovered majors into the recorded findings, not just the prose
@@ -3180,7 +3248,7 @@ class Dispatcher:
             truncated=truncated,
             confined=confined,
             notes=trailer,
-            hold_blocks=bool(dropped_finding) or bool(unaccounted),
+            hold_blocks=bool(dropped_finding) or bool(unaccounted) or bool(deferred),
             complete=complete,
             coverage_gaps=gaps,
             lanes=lanes,
@@ -3210,7 +3278,7 @@ class Dispatcher:
             **size,
             findings=len(findings),
             notes=len(notes),
-            held=bool(dropped_finding) or bool(unaccounted),
+            held=bool(dropped_finding) or bool(unaccounted) or bool(deferred),
             confined=len(confined),
             nearby=len(nearby),
             # Every guard reports what it DECIDED, not only when it acted. A rule that
@@ -3237,6 +3305,10 @@ class Dispatcher:
             diff_truncated=diff_truncated,
             dispositions=len(dispositions),
             unaccounted=len(unaccounted),
+            # The targeted re-verification of priors (#218/#220/#232): how many it cleared, and
+            # how many re-listings were deferred to carried debt because nobody re-verified them.
+            recheck_cleared=len(rechecked_cleared) or None,
+            relisted_deferred=len(deferred) or None,
             latency_s=round(elapsed, 1),
             # Model/SDK gateway retries this round (issue #209): a slow gate looked identical to
             # a dead one until this was counted. A finder subagent's retries land here through the
@@ -4023,6 +4095,136 @@ class Dispatcher:
             return queue.has_round_for(repo, pr, exclude_kinds=("webhook",))
         return False
 
+    async def _recheck_priors(
+        self,
+        runner,
+        recipe: str,
+        inputs: dict,
+        steps: dict,
+        output: str,
+        reported: list[dict],
+        relistings: list[tuple[int, dict]],
+        unaccounted: list[dict],
+        *,
+        ranges: dict | None,
+        since_ranges: dict | None,
+        repo: str,
+        pr: int,
+        head: str,
+        round_number: int,
+    ) -> tuple[list[dict], list[dict], list[dict], list[dict]]:
+        """(reported, unaccounted, cleared, deferred) — prior blocker/majors re-verified at
+        THIS head before they are re-asserted (#218, #220, #232 ask 5).
+
+        Two kinds of prior are in question. A verdict-less RE-LISTING (the report carried an
+        `open` prior into its findings after the verify step, so no verifier saw it) would
+        otherwise block on a claim about code that may be gone (protoAgent#4017 r2). An
+        UNACCOUNTED prior — one this round did not credibly fix or refute — would otherwise be
+        carried forever when the panel's `fixed` cannot be proven mechanically (a fix 13 lines
+        from the cited line, protoAgent#3811) or the prior was never verified to begin with
+        (protoContent#565). Each gets ONE seeded verify step — the finders and the report are
+        not re-run — over just those priors, restated without their earlier ruling.
+
+        Fail-CLOSED throughout: no seeding host, the knob off, a crashed or empty re-check, or
+        a prior the verifier did not rule on ⇒ that prior is treated exactly as before. Only a
+        `refuted` that `recheck_clears` honours clears anything.
+        """
+        relisted_anchors = {_carry_anchor(p) for _, p in relistings}
+        targets: list[tuple[str, int]] = [("relisted", k) for k in range(len(relistings))]
+        targets += [
+            ("prior", k)
+            for k, m in enumerate(unaccounted)
+            if _carry_anchor(m) not in relisted_anchors and needs_recheck(m, ranges, since_ranges)
+        ]
+        targets = targets[:MAX_PRIOR_RECHECK]
+        candidates = [
+            recheck_payload(reported[relistings[k][0]] if kind == "relisted" else unaccounted[k]) for kind, k in targets
+        ]
+        rulings: list[dict | None] = [None] * len(candidates)
+        reason = ""
+        if not candidates:
+            reason = "nothing-to-recheck"
+        elif not self.prior_recheck:
+            reason = "disabled"
+        elif not _accepts_keyword(runner, "seed_outputs") or "verify" not in steps or "synthesize" not in steps:
+            reason = "cannot-seed"
+        else:
+            # Everything but `verify` is seeded — `report` too, with this round's own output,
+            # so the engine runs exactly one step and the round's report is untouched.
+            seeded = {k: str(v) for k, v in steps.items() if k != "verify"}
+            seeded["synthesize"] = restate_findings(candidates)
+            seeded["report"] = output
+            self.report_phase("verify")
+            try:
+                async with asyncio.timeout(self.panel_attempt_timeout_s):
+                    again = await runner(recipe, inputs, seed_outputs=seeded)
+            except Exception as exc:  # noqa: BLE001 — a failed re-check leaves the priors as they were
+                log.warning("[pr-reviewer] %s#%s prior re-check failed: %s", repo, pr, exc)
+                again = {}
+                reason = "crashed"
+            again_steps = again.get("steps") if isinstance(again.get("steps"), dict) else {}
+            verify_out = str(again_steps.get("verify") or "")
+            if not reason and (again.get("failed") or not verify_out.strip()):
+                reason = "no-verify-output"
+            if not reason:
+                rulings = align_recheck(candidates, self._parse_findings(verify_out))
+        ruling_for = dict(zip(targets, rulings))
+
+        cleared: list[dict] = []
+        deferred: list[dict] = []
+        drop: set[int] = set()
+        out = list(reported)
+        cleared_anchors: set[str] = set()  # priors a re-listing already settled
+        for k, (i, prior) in enumerate(relistings):
+            ruling = ruling_for.get(("relisted", k))
+            outcome, value = resolve_relisting(out[i], prior, ruling, ranges, since_ranges)
+            if outcome == "cleared":
+                drop.add(i)
+                cleared.append({**prior, "recheck_note": (ruling or {}).get("note", "")})
+                cleared_anchors.add(_carry_anchor(prior))
+            elif outcome == "deferred":
+                drop.add(i)
+                deferred.append(value)
+                cleared_anchors.add(_carry_anchor(prior))  # carried by `deferred`, named once
+            elif outcome in ("confirmed", "inherited"):
+                # The round's own finding, now with a ruling — judged by the verdict like any
+                # other; `carried_by: synthesizer` keeps it out of the verify-coverage count
+                # (the main verify step never saw it) and out of `carried_debt`.
+                out[i] = {**value, "carried": True, "carried_by": "synthesizer"}
+        out = [f for j, f in enumerate(out) if j not in drop]
+        still: list[dict] = []
+        for k, prior in enumerate(unaccounted):
+            if _carry_anchor(prior) in cleared_anchors:
+                continue  # its re-listing was settled above — the same prior, one outcome
+            ruling = ruling_for.get(("prior", k))
+            if ruling and recheck_clears(prior, ruling["verdict"], ranges, since_ranges):
+                cleared.append({**prior, "recheck_note": ruling.get("note", "")})
+                continue
+            if ruling and ruling["verdict"] == "confirmed":
+                prior = {k2: v for k2, v in prior.items() if k2 != "raised_unverified"}
+                prior["verdict"] = "confirmed"
+            still.append(prior)
+        if candidates:
+            verdicts = [r["verdict"] if r else "" for r in rulings]
+            self.telemetry.emit(
+                "prior_recheck",
+                repo=repo,
+                pr=pr,
+                sha=head,
+                round=round_number,
+                candidates=len(candidates),
+                relisted=len(relistings),
+                ran=not reason,
+                reason=reason or None,
+                confirmed=verdicts.count("confirmed"),
+                refuted=verdicts.count("refuted"),
+                uncertain=verdicts.count("uncertain"),
+                unruled=verdicts.count(""),
+                cleared=len(cleared),
+                deferred=len(deferred),
+            )
+        return out, still, cleared, deferred
+
     async def evaluate_promotion(self, repo: str, pr: int) -> str:
         """One PR through the approve-on-green pure function; applies only when we own
         promotion AND not shadow. Every hold is telemetered (the dry-run evidence)."""
@@ -4085,6 +4287,9 @@ class Dispatcher:
             # A round dispatched and unfinished has not spoken yet — `clear` is the newest
             # COMPLETE round, and the running one may FAIL it (issue #217).
             round_in_flight=self._round_in_flight(repo, pr),
+            # A clear verdict whose own record still carries a confirmed prior blocker/major
+            # (#218/#220) — an explicit hold now, not a side effect of `verified=false`.
+            carried_debt=bool(carried_debt(clear)) if clear else False,
         )
         backoff_key = f"{repo}#{pr}@{head}"
         if self._promote_failures.get(backoff_key, 0) >= PROMOTE_MAX_FAILURES:

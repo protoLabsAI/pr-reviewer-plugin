@@ -37,6 +37,7 @@ HOLD_NOT_OWNER = "hold:not-promotion-owner"
 HOLD_INCOMPLETE = "hold:incomplete-coverage"
 HOLD_UNVERIFIED = "hold:unverified"
 HOLD_ROUND_IN_FLIGHT = "hold:round-in-flight"
+HOLD_CARRIED_PRIOR = "hold:carried-prior"
 
 
 @dataclass(frozen=True)
@@ -71,6 +72,12 @@ class Observations:
     # tell, which holds like every other unknown. Defaults False so a caller that does not
     # track rounds keeps its old behaviour.
     round_in_flight: bool | None = False
+    # The clear verdict's own record still carries a prior blocker/major as standing debt
+    # (`rounds.carried_debt`): the round did not fix, refute, or re-verify it away. The
+    # verdict is clear on what THIS round found; the head is not clear of what an earlier
+    # round confirmed (#218/#220). This used to hold only because the carried rows made the
+    # round read as unverified — the wrong reason, and one no re-run could ever lift.
+    carried_debt: bool = False
 
 
 def promotion_decision(obs: Observations) -> str:
@@ -95,6 +102,8 @@ def promotion_decision(obs: Observations) -> str:
         # argument as incomplete coverage one step later in the pipeline: there, a
         # finder never looked; here, nothing checked what the finders claimed.
         return HOLD_UNVERIFIED
+    if obs.carried_debt:
+        return HOLD_CARRIED_PRIOR
     if not obs.complete:
         # A clear verdict on incomplete coverage is not earned: a finder that was meant
         # to run didn't (protoPatch down, a finder timed out), so "no findings" is
