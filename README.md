@@ -56,6 +56,16 @@ structural-trigger dispatch, approve-on-green + sweep, and the review eval.
   footnoted in the posted body). The panel prompts promise in-diff discipline; the
   dispatcher now enforces it. Fails open when the changed-path list is unreadable —
   a failed GitHub read must never launder a FAIL into a PASS.
+- **Structural scoping (#232)** — confinement's line-level step, for `source: protopatch`
+  findings only. protoPatch reviews whole features, so on a touched file it also reports code
+  that was already there (protoAgent#4017: seven findings in a file whose only hunk was a
+  comment). A structural finding outside the PR's changed lines (±5) — and, in a Python file,
+  outside every function those lines sit in — is a **nearby note**: listed in the body, flagged
+  `nearby: true` in the findings record, left out of the verdict, and never carried as a prior
+  debt. It fails closed (the finding gates as before) on no line, an unreadable patch or head
+  file, a file without a patch, or Python that does not parse. The LLM lanes are not scoped: they
+  read the diff itself, so a line they cite outside a hunk is usually the change's consequence.
+  protoPatch anchors a multi-location finding at a location the PR changed when it has one.
 - **Existing-thread awareness (v0.5.0)** — the dispatcher fetches the PR's inline
   review threads (Quinn's, CodeRabbit's, humans'), renders them as one escaped
   `<pr_review_threads>` data block (closing-tag neutralization, login-grammar

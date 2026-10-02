@@ -181,6 +181,108 @@ def confine_findings(findings: list[dict], changed_paths: list[str]) -> tuple[li
     return kept, dropped
 
 
+# Structural scoping (#232 ask 7) — confinement's line-level step, for the structural lane only.
+# `confine_findings` keeps a finding on any file the PR touched; protoPatch reviews whole
+# FEATURES (`--since <base>`), so on a touched file it also reports what was already there.
+# protoAgent#4017 r3: seven findings in `operator_api/config_routes.py`, whose only hunk was a
+# comment — and they made up the verdict.
+NEARBY_NOTE = (
+    "nearby: in code this PR did not change (outside its changed lines and the functions they sit "
+    "in) — reported, not gated (#232)"
+)
+STRUCTURAL_SOURCE = "protopatch"
+_PYTHON_SUFFIXES = (".py", ".pyi")
+
+
+def _function_spans(source: str) -> list[tuple[int, int]] | None:
+    """(first, last) line of every function in a Python file, decorators included — or None
+    when it does not parse. `ast.parse` only parses; nothing in the file runs."""
+    import ast
+
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        return None
+    spans: list[tuple[int, int]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            start = min([node.lineno, *(d.lineno for d in node.decorator_list)])
+            spans.append((start, int(getattr(node, "end_lineno", None) or node.lineno)))
+    return spans
+
+
+def nearby_structural(
+    findings: list[dict],
+    ranges: dict[str, list[tuple[int, int]]] | None,
+    sources: dict[str, str | None] | None = None,
+) -> list[int]:
+    """Indexes of the structural findings that sit in code this PR did not change.
+
+    `ranges` are the PR's base→head changed lines per file, head-side and context-padded
+    (`rounds.delta_ranges` over the PR's own `/files` patches). For a Python file a finding is
+    also in scope anywhere inside a function the PR changed — a hunk-only rule would demote a
+    defect the change caused a few lines further down its own function. `sources` is the file
+    at the reviewed head (None = could not be read).
+
+    Fails CLOSED — the finding keeps gating — whenever its place cannot be established: not
+    a `source: protopatch` finding (the LLM lanes read the diff itself, so what they cite
+    outside a hunk is usually the change's own consequence); no line; a file the read does
+    not list, or lists without a patch (binary, too large); a line past the end of the file;
+    a Python file that could not be read or parsed. None `ranges` (unreadable) scopes nothing.
+    """
+    if not ranges:
+        return []
+    out: list[int] = []
+    for i, finding in enumerate(findings or []):
+        if not isinstance(finding, dict) or str(finding.get("source") or "").strip().lower() != STRUCTURAL_SOURCE:
+            continue
+        file = _norm_path(str(finding.get("file") or ""))
+        spans = ranges.get(file)
+        line = finding.get("line")
+        if not spans or isinstance(line, bool) or not isinstance(line, int) or line <= 0:
+            continue
+        if any(start <= line <= end for start, end in spans):
+            continue
+        text = (sources or {}).get(file)
+        if isinstance(text, str) and line > len(text.splitlines()):
+            continue  # cites a line the head does not have — unmappable
+        if file.endswith(_PYTHON_SUFFIXES):
+            functions = _function_spans(text) if isinstance(text, str) else None
+            if functions is None:
+                continue
+            changed = [f for f in functions if any(f[0] <= end and start <= f[1] for start, end in spans)]
+            if any(start <= line <= end for start, end in changed):
+                continue
+        out.append(i)
+    return out
+
+
+def mark_nearby(finding: dict) -> dict:
+    """A NEW dict for a nearby finding: flagged, and noted so the reader sees why it did not gate."""
+    item = dict(finding)
+    item["nearby"] = True
+    note = str(item.get("note") or "").strip()
+    if NEARBY_NOTE not in note:
+        item["note"] = f"{note} — {NEARBY_NOTE}" if note else NEARBY_NOTE
+    return item
+
+
+def render_nearby_footnote(nearby: list[dict]) -> str:
+    """The trailer section for findings scoped out of the verdict — "" when there are none."""
+    if not nearby:
+        return ""
+    lines = "\n".join(
+        f"- `{f.get('file') or '(no file)'}:{f.get('line')}` ({f.get('severity') or '?'}) — "
+        f"{str(f.get('claim') or '')[:160]}"
+        for f in nearby
+    )
+    return (
+        f"\n\n---\n_{len(nearby)} structural finding(s) are **nearby notes**, not part of the verdict: "
+        f"they sit in code this PR did not change (outside its changed lines and the functions "
+        f"those lines are in). Worth a look; not a request for this PR._\n{lines}"
+    )
+
+
 _SEV_MARK = {"blocker": "🔴", "major": "🟠", "minor": "🟡", "nit": "⚪"}
 _VERDICT_MARK = {
     "confirmed": "confirmed",
@@ -216,6 +318,8 @@ def render_findings_table(findings: list[dict]) -> str:
         if isinstance(line, int) and line > 0:
             loc = f"{loc}:{line}"
         vmark = _VERDICT_MARK.get(str(f.get("verdict") or "").lower(), str(f.get("verdict") or ""))
+        if f.get("nearby"):
+            vmark = f"{vmark} · nearby, not gating" if vmark else "nearby, not gating"
         out.append(f"| {_SEV_MARK.get(sev, '•')} | {sev} | `{_cell(loc, 80)}` | {_cell(f.get('claim'))} | {vmark} |")
     return "\n".join(out)
 

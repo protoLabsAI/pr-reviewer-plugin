@@ -89,17 +89,22 @@ from .verdicts import (
     FAIL,
     FINDER_STEP_PREFIX,
     PASS,
+    STRUCTURAL_SOURCE,
     WARN,
+    _norm_path,
     confine_findings,
     coverage_gaps,
     coverage_verdict,
     demote_stale_findings,
     extract_brief,
     finder_completed,
+    mark_nearby,
     mentions_any,
     merge_carried_findings,
+    nearby_structural,
     overrun_lanes,
     parse_verdict_marker,
+    render_nearby_footnote,
     render_verdict_body,
     report_hard_stopped,
     restate_findings,
@@ -2215,6 +2220,28 @@ class Dispatcher:
         heads = [h for h in dict.fromkeys(raised_at) if h and h != history[-1].get("head")]
         return {h: await self._delta_ranges(repo, h, head) for h in heads[:SINCE_RANGES_LIMIT]}
 
+    async def _pr_hunk_ranges(self, repo: str, pr: int) -> dict | None:
+        """The PR's own base→head changed lines per file (head-side, context-padded), or None.
+
+        What structural scoping (#232) reads: the same `/files` patches the panel's diff is cut
+        from, through the same `delta_ranges` the convergence and fixed-proof rules use. None on
+        any unreadable page — scoping then stands down and every finding keeps gating."""
+        rc, out, _err = await self._run_gh(
+            [
+                "api",
+                f"repos/{repo}/pulls/{pr}/files",
+                "--paginate",
+                "--jq",
+                ".[] | {filename: .filename, patch: .patch}",
+            ]
+        )
+        if rc != 0:
+            return None
+        rows = gh_json_rows(out)
+        if not rows:
+            return None
+        return delta_ranges([r for r in rows if isinstance(r, dict)])
+
     async def _delta_ranges(self, repo: str, base: str, head: str) -> dict | None:
         """Line ranges that moved between two reviewed heads, or None (unreadable).
 
@@ -2907,6 +2934,10 @@ class Dispatcher:
         # annotated `uncertain`, which verdict_for already refuses to turn into a FAIL.
         grounded_findings, ungrounded, unreadable = [], [], []
         grounding_checked = 0
+        # The recorded objects behind `findings`, in order — grounding returns new dicts, and a
+        # nearby finding (#232) must be flagged in the RECORD too, which later rounds read.
+        recorded_kept = list(findings)
+        raw: dict = {}
         if self.grounding_enabled and findings:
             raw = await self._finding_sources(repo, pr, head, findings)
             blobs = {f: v[0] for f, v in raw.items()}
@@ -2915,6 +2946,28 @@ class Dispatcher:
             grounding_checked = len(findings)
             findings = grounded_findings
             findings = correct_line_numbers(findings, blobs)
+        # Structural scoping (#232): a protoPatch finding in code this PR did not change is a
+        # nearby note, not a verdict input. Runs on the grounded, line-corrected findings —
+        # the line decides it — and fails closed at every unknown (see `nearby_structural`).
+        try:
+            findings, reported, nearby = await self._scope_structural(
+                repo, pr, head, findings, recorded_kept, reported, raw
+            )
+        except Exception:  # noqa: BLE001 — scoping only ever relieves; failing it keeps every finding gating
+            log.exception("[pr-reviewer] structural scoping failed on %s#%s; all findings keep gating", repo, pr)
+            nearby = []
+        if nearby:
+            self.telemetry.emit(
+                "nearby",
+                repo=repo,
+                pr=pr,
+                sha=head,
+                round=round_number,
+                findings=[
+                    {"file": str(f.get("file") or ""), "line": f.get("line"), "severity": str(f.get("severity") or "")}
+                    for f in nearby
+                ],
+            )
         if ungrounded:
             self.telemetry.emit("ungrounded", repo=repo, pr=pr, sha=head, round=round_number, downgraded=ungrounded)
         if unreadable:
@@ -3033,6 +3086,7 @@ class Dispatcher:
             + render_grounding_footnote(ungrounded)
             + render_unreadable_footnote(unreadable)
             + render_absence_footnote(absence_demoted)
+            + render_nearby_footnote(nearby)
         )
         if degraded:
             trailer += render_degraded_note(degraded)
@@ -3118,6 +3172,7 @@ class Dispatcher:
             notes=len(notes),
             held=bool(dropped_finding) or bool(unaccounted),
             confined=len(confined),
+            nearby=len(nearby),
             # Every guard reports what it DECIDED, not only when it acted. A rule that
             # is silent unless it fires cannot be distinguished from a rule that never
             # ran — twice tonight "grounding checked N and downgraded 0" had to be
@@ -3168,6 +3223,47 @@ class Dispatcher:
             shadow=self.shadow,
         )
         return f"reviewed:{verdict}" if posted else f"error:post-failed:{verdict}"
+
+    async def _scope_structural(
+        self,
+        repo: str,
+        pr: int,
+        head: str,
+        findings: list[dict],
+        recorded_kept: list[dict],
+        reported: list[dict],
+        raw: dict,
+    ) -> tuple[list[dict], list[dict], list[dict]]:
+        """(verdict findings, recorded findings, nearby) — structural scoping (#232 ask 7).
+
+        `findings` is the confined, grounded list the verdict will read; `recorded_kept` the
+        recorded objects behind it, position for position (grounding never adds or drops one).
+        A nearby finding leaves the verdict list and is flagged `nearby` in the record, so the
+        prior-round ledger does not carry it as a debt. Reads only when a structural finding is
+        present; any unknown leaves everything as it was."""
+        if not any(str(f.get("source") or "").strip().lower() == STRUCTURAL_SOURCE for f in findings):
+            return findings, reported, []
+        if len(recorded_kept) != len(findings):
+            return findings, reported, []  # lost the record↔verdict pairing — scope nothing
+        ranges = await self._pr_hunk_ranges(repo, pr)
+        if not ranges:
+            return findings, reported, []
+        if not raw:
+            structural = [f for f in findings if str(f.get("source") or "").strip().lower() == STRUCTURAL_SOURCE]
+            raw = await self._finding_sources(repo, pr, head, structural)
+        # The head text when it was READ; an unreadable file is None, and a Python finding on
+        # it keeps gating (its functions cannot be found).
+        sources = {
+            _norm_path(file): (blob if combined is not UNREADABLE and isinstance(blob, str) else None)
+            for file, (blob, combined) in raw.items()
+        }
+        picked = set(nearby_structural(findings, ranges, sources))
+        if not picked:
+            return findings, reported, []
+        nearby = [mark_nearby(findings[i]) for i in sorted(picked)]
+        flagged = {id(recorded_kept[i]): mark_nearby(recorded_kept[i]) for i in picked}
+        reported = [flagged.get(id(f), f) for f in reported]
+        return [f for i, f in enumerate(findings) if i not in picked], reported, nearby
 
     @staticmethod
     def _parse_findings(output: str) -> list[dict]:
