@@ -521,3 +521,96 @@ async def test_an_unknown_feature_record_shape_falls_back_to_ci_since(tmp_path):
 
     await runner(tmp_path, run, {"m1.py": 3}).review(1, "o/r")
     assert calls[-1][1] == "ci"
+
+
+# ── the planned path keeps #236 (scoping) and #240 (lint check) ──────────────────────────────
+
+
+def scoped_git(lines: dict[str, int], hunks: dict[str, tuple[int, int]]):
+    """Numstat / name-only as `make_git`, plus a real-shaped `--unified=0` diff for `_changed_ranges`."""
+    base = make_git(lines)
+
+    async def run_git(args, timeout_s=180):
+        if "--unified=0" in args:
+            out = "".join(f"+++ b/{p}\n@@ -{s},{n} +{s},{n} @@\n" for p, (s, n) in hunks.items())
+            return 0, out, ""
+        return await base(args, timeout_s)
+
+    return run_git
+
+
+def cross_location(fid, untouched, changed_path, changed_line, title=None):
+    return {
+        "title": title or f"{fid}: this change breaks that caller",
+        "category": "correctness",
+        "severity": "high",
+        "confidence": "high",
+        "evidence": [
+            {"path": untouched, "startLine": 90, "quote": "caller()"},
+            {"path": changed_path, "startLine": changed_line, "quote": "changed()"},
+        ],
+        "reasoning": "r",
+        "recommendation": "fix",
+        "status": "open",
+        "signature": fid,
+    }
+
+
+@pytest.mark.parametrize("shape", ["capped", "cut-short"])
+async def test_partial_planned_passes_still_anchor_findings_at_the_changed_lines(tmp_path, shape):
+    """#236: a finding is anchored at the evidence location the PR changed, not its first one. A plan
+    pass that comes back partial (capped, or killed at the budget) goes through the same read."""
+    features = [feature(f"feat_{i}", owned=[f"m{i}.py", "lib/caller.py"]) for i in range(3)]
+    script = [{"timed_out": True, "rc": 124}] if shape == "cut-short" else []
+    claw = FakeClawpatch(features, finish=1 if shape == "cut-short" else None, review_script=script)
+    real_write = FakeClawpatch.__call__
+
+    async def run(args, cwd, env, budget_s):
+        result = await real_write(claw, args, cwd, env, budget_s)
+        if args[1] == "review":  # replace the stock findings with cross-location ones
+            state = Path(args[args.index("--state-dir") + 1]) / "findings"
+            for f in state.glob("*.json"):
+                fid = f.stem
+                f.write_text(json.dumps(cross_location(fid, "lib/caller.py", f"m{fid[-1]}.py", 12)))
+        return result
+
+    lines = {f"m{i}.py": 10 - i for i in range(3)} | {"lib/caller.py": 1}
+    hunks = {f"m{i}.py": (10, 5) for i in range(3)}  # caller.py's change is elsewhere (line 1)
+    hunks["lib/caller.py"] = (1, 1)
+    base = {"checkout_root": str(tmp_path / "co"), "state_root": str(tmp_path / "st"), "default_repo": ""}
+    cfg = {**base, "structural_max_features": 2 if shape == "capped" else 0}
+    out = await ProtoPatchRunner(cfg, run_git=scoped_git(lines, hunks), run_clawpatch=run).review(1, "o/r")
+    assert out.startswith(PARTIAL_PREFIX), out[:200]
+    found = fenced(out)
+    assert found and all(f["file"].startswith("m") and f["line"] == 12 for f in found)  # not lib/caller.py:90
+
+
+async def test_a_capped_planned_pass_still_drops_a_lint_claim_the_pinned_ruff_refutes(tmp_path):
+    """#240: the lint check runs on what a planned pass found, partial or not."""
+    from tests.test_lint_claims_232 import CHECKS_YML, F841_CLAIM, TEST_SRC, FakeTools
+
+    path = "tests/test_fs_missing_root_3643.py"
+    features = [feature("feat_t", owned=[path]), feature("feat_other", owned=["m.py"])]
+    claw = FakeClawpatch(features)
+
+    async def run(args, cwd, env, budget_s):
+        result = await FakeClawpatch.__call__(claw, args, cwd, env, budget_s)
+        if args[-1] == "init":  # the plan step: `clawpatch --state-dir … init`
+            (Path(cwd) / "tests").mkdir(parents=True, exist_ok=True)
+            (Path(cwd) / path).write_text(TEST_SRC)
+            (Path(cwd) / ".github" / "workflows").mkdir(parents=True, exist_ok=True)
+            (Path(cwd) / ".github" / "workflows" / "checks.yml").write_text(CHECKS_YML)
+        if args[1] == "review":
+            rec = finding("feat_t", path) | {"title": F841_CLAIM, "category": "maintainability"}
+            rec["evidence"] = [{"path": path, "startLine": 2, "quote": "cfg, a, b = two_projects"}]
+            (Path(args[args.index("--state-dir") + 1]) / "findings" / "feat_t.json").write_text(json.dumps(rec))
+        return result
+
+    base = {"checkout_root": str(tmp_path / "co"), "state_root": str(tmp_path / "st"), "default_repo": ""}
+    cfg = {**base, "structural_max_features": 1, "lint_tools_dir": str(tmp_path / "tools")}
+    r = ProtoPatchRunner(cfg, run_git=make_git({path: 5, "m.py": 1}), run_clawpatch=run, run_lint=FakeTools([]))
+    out = await r.review(4017, "o/r")
+    assert claw.listed == ["feat_t"]
+    assert out.startswith(PARTIAL_PREFIX) and classify_outage(outage_reason(out)) == "feature-cap"
+    assert fenced(out) == []  # the F841 claim was refuted and dropped, before the relay
+    assert "1 lint claim(s) refuted by the repo's pinned ruff 0.15.10" in out
