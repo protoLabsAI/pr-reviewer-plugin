@@ -41,6 +41,17 @@ The deterministic half of protoAgent's PR-review QA tier
     telemetry row carries `structural_partial: true` (and the usual `structural_reason`). With nothing
     finished it is the outage it always was. The scratch state dir of a partial pass is kept for a
     postmortem like any failed pass.
+  - **Lint-rule claims are checked with the repo's own linter (#232).** A finding whose claim cites a
+    ruff rule code (F841, E501, …) on a `.py`/`.pyi` file is run past the ruff version the repo's
+    `.github/workflows/*.yml` pin (`ruff==X.Y.Z`, `ruff@X.Y.Z`, or ruff-action's `version:`), with
+    `--select <code>` on that file in the checkout. If ruff reports no such diagnostic at (±3 lines
+    of) the cited line, about the name the claim cites, the finding is dropped and the header says
+    so (protoAgent#4017 r1: F841 on a tuple-unpack target, which F841 never flags). Each version is
+    pip-installed once (`--only-binary=:all: --no-deps`, exact digits-and-dots version) into
+    `~/.protoagent/pr-reviewer/tools/ruff/`. Both subprocesses get a token-free environment, ruff
+    runs with `--no-cache`, and the check is bounded by `lint_check_budget_s` (90). No pin, two
+    different pins, no line, a failed install, a ruff error or a timeout leave the finding as it
+    was. `lint_check: false` turns it off.
 - **`structural-finder`** — the subagent seat: calls the tool once, relays the findings
   verbatim, reports the Gap on unavailability. A relay, not a reviewer.
 - **`workflows/code-review-structural.yaml`** — the five-finder panel recipe: the four
