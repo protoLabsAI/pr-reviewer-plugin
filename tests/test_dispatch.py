@@ -1757,13 +1757,138 @@ async def test_a_refuted_structural_finding_is_remembered_for_the_repo_when_the_
     async def runner(name, inputs):
         return {"output": report, "failed": [], "steps": _panel_steps(synthesize=report, verify=report)}
 
-    gh = _structural_gh()
+    gh = _patched_gh(10)  # the PR changed lib.rs at line 10: line 11 is in the change
     d = make(tmp_path, cfg={"state_root": str(tmp_path / "st")}, gh=gh, runner=runner)
-    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "reviewed:PASS"
+    # A report that KEEPS a refuted minor still posts (its verdict is verdict_for's business).
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")).startswith("reviewed:")
     hit = RefutationStore(tmp_path / "st").match(
         "o/r", "packs/necromunda/src/lib.rs", "builtin_world panics via .expect() on TOML parse failure"
     )
     assert hit and hit["pr"] == 1 and "returns Result" in hit["note"]
+
+
+async def test_a_refuted_structural_finding_is_remembered_from_the_verify_step_when_the_report_drops_it(tmp_path):
+    """#238: the real recipe shape. The verifier marks the claim `refuted`; the report, as
+    the recipe tells it to, DROPS refuted rows. The store must still learn the claim — it
+    used to read only the report, so on Vera it never recorded anything."""
+    import json as _json
+
+    from pr_reviewer.refutations import RefutationStore
+
+    claim = "builtin_world panics via .expect() on TOML parse failure"
+    row = {
+        "file": "packs/necromunda/src/lib.rs",
+        "line": 11,
+        "severity": "minor",
+        "category": "bug",
+        "claim": claim,
+        "evidence": "e",
+        "source": "protopatch",
+    }
+    synthesized = f"<!-- brief -->\nOne.\n<!-- /brief -->\n\n```json\n{_json.dumps([row])}\n```"
+    refuted = [{**row, "verdict": "refuted", "note": "the function returns Result and uses ?"}]
+    verify = f"VERIFY_STATUS: annotated n=1\n\n```json\n{_json.dumps(refuted)}\n```"
+    report = "<!-- brief -->\nThe one finding was refuted.\n<!-- /brief -->\n\n```json\n[]\n```"
+
+    async def runner(name, inputs):
+        steps = _panel_steps(synthesize=synthesized, verify=verify, report=report)
+        return {"output": report, "failed": [], "steps": steps}
+
+    d = make(tmp_path, cfg={"state_root": str(tmp_path / "st")}, gh=_patched_gh(10), runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "reviewed:PASS"
+    hit = RefutationStore(tmp_path / "st").match("o/r", "packs/necromunda/src/lib.rs", claim)
+    assert hit and hit["pr"] == 1 and "returns Result" in hit["note"]
+
+
+async def _refuted_structural_round(tmp_path, gh) -> None:
+    """The real recipe shape: verify refutes one protoPatch claim at lib.rs:11, report drops it."""
+    import json as _json
+
+    row = {
+        "file": "packs/necromunda/src/lib.rs",
+        "line": 11,
+        "severity": "minor",
+        "category": "bug",
+        "claim": "builtin_world panics via .expect() on TOML parse failure",
+        "evidence": "e",
+        "source": "protopatch",
+    }
+    refuted = [{**row, "verdict": "refuted", "note": "returns Result"}]
+    verify = f"VERIFY_STATUS: annotated n=1\n\n```json\n{_json.dumps(refuted)}\n```"
+    report = "<!-- brief -->\nRefuted.\n<!-- /brief -->\n\n```json\n[]\n```"
+
+    async def runner(name, inputs):
+        return {"output": report, "failed": [], "steps": _panel_steps(verify=verify, report=report)}
+
+    d = make(tmp_path, cfg={"state_root": str(tmp_path / "st")}, gh=gh, runner=runner)
+    await d.handle_pr_event("o/r", 1, HEAD, "opened")
+
+
+async def test_a_refuted_structural_claim_in_code_the_pr_did_not_change_is_not_remembered(tmp_path):
+    """#232 x #238: a protoPatch claim outside the PR's changed lines is a nearby note. Its
+    refutation usually means "not this PR's", not "false" — remembered, it would be pre-marked
+    away on a later PR that does change that code. Only claims IN the change are learned."""
+    await _refuted_structural_round(tmp_path, _patched_gh(200))  # the PR changed line 200 only
+    assert not list((tmp_path / "st").rglob("refuted.json"))
+
+
+async def test_an_unreadable_pr_diff_remembers_no_structural_refutation(tmp_path):
+    await _refuted_structural_round(tmp_path, _patched_gh(None))  # /files read fails
+    assert not list((tmp_path / "st").rglob("refuted.json"))
+
+
+def test_a_row_flagged_nearby_is_never_remembered_even_on_a_changed_line():
+    from pr_reviewer.refutations import structural_refutations_in_change
+
+    row = {"file": "a.rs", "line": 11, "source": "protopatch", "verdict": "refuted", "claim": "x_y() panics"}
+    ranges = {"a.rs": [(5, 16)]}
+    assert structural_refutations_in_change([row], ranges) == [row]
+    assert structural_refutations_in_change([{**row, "nearby": True}], ranges) == []
+    assert structural_refutations_in_change([row], None) == []
+    assert structural_refutations_in_change([{**row, "line": 0}], ranges) == []
+    assert structural_refutations_in_change([row], {"a.rs": []}) == []
+
+
+class _PatchedGH(RoutedGH):
+    """Serves the PR's own `/files` patches (what `_pr_hunk_ranges` reads); None ⇒ the read fails."""
+
+    def __init__(self, patch_start, **kw):
+        super().__init__(**kw)
+        self.patch_start = patch_start
+
+    async def __call__(self, args, timeout=30):
+        joined = " ".join(args)
+        if "/files" in joined and "filename: .filename, patch: .patch" in joined:
+            if self.patch_start is None:
+                return 1, "", "502"
+            n = self.patch_start
+            return (
+                0,
+                json.dumps({"filename": "packs/necromunda/src/lib.rs", "patch": f"@@ -{n},1 +{n},1 @@\n-a\n+b\n"}),
+                "",
+            )
+        return await super().__call__(args, timeout=timeout)
+
+
+def _patched_gh(patch_start) -> RoutedGH:
+    return _PatchedGH(
+        patch_start,
+        pr_facts=facts(changed_files=6, additions=300, deletions=50),
+        files="packs/necromunda/src/lib.rs\nb\nc\nd\ne\nf\n",
+    )
+
+
+async def test_a_verify_step_that_does_not_parse_records_nothing(tmp_path):
+    """Fail closed (#238): no readable verify array ⇒ nothing remembered, nothing pre-marked later."""
+    report = "<!-- brief -->\nNothing.\n<!-- /brief -->\n\n```json\n[]\n```"
+
+    async def runner(name, inputs):
+        verify = "VERIFY_STATUS: annotated n=1\n\nrefuted: builtin_world panics via .expect() (no array)"
+        return {"output": report, "failed": [], "steps": _panel_steps(verify=verify, report=report)}
+
+    d = make(tmp_path, cfg={"state_root": str(tmp_path / "st")}, gh=_structural_gh(), runner=runner)
+    await d.handle_pr_event("o/r", 1, HEAD, "opened")
+    assert not list((tmp_path / "st").rglob("refuted.json"))
 
 
 def _structural_gh() -> RoutedGH:

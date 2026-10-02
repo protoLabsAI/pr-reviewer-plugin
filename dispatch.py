@@ -68,6 +68,15 @@ from .grounding import (
     render_unreadable_footnote,
 )
 from .protopatch import STRUCTURAL_GAP_MARKERS, classify_outage, is_partial_output, outage_reason
+from .refutations import _norm_path as _norm_ref_path
+from .refutations import (
+    refuted_before_marks,
+    remembered_for,
+    render_refuted_before,
+    render_refuted_before_note,
+    settle_refuted_before,
+    structural_refutations_in_change,
+)
 from .rounds import (
     DEFAULT_CONVERGENCE_ROUNDS,
     MAX_PRIOR_RECHECK,
@@ -1094,9 +1103,11 @@ class Dispatcher:
         _ensure_gateway_retry_handler(_GATEWAY)
         # Refuted structural claims, remembered per repo (#190) — written here when a round
         # posts, read by the structural pass; one constructor so root and TTL cannot drift.
-        from .refutations import RefutationStore
+        from .refutations import LlmRefutationStore, RefutationStore
 
         self.refutations = RefutationStore.from_cfg(self._cfg)  # one constructor: root and TTL cannot drift
+        # …and the LLM lanes' refuted claims (#207), on the same root and TTL.
+        self.llm_refutations = LlmRefutationStore.from_cfg(self._cfg)
         # Boot-time by necessity: the chokepoint owns in-flight/cooldown state, so it
         # cannot be rebuilt per read without dropping the bookkeeping it exists for.
         # On-demand summon surface (issue #28). Off disables the comment commands
@@ -1423,11 +1434,12 @@ class Dispatcher:
         stale next to them: the summon switch, the refutation store (root + TTL) and
         the chokepoint's cooldown are rebuilt from the new config here (review on
         #199, round 1)."""
-        from .refutations import RefutationStore
+        from .refutations import LlmRefutationStore, RefutationStore
 
         self._cfg = cfg or {}
         self._cfg_provider = cfg_provider
         self.refutations = RefutationStore.from_cfg(self._cfg)
+        self.llm_refutations = LlmRefutationStore.from_cfg(self._cfg)
         self.summon_enabled = (
             bool(self.cfg["summon"]) if "summon" in self.cfg else _env_bool("PR_REVIEWER_SUMMON", True)
         )
@@ -1542,6 +1554,17 @@ class Dispatcher:
             bool(cfg["hold_unexplained_clearance"])
             if "hold_unexplained_clearance" in cfg
             else _env_bool("PR_REVIEWER_HOLD_UNEXPLAINED_CLEARANCE", True)
+        )
+
+    @property
+    def llm_refutation_memory(self) -> bool:
+        """Remember LLM-lane claims the verifier refuted and pre-mark a repeat (#207). Off ⇒
+        no block reaches the synthesizer, so every mark that still arrives is rejected."""
+        cfg = self.cfg
+        return (
+            bool(cfg["llm_refutation_memory"])
+            if "llm_refutation_memory" in cfg
+            else _env_bool("PR_REVIEWER_LLM_REFUTATION_MEMORY", True)
         )
 
     @property
@@ -2328,6 +2351,154 @@ class Dispatcher:
             return None
         return delta_ranges(files) if isinstance(files, list) else None
 
+    # ── LLM-lane refutation memory (#207) ───────────────────────────────────────
+
+    async def _refuted_before_input(
+        self, repo: str, head: str, facts: dict, paths
+    ) -> tuple[str, dict[str, list[tuple[int, int]]] | None]:
+        """(the `<refuted_before>` block, the PR's changed ranges) — ("", None) when the memory
+        is off, holds nothing for the files this PR changes, or the diff is unreadable. The
+        compare is only spent when there is something to show; never raises."""
+        try:
+            if not self.llm_refutation_memory:
+                return "", None
+            changed = list(paths or [])
+            changed_files = {_norm_ref_path(p) for p in changed}
+            if not any(_norm_ref_path(e.get("file")) in changed_files for e in self.llm_refutations.entries(repo)):
+                return "", None
+            ranges = await self._delta_ranges(repo, str(facts.get("base_ref") or ""), head)
+            return render_refuted_before(remembered_for(self.llm_refutations, repo, changed, ranges)), ranges
+        except Exception:  # noqa: BLE001 — a memory read must never fail the round
+            log.exception("[pr-reviewer] %s refuted-before input failed", repo)
+            return "", None
+
+    def _settle_refuted_before(
+        self, repo: str, pr: int, head: str, round_number: int, steps: dict, reported: list[dict], ranges
+    ) -> tuple[list[dict], list[dict]]:
+        """Grant or refuse every `refuted-before` mark the panel made (#207) → (reported,
+        relieved). A refused mark leaves its finding live and unverified. Telemetered either
+        way, per lane, so the eval can count the verify rounds the memory saved."""
+        marks = refuted_before_marks(
+            str(steps.get("synthesize") or ""), str(steps.get("verify") or ""), str(steps.get("report") or "")
+        )
+        verified = self._parse_findings(str(steps.get("verify") or "")) if marks else []
+        kept, relieved, rejected = settle_refuted_before(
+            reported, marks, self.llm_refutations, repo, ranges, verified=verified
+        )
+        if relieved or rejected:
+            lanes: dict[str, int] = {}
+            for r in relieved:
+                lanes[r["lane"]] = lanes.get(r["lane"], 0) + 1
+            self.telemetry.emit(
+                "refuted_before",
+                repo=repo,
+                pr=pr,
+                sha=head,
+                round=round_number,
+                count=len(relieved),
+                lanes=lanes,
+                rejected=[
+                    {"file": str(f.get("file") or ""), "line": f.get("line"), "why": f.get("why")} for f in rejected
+                ],
+                findings=[{k: r[k] for k in ("file", "line", "lane", "refuted_before")} for r in relieved],
+            )
+        return kept, relieved
+
+    def _verified_rows(self, steps: dict, reported: list[dict]) -> list[dict]:
+        """The rows a refutation memory learns from: the verify step's annotated array — the
+        only place a `refuted` row survives, because the report is told to drop them (#238) —
+        plus the report's own rows. Fails closed: a verify step that did not parse adds
+        nothing, so a parse miss can only make the memory forget less, never invent."""
+        return [*self._parse_findings(str((steps or {}).get("verify") or "")), *(reported or [])]
+
+    async def _structural_refutations(self, repo: str, pr: int, steps: dict, reported: list[dict]) -> list[dict]:
+        """The refuted `source: protopatch` rows the structural store may learn from (#238):
+        read from the verify step, minus anything scoped `nearby` (#232) or not provably on a
+        line this PR changed. Fails closed — an unreadable diff, or any error, records nothing."""
+        try:
+            rows = [
+                f
+                for f in self._verified_rows(steps, reported)
+                if str(f.get("source") or "").strip().lower() == "protopatch"
+                and str(f.get("verdict") or "").strip().lower() == "refuted"
+            ]
+            if not rows:
+                return []
+            return structural_refutations_in_change(rows, await self._pr_hunk_ranges(repo, pr))
+        except Exception:  # noqa: BLE001 — memory is best-effort; a miss records nothing
+            log.exception("[pr-reviewer] %s#%s structural refutation read failed", repo, pr)
+            return []
+
+    async def _remember_llm_refutations(
+        self, repo: str, pr: int, head: str, steps: dict, reported: list[dict], ours: list[dict] | None
+    ) -> None:
+        """After a round posts: remember the LLM-lane claims its verifier refuted, forget the
+        ones it confirmed, and harvest any of our reviews an operator dismissed (#207). The
+        verify step's array is the source — the report is told to drop refuted rows. Never
+        raises: losing memory must not lose the review."""
+        if not self.llm_refutation_memory:
+            return
+        try:
+            verified = self._verified_rows(steps, reported)
+            remembered, forgotten = self.llm_refutations.observe(repo, verified, pr=pr, head=head)
+            dismissed = await self._harvest_dismissals(repo, pr, ours)
+            if remembered or forgotten or dismissed:
+                self.telemetry.emit(
+                    "llm_refutations",
+                    repo=repo,
+                    pr=pr,
+                    sha=head,
+                    remembered=remembered,
+                    forgotten=forgotten,
+                    dismissed=dismissed,
+                )
+        except Exception:  # noqa: BLE001 — memory is best-effort
+            log.exception("[pr-reviewer] %s#%s LLM refutation memory update failed", repo, pr)
+
+    async def _harvest_dismissals(self, repo: str, pr: int, ours: list[dict] | None) -> int:
+        """Our reviews an OPERATOR dismissed → their LLM findings remembered as refuted. Our
+        own `_dismiss_stale_blocks` dismisses reviews too, so the dismisser is read from the
+        timeline and must not be us; an unreadable timeline harvests nothing this round."""
+        pending = [
+            r
+            for r in ours or []
+            if str(r.get("state") or "").upper() == "DISMISSED"
+            and r.get("id") is not None
+            and not self.llm_refutations.harvested(repo, r["id"])
+        ]
+        if not pending:
+            return 0
+        viewer = await self._viewer_login()
+        if not viewer:
+            return 0
+        rc, out, _err = await self._run_gh(
+            [
+                "api",
+                f"repos/{repo}/issues/{pr}/timeline",
+                "--paginate",
+                "--jq",
+                '.[] | select(.event == "review_dismissed") | {actor: .actor.login, review_id: .dismissed_review.review_id}',
+            ],
+        )
+        rows = gh_json_rows(out) if rc == 0 else None
+        if rows is None:
+            return 0
+        by_review = {str(r.get("review_id")): str(r.get("actor") or "") for r in rows if isinstance(r, dict)}
+        added = 0
+        for review in pending:
+            actor = by_review.get(str(review["id"]))
+            if actor is None:
+                continue  # not on the timeline yet — try again next round
+            findings: list[dict] = []
+            if actor and not is_own_login(actor.lower(), viewer):
+                from .verdicts import read_findings_record
+
+                findings, _recorded = read_findings_record(str(review.get("body") or ""))
+            added += self.llm_refutations.record_dismissal(
+                repo, review["id"], findings, pr=pr, head=str(review.get("head") or "")
+            )
+        return added
+
     async def _checks_state(self, repo: str, sha: str) -> str | None:
         """'green' | 'pending' | 'failed' | None(unreadable). NO check runs at all →
         'no-checks' (terminal by definition, but NEVER green — Quinn's allChecksGreen
@@ -2706,6 +2877,12 @@ class Dispatcher:
         threads_block = await self._existing_threads_block(repo, pr)
         if threads_block:
             inputs["existing_threads"] = threads_block
+        # Claims this repo already refuted (#207), for the synthesizer to mark rather than
+        # the verifier to re-check. `pr_ranges` is what decides, after the run, whether a
+        # mark holds; None (no memory, or an unreadable diff) ⇒ no mark can hold.
+        refuted_block, pr_ranges = await self._refuted_before_input(repo, head, facts, paths)
+        if refuted_block:
+            inputs["refuted_before"] = refuted_block
         # D3 spells the caller's options as "retry or escalate to the operator" — a
         # partial panel still never synthesizes a verdict, we just don't give up on
         # the FIRST failure. Retries re-run the whole recipe (the runner's unit of
@@ -2936,6 +3113,9 @@ class Dispatcher:
         # — see verdicts.py). `reported` is what the panel said this round and what the
         # body records; `findings` is the confined subset the verdict is computed from.
         reported = self._parse_findings(output)
+        reported, refuted_before = self._settle_refuted_before(
+            repo, pr, head, round_number, steps_out, reported, pr_ranges
+        )
         # A re-listing of a prior minor/nit with no verdict and no fresh quote is the panel's
         # memory leaking into its findings, not a finding (issue #204): it is normalized to a
         # carried, `uncertain` row BEFORE grounding and the verified check see it, so the
@@ -3200,6 +3380,7 @@ class Dispatcher:
             + render_unreadable_footnote(unreadable)
             + render_absence_footnote(absence_demoted)
             + render_nearby_footnote(nearby)
+            + render_refuted_before_note(refuted_before)
         )
         if degraded:
             trailer += render_degraded_note(degraded)
@@ -3276,9 +3457,16 @@ class Dispatcher:
         if posted:
             # Structural claims the verifier refuted this round: remembered for the repo, so
             # the next PR touching the file does not spend a verify round on them (#190).
-            remembered = self.refutations.record(repo, reported, pr=pr, head=head)
+            # Read from the VERIFY step (#238): the report is told to drop refuted rows, so
+            # reading `reported` alone remembered nothing, ever.
+            # Only a claim IN the change (#232): a refuted nearby note is usually "not this PR's",
+            # not "false", and must not be pre-marked away on a later PR that does change it.
+            remembered = self.refutations.record(
+                repo, await self._structural_refutations(repo, pr, steps_out, reported), pr=pr, head=head
+            )
             if remembered:
                 log.info("[pr-reviewer] %s#%s remembered %d refuted structural claim(s)", repo, pr, remembered)
+            await self._remember_llm_refutations(repo, pr, head, steps_out, reported, ours)
         self.telemetry.emit(
             "reviewed",
             repo=repo,
