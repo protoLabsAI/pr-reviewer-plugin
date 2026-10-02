@@ -467,12 +467,57 @@ def _disposition_anchor(row: dict) -> tuple[str, int | None]:
     return _norm(str(file or "")), (line if isinstance(line, int) else None)
 
 
+def _proof(
+    prior: dict,
+    ranges: dict[str, list[tuple[int, int]]] | None,
+    since_ranges: dict[str, dict[str, list[tuple[int, int]]] | None] | None,
+) -> dict[str, list[tuple[int, int]]] | None:
+    """The delta a claim about `prior` is checked against: since the head it was RAISED at
+    (`since_ranges[since]`, issue #131), else the prior-round delta. `is None`, not falsy: a
+    READABLE delta with nothing in it proves nothing moved, and must not fall through to the
+    narrower window. None ⇒ unreadable."""
+    proof = (since_ranges or {}).get(str(prior.get("since") or ""))
+    return ranges if proof is None else proof
+
+
+def _line_moved(probe: dict, prior: dict, ranges, since_ranges) -> bool:
+    proof = _proof(prior, ranges, since_ranges)
+    return proof is not None and in_delta(probe, proof)
+
+
+def prior_touched(
+    prior: dict,
+    ranges: dict[str, list[tuple[int, int]]] | None,
+    since_ranges: dict[str, dict[str, list[tuple[int, int]]] | None] | None,
+    *,
+    line_level: bool = True,
+) -> bool | None:
+    """Did the PR change the code `prior` is about since it was raised? None ⇒ the delta was
+    unreadable, which callers treat as "not proven" (fail-closed). `line_level=False` asks
+    about the FILE: a fix rarely lands on the exact line cited — protoAgent#3811's finding
+    cited the function at line 371 and the try/catch landed at 384-395, outside the padded
+    hunk — so a re-verification is worth running when the file moved at all."""
+    proof = _proof(prior, ranges, since_ranges)
+    if proof is None:
+        return None
+    if line_level:
+        return in_delta(prior, proof)
+    return _norm(str(prior.get("file") or "")) in proof
+
+
+def _verifier_confirmed(prior: dict) -> bool:
+    """Did a verifier ever confirm this prior? A carried row is stamped `confirmed` either
+    way, so `raised_unverified` (set by `merge_carried_findings`) is what remembers it."""
+    return str(prior.get("verdict") or "").lower() == "confirmed" and not prior.get("raised_unverified")
+
+
 def unaccounted_priors(
     history: list[dict],
     dispositions: list[dict],
     *,
     ranges: dict[str, list[tuple[int, int]]] | None = None,
     since_ranges: dict[str, dict[str, list[tuple[int, int]]] | None] | None = None,
+    paths: list[str] | None = None,
 ) -> list[dict]:
     """Prior blocker/major findings this round neither reported nor honestly dispositioned.
 
@@ -521,6 +566,18 @@ def unaccounted_priors(
     and `since_ranges[since]` (that head→current head) is what a `fixed` on it is checked
     against. Still fail-closed: a `since` with no readable delta falls back to `ranges`.
 
+    A `refuted` on a CONFIRMED prior is honoured when the flagged line moved since the prior
+    was raised — the same proof a `fixed` needs (#218). On protoAgent#3812 the panel wrote
+    `refuted — the current head places the (#3805) reference inside the bold lead-in` about
+    a line the delta rewrote: a fix, worded as a refutation. #38 still stands for the case it
+    was written for — a refutation of a confirmed finding on code that did NOT move is one
+    model draw against another, and the block holds.
+
+    `paths` (the PR's changed files, when readable) drops a prior on a file the PR no longer
+    changes: confinement would exclude it from any verdict, so it is not debt this PR can
+    pay (#220 — protoContent#565 carried a confined `(repo root)` "no changeset" finding for
+    five rounds after the changeset landed). Empty or None ⇒ no filtering, fail-closed.
+
     Only the LAST substantive round is consulted, same as `unexplained_clearance`.
     """
     if not dispositions:
@@ -553,31 +610,28 @@ def unaccounted_priors(
         if disposition == "open":
             # Still present by the panel's own admission — never clears a blocker/major.
             continue
+        raised = prior_index.get(anchor) or prior_index.get(file)
         if disposition == "refuted":
             # A `refuted` against a *confirmed* prior is treated as `open`: the block stands
-            # until delta-verified `fixed` or operator dismissal (issue #38). Only a prior
-            # finding graded `uncertain` can be cleared by refutation alone.
-            prior_f = prior_index.get(anchor) or prior_index.get(file)
-            if prior_f is None or str(prior_f.get("verdict") or "").lower() != "uncertain":
-                continue  # confirmed (or unknown verdict) → refuted rejected; block held
+            # until delta-verified `fixed` or operator dismissal (issue #38) — unless the
+            # flagged line moved since it was raised, which is a `fixed` by another name (#218).
+            # A prior graded `uncertain` can be cleared by refutation alone.
+            if raised is None:
+                continue  # names no prior we know — accounts for nothing
+            if str(raised.get("verdict") or "").lower() != "uncertain" and not _line_moved(
+                {"file": file, "line": line}, raised, ranges, since_ranges
+            ):
+                continue  # confirmed (or unknown verdict) on code that did not move → block held
         if disposition == "fixed":
             # An unverifiable "fixed" accounts for nothing — the finding stays a debt.
-            raised = prior_index.get(anchor) or prior_index.get(file) or {}
-            # `is None`, not falsy: a READABLE delta with nothing in it proves the line never
-            # moved since it was raised, and must not fall through to the narrower window.
-            proof = (since_ranges or {}).get(str(raised.get("since") or ""))
-            if proof is None:
-                proof = ranges
-            if proof is None:
-                continue
-            probe = {"file": file, "line": line}
-            if not in_delta(probe, proof):
+            if not _line_moved({"file": file, "line": line}, raised or {}, ranges, since_ranges):
                 continue
         accounted.add(anchor)
         accounted.add(file)
 
     if not last_round_findings:
         return []
+    changed = {_norm(p) for p in paths or [] if p and p.strip()}
     missing = []
     for finding in last_round_findings:
         if finding.get("ungrounded"):
@@ -587,6 +641,8 @@ def unaccounted_priors(
             # a structural note on code the PR did not change (#232) — it never gated, so it
             # is no debt either; if a later head touches that code, protoPatch re-raises it
             continue
+        if changed and _norm(str(finding.get("file") or "")) not in changed:
+            continue  # confinement keeps it out of every verdict — not this PR's debt
         severity = str(finding.get("severity") or "").lower()
         if severity not in ("blocker", "major"):
             continue
@@ -671,6 +727,234 @@ def normalize_relisted_priors(findings: list[dict], history: list[dict]) -> tupl
         out.append(normalized)
         relisted.append(normalized)
     return out, relisted
+
+
+_BLOCKING = ("blocker", "major")
+
+# A re-verification of carried priors is one seeded verify step (seconds, not a panel), and
+# bounded: a PR carrying more debt than this re-checks the first few each round.
+MAX_PRIOR_RECHECK = 6
+
+RECHECK_CONFIRMED_NOTE = "re-verified at this head (#220)"
+INHERITED_NOTE = (
+    "re-listed without a fresh verifier ruling on a line unchanged since a verifier confirmed it — "
+    "the earlier confirmation stands (#232)"
+)
+
+
+def carried_debt(round_: dict | None) -> list[dict]:
+    """The prior blocker/major findings a round's RECORD carries as standing debt — rows
+    `merge_carried_findings` re-recorded because the round did not account for them.
+
+    A clear verdict that carries such a row has NOT cleared the head: the defect a verifier
+    confirmed is still on the books. That used to hold promotion only by accident — the
+    carried rows made `verification_ran` read the round as unverified (#220) — so the hold
+    said `hold:unverified` and could never lift without a waiver. It is its own fact now. A
+    synthesizer re-listing (`carried_by: synthesizer`) is the round's OWN finding, judged by
+    the verdict like any other, and is not debt in this sense."""
+    return [
+        f
+        for f in (round_ or {}).get("findings") or []
+        if isinstance(f, dict)
+        and f.get("carried")
+        and f.get("carried_by") != "synthesizer"
+        and str(f.get("severity") or "").lower() in _BLOCKING
+        and str(f.get("verdict") or "").lower() not in ("refuted", "uncertain")
+    ]
+
+
+def relisted_blocking_priors(findings: list[dict], history: list[dict]) -> tuple[list[dict], list[tuple[int, dict]]]:
+    """(findings, [(index, prior)]) — this round's VERDICT-LESS blocker/major rows that re-list
+    a finding of the last substantive round (#232 ask 5).
+
+    The report recipe tells the panel to carry an `open` prior "into your findings array
+    too", and it does — after the verify step, so the row never meets a verifier. On
+    protoAgent#4017 r2 that row read "Carried from round 1; no fix observed in this round's
+    diff" about a line the delta had just rewritten (`cfg, a, b` → `cfg, _, b`), and its
+    verdict-less major FAILed the round. Each such row is returned with the prior it re-lists
+    so the dispatcher can re-verify it against THIS head; the row gets the prior's `since`
+    (its provenance — a fix is provable against the head it was raised at, #131, and the
+    re-listing used to restart that window at every round) and, when it quotes nothing of its
+    own, the prior's `evidence`. Its verdict is left to the re-check (`resolve_relisting`).
+    """
+    from .verdicts import _same_defect  # history layer over the pure mapping
+
+    prior_round = next((r for r in reversed(history or []) if isinstance(r, dict) and r.get("findings")), None)
+    out = [f for f in findings or [] if isinstance(f, dict)]
+    if prior_round is None:
+        return out, []
+    origin = str(prior_round.get("head") or "")
+    # Blocker/major priors only: a minor the panel now calls a major is an escalation, a claim
+    # of its own — not the earlier ruling re-listed, and never one that may inherit it.
+    priors = [
+        p
+        for p in prior_round["findings"]
+        if isinstance(p, dict)
+        and str(p.get("verdict") or "").lower() != "refuted"
+        and str(p.get("severity") or "").lower() in _BLOCKING
+        # a #232 `nearby` note never gated, so a re-listing of it has no ruling to inherit
+        and not p.get("nearby")
+        and not p.get("ungrounded")
+    ]
+    pairs: list[tuple[int, dict]] = []
+    for i, finding in enumerate(out):
+        if str(finding.get("severity") or "").lower() not in _BLOCKING or str(finding.get("verdict") or "").strip():
+            continue
+        anchor = _anchor(finding.get("file"), finding.get("line"))
+        match = next(
+            (p for p in priors if _anchor(p.get("file"), p.get("line")) == anchor or _same_defect(finding, p)),
+            None,
+        )
+        if match is None:
+            continue
+        prior = {**match, "since": str(match.get("since") or origin)}
+        row = {**finding, "since": str(finding.get("since") or prior["since"])}
+        # The prior's quote when the re-listing brought none (protoAgent#4017 r2: `"evidence":
+        # ""`) or only prose — the verifier locates a claim by its quoted code.
+        if prior.get("evidence") and (
+            not str(row.get("evidence") or "").strip() or (not quoted_snippets(row) and quoted_snippets(prior))
+        ):
+            row["evidence"] = prior.get("evidence")
+        out[i] = row
+        pairs.append((i, prior))
+    return out, pairs
+
+
+def needs_recheck(prior: dict, ranges, since_ranges) -> bool:
+    """Could a re-verification of this UNACCOUNTED prior change anything? Only when its
+    refutation could be honoured (`recheck_clears`): the prior was never verifier-confirmed,
+    or its file moved since it was raised. A confirmed prior on untouched code stays debt
+    whatever one more draw says (#38) — so re-checking it would only spend a verify step."""
+    return not _verifier_confirmed(prior) or prior_touched(prior, ranges, since_ranges, line_level=False) is True
+
+
+def recheck_clears(prior: dict, verdict: str, ranges, since_ranges) -> bool:
+    """Does a re-verification's `verdict` at this head clear `prior`? Fail-CLOSED.
+
+    Only `refuted` clears, and only when it is new evidence rather than a re-draw: either no
+    verifier ever confirmed the prior (#220 — protoContent#565 carried two never-verified
+    priors until a waiver), or its file changed since it was raised (#218 — the fix to
+    protoAgent#3811's finding landed thirteen lines from the line it cited). A refutation of
+    a verifier-confirmed finding on code that has not moved does not override it (#38)."""
+    if str(verdict or "").lower() != "refuted":
+        return False
+    return not _verifier_confirmed(prior) or prior_touched(prior, ranges, since_ranges, line_level=False) is True
+
+
+def recheck_payload(finding: dict) -> dict:
+    """What the verifier is handed for one re-check: the claim and its quote, never the
+    earlier ruling — a verifier shown `verdict: confirmed` and a carry note re-reads the
+    ruling, not the code."""
+    return {k: finding[k] for k in ("file", "line", "severity", "category", "claim", "evidence") if k in finding}
+
+
+def align_recheck(candidates: list[dict], annotated: list[dict]) -> list[dict | None]:
+    """The verifier's annotated row for each candidate, or None where it gave none.
+
+    Positional when the verifier returned exactly what it was handed, file for file — the
+    contract ("return the same fenced findings array, annotated"). Otherwise by file and the
+    same claim, or the same defect at a re-anchored line. Anything unmatched is None, which
+    every caller treats as "not re-verified" — never as a ruling."""
+    from .verdicts import _same_defect
+
+    rows = [a for a in annotated or [] if isinstance(a, dict)]
+
+    def _verdict(row: dict | None) -> dict | None:
+        if row is None:
+            return None
+        verdict = str(row.get("verdict") or "").strip().lower()
+        if verdict not in ("confirmed", "refuted", "uncertain"):
+            return None
+        return {"verdict": verdict, "note": str(row.get("note") or "").strip()}
+
+    if len(rows) == len(candidates) and all(
+        _norm(str(a.get("file") or "")) == _norm(str(c.get("file") or "")) for a, c in zip(rows, candidates)
+    ):
+        return [_verdict(a) for a in rows]
+    out: list[dict | None] = []
+    for c in candidates:
+        claim = " ".join(str(c.get("claim") or "").split())
+        match = next(
+            (
+                a
+                for a in rows
+                if _norm(str(a.get("file") or "")) == _norm(str(c.get("file") or ""))
+                and (" ".join(str(a.get("claim") or "").split()) == claim or _same_defect(a, c))
+            ),
+            None,
+        )
+        out.append(_verdict(match))
+    return out
+
+
+def resolve_relisting(row: dict, prior: dict, ruling: dict | None, ranges, since_ranges) -> tuple[str, dict]:
+    """What a verdict-less re-listing of a prior blocker/major becomes (#232 ask 5).
+
+    ("confirmed", row)   the re-check confirmed it at this head — it blocks, verified.
+    ("cleared", row)     the re-check refuted it and `recheck_clears` honours that — it is
+                         dropped from this round; the body names it.
+    ("inherited", row)   no ruling, but the cited line has NOT moved since a verifier
+                         confirmed it — the earlier confirmation still describes this code.
+    ("deferred", prior)  no ruling, and the cited line CHANGED since it was raised: the claim
+                         is about code that is gone, so it may not block this round — but
+                         it is not cleared either. The PRIOR goes back to the carry, which
+                         records it as debt the next round must account for and which holds
+                         promotion (`carried_debt`). Never a laundered finding, never a
+                         blocking verdict nobody verified.
+    ("unverified", row)  no ruling, and nothing to inherit — the round stays unverified,
+                         exactly as before (the verify retry is the backstop).
+    """
+    verdict = (ruling or {}).get("verdict", "")
+    note = (ruling or {}).get("note", "")
+    if verdict == "confirmed":
+        return "confirmed", {
+            **row,
+            "verdict": "confirmed",
+            "note": f"{note} — {RECHECK_CONFIRMED_NOTE}" if note else RECHECK_CONFIRMED_NOTE,
+        }
+    if recheck_clears(prior, verdict, ranges, since_ranges):
+        return "cleared", {**row, "verdict": "refuted", "note": note}
+    moved = prior_touched(prior, ranges, since_ranges, line_level=True)
+    if moved is True:
+        return "deferred", prior
+    if moved is False and _verifier_confirmed(prior):
+        return "inherited", {**row, "verdict": "confirmed", "note": INHERITED_NOTE}
+    return "unverified", row
+
+
+def render_recheck_cleared_note(cleared: list[dict]) -> str:
+    """Names the priors a re-verification at this head refuted (#218/#220)."""
+    if not cleared:
+        return ""
+    lines = "\n".join(
+        f"- `{_anchor(m.get('file'), m.get('line'))}` ({m.get('severity') or '?'}) — "
+        f"{str(m.get('claim') or '')[:200]}"
+        + (f" _(verifier: {str(m.get('recheck_note'))[:200]})_" if m.get("recheck_note") else "")
+        for m in cleared
+    )
+    return (
+        "\n\n---\n**Prior finding(s) cleared by re-verification.** The verifier re-read the code at "
+        "this head and refuted these; each had either never been verified, or its file changed "
+        "since it was raised (#218, #220):\n"
+        f"{lines}\n"
+    )
+
+
+def render_deferred_note(deferred: list[dict]) -> str:
+    """Names the re-listed priors this round could not re-verify on changed code (#232)."""
+    if not deferred:
+        return ""
+    lines = "\n".join(
+        f"- `{_anchor(m.get('file'), m.get('line'))}` ({m.get('severity') or '?'}) — {str(m.get('claim') or '')[:200]}"
+        for m in deferred
+    )
+    return (
+        "\n\n---\n**Re-listed prior finding(s) not re-verified.** The panel re-listed these, but the "
+        "code they cite changed since they were raised and no verifier ruled on them at this head, "
+        "so they do not block this verdict. They are not cleared either: they stay on the record as "
+        "carried debt, and the gate holds until a round fixes, refutes, or re-confirms them (#232):\n"
+        f"{lines}\n"
+    )
 
 
 def render_unaccounted_note(missing: list[dict]) -> str:

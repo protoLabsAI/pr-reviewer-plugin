@@ -46,6 +46,7 @@ from dataclasses import dataclass
 
 from .approve import (
     HOLD_ALREADY_PROMOTED,
+    HOLD_CARRIED_PRIOR,
     HOLD_CHECKS_FAILED,
     HOLD_CHECKS_PENDING,
     HOLD_CHECKS_UNKNOWN,
@@ -166,6 +167,20 @@ def check_for(
             None,
             "Waiting for the panel",
             "No verdict for this head yet.",
+        )
+    if decision == HOLD_CARRIED_PRIOR:
+        # The verdict for this head is clear, but its record still carries a blocker/major an
+        # earlier round confirmed and no round since has fixed, refuted, or re-verified away.
+        # That is a standing defect, not an unknown — so it fails, like a FAIL verdict, and
+        # says what clears it rather than sitting at "Not cleared yet" (#220).
+        return CheckRun(
+            COMPLETED,
+            FAILURE,
+            "Prior blocking finding still open",
+            "The panel's verdict for this head is clear, but a blocker/major an earlier round "
+            "confirmed is still carried on the record — the review body lists it. Push a fix "
+            "(the next round proves it against the delta), or comment `@vera review` if it is "
+            "already fixed: the next round re-verifies carried findings at the new head.",
         )
     if decision == HOLD_STALE_HEAD:
         return CheckRun(

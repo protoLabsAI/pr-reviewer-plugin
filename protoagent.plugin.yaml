@@ -33,6 +33,9 @@ config_section: pr_reviewer
 config:
   default_repo: ""             # repo the tool falls back to when `repo` is omitted (owner/name)
   verify_reruns: 1             # re-run a verifier that contradicted the synthesizer, alone (#167)
+  prior_recheck: true          # re-verify carried / re-listed prior blocker-majors at the new head,
+                               # alone, before re-asserting them (#218, #220, #232). Env fallback:
+                               # PR_REVIEWER_PRIOR_RECHECK.
   finder_timeout_s: 0          # seconds each parallel finder may run (issue #93). 0 = the recipe's
                                # default (900). Calibrate to YOUR model: just above the slow finders'
                                # p95 (telemetry `step_s`). Clamped below the (clamped) panel_attempt_timeout.

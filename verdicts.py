@@ -461,17 +461,43 @@ def merge_carried_findings(findings: list[dict], carried: list[dict]) -> list[di
             continue
         seen.add(key)
         # `since` rides along so the next round can prove a fix against the head this was
-        # raised at, not merely against the round that carried it (issue #131).
-        item = {k: finding.get(k) for k in ("file", "line", "severity", "claim") if finding.get(k) is not None}
+        # raised at, not merely against the round that carried it (issue #131). `evidence`
+        # rides along too (#218): it is the quote the next round's evidence-gone check and a
+        # re-verification read, and a carry that dropped it left later rounds nothing to test.
+        item = {
+            k: finding.get(k) for k in ("file", "line", "severity", "claim", "evidence") if finding.get(k) is not None
+        }
         if finding.get("since"):
             item["since"] = str(finding["since"])
         item.setdefault("severity", "major")
+        # A prior no verifier ever ruled on (a verdict-less re-listing, or one carried from
+        # such a row) is stamped `confirmed` like any carry — an unproven downgrade must not
+        # un-block it — but remembers that it was never verified (#220), so a targeted
+        # re-verification may clear it even on code that has not moved.
+        if finding.get("raised_unverified") or str(finding.get("verdict") or "").strip().lower() not in (
+            "confirmed",
+            "uncertain",
+            POSSIBLY_ADDRESSED,
+        ):
+            item["raised_unverified"] = True
         item["verdict"] = "confirmed"
         item["carried"] = True
-        note = str(finding.get("note") or "").strip()
-        item["note"] = f"{note} — {CARRIED_NOTE}" if note else CARRIED_NOTE
+        item["note"] = _with_carried_note(finding.get("note"))
         additions.append(item)
     return existing + additions
+
+
+def _with_carried_note(note: object) -> str:
+    """`note` with exactly ONE carry suffix. A finding carried round after round used to
+    gain one more "— carried from a prior round …" per round (#218: the same note twice on
+    protoAgent#3811, three times on protoContent#565)."""
+    text = str(note or "").strip()
+    while True:
+        stripped = text.removesuffix(CARRIED_NOTE).rstrip()
+        if stripped == text:
+            break
+        text = stripped.removesuffix("—").rstrip()
+    return f"{text} — {CARRIED_NOTE}" if text else CARRIED_NOTE
 
 
 def demote_stale_findings(findings: list[dict], ranges: dict[str, list[tuple[int, int]]]) -> tuple[list[dict], int]:
@@ -850,6 +876,15 @@ def verification_ran(verify_output: str, findings: list[dict] | None) -> bool:
     unverified, because wrongly trusting an unverified PASS merges a defect behind a
     green badge, while wrongly withholding costs one human glance.
     """
+    # Only what THIS round's verifier was handed. A prior the dispatcher carried forward
+    # (`merge_carried_findings`) or normalized out of a re-listing never reached the verify
+    # step, so it cannot be a finding the verifier missed — yet counting it read "nothing to
+    # verify" over a clean round, or `annotated n=1` beside two carried rows, as a verifier
+    # gap: every round that carried a prior posted `verified=false` and held at
+    # `hold:unverified` for good (#220, protoContent#565). Carried debt holds the gate on
+    # its own terms (`rounds.carried_debt`), not by impersonating a verifier failure. A
+    # carried row WITHOUT a verdict still counts — nothing vouched for it.
+    findings = [f for f in findings or [] if not (f.get("carried") and str(f.get("verdict") or "").strip())]
     if not findings:
         return True  # nothing to verify is not a failure to verify
     if VERIFY_GAP_PREFIX in verify_output or NOTHING_TO_VERIFY in verify_output:

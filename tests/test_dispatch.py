@@ -12,12 +12,19 @@ import pytest
 from pr_reviewer.dispatch import POST_MAX_FAILURES, Dispatcher
 from pr_reviewer.protopatch import PARTIAL_HEADER, STRUCTURAL_GAP_MARKERS
 from pr_reviewer.telemetry import Telemetry
-from pr_reviewer.verdicts import extract_findings_json, parse_verdict_marker, render_verdict_body, verdict_for
+from pr_reviewer.verdicts import (
+    CARRIED_NOTE,
+    extract_findings_json,
+    parse_verdict_marker,
+    render_verdict_body,
+    verdict_for,
+)
 
 from tests.conftest import note_write
 
 HEAD = "a" * 40
 OLD_HEAD = "b" * 40
+NEXT_HEAD = "d" * 40
 
 REPORT = (
     "<!-- brief -->\nBrief prose.\n<!-- /brief -->\n\n```json\n"
@@ -3464,6 +3471,36 @@ async def test_a_fabricated_blocker_is_downgraded_and_cannot_fail(tmp_path):
     assert "Path(str(configured))" in body  # the absent quote is named
 
 
+async def test_a_fabricated_finding_is_flagged_in_the_record_so_it_is_never_carried(tmp_path):
+    # Grounding annotated a COPY, so the posted record kept the fabricated blocker as
+    # `confirmed` with no `ungrounded` flag — and the next round's ledger, which skips
+    # `ungrounded` priors, never saw the flag: an undispositioned fabrication was carried as
+    # debt (`merge_carried_findings` re-stamps it confirmed) and held the head.
+    gh = GroundingGH(source=SRC_WITH_EXPANDUSER, pr_facts=facts(), reviews=[])
+    runner, _seen = capturing_runner(FABRICATED_REPORT)
+    d = make(tmp_path, cfg={"shadow_mode": False}, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "reviewed:WARN"
+    body = gh.reviews_posted[0]["body"]
+    [row] = json.loads(extract_findings_json(body))
+    assert row["ungrounded"] is True and row["verdict"] == "uncertain"
+    # Next round: the panel dispositions nothing about it. It must not come back as debt.
+    gh2 = GroundingGH(
+        source=SRC_WITH_EXPANDUSER,
+        pr_facts=facts(),
+        reviews=[{"state": "COMMENTED", "body": body, "id": 70}],
+    )
+    report = (
+        "prose\n\n```json\n" + json.dumps([{"prior": "x.py:36", "disposition": "open"}]) + "\n```\n\n```json\n[]\n```"
+    )
+    runner2, _ = capturing_runner(report)
+    gh2.pr_facts = facts(head=NEXT_HEAD)
+    d2 = make(tmp_path / "r2", cfg={"shadow_mode": False}, gh=gh2, runner=runner2)
+    assert (await d2.handle_pr_event("o/r", 1, NEXT_HEAD, "synchronize")) == "reviewed:PASS"
+    body2 = gh2.reviews_posted[0]["body"]
+    assert "Unaccounted prior finding" not in body2
+    assert json.loads(extract_findings_json(body2)) == []
+
+
 async def test_a_grounded_blocker_still_fails(tmp_path):
     gh = GroundingGH(source="writable = Path(str(configured))\n", pr_facts=facts(), reviews=[])
     runner, _seen = capturing_runner(FABRICATED_REPORT)
@@ -3748,6 +3785,318 @@ async def test_a_false_disposition_still_holds_via_the_narrow_rule_when_the_bloc
     assert (await d.handle_pr_event("o/r", 1, HEAD, "synchronize")) == "reviewed:PASS"
     assert gh.dismissed == []
     assert "does not lift the standing block" in gh.posted[0]["body"]
+
+
+# ── carried priors: dispositioned, re-verified, never re-asserted unverified ────
+# (#218, #220's refinement, #232 ask 5; the pure layer is tests/test_carried_priors.py)
+
+A2A_FILE = "apps/web/src/lib/api/a2aStream.ts"
+A2A_MAJOR = {
+    "file": A2A_FILE,
+    "line": 371,
+    "severity": "major",
+    "claim": "A single malformed SSE frame kills the entire stream in drainSseBuffer.",
+    "evidence": "drainSseBuffer calls JSON.parse(data) without a try/catch.",
+    "verdict": "confirmed",
+}
+# protoAgent#3811 adf3b10c→a0dab844: the try/catch landed in a hunk starting at 381 —
+# padded to 376–403, which leaves the cited line 371 outside it.
+A2A_FIX = [{"filename": A2A_FILE, "patch": "@@ -381,7 +381,18 @@ export function drainSseBuffer\n ctx\n-old\n+new\n"}]
+_CLEAN_STEPS = {
+    "synthesize": "<!-- brief -->\nNothing raised.\n<!-- /brief -->\n\n```json\n[]\n```",
+    "verify": "VERIFY_STATUS: nothing-to-verify\n\n```json\n[]\n```",
+}
+
+
+def _verify_reply(*rows):
+    return f"VERIFY_STATUS: annotated n={len(rows)}\n\n```json\n" + json.dumps(list(rows)) + "\n```"
+
+
+def recheck_runner(report, reply=None, steps=None):
+    """A seed-capable host (protoAgent#3571): the first call is the panel; a seeded call is the
+    targeted re-check, answered with `reply` as the verify step's output."""
+    calls: list[dict | None] = []
+
+    async def runner(name, inputs, *, seed_outputs=None):
+        calls.append(seed_outputs)
+        if seed_outputs is None:
+            return {"output": report, "steps": {**(steps or _CLEAN_STEPS), "report": report}, "failed": []}
+        return {"output": seed_outputs["report"], "steps": {**seed_outputs, "verify": reply or ""}, "failed": []}
+
+    return runner, calls
+
+
+def _record(body: str) -> list[dict]:
+    return json.loads(extract_findings_json(body))
+
+
+async def test_a_fix_beside_the_cited_line_is_cleared_by_re_verification_not_carried(tmp_path):
+    # #218, protoAgent#3811 @844797f0: the panel said `fixed`, the fix was real, but it landed
+    # 13 lines from the cited line, so the delta could not prove it — and the PASS body re-listed
+    # the major as carried + confirmed, called it "unaccounted", and held the block.
+    gh = RoutedGH(
+        pr_facts=facts(),
+        reviews=[review_row(OLD_HEAD, "FAIL", state="CHANGES_REQUESTED", findings_json=json.dumps([A2A_MAJOR]), id=77)],
+        compare=A2A_FIX,
+        files=f"{A2A_FILE}\n",
+    )
+    report = report_with_dispositions([{"prior": f"{A2A_FILE}:371", "disposition": "fixed", "why": "try/catch added"}])
+    reply = _verify_reply({**A2A_MAJOR, "verdict": "refuted", "note": "JSON.parse is inside a try/catch at 389"})
+    runner, calls = recheck_runner(report, reply)
+    d = make(tmp_path, cfg={"shadow_mode": False, "evidence_grounding": False}, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "synchronize")) == "reviewed:PASS"
+    body = gh.reviews_posted[0]["body"]
+    assert "Unaccounted prior finding" not in body
+    assert "cleared by re-verification" in body and "try/catch at 389" in body
+    assert _record(body) == []  # the prior appears only in Prior requests, never as a carried row
+    assert gh.dismissed  # the standing block lifts
+    marker = parse_verdict_marker(body)
+    assert marker["verified"] is True
+    # One seeded call: only `verify` ran, over the prior restated WITHOUT its earlier ruling.
+    seeded = calls[1]
+    assert len(calls) == 2 and seeded["report"] == report and "verify" not in seeded
+    restated = json.loads(seeded["synthesize"].split("```json\n", 1)[1].rsplit("\n```", 1)[0])
+    assert restated == [{k: v for k, v in A2A_MAJOR.items() if k != "verdict"}]
+    event = _events(tmp_path, "prior_recheck")[-1]
+    assert (event["ran"], event["refuted"], event["cleared"]) == (True, 1, 1)
+
+
+async def test_a_confirmed_prior_on_untouched_code_is_not_re_drawn(tmp_path):
+    # #38 kept: nothing moved in the prior's file, and a verifier confirmed it — a re-check
+    # could only be one draw against another, so none is spent and the block holds.
+    gh = RoutedGH(
+        pr_facts=facts(),
+        reviews=[review_row(OLD_HEAD, "FAIL", state="CHANGES_REQUESTED", findings_json=json.dumps([A2A_MAJOR]), id=77)],
+        compare=[{"filename": "other.ts", "patch": "@@ -1,2 +1,3 @@\n a\n+b\n c\n"}],
+        files=f"{A2A_FILE}\nother.ts\n",
+    )
+    report = report_with_dispositions([{"prior": f"{A2A_FILE}:371", "disposition": "fixed", "why": "resolved"}])
+    runner, calls = recheck_runner(report, _verify_reply({**A2A_MAJOR, "verdict": "refuted"}))
+    d = make(tmp_path, cfg={"shadow_mode": False, "evidence_grounding": False}, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "synchronize")) == "reviewed:PASS"
+    assert len(calls) == 1  # no re-check
+    assert gh.dismissed == []
+    assert "Unaccounted prior finding" in gh.reviews_posted[0]["body"]
+
+
+async def test_a_refutation_on_a_line_the_delta_rewrote_drops_the_carried_row(tmp_path):
+    # #218, protoAgent#3812 @e546ec79: "🚫 refuted — the current head places the (#3805)
+    # reference inside the bold lead-in", on line 1, which the delta rewrote.
+    prior = {"file": "changelog.d/3805.fixed.md", "line": 1, "severity": "major", "claim": "(#3805) outside the bold"}
+    prior["verdict"] = "confirmed"
+    gh = RoutedGH(
+        pr_facts=facts(),
+        reviews=[review_row(OLD_HEAD, "FAIL", state="CHANGES_REQUESTED", findings_json=json.dumps([prior]), id=77)],
+        compare=[{"filename": "changelog.d/3805.fixed.md", "patch": "@@ -1,5 +1,8 @@\n-old\n+new\n"}],
+        files="changelog.d/3805.fixed.md\nserver/chat.py\n",
+    )
+    runner, _seen = capturing_runner(
+        report_with_dispositions(
+            [{"prior": "changelog.d/3805.fixed.md:1", "disposition": "refuted", "why": "now inside the bold"}]
+        )
+    )
+    d = make(tmp_path, cfg={"shadow_mode": False, "evidence_grounding": False}, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "synchronize")) == "reviewed:PASS"
+    body = gh.reviews_posted[0]["body"]
+    assert "Unaccounted prior finding" not in body and _record(body) == []
+    assert gh.dismissed
+
+
+async def test_a_prior_carried_again_keeps_one_carry_note(tmp_path):
+    # #218: protoAgent#3811's second round appended the carry note twice; protoContent#565's
+    # third, three times. The carried set is restated each round, not re-merged into itself.
+    carried = {**A2A_MAJOR, "carried": True, "since": OLD_HEAD, "note": f"re-read at head — {CARRIED_NOTE}"}
+    gh = RoutedGH(
+        pr_facts=facts(),
+        reviews=[
+            review_row(OLD_HEAD, "FAIL", state="CHANGES_REQUESTED", findings_json=json.dumps([A2A_MAJOR]), id=77),
+            review_row(MID_HEAD, "PASS", findings_json=json.dumps([carried]), id=78),
+        ],
+        files=f"{A2A_FILE}\n",
+    )
+    runner, _seen = capturing_runner(
+        report_with_dispositions([{"prior": f"{A2A_FILE}:371", "disposition": "open", "why": "unchanged"}])
+    )
+    d = make(tmp_path, cfg={"shadow_mode": False, "evidence_grounding": False}, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "synchronize")) == "reviewed:PASS"
+    [row] = _record(gh.reviews_posted[0]["body"])
+    assert row["carried"] is True and row["note"].count(CARRIED_NOTE) == 1
+    assert row["since"] == OLD_HEAD and row["evidence"] == A2A_MAJOR["evidence"]
+
+
+async def test_a_round_carrying_a_prior_is_verified_and_holds_on_the_debt_itself(tmp_path):
+    # #220's refinement, protoContent#565 r6: PASS, zero findings, the verifier said
+    # nothing-to-verify, and two carried priors made the round read as unverified — so
+    # promotion held `hold:unverified` forever. The round IS verified; the debt holds on its own.
+    gh = RoutedGH(
+        pr_facts=facts(),
+        reviews=[review_row(OLD_HEAD, "FAIL", state="CHANGES_REQUESTED", findings_json=json.dumps([A2A_MAJOR]), id=77)],
+        files=f"{A2A_FILE}\n",
+    )
+
+    async def runner(name, inputs):  # a host that cannot seed — no re-check is possible
+        report = report_with_dispositions([{"prior": f"{A2A_FILE}:371", "disposition": "open", "why": "still"}])
+        return {"output": report, "steps": dict(_CLEAN_STEPS), "failed": []}
+
+    d = make(tmp_path, cfg={"shadow_mode": False, "evidence_grounding": False}, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "synchronize")) == "reviewed:PASS"
+    body = gh.reviews_posted[0]["body"]
+    assert "verified=false" not in body.splitlines()[0]
+    assert [r["carried"] for r in _record(body)] == [True]
+    assert gh.dismissed == []  # the standing block stays up
+    # The promotion gate reads the posted round and holds on the carried debt, by name.
+    green = [{"status": "completed", "conclusion": "success"}]
+    gate = RoutedGH(
+        pr_facts=facts(),
+        reviews=[
+            review_row(OLD_HEAD, "FAIL", state="CHANGES_REQUESTED", findings_json=json.dumps([A2A_MAJOR]), id=77),
+            {"state": "COMMENTED", "body": body, "id": 78},
+        ],
+        checks=green,
+    )
+    d2 = make(tmp_path / "gate", cfg={"shadow_mode": False, "promotion_owner": True}, gh=gate)
+    assert (await d2.evaluate_promotion("o/r", 1)) == "hold:carried-prior"
+    assert gate.reviews_posted == []
+
+
+async def test_a_never_verified_prior_is_cleared_by_a_targeted_re_check(tmp_path):
+    # #220's refinement: FALSE priors carried from an unverified round (verdict-less in its
+    # record) were never dispositioned honestly, and nothing could clear them. A re-check at
+    # the new head can — even though their file did not move, because nothing ever verified them.
+    unverified = {k: v for k, v in A2A_MAJOR.items() if k != "verdict"}
+    gh = RoutedGH(
+        pr_facts=facts(),
+        reviews=[
+            review_row(OLD_HEAD, "FAIL", state="CHANGES_REQUESTED", findings_json=json.dumps([unverified]), id=77)
+        ],
+        compare=[{"filename": "other.ts", "patch": "@@ -1,2 +1,3 @@\n a\n+b\n c\n"}],
+        files=f"{A2A_FILE}\nother.ts\n",
+    )
+    report = report_with_dispositions([{"prior": f"{A2A_FILE}:371", "disposition": "open", "why": "not sure"}])
+    runner, calls = recheck_runner(report, _verify_reply({**unverified, "verdict": "refuted", "note": "guarded"}))
+    d = make(tmp_path, cfg={"shadow_mode": False, "evidence_grounding": False}, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "synchronize")) == "reviewed:PASS"
+    body = gh.reviews_posted[0]["body"]
+    assert len(calls) == 2 and _record(body) == [] and "cleared by re-verification" in body
+    assert gh.dismissed
+
+
+F841_FILE = "tests/test_fs_missing_root_3643.py"
+F841_MAJOR = {
+    "file": F841_FILE,
+    "line": 64,
+    "severity": "major",
+    "claim": "The `a` variable unpacked from `two_projects` is assigned but never used, an F841.",
+    "evidence": "cfg, a, b = two_projects",
+    "verdict": "confirmed",
+}
+# protoAgent#4017 r2: the report re-listed round 1's finding with no verdict and no quote…
+F841_RELISTED = {k: v for k, v in F841_MAJOR.items() if k != "verdict"} | {"evidence": ""}
+# …on a head whose delta renamed exactly that line (`cfg, a, b` → `cfg, _, b`).
+F841_RENAME = [{"filename": F841_FILE, "patch": "@@ -64,1 +64,1 @@\n-    cfg, a, b = two_projects\n+    cfg, _, b\n"}]
+
+
+def _f841_gh(compare=F841_RENAME):
+    return RoutedGH(
+        pr_facts=facts(),
+        reviews=[
+            review_row(OLD_HEAD, "FAIL", state="CHANGES_REQUESTED", findings_json=json.dumps([F841_MAJOR]), id=77)
+        ],
+        compare=compare,
+        files=f"{F841_FILE}\ntools/fs_tools.py\n",
+    )
+
+
+_F841_REPORT = report_with_dispositions(
+    [{"prior": f"{F841_FILE}:64", "disposition": "open", "why": "no fix observed in this round's diff"}],
+    json.dumps([F841_RELISTED]),
+)
+
+
+async def test_a_re_listed_prior_on_a_rewritten_line_never_fails_the_round_unverified(tmp_path):
+    # #232 ask 5, protoAgent#4017 r2: FAIL (verified=false) on "Carried from round 1; no fix
+    # observed" — about a line the delta had just changed. With no re-check possible, it may
+    # not block; it is not cleared either: it rides as carried debt, and the block holds.
+    async def runner(name, inputs):  # cannot seed
+        return {"output": _F841_REPORT, "steps": dict(_CLEAN_STEPS), "failed": []}
+
+    gh = _f841_gh()
+    d = make(tmp_path, cfg={"shadow_mode": False, "evidence_grounding": False}, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "synchronize")) == "reviewed:PASS"
+    body = gh.reviews_posted[0]["body"]
+    assert "not re-verified" in body
+    [row] = _record(body)
+    assert row["carried"] is True and row["verdict"] == "confirmed" and "carried_by" not in row
+    assert row["since"] == OLD_HEAD
+    assert "verified=false" not in body.splitlines()[0]
+    assert gh.dismissed == []  # not cleared: the earlier block stands
+
+
+async def test_a_re_listed_prior_the_re_check_refutes_is_dropped(tmp_path):
+    reply = _verify_reply({**F841_RELISTED, "verdict": "refuted", "note": "the variable is `_`"})
+    runner, calls = recheck_runner(_F841_REPORT, reply)
+    gh = _f841_gh()
+    d = make(tmp_path, cfg={"shadow_mode": False, "evidence_grounding": False}, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "synchronize")) == "reviewed:PASS"
+    body = gh.reviews_posted[0]["body"]
+    assert _record(body) == [] and "cleared by re-verification" in body and "the variable is `_`" in body
+    # The re-listing inherited the prior's quote, so the verifier had code to look for.
+    restated = json.loads(calls[1]["synthesize"].split("```json\n", 1)[1].rsplit("\n```", 1)[0])
+    assert restated[0]["evidence"] == F841_MAJOR["evidence"]
+    assert gh.dismissed
+
+
+async def test_a_re_listed_prior_the_re_check_confirms_fails_verified(tmp_path):
+    reply = _verify_reply({**F841_RELISTED, "verdict": "confirmed", "note": "`a` is still unused at line 70"})
+    runner, _calls = recheck_runner(_F841_REPORT, reply)
+    gh = _f841_gh()
+    d = make(tmp_path, cfg={"shadow_mode": False, "evidence_grounding": False}, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "synchronize")) == "reviewed:FAIL"
+    body = gh.reviews_posted[0]["body"]
+    assert "verified=false" not in body.splitlines()[0]
+    [row] = _record(body)
+    assert row["verdict"] == "confirmed" and row["carried_by"] == "synthesizer" and row["since"] == OLD_HEAD
+
+
+async def test_a_re_listed_prior_on_an_unchanged_line_keeps_its_confirmation(tmp_path):
+    # The cited line did not move since a verifier confirmed it: the panel re-listing it is
+    # that same confirmed defect — a FAIL, and a verified one, re-check or not.
+    async def runner(name, inputs):  # cannot seed
+        return {"output": _F841_REPORT, "steps": dict(_CLEAN_STEPS), "failed": []}
+
+    gh = _f841_gh(compare=[{"filename": "tools/fs_tools.py", "patch": "@@ -10,1 +10,2 @@\n a\n+b\n"}])
+    d = make(tmp_path, cfg={"shadow_mode": False, "evidence_grounding": False}, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "synchronize")) == "reviewed:FAIL"
+    body = gh.reviews_posted[0]["body"]
+    assert "verified=false" not in body.splitlines()[0]
+    assert _record(body)[0]["verdict"] == "confirmed"
+
+
+async def test_a_prior_recheck_can_be_switched_off(tmp_path):
+    runner, calls = recheck_runner(_F841_REPORT, _verify_reply({**F841_RELISTED, "verdict": "refuted"}))
+    gh = _f841_gh()
+    cfg = {"shadow_mode": False, "evidence_grounding": False, "prior_recheck": False}
+    d = make(tmp_path, cfg=cfg, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "synchronize")) == "reviewed:PASS"  # deferred, not cleared
+    assert len(calls) == 1 and "not re-verified" in gh.reviews_posted[0]["body"]
+    assert _events(tmp_path, "prior_recheck")[-1]["reason"] == "disabled"
+
+
+def test_a_round_carrying_debt_is_not_reaffirmed_onto_a_rebased_head(tmp_path):
+    # A rebase with a byte-identical diff would re-post the debt unexamined; a fresh round
+    # re-verifies it at the new head instead.
+    d = make(tmp_path)
+    prior = {
+        "head": OLD_HEAD,
+        "verdict": "PASS",
+        "diff_id": "same",
+        "findings": [{**A2A_MAJOR, "carried": True}],
+        "complete": True,
+        "verified": True,
+    }
+    assert d._reaffirm_by_diff("o/r", 1, HEAD, prior, "same") is None
+    assert _events(tmp_path, "reaffirm-miss")[-1]["reason"] == "prior-carried-debt"
+    assert d._reaffirm_by_diff("o/r", 1, HEAD, {**prior, "findings": []}, "same") == "reaffirmed:PASS"
 
 
 # ── a promoted WARN carries its findings (issue #22) ─────────────────────────
