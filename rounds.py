@@ -792,6 +792,9 @@ def relisted_blocking_priors(findings: list[dict], history: list[dict]) -> tuple
         if isinstance(p, dict)
         and str(p.get("verdict") or "").lower() != "refuted"
         and str(p.get("severity") or "").lower() in _BLOCKING
+        # a #232 `nearby` note never gated, so a re-listing of it has no ruling to inherit
+        and not p.get("nearby")
+        and not p.get("ungrounded")
     ]
     pairs: list[tuple[int, dict]] = []
     for i, finding in enumerate(out):

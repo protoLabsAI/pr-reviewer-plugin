@@ -243,3 +243,9 @@ def test_an_escalated_minor_is_not_a_relisting_of_it():
     minor = {**F841, "severity": "minor"}
     _f, pairs = relisted_blocking_priors([F841_RELISTED], _history(minor))
     assert pairs == []
+
+
+def test_a_nearby_or_ungrounded_prior_is_not_a_ruling_to_inherit():
+    for flag in ("nearby", "ungrounded"):
+        _f, pairs = relisted_blocking_priors([F841_RELISTED], _history({**F841, flag: True}))
+        assert pairs == []
