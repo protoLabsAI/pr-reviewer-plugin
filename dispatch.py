@@ -3669,6 +3669,46 @@ class Dispatcher:
             )
         if self.promotion_owner:
             await self._publish_qa_check(repo, head, check_for(HOLD_NO_CLEAR_VERDICT, verdict=FAIL))
+            await self._disarm_auto_merge(repo, pr, head)
+
+    async def _auto_merge_enabled(self, repo: str, pr: int) -> bool | None:
+        """Is GitHub auto-merge enabled on the PR? None = could not read."""
+        rc, out, _err = await self._run_gh(["api", f"repos/{repo}/pulls/{pr}", "--jq", ".auto_merge != null"])
+        answer = out.strip().lower() if rc == 0 else ""
+        return {"true": True, "false": False}.get(answer)
+
+    async def _disarm_auto_merge(self, repo: str, pr: int, head: str) -> None:
+        """A FAIL landed: turn off GitHub auto-merge on the PR (issue #235).
+
+        Approve-on-green arms native auto-merge when it promotes onto `main`. Withdrawing the
+        approval and failing `QA panel` (`_retract_promotion`) stops the merge only where
+        `QA panel` is a REQUIRED check; elsewhere the armed auto-merge lands the PR the
+        moment the remaining requirements go green — over a standing FAIL. Disarmed whoever
+        armed it: a FAIL on the head is a reason for any pending auto-merge to stop, and a
+        human can re-arm it deliberately.
+
+        Unknown state fails closed (we try to disarm). Degrades, never raises: a refusal is
+        logged, telemetered and escalated — an armed auto-merge over a FAIL is exactly the
+        merge this gate exists to stop, so it must not fail quietly.
+        """
+        enabled = await self._auto_merge_enabled(repo, pr)
+        if enabled is False:
+            return
+        rc, _out, err = await self._run_gh(["pr", "merge", str(pr), "--repo", repo, "--disable-auto"], timeout=30)
+        self.telemetry.emit(
+            "auto_merge_disabled", repo=repo, pr=pr, sha=head, ok=rc == 0, known_enabled=enabled is True
+        )
+        if rc == 0:
+            return
+        log.warning("[pr-reviewer] disabling auto-merge on %s#%s after a FAIL failed: %s", repo, pr, err[-300:])
+        if enabled is None and "not enabled" in err.lower():
+            return  # we could not read the state, and GitHub says there was nothing to disarm
+        await self._escalate(
+            f"pr-reviewer: a FAIL verdict posted on {repo}#{pr} @{head[:7]} but disabling its GitHub "
+            f"auto-merge was refused — the PR may still merge over the FAIL. Disable it by hand. "
+            f"Last error: {err[-200:]}",
+            dedup_key=f"pr-reviewer-disarm-auto-merge:{repo}#{pr}@{head}"[:96],
+        )
 
     # ── re-gate: arm a block the CI clock beat us to (issue #16) ──────────────
 
