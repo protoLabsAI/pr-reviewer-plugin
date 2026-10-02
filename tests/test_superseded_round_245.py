@@ -200,3 +200,87 @@ async def test_a_backfill_round_frees_both_its_chokepoint_and_queue_slots(tmp_pa
     assert outcome == "reviewed:FAIL" and runner.heads == [OLD, NEW]
     assert not d.chokepoint._in_flight
     assert queue._active == [] and queue._pending == [] and not queue.locked()
+
+
+# ── review on #246: the attempt's runner task never outlives the round ───────────
+
+
+class SlowToStopRunner:
+    """A runner whose cancellation takes a moment to finish — a host closing streams on its
+    way out — and that records whether it ever got there."""
+
+    def __init__(self):
+        self.task: asyncio.Task | None = None
+        self.stopped = False
+
+    async def __call__(self, name, inputs, on_step=None):
+        self.task = asyncio.current_task()
+        try:
+            await asyncio.Event().wait()  # hangs until cancelled
+        except asyncio.CancelledError:
+            await asyncio.sleep(0.05)  # cleanup that still uses the lane
+            self.stopped = True
+            raise
+        return {"output": REPORT, "failed": []}
+
+
+async def test_a_timed_out_round_leaves_no_pending_runner_task(tmp_path):
+    runner = SlowToStopRunner()
+    d = make(tmp_path, cfg={"round_timeout": 0.2}, gh=MovableGH(), runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, OLD, "opened")) == "drop:round-timeout"
+    # The round is over, so its runner must be too: cancelled AND awaited, not left to
+    # finish (or never finish) on its own in the background.
+    assert runner.task is not None and runner.task.done()
+    assert runner.stopped
+    assert not d.chokepoint._in_flight
+
+
+async def test_a_timed_out_attempt_leaves_no_pending_runner_task(tmp_path):
+    runners: list[SlowToStopRunner] = []
+
+    async def runner(name, inputs, on_step=None):
+        r = SlowToStopRunner()
+        runners.append(r)
+        return await r(name, inputs, on_step=on_step)
+
+    d = make(tmp_path, cfg={"panel_attempt_timeout": 0.1, "panel_retries": 1}, gh=MovableGH(), runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, OLD, "opened")) == "error:run-timed-out"
+    assert len(runners) == 2 and all(r.task.done() and r.stopped for r in runners)
+
+
+async def test_settle_cancels_and_waits_for_a_runner_still_going():
+    from pr_reviewer.dispatch import _settle_attempt
+
+    runner = SlowToStopRunner()
+    task = asyncio.ensure_future(runner("r", {}))
+    await asyncio.sleep(0)
+    await _settle_attempt(task)
+    assert task.done() and runner.stopped
+
+
+async def test_settle_never_swallows_the_rounds_own_cancel():
+    from pr_reviewer.dispatch import _settle_attempt
+
+    stubborn_release = asyncio.Event()
+
+    async def stubborn():
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await stubborn_release.wait()  # takes its time stopping
+
+    inner = asyncio.ensure_future(stubborn())
+    await asyncio.sleep(0)
+    outer = asyncio.ensure_future(_settle_attempt(inner))
+    await asyncio.sleep(0.01)
+    outer.cancel()  # the round is cancelled while it waits for the runner
+    await asyncio.sleep(0)
+    assert outer.cancelled() or outer.cancelling()
+    stubborn_release.set()
+    try:
+        await outer
+    except asyncio.CancelledError:
+        pass
+    else:
+        raise AssertionError("the round's cancel was swallowed")
+    await inner

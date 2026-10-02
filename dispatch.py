@@ -643,6 +643,27 @@ class _Running:
         self.ran = False
 
 
+async def _settle_attempt(task: asyncio.Task) -> None:
+    """Make sure a panel attempt's runner task has ENDED before the round moves on (#246).
+
+    asyncio already forwards a cancel of the awaiting round (attempt timeout, round
+    timeout, shutdown) to the task it is awaiting, and the round only wakes once that task
+    has finished. So on every path the dispatcher has today, this finds the task done and
+    does nothing. It exists so that a path added later, one that leaves the `await`
+    without the task finishing, cancels the runner and waits for it rather than leaving it
+    running in the background on the model lane.
+
+    `asyncio.wait`, not `await task` under `suppress(CancelledError)`: if the ROUND is
+    cancelled again while it waits here, that suppress would swallow the round's own
+    cancel. `wait` lets that propagate and never raises the task's result."""
+    if task.done():
+        return
+    task.cancel()
+    await asyncio.wait({task})
+    if not task.cancelled():
+        task.exception()  # retrieved, so a swallowed-cancel failure is not logged as lost
+
+
 class _RoundWatch:
     """One running panel round's supersede watch (issue #245).
 
@@ -3029,7 +3050,10 @@ class Dispatcher:
                     # A task, so a supersede check can cancel THIS attempt without
                     # cancelling the round around it (#245).
                     watch.task = asyncio.ensure_future(runner(recipe, inputs, **step_kwargs))
-                    result = await watch.task
+                    try:
+                        result = await watch.task
+                    finally:
+                        await _settle_attempt(watch.task)
             except asyncio.CancelledError:
                 current = asyncio.current_task()
                 if watch.superseded_by is None or (current is not None and current.cancelling()):
