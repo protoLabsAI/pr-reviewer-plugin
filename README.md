@@ -11,8 +11,26 @@ The deterministic half of protoAgent's PR-review QA tier
   - Head/base SHAs resolved **server-side** from the PR (never model-supplied refs).
   - A content-addressed checkout cache: blobless partial clones (`--filter=blob:none`)
     keyed on `repo@headSha`, 1h TTL, LRU `prune()` under entry/byte caps.
-  - `clawpatch ci --provider gateway --json --state-dir <per-review> --since <baseSha> --jobs <n>`
-    under a hard wall-clock budget (default 300s, SIGKILL past it).
+  - `clawpatch init` + `map` into a per-review state dir, then `clawpatch review --provider gateway
+    --json --state-dir <per-review> --feature-list <plan> --jobs <n>` under a hard wall-clock budget
+    (SIGKILL past it). `structural_plan: false` restores the old single
+    `clawpatch ci … --since <baseSha>` run (the rollback switch; also the fallback when `map` fails).
+  - **The plugin plans the features (#232).** `ci --since` reviews every feature that owns a changed
+    file *or lists one as context*, and clawpatch's Python mapper lists `pyproject.toml` as context of
+    every Python feature: a one-line version bump on protoAgent planned 276 of 361 features and could
+    not finish at any budget. Now a lockfile, generated file, changelog fragment or dependency
+    manifest (`uv.lock`, `package-lock.json`, `pnpm-lock.yaml`, `THIRD_PARTY_LICENSES.md`,
+    `changelog.d/`, `pyproject.toml`, `package.json`, `Cargo.toml`, `requirements*.txt`, …) never
+    pulls a feature in as context (its findings are confined to the diff anyway); the remaining
+    features are ranked by changed lines in files they own, then in their context files, and at most
+    `structural_max_features` (default 16; `0` = no cap) are reviewed. **Features the cap leaves out
+    are a coverage gap**, never a silent drop: the pass comes back partial (`N of M features
+    reviewed — feature cap reached …`, `structural_reason: feature-cap`), the round is incomplete and
+    the verdict capped at WARN. Every pass writes a `structural_plan` telemetry event: features
+    mapped / eligible / selected / dropped / out of scope, and per planned feature its owned and
+    context changed lines, file count, prompt size, `elapsed_s` and how it ended (`finished`,
+    `error`, `killed` = in flight at the kill, `not-started`), so an over-planned pass can be told
+    from a hang without the container log.
   - **Concurrency is capped (#221).** `structural_jobs` (default 4) is clawpatch's `--jobs`. Left
     alone clawpatch reviews about half the host's cores of features at once (max 10) — each a
     50-115k-token prompt — so one big PR floods the model lane's KV cache and everything on it

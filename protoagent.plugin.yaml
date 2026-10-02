@@ -106,6 +106,11 @@ config:
                                # untouched by 4. A pass takes ceil(features/jobs) waves, so if you LOWER this
                                # also raise time_budget_s (the wall clock is fixed). 0 = clawpatch's own
                                # default (no --jobs): the rollback switch. Clamped to 10.
+  structural_max_features: 16  # features reviewed per structural pass (#232), ranked by changed lines. Features
+                               # the cap leaves out make the pass PARTIAL (a coverage gap, WARN cap), never a
+                               # silent drop. Lockfiles / generated files / dependency manifests never pull a
+                               # feature in as context. 0 = no cap.
+  structural_plan: true        # false = let `clawpatch ci --since` pick the features (pre-#232; the rollback)
   model: ""                    # clawpatch --model override; "" = its default (protolabs/smart)
   gateway_base_url: ""         # exported as OPENAI_BASE_URL to clawpatch; "" = its default
   checkout_root: ""            # "" = ~/.protoagent/pr-reviewer/checkouts
@@ -136,6 +141,8 @@ settings:
   - {key: viewer_login, label: "Our own login (required on App auth, e.g. myapp[bot])", type: string}
   - {key: time_budget_s, label: "protoPatch time budget (seconds)", type: int}
   - {key: structural_jobs, label: "protoPatch concurrent feature reviews (0 = engine default)", type: int}
+  - {key: structural_max_features, label: "protoPatch features per pass (0 = no cap)", type: int}
+  - {key: structural_plan, label: "protoPatch: plugin plans the features (off = clawpatch --since)", type: bool}
   - {key: model, label: "protoPatch model override", type: string}
 
 # The webhook page-load can't carry a bearer — the HMAC inside the handler is the

@@ -1924,6 +1924,38 @@ async def test_a_partial_lanes_coverage_and_reason_reach_the_banner(tmp_path):
     assert row["structural_reason"] == "budget-timeout"  # the coverage lead did not hide the class
 
 
+@pytest.mark.parametrize("relay", ["echoes the tool's text", "states the Gap line", "echoes only the run header"])
+async def test_a_capped_structural_pass_is_a_gap_even_when_every_planned_feature_finished(tmp_path, relay):
+    """#232: the plan reviews at most `structural_max_features`. clawpatch exits 0 — nothing failed —
+    but features the diff touches went unreviewed, so the round must not read as a complete pass."""
+    from pr_reviewer.protopatch import partial_result
+
+    coverage = "16 of 40 features reviewed"
+    reason = "feature cap reached: the 16 features with the most changed lines were reviewed, 24 were not"
+    header = f"{PARTIAL_HEADER} o/r#1 — head {HEAD[:12]}, base bbbbbbbbbbbb, 700s, 1 reportable finding(s)"
+    array = f"```json\n{json.dumps([_PARTIAL_FINDING])}\n```"
+    text = {
+        "echoes the tool's text": partial_result(coverage, reason, header, [_PARTIAL_FINDING]),
+        "states the Gap line": f"Gap: structural pass partial — {coverage} — {reason}\n\n{array}",
+        "echoes only the run header": f"{header}\n\n{array}",
+    }[relay]
+    gh = _structural_gh()
+    lane = _lane("find_structural", text)
+
+    async def runner(name, inputs):
+        return {"output": CLEAN_REPORT, "failed": [], "steps": _panel_steps(find_structural=lane)}
+
+    d = make(tmp_path, cfg={"shadow_mode": False}, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "reviewed:WARN"
+    body = gh.reviews_posted[0]["body"]
+    assert "complete=false" in body and "came back clean" not in body
+    (row,) = _telemetry_events(tmp_path, "reviewed")
+    assert row["complete"] is False and row["structural_partial"] is True
+    if relay != "echoes only the run header":  # the header carries detection, not a reason
+        assert coverage in body
+        assert row["structural_reason"] == "feature-cap"
+
+
 async def test_a_complete_structural_lane_is_not_marked_partial(tmp_path):
     gh = _structural_gh()
 

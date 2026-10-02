@@ -69,7 +69,14 @@ def state_of(args) -> Path:
 
 
 def runner(tmp_path, run_clawpatch):
-    cfg = {"checkout_root": str(tmp_path / "co"), "state_root": str(tmp_path / "st"), "default_repo": ""}
+    # These pin the `clawpatch ci --since` path (`structural_plan: false`, the rollback switch); the
+    # plugin-planned path (#232) reuses the same retry/salvage code and is pinned in test_protopatch_feature_plan_232.py.
+    cfg = {
+        "checkout_root": str(tmp_path / "co"),
+        "state_root": str(tmp_path / "st"),
+        "default_repo": "",
+        "structural_plan": False,
+    }
     return ProtoPatchRunner(cfg, run_git=make_git(), run_clawpatch=run_clawpatch)
 
 
