@@ -429,6 +429,24 @@ def _touched(finding: dict, ranges: dict[str, list[tuple[int, int]]]) -> bool:
     return any(a - TOUCH_LINES <= line <= b + TOUCH_LINES for a, b in spans)
 
 
+def structural_refutations_in_change(rows: list[dict], ranges: dict[str, list[tuple[int, int]]] | None) -> list[dict]:
+    """The refuted structural rows worth remembering (#238): only ones on a line this PR
+    changed (`ranges` = the PR's context-padded hunks). A row flagged `nearby` (#232), with no
+    line, on a file with unknown hunks, or any row when `ranges` is unreadable, is dropped —
+    remembering it could later hide a claim, so every unknown records nothing."""
+    if not ranges:
+        return []
+    out = []
+    for f in rows or []:
+        if not isinstance(f, dict) or f.get("nearby"):
+            continue
+        spans = ranges.get(_norm_path(str(f.get("file") or "")))
+        line = _line(f)
+        if spans and line and any(a <= line <= b for a, b in spans):
+            out.append(f)
+    return out
+
+
 def premark_check(
     finding: dict, store: LlmRefutationStore, repo: str, ranges: dict[str, list[tuple[int, int]]] | None
 ) -> tuple[dict | None, str]:
@@ -436,6 +454,8 @@ def premark_check(
     (None, why not). Every edge fails closed."""
     if not is_llm_finding(finding):
         return None, "not an LLM-lane finding"
+    if finding.get("nearby"):
+        return None, "a nearby note is never pre-marked"
     if str(finding.get("severity") or "").strip().lower() == "blocker":
         return None, "a blocker is never pre-marked"
     if _line(finding) <= 0:

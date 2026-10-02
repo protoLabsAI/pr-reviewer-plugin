@@ -75,6 +75,7 @@ from .refutations import (
     render_refuted_before,
     render_refuted_before_note,
     settle_refuted_before,
+    structural_refutations_in_change,
 )
 from .rounds import (
     DEFAULT_CONVERGENCE_ROUNDS,
@@ -2410,6 +2411,24 @@ class Dispatcher:
         nothing, so a parse miss can only make the memory forget less, never invent."""
         return [*self._parse_findings(str((steps or {}).get("verify") or "")), *(reported or [])]
 
+    async def _structural_refutations(self, repo: str, pr: int, steps: dict, reported: list[dict]) -> list[dict]:
+        """The refuted `source: protopatch` rows the structural store may learn from (#238):
+        read from the verify step, minus anything scoped `nearby` (#232) or not provably on a
+        line this PR changed. Fails closed — an unreadable diff, or any error, records nothing."""
+        try:
+            rows = [
+                f
+                for f in self._verified_rows(steps, reported)
+                if str(f.get("source") or "").strip().lower() == "protopatch"
+                and str(f.get("verdict") or "").strip().lower() == "refuted"
+            ]
+            if not rows:
+                return []
+            return structural_refutations_in_change(rows, await self._pr_hunk_ranges(repo, pr))
+        except Exception:  # noqa: BLE001 — memory is best-effort; a miss records nothing
+            log.exception("[pr-reviewer] %s#%s structural refutation read failed", repo, pr)
+            return []
+
     async def _remember_llm_refutations(
         self, repo: str, pr: int, head: str, steps: dict, reported: list[dict], ours: list[dict] | None
     ) -> None:
@@ -3440,7 +3459,11 @@ class Dispatcher:
             # the next PR touching the file does not spend a verify round on them (#190).
             # Read from the VERIFY step (#238): the report is told to drop refuted rows, so
             # reading `reported` alone remembered nothing, ever.
-            remembered = self.refutations.record(repo, self._verified_rows(steps_out, reported), pr=pr, head=head)
+            # Only a claim IN the change (#232): a refuted nearby note is usually "not this PR's",
+            # not "false", and must not be pre-marked away on a later PR that does change it.
+            remembered = self.refutations.record(
+                repo, await self._structural_refutations(repo, pr, steps_out, reported), pr=pr, head=head
+            )
             if remembered:
                 log.info("[pr-reviewer] %s#%s remembered %d refuted structural claim(s)", repo, pr, remembered)
             await self._remember_llm_refutations(repo, pr, head, steps_out, reported, ours)

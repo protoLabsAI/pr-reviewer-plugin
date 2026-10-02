@@ -143,6 +143,7 @@ def test_premark_check_fails_closed_on_every_edge(tmp_path):
         (_finding(line="eleven"), UNTOUCHED, "no line"),
         (_finding(claim="this panics on a parse failure"), UNTOUCHED, "identifier"),
         (_finding(source="protopatch"), UNTOUCHED, "LLM"),
+        (_finding(nearby=True), UNTOUCHED, "nearby"),  # #232: a nearby note is never pre-marked
         (_finding(), None, "unreadable"),
         (_finding(), TOUCHED, "changes the code"),
         (_finding(), {FILE: [(14, 20)]}, "changes the code"),  # line 11 is within 3 of 14
