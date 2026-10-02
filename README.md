@@ -195,6 +195,14 @@ structural-trigger dispatch, approve-on-green + sweep, and the review eval.
   - **A summon overrides the reaffirm short-circuit.** An unchanged head normally reaffirms
     without re-spending the panel; `@vera review` on that head is precisely the "I think you
     got this wrong" case, and reaffirming would answer with the answer under dispute.
+  - **A push mid-round stops the old round (#245).** A `synchronize` that arrives while a
+    panel runs on an older head is dropped `in-flight`, but it tells the running round to
+    check. At its next step boundary (and always before synthesize and verify), the round
+    reads the PR's head. If the head has moved, the round cancels its attempt, posts
+    **nothing**, concludes its `protoReview` run `neutral` ("Superseded"), records
+    `superseded cancelled=true`, and hands its slot straight to the new head. The new head is
+    admitted before the old slot is released, so there is never a moment with nothing in
+    flight for promotion to slip into. An unreadable head cancels nothing.
   - **Bypasses the cooldown, not the in-flight guard** — the cooldown eats webhook bursts,
     and a human who typed a command is not a burst; two panels on one PR is still wrong.
     The guard can't wedge a PR, though: each panel attempt and each round is bounded

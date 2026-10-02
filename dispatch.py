@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import contextvars
+import functools
 import json
 import logging
 import math
@@ -48,6 +49,7 @@ from .checks import (
     COMPLETED,
     FAILURE,
     IN_PROGRESS,
+    NEUTRAL,
     SUCCESS,
     CheckRun,
     check_for,
@@ -156,6 +158,13 @@ DROP_REVIEWS_UNREADABLE = "reviews-unreadable"  # blind on our own history (issu
 DROP_VIEWER_UNKNOWN = "viewer-unknown"  # blind on our own IDENTITY — can't rule out self-review
 DROP_POST_REFUSED = "post-refused"  # GitHub keeps rejecting this verdict post (issue #78)
 DROP_ROUND_TIMEOUT = "round-timeout"  # a round outlived round_timeout_s and was cancelled
+DROP_SUPERSEDED = "superseded"  # the PR moved past this round's head mid-panel; cancelled (#245)
+# Consecutive superseded-round handoffs one slot will make before leaving the rest to the
+# sweep's backfill (#245) — a bound on a pathological push storm, not a normal limit.
+MAX_SUPERSEDE_HANDOFFS = 5
+# Phases whose step is worth a head read before it runs (#245): the expensive tail, after
+# which nothing a newer head needs can come out of this round.
+_SUPERSEDE_CHECK_PHASES = ("synthesize", "verify")
 
 # Our own reviews could not be read this pass (issue #71). Distinct from every other
 # hold because it says nothing about the PR — only that we are blind — and blind is
@@ -632,6 +641,26 @@ class _Running:
         self.phase = "finders"
         self.model_retries = 0
         self.ran = False
+
+
+class _RoundWatch:
+    """One running panel round's supersede watch (issue #245).
+
+    The runner runs the whole recipe in one call, so the only step boundaries the
+    dispatcher sees are the host's `on_step` callbacks. At a boundary worth checking — the
+    synthesize/verify tail, or any step once a newer head has been signalled for the PR — a
+    head read is scheduled; if the PR's head is readable and is no longer `head`, the
+    attempt task is cancelled and `superseded_by` names the head that replaced it.
+    """
+
+    __slots__ = ("repo", "pr", "head", "task", "superseded_by", "checking", "phase")
+
+    def __init__(self, repo: str, pr: int, head: str):
+        self.repo, self.pr, self.head = repo, pr, head
+        self.task: asyncio.Task | None = None
+        self.superseded_by: str | None = None
+        self.checking = False
+        self.phase = ""
 
 
 class PanelQueue(asyncio.Semaphore):
@@ -1121,6 +1150,11 @@ class Dispatcher:
         # posting cannot be re-scheduled every sweep tick, and an escalation fires once.
         self._verify_retried: dict[str, None] = {}  # insertion-ordered, so trimming drops the oldest
         self._verify_escalated: dict[str, None] = {}
+        # Supersede bookkeeping (#245): repo#pr -> a newer head some event saw while a round
+        # was in flight (a hint that makes every step boundary check, not only the tail), and
+        # repo#pr -> the head a cancelled round was superseded by, for the slot handoff.
+        self._newer_head_hint: dict[str, str] = {}
+        self._superseded_to: dict[str, str] = {}
         self._installation_repos: list[str] = []  # last good App-installation scope
         self._installation_repos_at: float = 0.0
         # The cross-PR panel cap (#96) is a WEBHOOK-LAYER concern: build_routers sizes an
@@ -2580,6 +2614,94 @@ class Dispatcher:
 
     # ── the review path ───────────────────────────────────────────────────────
 
+    def _hint_newer_head(self, repo: str, pr: int, head: str) -> None:
+        """Note that an event named `head` for this PR while a round may be running (#245).
+        Only a hint: the round confirms against GitHub before it stops anything."""
+        self._newer_head_hint[f"{repo}#{pr}"] = head
+        if len(self._newer_head_hint) > 1024:
+            self._newer_head_hint = dict(list(self._newer_head_hint.items())[-512:])
+
+    async def _review_in_slot(self, repo: str, pr: int, sha: str, **review_kwargs) -> str:
+        """`_bounded_review` for a caller holding the chokepoint slot at `sha`, plus the
+        superseded-round handoff (issue #245).
+
+        A round cancelled because the PR moved past its head returns `drop:superseded`. The
+        new head's own event was dropped `in-flight` while that round ran, so nothing else
+        would review it until the sweep's backfill. The slot passes straight to it instead:
+        the new head is ADMITTED before the old head's slot is released, so the PR is never
+        without a live slot between the two rounds. That gap would be a promotion window
+        (`_round_in_flight`, #217) and a backfill race. The new round reuses the caller's
+        panel-queue slot rather than queueing again behind other PRs: it is the review the
+        cancelled round was holding the slot for.
+
+        If another round already holds the new head (a backfill admitted past us, #209), the
+        handoff stops and that round reviews it. The caller still releases `sha`; this
+        releases any head it handed off to.
+        """
+        key = f"{repo}#{pr}"
+        held = sha
+        try:
+            outcome = await self._bounded_review(repo, pr, **review_kwargs)
+            for _ in range(MAX_SUPERSEDE_HANDOFFS):
+                new = self._superseded_to.pop(key, None)
+                if outcome != f"drop:{DROP_SUPERSEDED}" or not new:
+                    break
+                if new != held:
+                    decision = self.chokepoint.admit(repo, pr, new, bypass_cooldown=True, supersede_stale=True)
+                    if decision != "accept":
+                        self.telemetry.emit(
+                            "drop", repo=repo, pr=pr, sha=new, reason=decision, action="superseded-handoff"
+                        )
+                        break
+                    if held != sha:
+                        self.chokepoint.done(repo, pr, held)  # the new head's slot is already held
+                    held = new
+                self.telemetry.emit("superseded_handoff", repo=repo, pr=pr, sha=new)
+                outcome = await self._bounded_review(repo, pr, **review_kwargs)
+            return outcome
+        finally:
+            self._superseded_to.pop(key, None)
+            if held != sha:
+                self.chokepoint.done(repo, pr, held)
+
+    def _watch_step(self, watch: _RoundWatch, step=None, *args, **kwargs) -> None:
+        """The `on_step` callback for a watched round: report the phase as before, then, at a
+        boundary worth it, schedule the supersede check (#245). Synchronous like the host's
+        callback; the head read runs as its own task. Never raises into the host."""
+        self._on_panel_step(step, *args, **kwargs)
+        try:
+            phase = _phase_for_step(step)
+            watch.phase = phase
+            hinted = f"{watch.repo}#{watch.pr}" in self._newer_head_hint
+            if watch.checking or watch.superseded_by or (phase not in _SUPERSEDE_CHECK_PHASES and not hinted):
+                return
+            watch.checking = True
+            asyncio.get_running_loop().create_task(self._check_superseded(watch))
+        except Exception:  # noqa: BLE001 — a supersede check must never fail the round
+            watch.checking = False
+
+    async def _check_superseded(self, watch: _RoundWatch) -> None:
+        """Cancel the round's running attempt if the PR's head has moved past it (#245).
+
+        Fail-closed in the sense that matters for a cancel: an unreadable head, or a closed /
+        draft PR, cancels NOTHING, and the round carries on exactly as before (#211 still
+        keeps a superseded verdict off the new head at post time). Only a readable head that
+        differs from the round's head stops it."""
+        try:
+            facts = await self._pr_facts(watch.repo, watch.pr)
+            current = str((facts or {}).get("head") or "")
+            if not current or current == watch.head or ineligible_reason(facts):
+                return
+            task = watch.task
+            if task is None or task.done():
+                return
+            watch.superseded_by = current
+            task.cancel()
+        except Exception:  # noqa: BLE001
+            log.warning("[pr-reviewer] supersede check failed on %s#%s", watch.repo, watch.pr, exc_info=True)
+        finally:
+            watch.checking = False
+
     async def handle_pr_event(self, repo: str, pr: int, head_sha: str, action: str) -> str:
         """Webhook/manual entry. Returns 'reviewed:<verdict>' or a typed drop/outcome."""
         # A draft→ready conversion resets the max-rounds cap before any other gate so
@@ -2610,10 +2732,15 @@ class Dispatcher:
             del self._round_cap[cap_key]  # cooldown elapsed — let the next push through
         decision = self.chokepoint.admit(repo, pr, head_sha)
         if decision != "accept":
+            if decision == DROP_IN_FLIGHT and head_sha:
+                # A push for this PR while a round runs (#245): the running round checks the
+                # PR's head at its next step boundary and, if it was superseded, hands its
+                # slot to this head instead of finishing a verdict nobody can use.
+                self._hint_newer_head(repo, pr, head_sha)
             self.telemetry.emit("drop", repo=repo, pr=pr, sha=head_sha, reason=decision)
             return f"drop:{decision}"
         try:
-            return await self._bounded_review(repo, pr, push_triggered=True)
+            return await self._review_in_slot(repo, pr, head_sha, push_triggered=True)
         finally:
             self.chokepoint.done(repo, pr, head_sha)
 
@@ -2663,7 +2790,7 @@ class Dispatcher:
         # override the flood guard, and the operator has implicitly acknowledged the cost.
         self._round_cap.pop(f"{repo}#{pr}", None)
         try:
-            return await self._bounded_review(repo, pr, force=True)
+            return await self._review_in_slot(repo, pr, slot_sha, force=True)
         finally:
             self.chokepoint.done(repo, pr, slot_sha)
 
@@ -2879,7 +3006,12 @@ class Dispatcher:
         self.report_phase("structural" if recipe == "code-review-structural" else "finders")
         # Fine-grained phase reporting rides the runner ONLY when it declares `on_step`
         # (protoAgent's engine does; a test fake / older host does not, so this stays {}).
-        step_kwargs = {"on_step": self._on_panel_step} if _accepts_keyword(runner, "on_step") else {}
+        if self._newer_head_hint.get(f"{repo}#{pr}") == head:
+            self._newer_head_hint.pop(f"{repo}#{pr}", None)  # this round IS the newer head
+        watch = _RoundWatch(repo, pr, head)
+        step_kwargs = (
+            {"on_step": functools.partial(self._watch_step, watch)} if _accepts_keyword(runner, "on_step") else {}
+        )
         # Stage boundaries whose findings payload never arrived (#113). An ABSENT array is
         # not an empty one, and parsing it as `[]` is what posted a clean PASS beneath a
         # verify note saying the findings may have been lost. It is handled like a failed
@@ -2894,7 +3026,15 @@ class Dispatcher:
             attempt_bound = asyncio.timeout(self.panel_attempt_timeout_s)
             try:
                 async with attempt_bound:
-                    result = await runner(recipe, inputs, **step_kwargs)
+                    # A task, so a supersede check can cancel THIS attempt without
+                    # cancelling the round around it (#245).
+                    watch.task = asyncio.ensure_future(runner(recipe, inputs, **step_kwargs))
+                    result = await watch.task
+            except asyncio.CancelledError:
+                current = asyncio.current_task()
+                if watch.superseded_by is None or (current is not None and current.cancelling()):
+                    raise  # the round itself is being cancelled (round timeout, shutdown)
+                return await self._abandon_superseded(repo, pr, head, watch, review_check_id)
             except Exception as exc:  # noqa: BLE001 — the attempt's own TimeoutError included
                 timed_out = isinstance(exc, TimeoutError) and attempt_bound.expired()
                 why = f"timed out after {self.panel_attempt_timeout_s:g}s" if timed_out else type(exc).__name__
@@ -2923,6 +3063,10 @@ class Dispatcher:
                     dedup_key=f"pr-reviewer-crash:{repo}#{pr}@{head[:7]}",
                 )
                 return "error:run-timed-out" if timed_out else "error:run-crashed"
+            if watch.superseded_by is not None:
+                # The host swallowed the cancel and returned anyway. The result is still a
+                # superseded head's, and is discarded all the same (#245).
+                return await self._abandon_superseded(repo, pr, head, watch, review_check_id)
             failed = list(result.get("failed") or [])
             steps_now = result.get("steps") if isinstance(result.get("steps"), dict) else {}
             # A finder that overran the model's context window (#176) is a coverage gap
@@ -3629,6 +3773,38 @@ class Dispatcher:
             return None
         commits = payload.get("commits")
         return delta_ranges(payload["files"]), (commits if isinstance(commits, int) and commits >= 0 else 0)
+
+    async def _abandon_superseded(
+        self, repo: str, pr: int, head: str, watch: _RoundWatch, review_check_id: int | None
+    ) -> str:
+        """End a round whose PR moved past its head mid-panel (#245). Posts NO review: the
+        partial result is never used, for this head or the new one. The `protoReview` run
+        this round opened on the old head is concluded `neutral` so it does not dangle
+        in_progress (#153). That is a check on a commit the PR no longer points at, not a
+        verdict. The caller hands the slot to the new head (`_review_in_slot`)."""
+        key = f"{repo}#{pr}"
+        new = watch.superseded_by or ""
+        self._superseded_to[key] = new
+        self._newer_head_hint.pop(key, None)
+        self.telemetry.emit(
+            "superseded",
+            repo=repo,
+            pr=pr,
+            sha=head,
+            new_head=new,
+            phase=watch.phase,
+            cancelled=True,
+            model_retries=self._round_retries(),
+        )
+        await self._conclude_review_check(
+            repo,
+            review_check_id,
+            NEUTRAL,
+            "Superseded — no verdict",
+            f"The PR moved to `{new[:12]}` while the panel was reviewing `{head[:12]}`, so this round "
+            f"was stopped before posting. The new head is reviewed on its own round.",
+        )
+        return f"drop:{DROP_SUPERSEDED}"
 
     async def _stale_head_guard(
         self, repo: str, pr: int, head: str, findings: list[dict]
@@ -4859,13 +5035,16 @@ class Dispatcher:
             self.telemetry.emit("drop", repo=repo, pr=pr, sha=head, reason=decision, action=BACKFILL_ACTION)
             return f"drop:{decision}"
         self.telemetry.emit("backfill", repo=repo, pr=pr, sha=head)
+        # Admitted past an in-flight round for an older head (`supersede_stale`, #209)? That
+        # round's verdict can only land on a superseded head; let it notice and stop (#245).
+        self._hint_newer_head(repo, pr, head)
         sem = self.panel_sem
         try:
             if isinstance(sem, PanelQueue):
                 # The tracked slot registers this backfill in the queue's running/waiter
                 # view (so GET /queue sees it) and emits its own `queued` telemetry.
                 async with sem.slot(repo=repo, pr=pr, head=head, kind=BACKFILL_ACTION):
-                    return await self._bounded_review(repo, pr)
+                    return await self._review_in_slot(repo, pr, head)
             # A raw semaphore (a test injection) or None — the legacy path, unchanged:
             # `locked()` is True exactly when no slot is free, i.e. this panel WILL wait —
             # the queue-depth signal the operator reads out of the panel stats.
@@ -4873,7 +5052,7 @@ class Dispatcher:
                 self.telemetry.emit("queued", kind=BACKFILL_ACTION, repo=repo, pr=pr, sha=head)
             slot = sem if sem is not None else contextlib.nullcontext()
             async with slot:
-                return await self._bounded_review(repo, pr)
+                return await self._review_in_slot(repo, pr, head)
         finally:
             self.chokepoint.done(repo, pr, head)
 
