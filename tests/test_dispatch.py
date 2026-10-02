@@ -1766,6 +1766,52 @@ async def test_a_refuted_structural_finding_is_remembered_for_the_repo_when_the_
     assert hit and hit["pr"] == 1 and "returns Result" in hit["note"]
 
 
+async def test_a_refuted_structural_finding_is_remembered_from_the_verify_step_when_the_report_drops_it(tmp_path):
+    """#238: the real recipe shape. The verifier marks the claim `refuted`; the report, as
+    the recipe tells it to, DROPS refuted rows. The store must still learn the claim — it
+    used to read only the report, so on Vera it never recorded anything."""
+    import json as _json
+
+    from pr_reviewer.refutations import RefutationStore
+
+    claim = "builtin_world panics via .expect() on TOML parse failure"
+    row = {
+        "file": "packs/necromunda/src/lib.rs",
+        "line": 11,
+        "severity": "minor",
+        "category": "bug",
+        "claim": claim,
+        "evidence": "e",
+        "source": "protopatch",
+    }
+    synthesized = f"<!-- brief -->\nOne.\n<!-- /brief -->\n\n```json\n{_json.dumps([row])}\n```"
+    refuted = [{**row, "verdict": "refuted", "note": "the function returns Result and uses ?"}]
+    verify = f"VERIFY_STATUS: annotated n=1\n\n```json\n{_json.dumps(refuted)}\n```"
+    report = "<!-- brief -->\nThe one finding was refuted.\n<!-- /brief -->\n\n```json\n[]\n```"
+
+    async def runner(name, inputs):
+        steps = _panel_steps(synthesize=synthesized, verify=verify, report=report)
+        return {"output": report, "failed": [], "steps": steps}
+
+    d = make(tmp_path, cfg={"state_root": str(tmp_path / "st")}, gh=_structural_gh(), runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "reviewed:PASS"
+    hit = RefutationStore(tmp_path / "st").match("o/r", "packs/necromunda/src/lib.rs", claim)
+    assert hit and hit["pr"] == 1 and "returns Result" in hit["note"]
+
+
+async def test_a_verify_step_that_does_not_parse_records_nothing(tmp_path):
+    """Fail closed (#238): no readable verify array ⇒ nothing remembered, nothing pre-marked later."""
+    report = "<!-- brief -->\nNothing.\n<!-- /brief -->\n\n```json\n[]\n```"
+
+    async def runner(name, inputs):
+        verify = "VERIFY_STATUS: annotated n=1\n\nrefuted: builtin_world panics via .expect() (no array)"
+        return {"output": report, "failed": [], "steps": _panel_steps(verify=verify, report=report)}
+
+    d = make(tmp_path, cfg={"state_root": str(tmp_path / "st")}, gh=_structural_gh(), runner=runner)
+    await d.handle_pr_event("o/r", 1, HEAD, "opened")
+    assert not list((tmp_path / "st").rglob("refuted.json"))
+
+
 def _structural_gh() -> RoutedGH:
     return RoutedGH(pr_facts=facts(changed_files=6, additions=300, deletions=50), files="x.py\nb\nc\nd\ne\nf\n")
 

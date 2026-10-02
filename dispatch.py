@@ -2403,6 +2403,13 @@ class Dispatcher:
             )
         return kept, relieved
 
+    def _verified_rows(self, steps: dict, reported: list[dict]) -> list[dict]:
+        """The rows a refutation memory learns from: the verify step's annotated array — the
+        only place a `refuted` row survives, because the report is told to drop them (#238) —
+        plus the report's own rows. Fails closed: a verify step that did not parse adds
+        nothing, so a parse miss can only make the memory forget less, never invent."""
+        return [*self._parse_findings(str((steps or {}).get("verify") or "")), *(reported or [])]
+
     async def _remember_llm_refutations(
         self, repo: str, pr: int, head: str, steps: dict, reported: list[dict], ours: list[dict] | None
     ) -> None:
@@ -2413,7 +2420,7 @@ class Dispatcher:
         if not self.llm_refutation_memory:
             return
         try:
-            verified = [*self._parse_findings(str(steps.get("verify") or "")), *reported]
+            verified = self._verified_rows(steps, reported)
             remembered, forgotten = self.llm_refutations.observe(repo, verified, pr=pr, head=head)
             dismissed = await self._harvest_dismissals(repo, pr, ours)
             if remembered or forgotten or dismissed:
@@ -3431,7 +3438,9 @@ class Dispatcher:
         if posted:
             # Structural claims the verifier refuted this round: remembered for the repo, so
             # the next PR touching the file does not spend a verify round on them (#190).
-            remembered = self.refutations.record(repo, reported, pr=pr, head=head)
+            # Read from the VERIFY step (#238): the report is told to drop refuted rows, so
+            # reading `reported` alone remembered nothing, ever.
+            remembered = self.refutations.record(repo, self._verified_rows(steps_out, reported), pr=pr, head=head)
             if remembered:
                 log.info("[pr-reviewer] %s#%s remembered %d refuted structural claim(s)", repo, pr, remembered)
             await self._remember_llm_refutations(repo, pr, head, steps_out, reported, ours)
