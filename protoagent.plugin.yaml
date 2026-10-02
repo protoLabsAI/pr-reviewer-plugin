@@ -108,6 +108,11 @@ config:
   checkout_root: ""            # "" = ~/.protoagent/pr-reviewer/checkouts
   state_root: ""               # "" = ~/.protoagent/pr-reviewer/clawpatch (per-repo dirs: refuted.json, provider-failures/; each review works in <repo>/scratch/)
   refutation_ttl_days: 14      # how long a verifier-refuted protoPatch claim stays remembered per repo (#190)
+  lint_check: true             # a protoPatch finding citing a ruff rule (F841…) on a .py file is checked with
+                               # the ruff version the repo's CI workflows pin (pip-installed once per version
+                               # into ~/.protoagent/pr-reviewer/tools/ruff/); no such diagnostic at the cited
+                               # line ⇒ dropped (#232). Any failure leaves the finding unchecked.
+  lint_check_budget_s: 90      # wall-clock cap for the whole check (install + runs) per structural pass
   checkout_ttl_s: 3600         # cache entry freshness window (Quinn's model: ~token lifetime)
   checkout_max_entries: 50     # LRU prune caps (enforced on prune())
   checkout_max_bytes: 5000000000

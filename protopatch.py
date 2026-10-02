@@ -39,6 +39,7 @@ from pathlib import Path
 
 from .checkout_cache import CheckoutCache, CheckoutError, redact
 from .gh_cli import bad_repo, resolve_token, run_gh
+from .lintcheck import LintChecker, render_refuted
 from .refutations import RefutationStore, _norm_path, premark_refuted
 
 log = logging.getLogger("protoagent.plugins.pr_reviewer")
@@ -456,7 +457,7 @@ SCRATCH_KEEP_FAILED_S = 6 * 3600
 class ProtoPatchRunner:
     """The orchestration the tool calls — every step degrades to `unavailable(...)`."""
 
-    def __init__(self, cfg: dict, *, run_clawpatch=None, run_git=None):
+    def __init__(self, cfg: dict, *, run_clawpatch=None, run_git=None, run_lint=None):
         self.cfg = cfg or {}
         home = Path(os.environ.get("PR_REVIEWER_HOME") or Path.home() / ".protoagent" / "pr-reviewer")
         self.checkout_root = Path(self.cfg.get("checkout_root") or home / "checkouts")
@@ -464,6 +465,8 @@ class ProtoPatchRunner:
         # Claims this repo's verifier already refuted (#190) — shared with the dispatcher,
         # which writes them when a round posts; the structural pass reads them here.
         self.refutations = RefutationStore.from_cfg(self.cfg)
+        # Lint-rule claims checked with the repo's own pinned ruff, in this checkout (#232 ask 6).
+        self.lint = LintChecker(self.cfg, tools_dir=home / "tools", run=run_lint)
         self.budget_s = int(self.cfg.get("time_budget_s") or 600)
         self.jobs = structural_jobs(self.cfg.get("structural_jobs"))  # None = clawpatch's own default
         self.bin = str(self.cfg.get("clawpatch_bin") or "clawpatch")
@@ -773,6 +776,11 @@ class ProtoPatchRunner:
         (coverage, reason). The one place findings are read, confined and pre-marked."""
         ranges = await self._changed_ranges(checkout, base_sha)
         findings = read_findings(state_dir, changed, ranges)
+        # A finding that cites a lint rule is settled by the linter CI runs, not by a model
+        # (#232 ask 6, protoAgent#4017 r1: F841 on a tuple-unpack target, which F841 never
+        # flags). Refuted ⇒ dropped here, before the relay can carry it; anything uncertain
+        # leaves the finding as it was. Bounded and never raises.
+        findings, lint_refuted, lint_version = await self.lint.check(checkout, findings)
         # A repeat of a claim this repo's verifier already refuted, at a spot this PR does
         # not touch, goes to the synthesizer already marked (#190) — it is dropped there
         # instead of costing a verify round on every PR that touches the file.
@@ -782,7 +790,8 @@ class ProtoPatchRunner:
         header = (
             f"{PARTIAL_HEADER if partial else 'protoPatch structural pass on'} {repo}#{pr} — "
             f"head {head_sha[:12]}, base {base_sha[:12]}, {elapsed:.0f}s, {len(findings)} reportable finding(s)"
-            f"{' from the features that finished' if partial else ''}{repeats}, scope: {confinement}."
+            f"{' from the features that finished' if partial else ''}{repeats}"
+            f"{render_refuted(lint_refuted, lint_version)}, scope: {confinement}."
         )
         if partial:
             return partial_result(partial[0], partial[1], header, findings)
