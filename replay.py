@@ -42,6 +42,7 @@ import json
 import re
 from urllib.parse import quote
 
+from .gh_cli import gh_json_rows
 from .grounding import UNREADABLE, apply_grounding
 from .rounds import converge, delta_ranges, parse_dispositions, unaccounted_priors
 from .verdicts import confine_findings, extract_findings_json, verdict_for
@@ -262,15 +263,13 @@ async def _finding_sources(run_gh, repo: str, pr: int, head: str, findings: list
 
     patches: dict[str, str] = {}
     rc, out, _e = await run_gh(
-        ["api", f"repos/{repo}/pulls/{pr}/files", "--paginate", "--jq", "[.[] | {f: .filename, p: .patch}]"]
+        # One object per line (as `Dispatcher._finding_sources` reads it): an array-wrapping
+        # filter with --paginate emits `[…][…]` past one page and the whole read failed.
+        ["api", f"repos/{repo}/pulls/{pr}/files", "--paginate", "--jq", ".[] | {f: .filename, p: .patch}"]
     )
-    if rc == 0:
-        try:
-            for r in json.loads(out) or []:
-                if isinstance(r, dict) and r.get("f"):
-                    patches[str(r["f"])] = str(r.get("p") or "")
-        except json.JSONDecodeError:
-            pass
+    for r in (gh_json_rows(out) if rc == 0 else None) or []:
+        if isinstance(r, dict) and r.get("f"):
+            patches[str(r["f"])] = str(r.get("p") or "")
     sources: dict[str, str | object | None] = {}
     for file in {str(f.get("file") or "") for f in findings if f.get("file")}:
         ref = quote(head, safe="")

@@ -22,8 +22,9 @@ caller (CLI/API) fetches only what's needed.
 
 from __future__ import annotations
 
-import json
 from collections import Counter
+
+from .gh_cli import gh_json_rows
 
 
 def _percentile(values: list[float], q: float) -> float | None:
@@ -208,20 +209,22 @@ async def three_way_rows(
                 f"repos/{repo}/pulls/{pr}/reviews",
                 "--paginate",
                 "--jq",
-                "[.[] | {login: .user.login, state: .state}]",
+                # One object per line, NOT `[.[] | …]`: --paginate applies the filter per
+                # page, so the wrapper emitted `[…][…]` past one page and the whole read
+                # failed to parse (the #75 shape) — a busy PR silently lost its comparison.
+                ".[] | {login: .user.login, state: .state}",
             ],
         )
         quinn_state, rabbit_reviews = "", 0
-        if rc == 0:
-            try:
-                for row in json.loads(out):
-                    login = str(row.get("login") or "").lower().removesuffix("[bot]")
-                    if any(login.startswith(q) for q in quinn_logins):
-                        quinn_state = row.get("state", "")
-                    if login.startswith(coderabbit_login):
-                        rabbit_reviews += 1
-            except json.JSONDecodeError:
-                pass
+        reviews = gh_json_rows(out) if rc == 0 else None  # None ⇒ unreadable: no reviews counted
+        for row in reviews or []:
+            if not isinstance(row, dict):
+                continue
+            login = str(row.get("login") or "").lower().removesuffix("[bot]")
+            if any(login.startswith(q) for q in quinn_logins):
+                quinn_state = row.get("state", "")
+            if login.startswith(coderabbit_login):
+                rabbit_reviews += 1
         rows.append(
             {"repo": repo, "pr": pr, "ours": our_verdict, "quinn": quinn_state, "coderabbit_reviews": rabbit_reviews}
         )

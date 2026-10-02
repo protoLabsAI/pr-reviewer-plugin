@@ -421,3 +421,12 @@ def test_every_hold_names_its_reason_in_the_summary():
     for decision in (HOLD_STALE_HEAD, HOLD_INCOMPLETE, HOLD_CHECKS_PENDING, "hold:promote-backoff"):
         assert decision in check_for(decision).summary
     assert "hold:" not in check_for("promote").summary
+
+
+def test_a_cleared_check_carries_no_hold_line():
+    # Vera on #242: "Hold: `hold:already-promoted`." under "Cleared by the QA panel".
+    from pr_reviewer.approve import HOLD_ALREADY_PROMOTED, HOLD_THREADS_UNRESOLVED
+
+    assert "Hold:" not in check_for(HOLD_ALREADY_PROMOTED).summary
+    external = check_for(HOLD_THREADS_UNRESOLVED, unresolved=2, panel_unresolved=0)
+    assert external.conclusion == "success" and "Hold:" not in external.summary

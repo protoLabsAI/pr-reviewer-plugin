@@ -117,7 +117,10 @@ def check_for(
         panel_unresolved=panel_unresolved,
         verify_retry=verify_retry,
     )
-    if decision.startswith("hold:") and decision not in run.summary:
+    # Only a check that is actually HELD: a SUCCESS (`hold:already-promoted`, or a clear
+    # verdict whose merge waits on someone else's threads) is cleared, and a "Hold:" line
+    # under "Cleared by the QA panel" would contradict it.
+    if decision.startswith("hold:") and run.conclusion != SUCCESS and decision not in run.summary:
         run = CheckRun(run.status, run.conclusion, run.title, f"{run.summary}\n\nHold: `{decision}`.")
     return run
 

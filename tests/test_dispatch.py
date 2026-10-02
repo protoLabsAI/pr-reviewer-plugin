@@ -5872,3 +5872,13 @@ async def test_a_paused_pr_or_an_empty_budget_is_not_re_run(tmp_path):
     d = make(tmp_path / "b", cfg={"shadow_mode": False, "promotion_owner": True}, gh=gh, runner=runner)
     assert (await d.reconcile_pr("o/r", 1, backfill_budget=0)) == ("hold:unverified", 0)
     assert ran == []
+
+
+def test_remembered_keys_are_bounded_and_drop_the_oldest():
+    from pr_reviewer.dispatch import _remember
+
+    keys: dict[str, None] = {}
+    for i in range(1025):
+        _remember(keys, f"k{i}")
+    assert len(keys) == 512
+    assert "k1024" in keys and "k0" not in keys and "k513" in keys and "k512" not in keys

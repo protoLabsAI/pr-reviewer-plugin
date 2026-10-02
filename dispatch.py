@@ -55,7 +55,7 @@ from .checks import (
     queued_run,
 )
 from .chokepoint import DISPATCH_ACTIONS, DROP_IN_FLIGHT, Chokepoint
-from .gh_cli import bad_repo, run_gh
+from .gh_cli import bad_repo, gh_json_rows, run_gh
 from .grounding import (
     UNREADABLE,
     apply_grounding,
@@ -333,6 +333,15 @@ def _accepts_keyword(fn, name: str) -> bool:
     return name in params or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
 
 
+def _remember(keys: dict[str, None], key: str, *, cap: int = 1024, keep: int = 512) -> None:
+    """Add `key` to an insertion-ordered key set, bounded like the other per-head maps: past
+    `cap` entries the oldest are dropped down to the newest `keep`."""
+    keys[key] = None
+    if len(keys) > cap:
+        for old in list(keys)[: len(keys) - keep]:
+            del keys[old]
+
+
 def _carry_anchor(finding: dict) -> str:
     """`file:line` (or the bare file) — how a prior is matched across the re-check lists."""
     path = str(finding.get("file") or "").strip().removeprefix("./")
@@ -506,45 +515,6 @@ REVIEW_CHECK_NAME = "protoReview"
 # Both of our own check runs sit `in_progress` while the panel runs; neither is a check we
 # WAIT on (see `_checks_state`), or the gate deadlocks on itself.
 OUR_CHECK_NAMES = frozenset({CHECK_NAME, REVIEW_CHECK_NAME})
-
-
-def gh_json_rows(out: str) -> list | None:
-    """Parse `gh api --paginate --jq '.[] | …'` output → rows, or None if unparseable.
-
-    `--paginate` applies the jq filter PER PAGE and concatenates the results, so an
-    array-wrapping filter (`[.[] | …]`) emits `[…][…]` on the second page — not valid
-    JSON, and every such read silently broke the moment a PR crossed 30 items
-    (issue #75). Emitting one object per line instead is pagination-safe by
-    construction: `gh` prints compact JSON, so embedded newlines stay escaped and one
-    row really is one line.
-
-    A single unparseable line makes the WHOLE read None rather than a short list.
-    These rows drive "has this been reviewed", "did an operator pause this" and "are
-    the checks green" — a silently-short answer is the failure mode of #71, where a
-    partial read was indistinguishable from an absence.
-
-    Still accepts a whole-array body, so a caller that drops --jq (or a fake that
-    returns one array) keeps working.
-    """
-    text = (out or "").strip()
-    if not text:
-        return []
-    try:
-        whole = json.loads(text)
-    except ValueError:
-        pass
-    else:
-        return whole if isinstance(whole, list) else [whole]
-    rows = []
-    for line in text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            rows.append(json.loads(line))
-        except ValueError:
-            return None  # a partial read is worse than none — it looks complete
-    return rows
 
 
 def _env_repos() -> list[str]:
@@ -1149,8 +1119,8 @@ class Dispatcher:
         # repo#pr@head keys whose one automatic unverified re-run (#220) this process has
         # started / whose exhaustion it has escalated — so a re-run that crashes without
         # posting cannot be re-scheduled every sweep tick, and an escalation fires once.
-        self._verify_retried: set[str] = set()
-        self._verify_escalated: set[str] = set()
+        self._verify_retried: dict[str, None] = {}  # insertion-ordered, so trimming drops the oldest
+        self._verify_escalated: dict[str, None] = {}
         self._installation_repos: list[str] = []  # last good App-installation scope
         self._installation_repos_at: float = 0.0
         # The cross-PR panel cap (#96) is a WEBHOOK-LAYER concern: build_routers sizes an
@@ -4996,9 +4966,7 @@ class Dispatcher:
         key = f"{repo}#{pr}@{head}"
         if state == VERIFY_RETRY_EXHAUSTED:
             if key not in self._verify_escalated:
-                self._verify_escalated.add(key)
-                if len(self._verify_escalated) > 1024:
-                    self._verify_escalated = set(list(self._verify_escalated)[-512:])
+                _remember(self._verify_escalated, key)
                 self.telemetry.emit("verify_retry", repo=repo, pr=pr, sha=head, outcome="exhausted")
                 await self._escalate(
                     f"pr-reviewer: the verifier failed twice on {repo}#{pr} @{head[:7]} — the head holds at "
@@ -5016,9 +4984,7 @@ class Dispatcher:
                 return None
         if detach and len(self._backfills) >= max(1, self.backfill_per_pass):
             return None  # the detached-panel cap is full; the next tick tries again
-        self._verify_retried.add(key)
-        if len(self._verify_retried) > 1024:  # bounded, like the other per-head maps
-            self._verify_retried = set(list(self._verify_retried)[-512:])
+        _remember(self._verify_retried, key)
         self.telemetry.emit("verify_retry", repo=repo, pr=pr, sha=head, outcome="scheduled")
         if not detach:
             await self._run_verify_retry(repo, pr, head)
