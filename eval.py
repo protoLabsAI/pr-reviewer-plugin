@@ -82,6 +82,21 @@ def _unreviewed_prs(exhaustions: list[dict], reviewed: list[dict], limit: int = 
     }
 
 
+def _refuted_before(events: list[dict]) -> dict:
+    lanes: Counter = Counter()
+    rejected = 0
+    for e in events:
+        if e.get("event") != "refuted_before":
+            continue
+        for lane, n in (e.get("lanes") or {}).items():
+            try:
+                lanes[str(lane)] += int(n)
+            except (TypeError, ValueError):
+                continue
+        rejected += len(e.get("rejected") or [])
+    return {"total": sum(lanes.values()), "lanes": dict(lanes), "rejected": rejected}
+
+
 def build_report(events: list[dict]) -> dict:
     """The numeric summary over raw telemetry events."""
     dispatches = [e for e in events if e.get("event") == "dispatch"]
@@ -140,6 +155,10 @@ def build_report(events: list[dict]) -> dict:
             "downgraded": sum(int(e.get("grounding_downgraded") or 0) for e in reviewed),
         },
         "blocks_held": sum(1 for e in reviewed if e.get("held")),
+        # LLM-lane refutation memory (#207): repeats of an already-refuted claim the panel
+        # did not spend a verify round on, per lane — and the marks it REFUSED (a mark that
+        # did not hold reports live). A memory that only ever refuses is matching nothing.
+        "refuted_before": _refuted_before(events),
         "unaccounted_priors": sum(int(e.get("unaccounted") or 0) for e in reviewed),
         "slowest_step_mix": dict(Counter(str(e.get("slowest_step")) for e in reviewed if e.get("slowest_step"))),
         "step_p50_s": _step_percentiles(reviewed),
@@ -232,6 +251,9 @@ def render_report_markdown(summary: dict, rows: list[dict] | None = None) -> str
         f"- **Guards:** grounding checked {(summary.get('grounding') or {}).get('findings_checked', 0)} finding(s), "
         f"downgraded {(summary.get('grounding') or {}).get('downgraded', 0)} · blocks held: {summary.get('blocks_held', 0)} · "
         f"unaccounted priors: {summary.get('unaccounted_priors', 0)}",
+        f"- **Refuted before (not re-verified):** {(summary.get('refuted_before') or {}).get('total', 0)} "
+        f"by lane {(summary.get('refuted_before') or {}).get('lanes') or {}} · marks refused: "
+        f"{(summary.get('refuted_before') or {}).get('rejected', 0)} (issue #207)",
         f"- **Convergence decisions:** {summary.get('convergence_decisions') or {}} — a rule that only "
         f"reports when it fires cannot be told apart from one that never runs",
         f"- **Step p50s:** {summary.get('step_p50_s') or 'n/a (host reports no timings)'} · "

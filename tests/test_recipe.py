@@ -27,6 +27,7 @@ def test_recipe_shape():
         "review_round",
         "head_sha",
         "base_ref",
+        "refuted_before",
         "existing_threads",
     }
     assert RECIPE["output"] == "{{steps.report.output}}"
