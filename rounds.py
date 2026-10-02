@@ -242,6 +242,8 @@ def render_prior_requests(rounds: list[dict]) -> str:
     for number, round_ in numbered:
         out.append(f'  <round number="{number}" verdict="{_attr(round_.get("verdict"))}">')
         for finding in round_["findings"][:MAX_REQUESTS_PER_ROUND]:
+            if isinstance(finding, dict) and finding.get("nearby"):
+                continue  # a nearby note (#232) was never a request of this PR
             if str(finding.get("verdict") or "").lower() == "refuted":
                 status = REQUEST_REFUTED
             elif _anchor(finding.get("file"), finding.get("line")) in latest:
@@ -393,6 +395,8 @@ def unexplained_clearance(
             clean_runs += 1
             continue
         for finding in prior:
+            if finding.get("nearby"):
+                continue  # a nearby note never gated (#232); its absence clears nothing
             severity = str(finding.get("severity") or "").lower()
             if severity in ("blocker", "major") and str(finding.get("verdict") or "").lower() != "refuted":
                 if clean_runs >= corroborate:
@@ -578,6 +582,10 @@ def unaccounted_priors(
     for finding in last_round_findings:
         if finding.get("ungrounded"):
             # grounding already decided the evidence is fabricated — not a debt
+            continue
+        if finding.get("nearby"):
+            # a structural note on code the PR did not change (#232) — it never gated, so it
+            # is no debt either; if a later head touches that code, protoPatch re-raises it
             continue
         severity = str(finding.get("severity") or "").lower()
         if severity not in ("blocker", "major"):

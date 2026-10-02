@@ -344,13 +344,42 @@ async def _default_run_clawpatch(args: list[str], cwd: Path, env: dict, budget_s
     return proc.returncode or 0, stdout.decode(errors="replace"), stderr.decode(errors="replace"), False
 
 
-def map_finding(record: dict) -> dict | None:
+# Lines of context around a changed hunk that still count as "this PR's code" when picking a
+# finding's anchor — the same padding `rounds.DELTA_CONTEXT_LINES` gives the dispatcher's scoping.
+ANCHOR_CONTEXT_LINES = 5
+
+
+def _touches_change(ref: dict, ranges: dict[str, list[tuple[int, int]]] | None) -> bool:
+    """Does one evidence location overlap a line this PR changed (± `ANCHOR_CONTEXT_LINES`)?"""
+    if not ranges:
+        return False
+    spans = ranges.get(_norm_path(str(ref.get("path") or "")))
+    if not spans:
+        return False
+    try:
+        start = int(ref.get("startLine") or 0)
+        end = int(ref.get("endLine") or start)
+    except (TypeError, ValueError):
+        return False
+    if start <= 0:
+        return False
+    end = max(end, start)
+    return any(start <= hi + ANCHOR_CONTEXT_LINES and lo - ANCHOR_CONTEXT_LINES <= end for lo, hi in spans)
+
+
+def map_finding(record: dict, ranges: dict[str, list[tuple[int, int]]] | None = None) -> dict | None:
     """One protoPatch FindingRecord → an ADR 0077 finding dict, or None if not reportable.
 
     Category passes through verbatim (the contract's category vocabulary is advisory);
     severity maps critical/high/medium/low → blocker/major/minor/nit; `source` is
     always "protopatch". Only open/uncertain findings report — fixed, wont-fix and
     false-positive records are protoPatch's own resolved state.
+
+    The finding is anchored (file, line, quote) at its FIRST evidence location — unless
+    `ranges` (this PR's changed lines) shows another of its locations in code the PR changed,
+    which then wins (#232). The dispatcher scopes structural findings by their anchor: a
+    cross-location finding ("this change breaks that caller") anchored at its untouched end
+    would read as a pre-existing note about code the PR never touched.
     """
     if record.get("status") not in ("open", "uncertain"):
         return None
@@ -358,7 +387,7 @@ def map_finding(record: dict) -> dict | None:
     if not title:
         return None
     evidence_refs = [e for e in record.get("evidence") or [] if isinstance(e, dict) and e.get("path")]
-    first = evidence_refs[0] if evidence_refs else {}
+    first = next((e for e in evidence_refs if _touches_change(e, ranges)), evidence_refs[0] if evidence_refs else {})
     quote = str(first.get("quote") or "").strip()
     reasoning = str(record.get("reasoning") or "").strip()
     recommendation = str(record.get("recommendation") or "").strip()
@@ -379,12 +408,15 @@ def map_finding(record: dict) -> dict | None:
     }
 
 
-def read_findings(state_dir: Path, changed_files: set[str] | None) -> list[dict]:
+def read_findings(
+    state_dir: Path, changed_files: set[str] | None, ranges: dict[str, list[tuple[int, int]]] | None = None
+) -> list[dict]:
     """Open findings from `<state>/findings/*.json`, confined to this PR.
 
     The state dir is per REVIEW (#223): it holds only this pass's findings, so another PR's
     findings on a shared file can never leak in. `changed_files`, when known, still confines the
-    report to the diff. Deduped by protoPatch `signature`.
+    report to the diff. Deduped by protoPatch `signature`. `ranges` (changed lines per file)
+    picks each finding's anchor — see `map_finding`.
     """
     findings_dir = state_dir / "findings"
     if not findings_dir.is_dir():
@@ -404,7 +436,7 @@ def read_findings(state_dir: Path, changed_files: set[str] | None) -> list[dict]
         paths = {str(e.get("path")) for e in record.get("evidence") or [] if isinstance(e, dict) and e.get("path")}
         if changed_files is not None and paths and not (paths & changed_files):
             continue  # a prior PR's finding — not this diff's
-        mapped = map_finding(record)
+        mapped = map_finding(record, ranges)
         if mapped:
             seen.add(sig)
             out.append(mapped)
@@ -739,11 +771,12 @@ class ProtoPatchRunner:
     ) -> str:
         """The header + fenced findings array for a pass, complete — or partial when `partial` is
         (coverage, reason). The one place findings are read, confined and pre-marked."""
-        findings = read_findings(state_dir, changed)
+        ranges = await self._changed_ranges(checkout, base_sha)
+        findings = read_findings(state_dir, changed, ranges)
         # A repeat of a claim this repo's verifier already refuted, at a spot this PR does
         # not touch, goes to the synthesizer already marked (#190) — it is dropped there
         # instead of costing a verify round on every PR that touches the file.
-        premarked = premark_refuted(findings, self.refutations, repo, await self._changed_ranges(checkout, base_sha))
+        premarked = premark_refuted(findings, self.refutations, repo, ranges)
         confinement = f"{len(changed)} changed file(s)" if changed is not None else "unconfined (diff unavailable)"
         repeats = f", {premarked} refuted before (pre-marked)" if premarked else ""
         header = (
