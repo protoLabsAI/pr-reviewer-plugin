@@ -24,6 +24,7 @@ from tests.conftest import note_write
 
 HEAD = "a" * 40
 OLD_HEAD = "b" * 40
+NEXT_HEAD = "d" * 40
 
 REPORT = (
     "<!-- brief -->\nBrief prose.\n<!-- /brief -->\n\n```json\n"
@@ -3468,6 +3469,36 @@ async def test_a_fabricated_blocker_is_downgraded_and_cannot_fail(tmp_path):
     assert gh.posted[0]["event"] == "COMMENT"  # not REQUEST_CHANGES
     assert "downgraded to **uncertain**" in body
     assert "Path(str(configured))" in body  # the absent quote is named
+
+
+async def test_a_fabricated_finding_is_flagged_in_the_record_so_it_is_never_carried(tmp_path):
+    # Grounding annotated a COPY, so the posted record kept the fabricated blocker as
+    # `confirmed` with no `ungrounded` flag — and the next round's ledger, which skips
+    # `ungrounded` priors, never saw the flag: an undispositioned fabrication was carried as
+    # debt (`merge_carried_findings` re-stamps it confirmed) and held the head.
+    gh = GroundingGH(source=SRC_WITH_EXPANDUSER, pr_facts=facts(), reviews=[])
+    runner, _seen = capturing_runner(FABRICATED_REPORT)
+    d = make(tmp_path, cfg={"shadow_mode": False}, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "reviewed:WARN"
+    body = gh.reviews_posted[0]["body"]
+    [row] = json.loads(extract_findings_json(body))
+    assert row["ungrounded"] is True and row["verdict"] == "uncertain"
+    # Next round: the panel dispositions nothing about it. It must not come back as debt.
+    gh2 = GroundingGH(
+        source=SRC_WITH_EXPANDUSER,
+        pr_facts=facts(),
+        reviews=[{"state": "COMMENTED", "body": body, "id": 70}],
+    )
+    report = (
+        "prose\n\n```json\n" + json.dumps([{"prior": "x.py:36", "disposition": "open"}]) + "\n```\n\n```json\n[]\n```"
+    )
+    runner2, _ = capturing_runner(report)
+    gh2.pr_facts = facts(head=NEXT_HEAD)
+    d2 = make(tmp_path / "r2", cfg={"shadow_mode": False}, gh=gh2, runner=runner2)
+    assert (await d2.handle_pr_event("o/r", 1, NEXT_HEAD, "synchronize")) == "reviewed:PASS"
+    body2 = gh2.reviews_posted[0]["body"]
+    assert "Unaccounted prior finding" not in body2
+    assert json.loads(extract_findings_json(body2)) == []
 
 
 async def test_a_grounded_blocker_still_fails(tmp_path):

@@ -3082,6 +3082,18 @@ class Dispatcher:
             grounding_sources = {f: v[1] for f, v in raw.items()}
             grounded_findings, ungrounded, unreadable = apply_grounding(findings, grounding_sources)
             grounding_checked = len(findings)
+            # Grounding annotates COPIES; the record must carry the same annotation. Before
+            # this, the posted findings array kept a fabricated blocker as `confirmed` with no
+            # `ungrounded` flag, so the next round's ledger (which skips `ungrounded` priors)
+            # carried it as debt. `apply_grounding` is positional and never adds or drops one,
+            # so each annotated copy replaces its recorded original by identity.
+            regraded = {
+                id(before): after
+                for before, after in zip(findings, grounded_findings)
+                if after is not before and (after.get("ungrounded") or after.get("source_unavailable"))
+            }
+            if regraded:
+                reported = [regraded.get(id(f), f) for f in reported]
             findings = grounded_findings
             findings = correct_line_numbers(findings, blobs)
         # Structural scoping (#232): a protoPatch finding in code this PR did not change is a
