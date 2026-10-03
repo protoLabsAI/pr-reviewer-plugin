@@ -145,3 +145,15 @@ def test_from_cfg_builds_the_same_store_for_writer_and_reader(tmp_path, monkeypa
     monkeypatch.setenv("PR_REVIEWER_HOME", str(tmp_path / "home"))
     d = RefutationStore.from_cfg({})
     assert d.root == tmp_path / "home" / "clawpatch" and d.ttl_s == 14 * 86400
+
+
+def test_a_leading_slash_on_either_side_still_matches_the_remembered_claim(tmp_path):
+    # #247: one finder writes `/packs/...`, another `packs/...` — the same file, the same
+    # claim. `rounds._norm` already treats them as one path; the store must too.
+    store = RefutationStore(tmp_path)
+    store.record("o/r", [_finding(file="/packs/necromunda/src/lib.rs", verdict="refuted")], pr=1, head="abc")
+    assert store.match("o/r", "packs/necromunda/src/lib.rs", CLAIM, 11)
+    store = RefutationStore(tmp_path / "b")
+    store.record("o/r", [_finding(verdict="refuted")], pr=1, head="abc")
+    assert store.match("o/r", "/packs/necromunda/src/lib.rs", CLAIM, 11)
+    assert store.match("o/r", "./packs/necromunda/src/lib.rs", CLAIM, 11)
