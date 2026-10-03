@@ -36,7 +36,7 @@ def _load(name: str, path: Path):
 
 rah = _load("review_at_head_vendored", ROOT / "scripts" / "review_at_head.py")
 vendor = _load("vendor_supersede_rule", ROOT / "scripts" / "vendor_supersede_rule.py")
-SCRIPT = (ROOT / "scripts" / "review_at_head.py").read_text()
+SCRIPT = (ROOT / "scripts" / "review_at_head.py").read_text(encoding="utf-8")
 
 HEAD = "a" * 40
 

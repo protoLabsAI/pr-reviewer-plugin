@@ -96,7 +96,7 @@ def recorded(text: str) -> dict[str, str]:
 def rounds_hash(root: Path = ROOT) -> str:
     parts = []
     for module, names in SOURCES.items():
-        tree = ast.parse((root / module).read_text())
+        tree = ast.parse((root / module).read_text(encoding="utf-8"))
         found = {}
         for node in tree.body:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in names:
@@ -129,13 +129,13 @@ def main() -> int:
     group.add_argument("--stamp", metavar="COMMIT")
     group.add_argument("--sync", metavar="PATH", type=Path)
     args = parser.parse_args()
-    text = SCRIPT.read_text()
+    text = SCRIPT.read_text(encoding="utf-8")
     if args.stamp:
-        SCRIPT.write_text(stamp(text, commit=args.stamp, rounds=rounds_hash()))
+        SCRIPT.write_text(stamp(text, commit=args.stamp, rounds=rounds_hash()), encoding="utf-8")
         return 0
     if args.sync:
-        target = args.sync.read_text()
-        args.sync.write_text(target.replace(block(target), block(text)))
+        target = args.sync.read_text(encoding="utf-8")
+        args.sync.write_text(target.replace(block(target), block(text)), encoding="utf-8")
         return 0
     want = recorded(text)
     problems = []
