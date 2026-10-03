@@ -458,3 +458,37 @@ async def test_an_oversized_head_file_is_unreadable_not_an_empty_read_in_replay(
     assert out["telemetry"]["grounding_downgraded"] == 0  # nothing was read, so nothing is "absent"
     assert out["telemetry"]["grounding_unreadable"] == 1  # counted as a fetch failure, correctly
     assert out["verdict"] == "FAIL"  # severity PRESERVED — fail closed on unread evidence
+
+
+async def test_finding_sources_reads_a_second_page_of_patches():
+    # `--paginate` applies the jq per page: the old `[.[] | …]` filter emitted `[…][…]` past
+    # one page, which failed to parse, so EVERY patch was lost (the #75 shape).
+    from pr_reviewer.replay import _finding_sources
+
+    class TwoPageGH:
+        def __init__(self):
+            self.jq = ""
+
+        async def __call__(self, args, timeout=30):
+            j = " ".join(args)
+            if "/pulls/" in j and "/files" in j:
+                self.jq = args[-1]
+                page = (
+                    "["
+                    + json.dumps({"f": "a.py", "p": "patchA"})
+                    + "]"
+                    + "["
+                    + json.dumps({"f": "b.py", "p": "patchB"})
+                    + "]"
+                    if self.jq.startswith("[")
+                    else json.dumps({"f": "a.py", "p": "patchA"}) + "\n" + json.dumps({"f": "b.py", "p": "patchB"})
+                )
+                return 0, page, ""
+            if "/contents/" in j:
+                return 0, "base64\x00", ""
+            return 1, "", "unexpected call"
+
+    gh = TwoPageGH()
+    sources = await _finding_sources(gh, "o/r", 1, HEAD40, [{"file": "b.py"}])
+    assert not gh.jq.startswith("[")  # one object per line, pagination-safe
+    assert sources["b.py"].endswith("patchB")  # the second page's patch arrived

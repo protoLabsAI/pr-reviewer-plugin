@@ -7,6 +7,7 @@ from the env when set, else `gh`'s own ambient auth (`gh auth login`).
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 
@@ -54,3 +55,42 @@ async def run_gh(args: list[str], timeout: int = _COMMAND_TIMEOUT) -> tuple[int,
             proc.kill()
             await proc.communicate()
         return 124, "", f"gh {' '.join(args[:2])}: timed out after {timeout}s"
+
+
+def gh_json_rows(out: str) -> list | None:
+    """Parse `gh api --paginate --jq '.[] | …'` output → rows, or None if unparseable.
+
+    `--paginate` applies the jq filter PER PAGE and concatenates the results, so an
+    array-wrapping filter (`[.[] | …]`) emits `[…][…]` on the second page — not valid
+    JSON, and every such read silently broke the moment a PR crossed 30 items
+    (issue #75). Emitting one object per line instead is pagination-safe by
+    construction: `gh` prints compact JSON, so embedded newlines stay escaped and one
+    row really is one line.
+
+    A single unparseable line makes the WHOLE read None rather than a short list.
+    These rows drive "has this been reviewed", "did an operator pause this" and "are
+    the checks green" — a silently-short answer is the failure mode of #71, where a
+    partial read was indistinguishable from an absence.
+
+    Still accepts a whole-array body, so a caller that drops --jq (or a fake that
+    returns one array) keeps working.
+    """
+    text = (out or "").strip()
+    if not text:
+        return []
+    try:
+        whole = json.loads(text)
+    except ValueError:
+        pass
+    else:
+        return whole if isinstance(whole, list) else [whole]
+    rows = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rows.append(json.loads(line))
+        except ValueError:
+            return None  # a partial read is worse than none — it looks complete
+    return rows

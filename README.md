@@ -507,7 +507,7 @@ verdict"* with nothing saying it was in line. This gated GET route (same auth as
 }
 ```
 
-- **`kind`** is `webhook` | `summon` | `sweep-backfill`. **`phase`** is the running step —
+- **`kind`** is `webhook` | `summon` | `sweep-backfill` | `verify-retry`. **`phase`** is the running step —
   `finders` | `structural` | `verify` | `synthesize` | `posting` — updated as the panel
   progresses (`posting` is the dispatcher writing the verdict after the runner returns).
 - **`position`** is the FIFO place in line (1 = next to start); **`depth`** is `len(queued)`.
@@ -540,7 +540,12 @@ decisive first:
    must decide its review event when the panel lands, and #863 forbids blocking against
    pending CI, so a fast reviewer's FAIL posts as a comment and the gate never arms.
    This is the mirror of the stale-block dismissal: that lifts a block, this arms one.
-3. **Promote** — the existing approve-on-green path.
+3. **Promote** — the existing approve-on-green path. When it holds at `hold:unverified`
+   (the round's verifier flaked), the sweep runs **one** fresh round for that head on its
+   own — the same panel a `@vera review` summon runs, queued and budgeted like a backfill,
+   skipped on a paused PR. If that round is unverified too, it stops: the `QA panel` check
+   reads "Verifier failed twice — summon @vera review or push" and the operator is
+   escalated once (#220). Every held check names its `hold:*` reason in the summary.
 
 A PR that was just backfilled skips 2 and 3 for that pass; the fresh review posts its
 own verdict through the normal path and the next tick sees settled state.
