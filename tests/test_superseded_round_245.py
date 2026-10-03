@@ -284,3 +284,36 @@ async def test_settle_never_swallows_the_rounds_own_cancel():
     else:
         raise AssertionError("the round's cancel was swallowed")
     await inner
+
+
+# ── review on #246: an attempt that finishes during the head read is still superseded ──
+
+
+class SlowHeadReadGH(MovableGH):
+    """The PR read takes a moment, so a runner can finish while a head check is out."""
+
+    async def __call__(self, args, timeout=30):
+        if len(args) > 1 and args[1] == "repos/o/r/pulls/1":
+            await asyncio.sleep(0.05)
+        return await super().__call__(args, timeout)
+
+
+async def test_an_attempt_that_finishes_during_the_head_read_is_still_superseded(tmp_path):
+    gh = SlowHeadReadGH()
+    heads: list[str] = []
+
+    async def runner(name, inputs, on_step=None):
+        heads.append(inputs["head_sha"])
+        if inputs["head_sha"] == OLD:
+            gh.pr_facts = facts(head=NEW)  # force-pushed during the finders
+        on_step("synthesize")  # schedules the head read…
+        return {"output": REPORT, "steps": {}, "failed": []}  # …and finishes before it answers
+
+    d = make(tmp_path, gh=gh, runner=runner)
+    outcome = await d.handle_pr_event("o/r", 1, OLD, "opened")
+
+    assert _posted_heads(gh) == [NEW]  # nothing for the superseded head, not even #211's comment
+    assert outcome == "reviewed:FAIL" and heads == [OLD, NEW]  # handed off to the new head
+    sup = [e for e in _events(d, "superseded") if e.get("cancelled")]
+    assert sup and sup[0]["sha"] == OLD and sup[0]["new_head"] == NEW
+    assert not d.chokepoint._in_flight

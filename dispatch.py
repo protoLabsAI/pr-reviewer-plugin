@@ -646,12 +646,19 @@ class _Running:
 async def _settle_attempt(task: asyncio.Task) -> None:
     """Make sure a panel attempt's runner task has ENDED before the round moves on (#246).
 
-    asyncio already forwards a cancel of the awaiting round (attempt timeout, round
-    timeout, shutdown) to the task it is awaiting, and the round only wakes once that task
-    has finished. So on every path the dispatcher has today, this finds the task done and
-    does nothing. It exists so that a path added later, one that leaves the `await`
-    without the task finishing, cancels the runner and waits for it rather than leaving it
-    running in the background on the model lane.
+    What the tests show (`test_a_timed_out_*_leaves_no_pending_runner_task`, with a
+    runner whose cleanup takes 50ms; the same on Python 3.11 and 3.12): when the attempt
+    timeout, the round timeout or a shutdown cancels the round, asyncio passes that cancel
+    to the runner task the round is awaiting. The round wakes only after the runner has
+    finished, cleanup included. So this already finds the task done on the timeout,
+    shutdown, supersede and normal paths, and it cancels nothing there.
+
+    A related limit it does NOT fix: a host that catches the cancel and keeps running holds
+    the round until it returns. asyncio has passed the timeout's cancel to the runner, so
+    `asyncio.timeout` never fires; the round waits, rather than orphaning the runner.
+
+    It is the guard for any exit that leaves the `await` while the runner is still going:
+    there, it cancels the runner and waits for it instead of leaving it on the model lane.
 
     `asyncio.wait`, not `await task` under `suppress(CancelledError)`: if the ROUND is
     cancelled again while it waits here, that suppress would swallow the round's own
@@ -674,7 +681,7 @@ class _RoundWatch:
     attempt task is cancelled and `superseded_by` names the head that replaced it.
     """
 
-    __slots__ = ("repo", "pr", "head", "task", "superseded_by", "checking", "phase")
+    __slots__ = ("repo", "pr", "head", "task", "superseded_by", "checking", "phase", "check")
 
     def __init__(self, repo: str, pr: int, head: str):
         self.repo, self.pr, self.head = repo, pr, head
@@ -682,6 +689,7 @@ class _RoundWatch:
         self.superseded_by: str | None = None
         self.checking = False
         self.phase = ""
+        self.check: asyncio.Task | None = None  # the head read in progress, if any
 
 
 class PanelQueue(asyncio.Semaphore):
@@ -2697,7 +2705,7 @@ class Dispatcher:
             if watch.checking or watch.superseded_by or (phase not in _SUPERSEDE_CHECK_PHASES and not hinted):
                 return
             watch.checking = True
-            asyncio.get_running_loop().create_task(self._check_superseded(watch))
+            watch.check = asyncio.get_running_loop().create_task(self._check_superseded(watch))
         except Exception:  # noqa: BLE001 — a supersede check must never fail the round
             watch.checking = False
 
@@ -2713,11 +2721,15 @@ class Dispatcher:
             current = str((facts or {}).get("head") or "")
             if not current or current == watch.head or ineligible_reason(facts):
                 return
-            task = watch.task
-            if task is None or task.done():
-                return
+            # Record the supersede even if the attempt finished while we were reading: its
+            # result is still a superseded head's. The round waits for this check before
+            # using a result (`_review`), so it sees the mark, posts nothing and hands off.
+            # Returning early here used to let it post on the old head (as #211's
+            # non-blocking comment) and leave the new head to the sweep's backfill.
             watch.superseded_by = current
-            task.cancel()
+            task = watch.task
+            if task is not None and not task.done():
+                task.cancel()
         except Exception:  # noqa: BLE001
             log.warning("[pr-reviewer] supersede check failed on %s#%s", watch.repo, watch.pr, exc_info=True)
         finally:
@@ -3087,9 +3099,16 @@ class Dispatcher:
                     dedup_key=f"pr-reviewer-crash:{repo}#{pr}@{head[:7]}",
                 )
                 return "error:run-timed-out" if timed_out else "error:run-crashed"
+            if watch.check is not None and not watch.check.done():
+                # A head read started at a step boundary is still out. The attempt finished
+                # before it could answer, so wait for the answer before using the result:
+                # the read may say this head was superseded (#246 review). It is one bounded
+                # `gh` call, and it never cancels the round.
+                await asyncio.wait({watch.check})
             if watch.superseded_by is not None:
-                # The host swallowed the cancel and returned anyway. The result is still a
-                # superseded head's, and is discarded all the same (#245).
+                # Superseded: the host swallowed the cancel and returned anyway, or the attempt
+                # finished while the head read was out. Either way the result is a superseded
+                # head's, and is discarded (#245).
                 return await self._abandon_superseded(repo, pr, head, watch, review_check_id)
             failed = list(result.get("failed") or [])
             steps_now = result.get("steps") if isinstance(result.get("steps"), dict) else {}
