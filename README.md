@@ -147,6 +147,26 @@ structural-trigger dispatch, approve-on-green + sweep, and the review eval.
   quotes real code and reasons wrongly about it (a prefix that doesn't actually match) is
   the verify prompt's half.
 
+- **A `confirmed` must rest on a search or a quote (issue #259)** — an audit of 34 findings
+  from Vera's v0.54–v0.56.1 reviews found 10 false, 9 of them `confirmed`, in two classes the
+  verify step reads instead of tests. Two post-verify checks demote such a finding to
+  `uncertain` (never dropped, footnoted, written into the posted findings record):
+  - **Absence claims are searched** ("no test", "dead", "never called", "not covered", "no
+    `x.py` exists"). The claim's backticked subjects and the cited module are grepped
+    (`git grep`, bounded by `absence_search_budget_s`, 120) in a checkout of the head: the
+    structural pass's own cache entry when there is one, else a blobless clone into the same
+    cache (`absence_search_clone: false` skips the clone). A reference in another test file,
+    a non-definition use, or the named file existing refutes the claim; a search that could
+    not run leaves a `confirmed` absence `uncertain`. A dead local or field (no definition to
+    anchor on) and a code-shape absence ("without validation") are not searched.
+  - **Evidence guard.** A confirmed note that quotes no code and restates the claim, or that
+    asserts what a library the repo declares in `pyproject.toml` / `requirements*.txt` /
+    `package.json` does ("DuckDB's parser classifies DESCRIBE…") without quoting its source,
+    docs or a run of it.
+  The labelled audit set is `tests/fixtures/audit_259.json`; `tests/test_precision_259.py`
+  scores the checks on it (confirmed findings 32 with 9 false → 25 with 2 false; no true
+  finding demoted).
+
 - **Prior-finding dispositions (v0.11.0)** — the general form of the clearance hold. The
   report pass must state, per prior **blocker/major**, whether it was `fixed` (naming the
   change), is still `open`, or was `refuted` (on evidence). A confirmed major that simply
@@ -406,6 +426,8 @@ compose env (re-applied every roll) to keep the config volume disposable:
 | `PR_REVIEWER_SUMMON_IN_FLIGHT_GRACE_S` | `pr_reviewer.summon_in_flight_grace_s` | `10` | Seconds a summon waits for the PR's in-flight slot before answering `in-flight` (clamped 0–120). Covers a concurrent webhook that reaffirms/drops in under a second; a running round still drops the summon. |
 | `PR_REVIEWER_SUMMON` | `pr_reviewer.summon` | `true` | The comment-command surface (`@vera review` / `pause` / `resume` / `help`) **and** the pause check on the automated path. `false` costs nothing for a repo that never wants comment-driven behaviour. |
 | `PR_REVIEWER_EVIDENCE_GROUNDING` | `pr_reviewer.evidence_grounding` | `true` | A finding whose quoted code appears nowhere in the cited file at the reviewed head (nor in this PR's patch for it) is annotated `uncertain` — it still posts, it just can't carry a FAIL. Fails open on an unreadable blob or unquotable evidence. |
+| `PR_REVIEWER_ABSENCE_SEARCH` | `pr_reviewer.absence_search` | `true` | Grep the head checkout for what an absence claim ("no test", "dead", "never called", "no `x.py` exists") says is missing; a hit, or a search that could not run, leaves the finding `uncertain` (#259). Needs evidence grounding on. `absence_search_budget_s` (120) bounds it; `absence_search_clone: false` uses only a checkout the structural pass already made. |
+| `PR_REVIEWER_EVIDENCE_GUARD` | `pr_reviewer.evidence_guard` | `true` | A `confirmed` whose note restates the claim without quoting code, or asserts a declared dependency's behaviour without quoting its source/docs/a run, becomes `uncertain` (#259). Needs evidence grounding on. |
 | `PR_REVIEWER_HOLD_UNEXPLAINED_CLEARANCE` | `pr_reviewer.hold_unexplained_clearance` | `true` | A zero-finding PASS does not dismiss our standing block when a prior round confirmed a blocker/major it neither reports nor explains. A second consecutive clean PASS lifts it. `false` restores the old always-dismiss behaviour. |
 | `PR_REVIEWER_CONVERGENCE_ROUNDS` | `pr_reviewer.convergence_rounds` | `3` | The round from which an all-minor, all-in-delta WARN retires to PASS-with-notes. `0` disables the rule — the panel keeps re-reviewing rather than ever floor a minor. |
 | `PR_REVIEWER_QA_CHECK` | `pr_reviewer.qa_check` | `true` | Publish the **`QA panel` check run** (below). Rides the promotion-owner gate, so a shadow repo publishes nothing. `false` keeps approve-on-green without the check. |

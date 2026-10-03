@@ -36,6 +36,21 @@ DEFAULT_ENTRY_LIMIT = 50
 DEFAULT_SIZE_LIMIT_BYTES = 5 * 1024**3
 
 
+# One lock per checkout DIRECTORY, process-wide (issue #259). The structural pass and the
+# dispatcher's absence search each hold a `CheckoutCache` over the same root; per-instance locks
+# would let both clone into the same `<root>/<repo>/<sha>` at once.
+_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+def checkout_root_for(cfg: dict | None) -> Path:
+    """The checkout cache root for a plugin config — `checkout_root`, else
+    `$PR_REVIEWER_HOME/checkouts`. One definition, so every reader shares the structural pass's
+    checkouts instead of cloning its own."""
+    cfg = cfg or {}
+    home = Path(os.environ.get("PR_REVIEWER_HOME") or Path.home() / ".protoagent" / "pr-reviewer")
+    return Path(cfg.get("checkout_root") or home / "checkouts")
+
+
 class CheckoutError(Exception):
     """A checkout could not be produced (bad input, git failure, timeout)."""
 
@@ -78,8 +93,9 @@ class CheckoutCache:
         self.entry_limit = entry_limit
         self.size_limit_bytes = size_limit_bytes
         self._run_git = run_git or _default_run_git
-        # Simultaneous reviews of the same head queue rather than race the clone.
-        self._locks: dict[str, asyncio.Lock] = {}
+        # Simultaneous reviews of the same head queue rather than race the clone — across every
+        # cache over the same root, not just this instance (see `_LOCKS`).
+        self._locks = _LOCKS
 
     def dir_for(self, repo: str, sha: str) -> Path:
         return self.root / repo.replace("/", "-") / sha
@@ -90,7 +106,7 @@ class CheckoutCache:
             raise CheckoutError(f"invalid repo {repo!r} (want owner/name)")
         if not _SHA_RE.match(sha or ""):
             raise CheckoutError(f"invalid sha {sha!r} (want 7-40 hex chars)")
-        key = f"{repo}@{sha}"
+        key = str(self.dir_for(repo, sha).absolute())
         lock = self._locks.setdefault(key, asyncio.Lock())
         async with lock:
             return await self._resolve_locked(repo, sha, token)

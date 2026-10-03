@@ -118,3 +118,16 @@ def pytest_runtest_call(item):
     error = getattr(getattr(item, "module", None), "_LOAD_ERROR", None)
     if error is not None:
         pytest.fail(f"{item.module.__name__}: test data could not be loaded: {error!r}", pytrace=False)
+
+
+@pytest.fixture(autouse=True)
+def _no_checkout_clones(monkeypatch):
+    """The dispatcher's absence search (#259) greps a checkout of the PR head, cloning one on a
+    cache miss. A test must never clone from GitHub: the default resolver finds no checkout, and
+    a test that wants the search to run injects `resolve_checkout` with a local repo."""
+    import pr_reviewer.absence_search as absence
+
+    async def _no_checkout(repo, head):
+        return None
+
+    monkeypatch.setattr(absence, "default_resolver", lambda cfg: _no_checkout)

@@ -37,7 +37,7 @@ import time
 import uuid
 from pathlib import Path
 
-from .checkout_cache import CheckoutCache, CheckoutError, redact
+from .checkout_cache import CheckoutCache, CheckoutError, checkout_root_for, redact
 from .gh_cli import bad_repo, resolve_token, run_gh
 from .lintcheck import LintChecker, render_refuted
 from .refutations import RefutationStore, _norm_path, premark_refuted
@@ -715,7 +715,7 @@ class ProtoPatchRunner:
         # Where the per-pass `structural_plan` event goes (#232); None = not recorded.
         self.telemetry = telemetry
         home = Path(os.environ.get("PR_REVIEWER_HOME") or Path.home() / ".protoagent" / "pr-reviewer")
-        self.checkout_root = Path(self.cfg.get("checkout_root") or home / "checkouts")
+        self.checkout_root = checkout_root_for(self.cfg)  # shared with the absence search (#259)
         self.state_root = Path(self.cfg.get("state_root") or home / "clawpatch")
         # Claims this repo's verifier already refuted (#190) — shared with the dispatcher,
         # which writes them when a round posts; the structural pass reads them here.
