@@ -292,11 +292,15 @@ def test_a_later_racing_fail_is_not_superseded_by_an_earlier_refutation():
     assert verdict == "FAIL" and not decision.ok
 
 
-def test_review_at_head_falls_back_to_strictest_when_the_rule_cannot_load():
+def test_review_at_head_falls_back_to_strictest_when_the_rule_fails(monkeypatch):
     reviews = api([r1(), r2(), row("PASS", id=103, record=refuting())])
-    assert rah.decide(reviews, HEAD, []).ok  # with the plugin rule
-    attrs = rah.verdict_for_head(reviews, HEAD, rounds_module=None)
-    assert attrs["verdict"] == "FAIL"  # fail-closed without it
+    assert rah.decide(reviews, HEAD, []).ok  # with the vendored rule
+
+    def boom(_rounds):
+        raise RuntimeError("rule broke")
+
+    monkeypatch.setattr(rah, "_v_superseded_fails", boom)
+    assert rah.verdict_for_head(reviews, HEAD)["verdict"] == "FAIL"  # fail-closed without it
 
 
 def test_a_disposition_record_cannot_be_forged_from_review_prose():
