@@ -96,7 +96,14 @@ def scripted_clawpatch(script, calls):
 
 
 def runner(tmp_path, cfg=None, **kw):
-    base = {"checkout_root": str(tmp_path / "co"), "state_root": str(tmp_path / "st"), "default_repo": ""}
+    # These pin the `clawpatch ci --since` path (`structural_plan: false`, the rollback switch); the
+    # plugin-planned path (#232) reuses the same retry/salvage code and is pinned in test_protopatch_feature_plan_232.py.
+    base = {
+        "checkout_root": str(tmp_path / "co"),
+        "state_root": str(tmp_path / "st"),
+        "default_repo": "",
+        "structural_plan": False,
+    }
     return ProtoPatchRunner({**base, **(cfg or {})}, run_git=kw.pop("run_git", make_git()), **kw)
 
 

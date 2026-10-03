@@ -147,7 +147,14 @@ async def test_a_real_budget_kill_keeps_the_features_that_finished(tmp_path, rep
         "structural_jobs": 8,  # all 8 in flight, so the 5 fast ones finish and the 3 hung ones are cut off
         "gateway_base_url": gateway.url,
     }
-    runner = ProtoPatchRunner(cfg, run_git=run_git)  # the REAL `_run_clawpatch`: a real subprocess, a real SIGKILL
+    events: list = []
+
+    class Recorder:
+        def emit(self, event, **fields):
+            events.append((event, fields))
+
+    # the REAL `_run_clawpatch`: a real subprocess, a real SIGKILL
+    runner = ProtoPatchRunner(cfg, run_git=run_git, telemetry=Recorder())
 
     started = time.monotonic()
     out = await runner.review(1, "octo/repo")
@@ -168,3 +175,11 @@ async def test_a_real_budget_kill_keeps_the_features_that_finished(tmp_path, rep
     assert pass_coverage(state) == (len(FAST), FEATURES)
     assert len(read_findings(state, None)) == len(FAST)
     assert os.path.isdir(state / "provider-failures")  # the symlinked diagnostics dir is intact too
+
+    # #232: the stderr a SIGKILLed clawpatch wrote survives the kill, so the plan event can say which
+    # features finished and which were still in flight (a hang) rather than never started (too many).
+    [(event, row)] = events
+    assert event == "structural_plan" and row["outcome"] == "partial" and row["reason"] == "budget-timeout"
+    statuses = sorted(f["status"] for f in row["features"])
+    assert statuses == ["finished"] * len(FAST) + ["killed"] * (FEATURES - len(FAST))
+    assert all(isinstance(f.get("elapsed_s"), int) for f in row["features"] if f["status"] == "finished")

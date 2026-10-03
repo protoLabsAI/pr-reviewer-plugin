@@ -156,7 +156,14 @@ async def runner_argv(tmp_path, cfg):
             os.makedirs(args[-1], exist_ok=True)
         return (0, "x.yml\n", "") if "diff" in args else (0, "", "")
 
-    base = {"checkout_root": str(tmp_path / "co"), "state_root": str(tmp_path / "st"), "default_repo": ""}
+    # The `ci --since` argv (`structural_plan: false`); the planned `review --feature-list` path is
+    # exercised against the real binary in test_feature_plan_clawpatch_e2e.py (#232).
+    base = {
+        "checkout_root": str(tmp_path / "co"),
+        "state_root": str(tmp_path / "st"),
+        "default_repo": "",
+        "structural_plan": False,
+    }
     await ProtoPatchRunner({**base, **cfg, "clawpatch_bin": CLAWPATCH}, run_git=run_git, run_clawpatch=fake).review(
         1, "o/r"
     )

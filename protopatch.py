@@ -129,7 +129,8 @@ def classify_outage(reason: str) -> str:
     from an auth failure (`exit 4 … 401`) or a missing binary meant grepping the container
     log, because the reviewed row only said `structural_unavailable: true`.
 
-    Classes: `budget-timeout` (our SIGKILL), `not-installed`, `no-credentials`, `checkout`,
+    Classes: `budget-timeout` (our SIGKILL), `feature-cap` (the plan left features unreviewed, #232),
+    `not-installed`, `no-credentials`, `checkout`,
     `exit-N` for a clawpatch exit code, refined for exit 4 into `exit-4:gateway-timeout`
     (clawpatch's own provider timeout) or `exit-4:provider` (anything else in that class),
     and `other` for a reason this does not recognise.
@@ -140,6 +141,8 @@ def classify_outage(reason: str) -> str:
     lowered = text.lower()
     if lowered.startswith("timed out after"):
         return "budget-timeout"
+    if lowered.startswith(FEATURE_CAP_REASON):
+        return "feature-cap"
     if "is not installed" in lowered or "command not found" in lowered:
         return "not-installed"
     if lowered.startswith("no gateway credentials"):
@@ -270,6 +273,238 @@ def structural_jobs(value) -> int | None:
     return min(parsed, MAX_STRUCTURAL_JOBS)
 
 
+# ── The feature plan (#232) ─────────────────────────────────────────────────────────────────────
+# `clawpatch ci --since <base>` reviews every feature that OWNS a changed file or lists one as
+# CONTEXT. Its Python mapper lists `pyproject.toml` as context of every Python feature, so a one-line
+# version bump selected 276 of protoAgent's 361 features (protoAgent#4003: a ~150-line diff, 5
+# features own a changed file, 271 came in through `pyproject.toml` alone). At `--jobs 4` that is
+# hours of review; every such pass hit the budget. The plugin now picks the features itself:
+#   - a lockfile, generated file, changelog fragment or dependency manifest never pulls a feature
+#     in through CONTEXT (the feature's own code did not change; its findings are confined to the
+#     diff anyway, so reviewing it for a version bump buys nothing reportable),
+#   - the rest are ranked by changed lines in files the feature owns, then in its context files,
+#   - at most `structural_max_features` are reviewed; the rest are a COVERAGE GAP (partial pass,
+#     "N of M features reviewed"), never a silent drop.
+LOW_SIGNAL_BASENAMES = frozenset(
+    {
+        # lockfiles
+        "uv.lock",
+        "poetry.lock",
+        "Pipfile.lock",
+        "pdm.lock",
+        "package-lock.json",
+        "npm-shrinkwrap.json",
+        "pnpm-lock.yaml",
+        "yarn.lock",
+        "bun.lockb",
+        "bun.lock",
+        "Cargo.lock",
+        "Gemfile.lock",
+        "composer.lock",
+        "go.sum",
+        "mix.lock",
+        "Package.resolved",
+        # generated
+        "THIRD_PARTY_LICENSES.md",
+        "CHANGELOG.md",
+        # dependency manifests
+        "pyproject.toml",
+        "Pipfile",
+        "setup.cfg",
+        "package.json",
+        "Cargo.toml",
+        "go.mod",
+        "Gemfile",
+        "composer.json",
+        "mix.exs",
+    }
+)
+LOW_SIGNAL_DIRS = ("changelog.d",)
+_REQUIREMENTS_RE = re.compile(r"^requirements[\w.-]*\.(?:txt|in)$", re.IGNORECASE)
+
+# Features reviewed per pass. At `--jobs 4` the smart lane finishes roughly 1.5-2.5 features a
+# minute (one feature is ~20-90 s of prompt and 100-300 s of reply), so 16 is ~4 waves, about
+# 10-12 minutes, inside the 1500 s budget with room for a slow wave or the transient retry.
+DEFAULT_MAX_FEATURES = 16
+FEATURE_CAP_REASON = "feature cap reached"
+PLAN_FILENAME = "feature-plan.txt"
+PLAN_STEP_BUDGET_S = 120  # `init` + `map` are local and heuristic (~2-3 s on protoAgent)
+
+
+def is_low_signal(path: str) -> bool:
+    """A changed file that says nothing about which features a change touches: a lockfile, a
+    generated file, a changelog fragment, or a dependency manifest (#232)."""
+    parts = path.replace("\\", "/").strip("/").split("/")
+    name = parts[-1] if parts else ""
+    return (
+        name in LOW_SIGNAL_BASENAMES
+        or bool(_REQUIREMENTS_RE.match(name))
+        or any(d in parts[:-1] for d in LOW_SIGNAL_DIRS)
+    )
+
+
+def structural_max_features(value) -> int | None:
+    """The per-pass feature cap from the `structural_max_features` setting.
+
+    Unset / blank -> DEFAULT_MAX_FEATURES. `0` -> None: no cap (the lockfile/manifest scoping still
+    applies). Anything that is not a whole number >= 0 falls back to the default with a warning, so a
+    typo can neither stop the pass nor silently lift the cap."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return DEFAULT_MAX_FEATURES
+    parsed: int | None = None
+    if isinstance(value, bool):
+        parsed = None
+    elif isinstance(value, int):
+        parsed = value
+    elif isinstance(value, str) and re.fullmatch(r"\s*\d+\s*", value):
+        parsed = int(value)
+    if parsed is None or parsed < 0:
+        log.warning(
+            "[pr-reviewer] ignoring structural_max_features=%r (expected a whole number >= 0); using %d",
+            value,
+            DEFAULT_MAX_FEATURES,
+        )
+        return DEFAULT_MAX_FEATURES
+    return parsed or None
+
+
+def parse_numstat(out: str) -> dict[str, int]:
+    """{path: changed lines} from `git diff --numstat` (with or without `-z`, which keeps unusual paths
+    unquoted, as clawpatch reads them). A binary file (`-\t-`) counts as 1."""
+    lines: dict[str, int] = {}
+    text = out or ""
+    for row in text.split("\0") if "\0" in text else text.splitlines():
+        parts = row.split("\t")
+        if len(parts) < 3 or not parts[2].strip():
+            continue
+        added, deleted = parts[0].strip(), parts[1].strip()
+        n = (int(added) if added.isdigit() else 0) + (int(deleted) if deleted.isdigit() else 0)
+        lines[_norm_path(parts[2].strip())] = max(n, 1)
+    return lines
+
+
+def read_feature_records(state_dir: Path) -> list[dict]:
+    """The features `clawpatch map` wrote to `<state>/features/`. Unreadable records are skipped."""
+    out: list[dict] = []
+    for path in sorted((state_dir / "features").glob("*.json")):
+        try:
+            record = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        if isinstance(record, dict) and record.get("featureId"):
+            out.append(record)
+    return out
+
+
+def _paths(entries) -> set[str]:
+    return {_norm_path(str(e.get("path"))) for e in entries or [] if isinstance(e, dict) and e.get("path")}
+
+
+class FeaturePlan:
+    """Which features one structural pass reviews, and why (#232)."""
+
+    def __init__(self, mapped: int, eligible: list[dict], cap: int | None, low_signal_only: int, low_signal_files):
+        self.mapped = mapped
+        self.eligible = eligible  # ranked, most changed lines first
+        self.cap = cap
+        self.selected = eligible if cap is None else eligible[:cap]
+        self.low_signal_only = low_signal_only  # matched ONLY through a lockfile/manifest as context
+        self.low_signal_files = sorted(low_signal_files)
+
+    @property
+    def dropped(self) -> int:
+        return len(self.eligible) - len(self.selected)
+
+    def summary(self) -> str:
+        text = f"plan: {len(self.selected)} of {len(self.eligible)} eligible feature(s) of {self.mapped} mapped"
+        if self.dropped:
+            text += f", {self.dropped} over the per-pass cap of {self.cap}"
+        if self.low_signal_only:
+            text += (
+                f"; {self.low_signal_only} more depend on the diff only through a lockfile or dependency "
+                "manifest and are out of scope"
+            )
+        return text
+
+
+def plan_features(features: list[dict], changed_lines: dict[str, int], cap: int | None) -> FeaturePlan:
+    """Rank the features a diff touches and keep the top `cap` (None = all).
+
+    Eligible: the feature OWNS a changed file, or lists a changed file that is not low-signal as
+    context. Ranked by changed lines in owned files that are not low-signal, then by changed lines in
+    such context files, then by feature id (deterministic). A feature that owns only a low-signal
+    file (the config feature for `pyproject.toml`) stays eligible, ranked last."""
+    changed = set(changed_lines)
+    signal = {p for p in changed if not is_low_signal(p)}
+    eligible: list[dict] = []
+    low_signal_only = 0
+    low_signal_files: set[str] = set()
+    for feature in features:
+        owned = _paths(feature.get("ownedFiles")) & changed
+        context = (_paths(feature.get("contextFiles")) & changed) - owned
+        if not owned and not (context & signal):
+            if context:
+                low_signal_only += 1
+                low_signal_files |= context
+            continue
+        eligible.append(
+            {
+                "id": str(feature["featureId"]),
+                "owned_lines": sum(changed_lines[p] for p in owned & signal),
+                "context_lines": sum(changed_lines[p] for p in context & signal),
+                "files": len(_paths(feature.get("ownedFiles")) | _paths(feature.get("contextFiles"))),
+            }
+        )
+    eligible.sort(key=lambda f: (-f["owned_lines"], -f["context_lines"], f["id"]))
+    return FeaturePlan(len(features), eligible, cap, low_signal_only, low_signal_files)
+
+
+_PROGRESS_RE = re.compile(r"^clawpatch review (feature-start|feature-done|feature-error) (.*)$")
+_PROMPT_RE = re.compile(r"prompt=(\d+) bytes; approxTokens=(\d+)")
+
+
+def feature_outcomes(stderr: str, state_dir: Path, ids: list[str]) -> list[dict]:
+    """Per planned feature: how it ended and how long it took (#232 ask 1).
+
+    `status` is `finished` (its review completed), `error` (it failed), `killed` (in flight when the
+    pass ended) or `not-started` (it never got a worker). A pass where most features never started is
+    over-planned; one where a few have been in flight for the whole budget is a hang. `elapsed_s` is
+    clawpatch's own per-feature figure from its progress lines; prompt size comes from the feature's
+    record. Never raises."""
+    seen: dict[str, dict] = {}
+    for line in (stderr or "").splitlines():
+        m = _PROGRESS_RE.match(line.strip())
+        if not m:
+            continue
+        fields = dict(kv.split("=", 1) for kv in m.group(2).split(" ") if "=" in kv)
+        fid = fields.get("feature")
+        if not fid:
+            continue
+        row = seen.setdefault(fid, {"status": "killed"})
+        if m.group(1) != "feature-start":
+            row["status"] = "finished" if m.group(1) == "feature-done" else "error"
+            elapsed = fields.get("elapsed", "").rstrip("s")
+            if elapsed.isdigit():
+                row["elapsed_s"] = int(elapsed)
+    out: list[dict] = []
+    for fid in ids:
+        row = {"id": fid, "status": "not-started", **seen.get(fid, {})}
+        try:
+            record = json.loads((state_dir / "features" / f"{fid}.json").read_text())
+            status = record.get("status")
+            if status in COMPLETED_FEATURE_STATUSES:
+                row["status"] = "finished"
+            for entry in reversed(record.get("analysisHistory") or []):
+                m = _PROMPT_RE.search(str(entry.get("summary") or ""))
+                if m:
+                    row["prompt_bytes"], row["approx_tokens"] = int(m.group(1)), int(m.group(2))
+                    break
+        except (OSError, ValueError, AttributeError, TypeError):
+            pass
+        out.append(row)
+    return out
+
+
 def gateway_timeout_ms(attempt_budget_s: int, inherited: str | None = None) -> int:
     """CLAWPATCH_GATEWAY_TIMEOUT_MS for one attempt. The default SCALES with the attempt's budget
     (`budget - headroom`, floored at 30s), so raising time_budget_s really does buy a longer gateway
@@ -336,13 +571,31 @@ async def _default_run_clawpatch(args: list[str], cwd: Path, env: dict, budget_s
         )
     except FileNotFoundError:
         return 127, "", f"{args[0]}: command not found", False
+    # Read both pipes as they fill rather than with `communicate()`, so a pass SIGKILLed at the budget
+    # still hands back the stderr it wrote: its per-feature progress lines are the only record of
+    # which features were in flight, done or never started (#232).
+    out: list[bytes] = []
+    err: list[bytes] = []
+
+    async def pump(stream, sink: list[bytes]) -> None:
+        while chunk := await stream.read(65536):
+            sink.append(chunk)
+
+    done = asyncio.gather(pump(proc.stdout, out), pump(proc.stderr, err), proc.wait())
+    timed_out = False
     try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=budget_s)
+        await asyncio.wait_for(asyncio.shield(done), timeout=budget_s)
     except asyncio.TimeoutError:
+        timed_out = True
         proc.kill()
-        await proc.communicate()
-        return 124, "", "", True
-    return proc.returncode or 0, stdout.decode(errors="replace"), stderr.decode(errors="replace"), False
+        try:
+            await asyncio.wait_for(done, timeout=10)  # the pipes close with the process
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            done.cancel()
+    text = (b"".join(out).decode(errors="replace"), b"".join(err).decode(errors="replace"))
+    if timed_out:
+        return 124, text[0], text[1], True
+    return proc.returncode or 0, text[0], text[1], False
 
 
 # Lines of context around a changed hunk that still count as "this PR's code" when picking a
@@ -457,8 +710,10 @@ SCRATCH_KEEP_FAILED_S = 6 * 3600
 class ProtoPatchRunner:
     """The orchestration the tool calls — every step degrades to `unavailable(...)`."""
 
-    def __init__(self, cfg: dict, *, run_clawpatch=None, run_git=None, run_lint=None):
+    def __init__(self, cfg: dict, *, run_clawpatch=None, run_git=None, run_lint=None, telemetry=None):
         self.cfg = cfg or {}
+        # Where the per-pass `structural_plan` event goes (#232); None = not recorded.
+        self.telemetry = telemetry
         home = Path(os.environ.get("PR_REVIEWER_HOME") or Path.home() / ".protoagent" / "pr-reviewer")
         self.checkout_root = Path(self.cfg.get("checkout_root") or home / "checkouts")
         self.state_root = Path(self.cfg.get("state_root") or home / "clawpatch")
@@ -469,6 +724,9 @@ class ProtoPatchRunner:
         self.lint = LintChecker(self.cfg, tools_dir=home / "tools", run=run_lint)
         self.budget_s = int(self.cfg.get("time_budget_s") or 600)
         self.jobs = structural_jobs(self.cfg.get("structural_jobs"))  # None = clawpatch's own default
+        self.max_features = structural_max_features(self.cfg.get("structural_max_features"))  # None = no cap
+        # False = the pre-#232 path: `clawpatch ci --since <base>` picks the features (the rollback switch).
+        self.plan_features = str(self.cfg.get("structural_plan", "")).strip().lower() not in ("false", "0", "no", "off")
         self.bin = str(self.cfg.get("clawpatch_bin") or "clawpatch")
         self.model = str(self.cfg.get("model") or "")
         self.gateway_base_url = str(self.cfg.get("gateway_base_url") or "")
@@ -572,6 +830,68 @@ class ProtoPatchRunner:
             log.exception("[pr-reviewer] scratch state prune failed")
         return removed
 
+    async def _changed_lines(self, checkout: Path, base_sha: str) -> dict[str, int] | None:
+        """{file: changed lines} for the diff clawpatch's `--since` reads; None when unreadable."""
+        from .checkout_cache import _default_run_git
+
+        run = self._run_git or _default_run_git
+        rc, out, _err = await run(
+            ["-C", str(checkout), "diff", "--numstat", "-z", "--no-renames", f"{base_sha}...HEAD"]
+        )
+        return parse_numstat(out) if rc == 0 else None
+
+    async def _plan(
+        self, checkout: Path, base_sha: str, state_dir: Path, env: dict, deadline: float, changed: set[str] | None
+    ):
+        """Map the checkout into this pass's state dir and pick the features to review (#232).
+
+        None when a plan cannot be made (map failed, nothing mapped, diff unreadable): the pass then
+        falls back to `clawpatch ci --since`, the pre-#232 behaviour. Never raises."""
+        try:
+            for step in (["init"], ["map"]):
+                budget = max(min(PLAN_STEP_BUDGET_S, int(deadline - time.monotonic())), 1)
+                rc, _out, _err, timed_out = await self._run_clawpatch(
+                    [self.bin, "--state-dir", str(state_dir), "--json", "-q", *step], checkout, env, budget
+                )
+                if rc != 0 or timed_out:
+                    log.warning(
+                        "[pr-reviewer] structural plan: clawpatch %s failed (exit %s%s); using --since",
+                        step[0],
+                        rc,
+                        ", timed out" if timed_out else "",
+                    )
+                    return None
+            features = read_feature_records(state_dir)
+            lines = await self._changed_lines(checkout, base_sha)
+            if lines is None or changed is None or not any(isinstance(f.get("ownedFiles"), list) for f in features):
+                return None  # nothing mapped, or a record shape this planner does not know: let clawpatch pick
+            # Every file the name-only diff lists is in the plan, even one numstat did not count: a
+            # plan built from an incomplete diff must never decide that nothing needs reviewing.
+            for path in changed:
+                lines.setdefault(_norm_path(path), 1)
+            return plan_features(features, lines, self.max_features)
+        except Exception:  # noqa: BLE001 — a failed plan falls back to the pre-#232 path, never raises
+            log.exception("[pr-reviewer] structural plan failed; using --since")
+            return None
+
+    def _emit_plan(self, repo: str, pr: int, record: dict, result: str) -> None:
+        """One `structural_plan` event per pass (#232 ask 1): what was planned, what finished, and how
+        long each feature took — so an over-planned pass can be told from a hang without the log."""
+        if self.telemetry is None or not record:
+            return
+        try:
+            outcome = (
+                "unavailable"
+                if result.startswith(UNAVAILABLE_PREFIX)
+                else "partial"
+                if result.startswith(PARTIAL_PREFIX)
+                else "complete"
+            )
+            reason = classify_outage(outage_reason(result)) if outcome != "complete" else None
+            self.telemetry.emit("structural_plan", repo=repo, pr=pr, outcome=outcome, reason=reason or None, **record)
+        except Exception:  # noqa: BLE001 — telemetry never breaks the pass
+            log.exception("[pr-reviewer] structural_plan telemetry failed")
+
     async def review(self, pr: int, repo: str) -> str:
         """The full structural pass → prose header + fenced ADR 0077 findings JSON,
         or an `unavailable(...)` degradation message. Never raises.
@@ -585,8 +905,9 @@ class ProtoPatchRunner:
             self._prune()  # first use: sweep pre-fix accumulation before anything runs
             self._prune_scratch()  # and scratch dirs a redeploy orphaned mid-run
         scratch: list[Path] = []
+        record: dict = {}
         try:
-            result = await self._run_review(pr, repo, scratch)
+            result = await self._run_review(pr, repo, scratch, record)
             if not result.startswith((UNAVAILABLE_PREFIX, PARTIAL_PREFIX)):
                 # A pass that produced findings has nothing left to inspect: drop its state dir
                 # (each holds a full report set). A failed pass keeps its dir for a postmortem.
@@ -600,11 +921,15 @@ class ProtoPatchRunner:
                 log.warning("[pr-reviewer] structural pass unavailable on %s#%s: %s", repo, pr, result.splitlines()[0])
             elif result.startswith(PARTIAL_PREFIX):
                 log.warning("[pr-reviewer] structural pass PARTIAL on %s#%s: %s", repo, pr, result.splitlines()[0])
+            self._emit_plan(repo, pr, record, result)
             return result
         finally:
             self._prune()  # after each use — success or degradation alike
 
-    async def _run_review(self, pr: int, repo: str, scratch: list[Path] | None = None) -> str:
+    async def _run_review(
+        self, pr: int, repo: str, scratch: list[Path] | None = None, record: dict | None = None
+    ) -> str:
+        record = {} if record is None else record
         if err := bad_repo(repo):
             return unavailable(err)
         gateway_key, gateway_base = self._gateway_creds()
@@ -639,11 +964,6 @@ class ProtoPatchRunner:
         captures.mkdir(exist_ok=True)
         (state_dir / "provider-failures").symlink_to(captures, target_is_directory=True)
 
-        args = [self.bin, "ci", "--provider", "gateway", "--json", "--state-dir", str(state_dir), "--since", base_sha]
-        if self.jobs is not None:
-            args += ["--jobs", str(self.jobs)]  # cap the burst one big PR puts on the lane (#221)
-        if self.model:
-            args += ["--model", self.model]
         env = os.environ.copy()
         env["GATEWAY_API_KEY"] = gateway_key
         if gateway_base:
@@ -654,79 +974,11 @@ class ProtoPatchRunner:
         # clawpatch's own clean, classifiable gateway timeout. It is set per attempt below.
         inherited_timeout = env.get("CLAWPATCH_GATEWAY_TIMEOUT_MS")
 
-        # One structural pass may run clawpatch twice: a TRANSIENT gateway failure (a dropped
-        # request / socket timeout / gateway 5xx — #209) gets a single retry when enough of the
-        # budget survives the first attempt. Any other exit degrades exactly as before, never raises.
         started = time.monotonic()
         deadline = started + self.budget_s
-        attempt = 0
-        while True:
-            attempt += 1
-            remaining_s = deadline - time.monotonic()
-            attempt_budget_s = self.budget_s if attempt == 1 else max(int(remaining_s), 1)
-            gateway_ms = gateway_timeout_ms(attempt_budget_s, inherited_timeout)
-            env["CLAWPATCH_GATEWAY_TIMEOUT_MS"] = str(gateway_ms)
-            log.debug(
-                "[pr-reviewer] clawpatch attempt %d: gateway timeout=%dms, wall-clock=%ds (budget=%ds, inherited=%s)",
-                attempt,
-                gateway_ms,
-                attempt_budget_s,
-                self.budget_s,
-                inherited_timeout,
-            )
-            rc, stdout, stderr, timed_out = await self._run_clawpatch(args, checkout, env, attempt_budget_s)
-            if timed_out:
-                return await self._cut_short(
-                    f"timed out after {self.budget_s}s (budget exceeded; review proceeds without it)",
-                    f"timed out after {self.budget_s}s (budget exceeded; findings from the finished features kept)",
-                    attempt,
-                    pr=pr,
-                    repo=repo,
-                    head_sha=head_sha,
-                    base_sha=base_sha,
-                    checkout=checkout,
-                    changed=changed,
-                    state_dir=state_dir,
-                    elapsed=time.monotonic() - started,
-                )
-            if rc == 127:
-                return unavailable(
-                    _with_attempts(f"`{self.bin}` is not installed (npm: @protolabsai/protopatch)", attempt)
-                )
-            if rc == 0:
-                break
-            reason_name = _EXIT_REASONS.get(rc, "runtime failure")
-            detail = redact(redact((stderr or stdout).strip()[-400:], token), gateway_key)
-            reason = f"clawpatch exit {rc} ({reason_name}): {detail}"
-            remaining_s = deadline - time.monotonic()
-            if (
-                attempt == 1
-                and is_transient_gateway_failure(rc, stderr or stdout)
-                and remaining_s >= RETRY_MIN_BUDGET_S
-            ):
-                log.warning(
-                    "[pr-reviewer] clawpatch transient gateway failure (exit %d) on attempt %d; retrying "
-                    "once with %.0fs of the %ds budget left (#209)",
-                    rc,
-                    attempt,
-                    remaining_s,
-                    self.budget_s,
-                )
-                continue
-            return await self._cut_short(
-                reason,
-                reason,
-                attempt,
-                pr=pr,
-                repo=repo,
-                head_sha=head_sha,
-                base_sha=base_sha,
-                checkout=checkout,
-                changed=changed,
-                state_dir=state_dir,
-                elapsed=time.monotonic() - started,
-            )
-        return await self._render_findings(
+        record.update(sha=head_sha, base=base_sha, budget_s=self.budget_s, jobs=self.jobs, cap=self.max_features)
+        plan = await self._plan(checkout, base_sha, state_dir, env, deadline, changed) if self.plan_features else None
+        render = dict(
             pr=pr,
             repo=repo,
             head_sha=head_sha,
@@ -734,8 +986,126 @@ class ProtoPatchRunner:
             checkout=checkout,
             changed=changed,
             state_dir=state_dir,
-            elapsed=time.monotonic() - started,
+            plan=plan,
         )
+        if plan is None:
+            record["planner"] = "since"
+            args = [self.bin, "ci", "--provider", "gateway", "--json", "--state-dir", str(state_dir)]
+            args += ["--since", base_sha]
+        else:
+            record.update(
+                planner="plugin",
+                mapped=plan.mapped,
+                eligible=len(plan.eligible),
+                selected=len(plan.selected),
+                dropped=plan.dropped,
+                low_signal_only=plan.low_signal_only,
+                low_signal_files=plan.low_signal_files[:20] or None,
+            )
+            if not plan.selected:
+                # Nothing owns or depends on a changed source file: there is nothing to review, the same
+                # answer `ci --since` gives an untouched map (see `FeaturePlan` for the lockfile case).
+                record["elapsed_s"] = round(time.monotonic() - started, 1)
+                return await self._render_findings(**render, elapsed=time.monotonic() - started)
+            plan_path = state_dir / PLAN_FILENAME
+            plan_path.write_text("".join(f"{f['id']}\n" for f in plan.selected))
+            args = [self.bin, "review", "--provider", "gateway", "--json", "--state-dir", str(state_dir)]
+            args += ["--feature-list", str(plan_path)]
+        args_tail: list[str] = []
+        if self.jobs is not None:
+            args_tail += ["--jobs", str(self.jobs)]  # cap the burst one big PR puts on the lane (#221)
+        if self.model:
+            args_tail += ["--model", self.model]
+        args += args_tail
+
+        # One structural pass may run clawpatch twice: a TRANSIENT gateway failure (a dropped
+        # request / socket timeout / gateway 5xx — #209) gets a single retry when enough of the
+        # budget survives the first attempt. Any other exit degrades exactly as before, never raises.
+        attempt = 0
+        stderr_seen: list[str] = []
+        try:
+            while True:
+                attempt += 1
+                remaining_s = deadline - time.monotonic()
+                attempt_budget_s = max(round(remaining_s), 1)
+                gateway_ms = gateway_timeout_ms(attempt_budget_s, inherited_timeout)
+                env["CLAWPATCH_GATEWAY_TIMEOUT_MS"] = str(gateway_ms)
+                log.debug(
+                    "[pr-reviewer] clawpatch attempt %d: gateway timeout=%dms, wall-clock=%ds (budget=%ds, inherited=%s)",
+                    attempt,
+                    gateway_ms,
+                    attempt_budget_s,
+                    self.budget_s,
+                    inherited_timeout,
+                )
+                rc, stdout, stderr, timed_out = await self._run_clawpatch(args, checkout, env, attempt_budget_s)
+                stderr_seen.append(stderr or "")
+                if timed_out:
+                    return await self._cut_short(
+                        f"timed out after {self.budget_s}s (budget exceeded; review proceeds without it)",
+                        f"timed out after {self.budget_s}s (budget exceeded; findings from the finished features kept)",
+                        attempt,
+                        **render,
+                        elapsed=time.monotonic() - started,
+                    )
+                if rc == 127:
+                    return unavailable(
+                        _with_attempts(f"`{self.bin}` is not installed (npm: @protolabsai/protopatch)", attempt)
+                    )
+                if rc == 0:
+                    break
+                if plan is not None and rc == 2 and "feature-list" in f"{stderr}{stdout}":
+                    # An engine without `review --feature-list` (protoPatch < 0.7.0): run the pass the
+                    # pre-#232 way instead of losing it. Not a gateway attempt, so it is not counted.
+                    log.warning("[pr-reviewer] clawpatch has no --feature-list; using ci --since (needs >= 0.7.0)")
+                    plan = render["plan"] = None
+                    record.update(planner="since", feature_list_unsupported=True)
+                    args = [self.bin, "ci", "--provider", "gateway", "--json", "--state-dir", str(state_dir)]
+                    args += ["--since", base_sha] + args_tail
+                    attempt -= 1
+                    continue
+                reason_name = _EXIT_REASONS.get(rc, "runtime failure")
+                detail = redact(redact((stderr or stdout).strip()[-400:], token), gateway_key)
+                reason = f"clawpatch exit {rc} ({reason_name}): {detail}"
+                remaining_s = deadline - time.monotonic()
+                if (
+                    attempt == 1
+                    and is_transient_gateway_failure(rc, stderr or stdout)
+                    and remaining_s >= RETRY_MIN_BUDGET_S
+                ):
+                    log.warning(
+                        "[pr-reviewer] clawpatch transient gateway failure (exit %d) on attempt %d; retrying "
+                        "once with %.0fs of the %ds budget left (#209)",
+                        rc,
+                        attempt,
+                        remaining_s,
+                        self.budget_s,
+                    )
+                    continue
+                return await self._cut_short(reason, reason, attempt, **render, elapsed=time.monotonic() - started)
+            if plan is not None and plan.dropped:
+                # Every planned feature finished, but the plan itself left some out: a coverage gap,
+                # never a complete pass (the fail-open this guards: a capped pass reading as clean).
+                done = pass_coverage(state_dir)
+                return await self._render_findings(
+                    **render,
+                    elapsed=time.monotonic() - started,
+                    partial=(
+                        f"{done[0] if done else len(plan.selected)} of {len(plan.eligible)} features reviewed",
+                        f"{FEATURE_CAP_REASON}: the {len(plan.selected)} features with the most changed lines "
+                        f"were reviewed, {plan.dropped} were not (structural_max_features={plan.cap})",
+                    ),
+                )
+            return await self._render_findings(**render, elapsed=time.monotonic() - started)
+        finally:
+            record["attempts"] = attempt
+            record["elapsed_s"] = round(time.monotonic() - started, 1)
+            if plan is not None and plan.selected:
+                ids = [f["id"] for f in plan.selected]
+                outcomes = feature_outcomes(stderr_seen[-1] if stderr_seen else "", state_dir, ids)
+                ranked = {f["id"]: f for f in plan.selected}
+                record["features"] = [{**ranked[o["id"]], **o} for o in outcomes]
+                record["finished"] = sum(o["status"] == "finished" for o in outcomes)
 
     async def _cut_short(self, reason: str, partial_reason: str, attempt: int, **render) -> str:
         """The answer for a pass that did not finish: its findings so far, or an outage (#205).
@@ -744,14 +1114,19 @@ class ProtoPatchRunner:
         the findings features that HAD finished had already written (49 of them across three
         budget-killed passes on one night). When at least one claimed feature finished, those findings
         are returned as a PARTIAL result: still a lane gap (the verdict stays capped at WARN), but the
-        findings are not lost. With nothing finished it is the outage it always was. Never raises."""
+        findings are not lost. With nothing finished it is the outage it always was. Never raises.
+
+        With a plan (#232) the denominator is every ELIGIBLE feature, not just the planned ones, so a
+        pass that was both capped and cut short says how much of the diff's features it really covered."""
         try:
             coverage = pass_coverage(render["state_dir"])
             if coverage is not None and coverage[0] > 0:
+                plan = render.get("plan")
+                total = max(coverage[1], len(plan.eligible)) if plan is not None else coverage[1]
                 return await self._render_findings(
                     **render,
                     partial=(
-                        f"{coverage[0]} of {coverage[1]} features reviewed",
+                        f"{coverage[0]} of {total} features reviewed",
                         _with_attempts(partial_reason, attempt),
                     ),
                 )
@@ -771,6 +1146,7 @@ class ProtoPatchRunner:
         state_dir: Path,
         elapsed: float,
         partial: tuple[str, str] | None = None,
+        plan: FeaturePlan | None = None,
     ) -> str:
         """The header + fenced findings array for a pass, complete — or partial when `partial` is
         (coverage, reason). The one place findings are read, confined and pre-marked."""
@@ -791,18 +1167,27 @@ class ProtoPatchRunner:
             f"{PARTIAL_HEADER if partial else 'protoPatch structural pass on'} {repo}#{pr} — "
             f"head {head_sha[:12]}, base {base_sha[:12]}, {elapsed:.0f}s, {len(findings)} reportable finding(s)"
             f"{' from the features that finished' if partial else ''}{repeats}"
-            f"{render_refuted(lint_refuted, lint_version)}, scope: {confinement}."
+            f"{render_refuted(lint_refuted, lint_version)}, scope: {confinement}"
+            f"{f'; {plan.summary()}' if plan is not None else ''}."
         )
         if partial:
             return partial_result(partial[0], partial[1], header, findings)
         return f"{header}\n\n```json\n{json.dumps(findings, indent=2)}\n```"
 
 
+def _telemetry(cfg: dict):
+    """The plugin's telemetry sink, at the same home the dispatcher writes to (see __init__)."""
+    from . import _state_home
+    from .telemetry import Telemetry
+
+    return Telemetry(_state_home(cfg or {}))
+
+
 def get_tools(cfg: dict) -> list:
     """The plugin's tools — built against the live per-agent config."""
     from langchain_core.tools import tool
 
-    runner = ProtoPatchRunner(cfg)
+    runner = ProtoPatchRunner(cfg, telemetry=_telemetry(cfg))
     default_repo = str((cfg or {}).get("default_repo") or "")
 
     @tool
