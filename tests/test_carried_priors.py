@@ -69,9 +69,9 @@ def test_a_carry_keeps_the_evidence_and_remembers_a_prior_nobody_verified():
     assert carried["evidence"] == A2A["evidence"]  # the next round's evidence-gone read needs it
     assert "raised_unverified" not in carried
     unverified = merge_carried_findings([], [{k: v for k, v in A2A.items() if k != "verdict"}])[0]
-    assert unverified["verdict"] == "confirmed"  # still gates — an unproven downgrade must not un-block
-    assert unverified["raised_unverified"] is True
-    # …and the memory survives the next carry, which sees the stamped `confirmed`.
+    # Never stamped `confirmed` (#260) — but still debt: `carried_debt` holds on it.
+    assert "verdict" not in unverified and unverified["raised_unverified"] is True
+    assert carried_debt({"findings": [unverified]})
     assert merge_carried_findings([], [unverified])[0]["raised_unverified"] is True
 
 
@@ -111,8 +111,10 @@ def test_carried_rows_are_not_findings_the_verifier_missed():
     assert verification_ran("VERIFY_STATUS: annotated n=1", [fresh, *carried, *carried]) is True
     # A fresh finding the verifier never reached still reads as unverified…
     assert verification_ran("VERIFY_STATUS: nothing-to-verify", [*carried, {**fresh, "verdict": ""}]) is False
-    # …and so does a carried row with no ruling at all: nothing vouched for it.
-    assert verification_ran("", [{**A2A, "verdict": "", "carried": True}]) is False
+    # A dispatcher carry with no ruling is debt, held by `carried_debt` — not a verifier gap…
+    assert verification_ran("", [{**A2A, "verdict": "", "carried": True}]) is True
+    # …but a synthesizer re-listing nobody ruled on is one.
+    assert verification_ran("", [{**A2A, "verdict": "", "carried": True, "carried_by": "synthesizer"}]) is False
 
 
 def test_carried_debt_is_the_dispatchers_carry_not_a_relisting():
