@@ -19,7 +19,10 @@ from __future__ import annotations
 import difflib
 import json
 import logging
+import math
+import os
 import re
+import tempfile
 import time
 from pathlib import Path
 
@@ -31,6 +34,60 @@ log = logging.getLogger("protoagent.plugins.pr_reviewer")
 DEFAULT_TTL_DAYS = 14
 SAME_CLAIM_RATIO = 0.8  # SequenceMatcher on normalised claims — above what boilerplate alone reaches
 SAME_CLAIM_LINES = 25  # a remembered refutation applies at (about) the line it was refuted at
+
+
+# Clock skew a store written on another host may carry; anything further ahead is corrupt.
+_FUTURE_SLACK_S = 86400
+
+
+def _ts(entry: dict) -> float:
+    """An entry's `at` as a timestamp — 0.0 for anything that is not a finite number, or that
+    lies more than a day in the future (#254).
+
+    The store only ever writes `time.time()`, so either is a corrupt or hand-edited file. A
+    reader that raised on it would break *degrade, never raise* (the structural pre-mark runs
+    inside the protopatch pass), and a far-future `at` would never age out; 0.0 is older than
+    every cutoff, so the entry just ages out."""
+    try:
+        value = float(entry.get("at") or 0)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+    if not math.isfinite(value) or value > time.time() + _FUTURE_SLACK_S:
+        return 0.0
+    return value
+
+
+def _day(entry: dict) -> str:
+    """`at` as YYYY-MM-DD for a note; "unknown date" when it cannot be one."""
+    try:
+        return time.strftime("%Y-%m-%d", time.gmtime(_ts(entry)))
+    except (OverflowError, OSError, ValueError):
+        return "unknown date"
+
+
+def _int(value: object) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def _atomic_write(path: Path, text: str) -> None:
+    """Write `text` to `path` via a unique temp file in the same directory + `os.replace`, so a
+    crash mid-write never leaves a truncated store and two writers never share a temp file.
+    Raises OSError like `write_text`; the temp file is removed on failure."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _norm(text: str) -> str:
@@ -95,7 +152,7 @@ class RefutationStore:
         if not isinstance(data, list):
             return []
         cutoff = time.time() - self.ttl_s
-        return [e for e in data if isinstance(e, dict) and float(e.get("at") or 0) >= cutoff]
+        return [e for e in data if isinstance(e, dict) and _ts(e) >= cutoff]
 
     def record(self, repo: str, findings: list[dict], *, pr: int, head: str) -> int:
         """Remember every posted `source: protopatch` finding the verifier refuted. Returns
@@ -134,9 +191,7 @@ class RefutationStore:
                 }
             )
         try:
-            path = self._path(repo)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(entries, indent=2))
+            _atomic_write(self._path(repo), json.dumps(entries, indent=2))
         except OSError:
             log.exception("[pr-reviewer] refutation store write failed for %s", repo)
             return 0
@@ -180,7 +235,7 @@ def premark_refuted(
         touched = any(a - 3 <= line <= b + 3 for a, b in changed_ranges.get(_norm_path(str(f.get("file") or "")), []))
         if touched:
             continue
-        when = time.strftime("%Y-%m-%d", time.gmtime(float(hit.get("at") or 0)))
+        when = _day(hit)
         f["verdict"] = "refuted"
         f["refuted_before"] = f"#{hit.get('pr')} @{hit.get('head')} {when}"
         note = str(hit.get("note") or "").strip()
@@ -309,7 +364,7 @@ class LlmRefutationStore:
         entries = [
             e
             for e in data.get("entries") or []
-            if isinstance(e, dict) and str(e.get("repo") or "") == want and float(e.get("at") or 0) >= cutoff
+            if isinstance(e, dict) and str(e.get("repo") or "") == want and _ts(e) >= cutoff
         ]
         dismissals = [str(x) for x in data.get("dismissals") or []][-MAX_HARVESTED_REVIEWS:]
         return {"entries": entries, "dismissals": dismissals}
@@ -319,10 +374,7 @@ class LlmRefutationStore:
         if path is None:
             return False
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = path.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps({"repo": "/".join(_repo_parts(repo) or ()), **data}, indent=2))
-            tmp.replace(path)
+            _atomic_write(path, json.dumps({"repo": "/".join(_repo_parts(repo) or ()), **data}, indent=2))
         except OSError:
             log.exception("[pr-reviewer] LLM refutation store write failed for %s", repo)
             return False
@@ -492,10 +544,10 @@ def render_refuted_before(entries: list[dict]) -> str:
         return ""
     out = ["<refuted_before>"]
     for i, e in enumerate(entries, 1):
-        when = time.strftime("%Y-%m-%d", time.gmtime(float(e.get("at") or 0)))
+        when = _day(e)
         out.append(
-            f'  <claim id="R{i}" location="{_data(e.get("file"), 200)}:{int(e.get("line") or 0)}" '
-            f'refuted_on="#{int(e.get("pr") or 0)} @{_data(e.get("head"), 12)} {when}" '
+            f'  <claim id="R{i}" location="{_data(e.get("file"), 200)}:{_int(e.get("line"))}" '
+            f'refuted_on="#{_int(e.get("pr"))} @{_data(e.get("head"), 12)} {when}" '
             f'by="{_data(e.get("origin") or "verifier", 20)}">'
         )
         out.append(f"    {_data(e.get('claim'), 400)}")
@@ -594,7 +646,7 @@ def settle_refuted_before(
 
 
 def _relieved(finding: dict, hit: dict) -> dict:
-    when = time.strftime("%Y-%m-%d", time.gmtime(float(hit.get("at") or 0)))
+    when = _day(hit)
     return {
         "file": _norm_path(str(finding.get("file") or "")),
         "line": _line(finding),
