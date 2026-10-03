@@ -329,9 +329,10 @@ _DISPOSITION_MARK = {"fixed": "✅", "open": "🔴", "refuted": "🚫"}
 
 def render_dispositions_table(rows: list[dict]) -> str:
     """What the panel says happened to each prior blocker/major. Rendered from the parsed
-    rows rather than by echoing the model's fenced block — nothing reads dispositions back
+    rows rather than by echoing the model's fenced block — nothing reads this table back
     off a posted body (`parse_dispositions` runs on the raw output), so the body carries
-    the human form only, and the findings array stays the one JSON block in it."""
+    the human form only, and the findings array stays the one JSON block in it. What the
+    gate reads back is the marker's `disp=` record (#234), which the CODE derives."""
     rows = [r for r in rows if isinstance(r, dict)]
     if not rows:
         return ""
@@ -927,6 +928,7 @@ def render_verdict_body(
     coverage_gaps: dict[str, str] | None = None,
     lanes: int = 0,
     reaffirmed_from: str = "",
+    disposition_token: str = "",
 ) -> str:
     """The comment body, ASSEMBLED — marker line (machine), header (human), the brief,
     the dispositions table, the findings table + machine-readable array, then the
@@ -990,6 +992,12 @@ def render_verdict_body(
     # round machinery (cap, convergence, request history) skips it.
     if reaffirmed_from:
         marker += f" reaffirmed={reaffirmed_from}"
+    # `disp=<token>` is what this round did with the previous round's blocker/majors (#234):
+    # `rounds.encode_disposition_record`, read back by `rounds.supersedes` on BOTH checks. It
+    # lives in the marker — the code-written first line — so no model-authored text in the
+    # body can forge it, and the findings record stays the body's one JSON block.
+    if disposition_token and re.fullmatch(r"[A-Za-z0-9_-]+", disposition_token):
+        marker += f" disp={disposition_token}"
     marker += " -->"
     sections = [
         f"{marker}\n## QA panel review — **{verdict}**\n_{recipe} · head `{head_sha[:12]}` · {mode}_",
@@ -1014,7 +1022,7 @@ def render_verdict_body(
 
 
 def parse_verdict_marker(body: str) -> dict | None:
-    """{'head', 'verdict', 'promoted', 'complete', 'verified', 'diff_id', 'reaffirmed'} from
+    """{'head', 'verdict', 'promoted', 'complete', 'verified', 'diff_id', 'reaffirmed', 'disp'} from
     a posted body, or None if it isn't ours. `reaffirmed` is the head a verdict was carried
     FROM by an identical-diff reaffirm (issue #135), or "" for a round the panel ran."""
     m = _MARKER_RE.search(body or "")
@@ -1030,6 +1038,7 @@ def parse_verdict_marker(body: str) -> dict | None:
     # and the normal review runs.
     diff_m = re.search(r"\bdiff=([0-9a-f]+)", m.group(0))
     reaffirmed_m = re.search(r"\breaffirmed=([0-9a-f]{7,40})", m.group(0))
+    disp_m = re.search(r"\sdisp=([A-Za-z0-9_-]+)", m.group(0))
     return {
         "head": m.group("head"),
         "verdict": m.group("verdict"),
@@ -1039,6 +1048,9 @@ def parse_verdict_marker(body: str) -> dict | None:
         "diff_id": diff_m.group(1) if diff_m else None,
         # The head this verdict was carried FROM, or "" for a round the panel actually ran.
         "reaffirmed": reaffirmed_m.group(1) if reaffirmed_m else "",
+        # The round's disposition record (#234), still encoded — `rounds.panel_rounds`
+        # decodes it. "" when absent.
+        "disp": disp_m.group(1) if disp_m else "",
     }
 
 

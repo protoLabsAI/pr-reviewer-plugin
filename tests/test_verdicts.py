@@ -179,6 +179,7 @@ def test_body_marker_roundtrip():
         "verified": True,
         "diff_id": None,
         "reaffirmed": "",
+        "disp": "",  # no disposition record (#234) unless the round wrote one
     }
     assert "shadow" in body and "QA panel review" in body
 
@@ -255,6 +256,7 @@ def test_a_marker_with_trailing_attributes_still_parses():
         "verified": True,
         "diff_id": None,
         "reaffirmed": "",
+        "disp": "",
     }
 
 
@@ -527,6 +529,7 @@ def test_the_stale_header_rides_the_body_and_the_demotion_survives_recall():
         "verified": True,
         "diff_id": None,
         "reaffirmed": "",
+        "disp": "",
     }
 
 

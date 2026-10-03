@@ -90,7 +90,12 @@ from .rounds import (
     converge,
     delta_ranges,
     diff_identity,
+    disposition_record,
+    disputed_anchors,
+    encode_disposition_record,
+    finding_anchor,
     in_delta,
+    last_substantive_round,
     needs_recheck,
     normalize_relisted_priors,
     panel_rounds,
@@ -111,6 +116,8 @@ from .rounds import (
     resolve_relisting,
     round_cap_reached,
     spent_rounds,
+    superseded_fails,
+    supersedes,
     unaccounted_priors,
     unexplained_clearance,
     verify_retry_state,
@@ -383,6 +390,12 @@ def strictest_head_round(reviews: list[dict], head: str) -> dict | None:
     as its findings record is readable; an unreadable one still holds, fail-closed.
 
     Promotions (`promoted=true`) are not rounds and are excluded, same as `panel_rounds`.
+
+    A FAIL that a later round SUPERSEDES (#234, `rounds.supersedes`) leaves the tie-break
+    first: a newer complete, verified round on the same head refuted every one of its
+    blocking findings with evidence, and the refutation was honoured. Racing rounds (#89)
+    never name each other, so they still settle by strictest. `scripts/review_at_head.py`
+    applies the same `superseded_fails`, so `Review at head` and `QA panel` agree.
     """
     rounds = [
         r
@@ -392,6 +405,9 @@ def strictest_head_round(reviews: list[dict], head: str) -> dict | None:
     ]
     if not rounds:
         return None
+    gone = {id(fail) for fail, _by in superseded_fails(rounds)}
+    # Never empties the list: the newest round can supersede but is never superseded.
+    rounds = [r for r in rounds if id(r) not in gone]
     recovered = any(r["complete"] for r in rounds)
     if recovered:
         # Never empties the list: a complete round is not coverage-only by definition.
@@ -2098,7 +2114,7 @@ class Dispatcher:
                 # One object per line, NOT `[.[] | …]`: with --paginate the wrapper
                 # emits `[…][…]` past 30 reviews and this read — the one everything
                 # about review history depends on — went permanently unreadable (#75).
-                ".[] | {id: .id, state: .state, body: .body, author: .user.login}",
+                ".[] | {id: .id, state: .state, body: .body, author: .user.login, submitted_at: .submitted_at}",
             ],
         )
         if rc != 0:
@@ -2126,7 +2142,16 @@ class Dispatcher:
                     return None
                 not_ours += 1  # carries the marker, but a person's account wrote it
                 continue
-            ours.append({**marker, "state": row.get("state", ""), "body": row.get("body") or "", "id": row.get("id")})
+            ours.append(
+                {
+                    **marker,
+                    "state": row.get("state", ""),
+                    "body": row.get("body") or "",
+                    "id": row.get("id"),
+                    # When the review posted — the cutoff for counter-evidence intake (#234).
+                    "submitted_at": str(row.get("submitted_at") or ""),
+                }
+            )
         if not_ours:
             self.telemetry.emit("marker_not_ours", repo=repo, pr=pr, skipped=not_ours)
         return ours
@@ -2629,6 +2654,73 @@ class Dispatcher:
                 owned += 1
         return owned
 
+    async def _counter_evidence_block(self, repo: str, pr: int, head: str, facts: dict, ours: list[dict]) -> str:
+        """The `<author_counter_evidence>` block for a re-review of an already-reviewed head,
+        or "" (issue #234). Telemetered as `counter_evidence` (count, chars) either way.
+
+        Top-level PR comments never reached the panel, so a dispute posted as one (the SDK's
+        reachability audits on mythxengine-sdk#409) was invisible to the very re-review it was
+        summoned for. Taken: comments posted after the newest panel round on this head, by the
+        PR author or by a user GitHub says has write/maintain/admin — never ours, never a bare
+        summon. An enhancement, never a gate: any unreadable read ⇒ "" and the round runs.
+        """
+        from . import counter_evidence as ce
+
+        rounds_here = [r for r in ours if not r.get("promoted") and r.get("head") == head]
+        since = str(rounds_here[-1].get("submitted_at") or "") if rounds_here else ""
+        stats: dict = {"count": 0, "chars": 0}
+        block = ""
+        try:
+            viewer = await self._viewer_login()
+            rc, out, _err = await self._run_gh(
+                [
+                    "api",
+                    f"repos/{repo}/issues/{pr}/comments",
+                    "--paginate",
+                    "--jq",
+                    ".[] | {id: .id, url: .html_url, author: .user.login, created_at: .created_at, body: .body}",
+                ]
+            )
+            rows = gh_json_rows(out) if rc == 0 else None
+            pool = (
+                ce.candidates(
+                    rows,
+                    since=since,
+                    bot_login=viewer or "",
+                    handles=[
+                        str(self.cfg.get("summon_handle") or "vera"),
+                        viewer or "",
+                        (viewer or "").removesuffix("[bot]"),
+                    ],
+                    is_own_login=is_own_login,
+                )
+                if rows is not None and viewer
+                else None
+            )
+            if pool is None:
+                stats["reason"] = "unreadable" if rows is None or not viewer else "no-cutoff"
+            else:
+                pr_author = str(facts.get("author") or "")
+                trusted: set[str] = set()
+                others = list(dict.fromkeys(str(c.get("author") or "") for c in pool))
+                # Only well-formed logins reach the permission URL; anything else is untrusted.
+                others = [a for a in others if a.lower() != pr_author.lower() and ce.valid_login(a)]
+                others = others[: ce.MAX_PERMISSION_LOOKUPS]
+                for login in others:
+                    rc, out, _err = await self._run_gh(
+                        ["api", f"repos/{repo}/collaborators/{login}/permission", "--jq", ".permission"], timeout=20
+                    )
+                    if rc == 0 and out.strip().lower() in ce.TRUSTED_PERMISSIONS:
+                        trusted.add(login)
+                chosen = ce.select(pool, pr_author=pr_author, trusted=trusted)
+                block, count = ce.render(chosen, pr_author=pr_author)
+                stats.update(count=count, chars=len(block), considered=len(pool))
+        except Exception:  # noqa: BLE001 — counter-evidence never blocks a review
+            log.exception("[pr-reviewer] counter-evidence read failed on %s#%s", repo, pr)
+            block, stats = "", {"count": 0, "chars": 0, "reason": "error"}
+        self.telemetry.emit("counter_evidence", repo=repo, pr=pr, sha=head, **stats)
+        return block
+
     async def _existing_threads_block(self, repo: str, pr: int) -> str:
         """The rendered <pr_review_threads> block, or "" (unreadable/none — the
         recipe default "(none)" applies; thread awareness never blocks a review)."""
@@ -3021,6 +3113,12 @@ class Dispatcher:
         threads_block = await self._existing_threads_block(repo, pr)
         if threads_block:
             inputs["existing_threads"] = threads_block
+        if current is not None:
+            # A re-review of a head that already has a round (#234): what the author or a
+            # maintainer posted since, as untrusted claims for the panel to check.
+            counter_block = await self._counter_evidence_block(repo, pr, head, facts, ours)
+            if counter_block:
+                inputs["author_counter_evidence"] = counter_block
         # Claims this repo already refuted (#207), for the synthesizer to mark rather than
         # the verifier to re-check. `pr_ranges` is what decides, after the run, whether a
         # mark holds; None (no memory, or an unreadable diff) ⇒ no mark can hold.
@@ -3360,6 +3458,16 @@ class Dispatcher:
             ranges = await self._delta_ranges(repo, prior["head"], head)
             since_ranges = await self._since_ranges(repo, history, head)
         unaccounted = unaccounted_priors(history, dispositions, ranges=ranges, since_ranges=since_ranges, paths=paths)
+        # A re-review of the SAME head (#234): a prior the report refuted WITH EVIDENCE is
+        # disputed, and gets a verifier re-check whose refutation may clear it even though it
+        # was confirmed and the code has not moved (#38's one exception, `recheck_clears`).
+        # Only on an unchanged head, where no fix can exist and the dispute is the question.
+        dispositioned = last_substantive_round(history)
+        disputed = (
+            disputed_anchors(dispositions)
+            if dispositioned is not None and str(dispositioned.get("head") or "") == head
+            else set()
+        )
         # A carried prior whose quoted evidence is GONE at head, on a line the delta since
         # it was raised actually touched, was fixed — that is the same read `ground_finding`
         # applies to a fresh finding, and it is stronger than a model's `fixed` claim. Without
@@ -3402,7 +3510,12 @@ class Dispatcher:
             pr=pr,
             head=head,
             round_number=round_number,
+            disputed=disputed,
         )
+        # What became of the dispositioned round's blocking findings, for the marker (#234):
+        # the record `rounds.supersedes` reads on both checks. Written from the CODE's outcome
+        # (still carried or cleared), never from the model's say-so alone.
+        disposed = disposition_record(dispositioned, dispositions, still_open=list(unaccounted) + list(deferred))
         findings, confined = confine_findings(reported, paths)
         if confined:
             # Server-side in-diff enforcement — prompt discipline made a promise,
@@ -3599,6 +3712,7 @@ class Dispatcher:
             )
         elapsed = time.monotonic() - started
         self.report_phase("posting")  # runner done; posting the verdict is the dispatcher's step
+        round_verified = verification_ran(str(steps_out.get("verify") or ""), reported)
         posted = await self._post_verdict(
             repo,
             pr,
@@ -3620,11 +3734,39 @@ class Dispatcher:
             # Did anything actually CHECK these findings? Empty over a clean panel is
             # normal; empty over real findings means the verdict is ungrounded, and the
             # promotion gate must not auto-approve it (mirrors `complete` one step up).
-            verified=verification_ran(str(steps_out.get("verify") or ""), reported),
+            verified=round_verified,
             # Stamp the reviewed base↔head diff identity into the marker (issue #91) so a
             # later rebased/reworded head with a byte-identical diff reaffirms this verdict.
             diff_id=diff_id,
+            disposition_token=encode_disposition_record(disposed),
         )
+        if posted and dispositioned is not None and disposed is not None:
+            # Did this round just replace a FAIL on its head (#234)? The same pure rule the
+            # gate applies, over the round as posted; it is newer than every review we read.
+            this_round = {
+                "head": head,
+                "verdict": verdict,
+                "findings": reported,
+                "complete": complete,
+                "verified": round_verified,
+                "findings_recorded": True,
+                "reaffirmed": "",
+                "id": max(int(r.get("id") or 0) for r in history) + 1,
+                "disposed": disposed,
+            }
+            if supersedes(dispositioned, this_round):
+                self.telemetry.emit(
+                    "fail_superseded",
+                    repo=repo,
+                    pr=pr,
+                    sha=head,
+                    superseded={
+                        "review_id": dispositioned.get("id"),
+                        "round": next((i + 1 for i, r in enumerate(history) if r is dispositioned), None),
+                        "findings": len(disposed["rows"]),
+                    },
+                    superseding={"round": round_number, "verdict": verdict},
+                )
         if posted:
             # Structural claims the verifier refuted this round: remembered for the repo, so
             # the next PR touching the file does not spend a verify round on them (#190).
@@ -3938,6 +4080,7 @@ class Dispatcher:
         coverage_gaps: dict[str, str] | None = None,
         lanes: int = 0,
         reaffirmed_from: str = "",
+        disposition_token: str = "",
     ) -> bool:
         # Immediately before posting — the last moment a mid-round push can be caught.
         # The marker keeps the PINNED head on purpose: the round ran against it, and
@@ -3974,6 +4117,7 @@ class Dispatcher:
             coverage_gaps=coverage_gaps,
             lanes=lanes,
             reaffirmed_from=reaffirmed_from,
+            disposition_token=disposition_token,
         )
         event = "COMMENT"
         if not self.shadow and verdict == FAIL and not superseded:
@@ -4515,6 +4659,7 @@ class Dispatcher:
         pr: int,
         head: str,
         round_number: int,
+        disputed: set[str] | None = None,
     ) -> tuple[list[dict], list[dict], list[dict], list[dict]]:
         """(reported, unaccounted, cleared, deferred) — prior blocker/majors re-verified at
         THIS head before they are re-asserted (#218, #220, #232 ask 5).
@@ -4531,13 +4676,18 @@ class Dispatcher:
         Fail-CLOSED throughout: no seeding host, the knob off, a crashed or empty re-check, or
         a prior the verifier did not rule on ⇒ that prior is treated exactly as before. Only a
         `refuted` that `recheck_clears` honours clears anything.
+
+        `disputed` (#234): anchors a SAME-head round refuted with evidence. Such a prior is
+        re-checked even when it is confirmed on unmoved code, and a verifier `refuted` clears it.
         """
+        disputed = disputed or set()
         relisted_anchors = {_carry_anchor(p) for _, p in relistings}
         targets: list[tuple[str, int]] = [("relisted", k) for k in range(len(relistings))]
         targets += [
             ("prior", k)
             for k, m in enumerate(unaccounted)
-            if _carry_anchor(m) not in relisted_anchors and needs_recheck(m, ranges, since_ranges)
+            if _carry_anchor(m) not in relisted_anchors
+            and needs_recheck(m, ranges, since_ranges, disputed=finding_anchor(m) in disputed)
         ]
         targets = targets[:MAX_PRIOR_RECHECK]
         candidates = [
@@ -4600,7 +4750,9 @@ class Dispatcher:
             if _carry_anchor(prior) in cleared_anchors:
                 continue  # its re-listing was settled above — the same prior, one outcome
             ruling = ruling_for.get(("prior", k))
-            if ruling and recheck_clears(prior, ruling["verdict"], ranges, since_ranges):
+            if ruling and recheck_clears(
+                prior, ruling["verdict"], ranges, since_ranges, disputed=finding_anchor(prior) in disputed
+            ):
                 cleared.append({**prior, "recheck_note": ruling.get("note", "")})
                 continue
             if ruling and ruling["verdict"] == "confirmed":

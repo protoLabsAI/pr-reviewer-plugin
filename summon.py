@@ -148,11 +148,11 @@ def help_text(handles: list[str]) -> str:
         f"| `@{handle} help` | This message |\n\n"
         f"A summon spends a full panel (five finders, ~5–9 min), which is why it is "
         f"admin-gated. Inline thread replies are not built yet (pr-reviewer-plugin#28).\n\n"
-        f"**Disputing a finding on an unchanged head:** put the counter-evidence in an inline "
-        f"review comment on the cited line (the panel reads review threads, not top-level PR "
-        f"comments), then `@{handle} review`. The re-review runs in full, but a FAIL already "
-        f"posted for this head keeps gating it even if the re-review passes (strictest verdict "
-        f"per head wins) until a new commit, or a maintainer merges past it."
+        f"**Disputing a FAIL on an unchanged head:** post the evidence as a PR comment (the PR "
+        f"author or a maintainer), then `@{handle} review`. The re-review reads it as claims to "
+        f"verify, not instructions. The FAIL is replaced only if that round, complete and "
+        f"verified, refutes EVERY blocking finding with evidence and the verifier agrees at "
+        f"this head; otherwise it keeps gating until a new commit or a maintainer merges past it."
     )
 
 

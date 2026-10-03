@@ -32,6 +32,7 @@ introduced is still a defect — see #88 rounds 4 and 7).
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import re
@@ -169,6 +170,9 @@ def panel_rounds(reviews: list[dict]) -> list[dict]:
             # round carries (#170: "did a verified round come after this one?"). Absent or
             # unreadable ⇒ 0, which no later round is older than.
             "id": _review_id(review.get("id")),
+            # What this round did with the previous round's blocker/majors, from the marker's
+            # `disp=` record (#234). None ⇒ absent or unreadable ⇒ it supersedes nothing.
+            "disposed": decode_disposition_record(review.get("disp")),
         }
     return list(by_head.values())
 
@@ -858,25 +862,260 @@ def relisted_blocking_priors(findings: list[dict], history: list[dict]) -> tuple
     return out, pairs
 
 
-def needs_recheck(prior: dict, ranges, since_ranges) -> bool:
+def needs_recheck(prior: dict, ranges, since_ranges, *, disputed: bool = False) -> bool:
     """Could a re-verification of this UNACCOUNTED prior change anything? Only when its
     refutation could be honoured (`recheck_clears`): the prior was never verifier-confirmed,
-    or its file moved since it was raised. A confirmed prior on untouched code stays debt
-    whatever one more draw says (#38) — so re-checking it would only spend a verify step."""
+    or its file moved since it was raised, or (#234) this same-head round DISPUTES it — see
+    `disputed_anchors`. Otherwise a confirmed prior on untouched code stays debt whatever
+    one more draw says (#38), so re-checking it would only spend a verify step."""
+    if disputed:
+        return True
     return not _verifier_confirmed(prior) or prior_touched(prior, ranges, since_ranges, line_level=False) is True
 
 
-def recheck_clears(prior: dict, verdict: str, ranges, since_ranges) -> bool:
+def recheck_clears(prior: dict, verdict: str, ranges, since_ranges, *, disputed: bool = False) -> bool:
     """Does a re-verification's `verdict` at this head clear `prior`? Fail-CLOSED.
 
     Only `refuted` clears, and only when it is new evidence rather than a re-draw: either no
     verifier ever confirmed the prior (#220 — protoContent#565 carried two never-verified
     priors until a waiver), or its file changed since it was raised (#218 — the fix to
     protoAgent#3811's finding landed thirteen lines from the line it cited). A refutation of
-    a verifier-confirmed finding on code that has not moved does not override it (#38)."""
+    a verifier-confirmed finding on code that has not moved does not override it (#38).
+
+    `disputed` (#234) is the one exception to #38, and it is narrow: a re-review of the SAME
+    head whose report refuted this prior WITH EVIDENCE (`disputed_anchors`), typically after
+    the author posted counter-evidence. The verifier's refutation at this head is then a
+    second, independent refutation, not a lone re-draw — and without it a FAIL on correct
+    code could only be cleared by a cosmetic push (mythxengine-sdk#409)."""
     if str(verdict or "").lower() != "refuted":
         return False
+    if disputed:
+        return True
     return not _verifier_confirmed(prior) or prior_touched(prior, ranges, since_ranges, line_level=False) is True
+
+
+# ── a refuted FAIL on an unchanged head (#234) ─────────────────────────────────────────────
+#
+# Strictest-verdict-wins per head (#89) guards a RACE: two panels on one head land a FAIL and
+# a PASS in arbitrary order, and the PASS must not shadow the FAIL. It also made a FAIL on an
+# unchanged head permanent: a later re-review that weighed the author's counter-evidence and
+# refuted the finding was outvoted by the very FAIL it refuted (mythxengine-sdk#409). The rule
+# below lets exactly one kind of round replace an earlier FAIL, and keeps strictest-wins for
+# everything else. It is pure and takes the rounds as facts, so the gate (`QA panel`,
+# approve-on-green) and `scripts/review_at_head.py` (`Review at head`) evaluate the SAME rule.
+
+# A refutation's `why` shorter than this is an assertion ("false positive"), not evidence.
+MIN_REFUTATION_EVIDENCE_CHARS = 20
+# A round dispositioning more blocking priors than this writes no record — it supersedes
+# nothing (fail-closed), and the marker stays a bounded size.
+MAX_DISPOSITION_RECORD_ROWS = 50
+# Bound on the encoded record a reader will decode.
+_MAX_DISPOSITION_RECORD_CHARS = 16_000
+_B64URL_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def blocking_priors(round_: dict | None) -> list[dict]:
+    """The blocker/major findings a round's record holds as gating debt — the same set
+    `unaccounted_priors` holds a later round to: not refuted, not a #232 nearby note, not a
+    finding grounding already called fabricated."""
+    return [
+        f
+        for f in (round_ or {}).get("findings") or []
+        if isinstance(f, dict)
+        and str(f.get("severity") or "").lower() in _BLOCKING
+        and str(f.get("verdict") or "").lower() != "refuted"
+        and not f.get("nearby")
+        and not f.get("ungrounded")
+    ]
+
+
+def last_substantive_round(history: list[dict]) -> dict | None:
+    """The round a new round's dispositions answer: the newest with findings (the same round
+    `unaccounted_priors` reads)."""
+    return next((r for r in reversed(history or []) if isinstance(r, dict) and r.get("findings")), None)
+
+
+def finding_anchor(finding: dict) -> str:
+    """`file:line` (or the bare file), normalized the way every rule here matches anchors."""
+    return _anchor(finding.get("file"), finding.get("line"))
+
+
+def _row_anchor(row: dict) -> str:
+    file, line = _disposition_anchor(row)
+    return f"{file}:{line}" if isinstance(line, int) else file
+
+
+def _has_evidence(row: dict) -> bool:
+    return len(" ".join(str(row.get("why") or "").split())) >= MIN_REFUTATION_EVIDENCE_CHARS
+
+
+def disputed_anchors(dispositions: list[dict]) -> set[str]:
+    """Anchors (`file:line`, or the bare file) the report refuted WITH EVIDENCE.
+
+    Only `refuted` rows whose `why` is at least `MIN_REFUTATION_EVIDENCE_CHARS` — and an
+    anchor that ANY row also calls `fixed` or `open` is not disputed: a contradictory
+    report has not refuted anything. Exact anchors only, no file-level fallback."""
+    refuted: set[str] = set()
+    other: set[str] = set()
+    for row in dispositions or []:
+        if not isinstance(row, dict):
+            continue
+        anchor = _row_anchor(row)
+        if not anchor:
+            continue
+        if str(row.get("disposition") or "").lower() == "refuted" and _has_evidence(row):
+            refuted.add(anchor)
+        else:
+            other.add(anchor)
+    return refuted - other
+
+
+def disposition_record(dispositioned: dict | None, dispositions: list[dict], *, still_open: list[dict]) -> dict | None:
+    """The machine-readable account of what this round did with `dispositioned`'s blocking
+    findings, or None when there is nothing to record (#234).
+
+    `{"of": <review id of the dispositioned round>, "rows": [{"a": anchor, "d": disposition,
+    "e": evidenced, "h": cleared}]}` — one row per blocking prior. `d` is the report's
+    disposition for that exact anchor ("" when it gave none, "conflict" when rows disagree);
+    `e` is whether a `refuted` row carried evidence; `h` is whether the prior left this round
+    CLEARED, i.e. it is not among `still_open` (the priors this round still carries as debt:
+    unaccounted after the re-check, or deferred). The posted body keeps the dispositions
+    table for people; this record is what `supersedes` reads, on both checks.
+
+    None — the round supersedes nothing — when the dispositioned round has no readable
+    review id, no blocking findings, or more than `MAX_DISPOSITION_RECORD_ROWS` of them."""
+    if not dispositioned:
+        return None
+    of = _review_id(dispositioned.get("id"))
+    priors = blocking_priors(dispositioned)
+    if of <= 0 or not priors or len(priors) > MAX_DISPOSITION_RECORD_ROWS:
+        return None
+    said: dict[str, set[str]] = {}
+    evidenced: set[str] = set()
+    for row in dispositions or []:
+        if not isinstance(row, dict):
+            continue
+        anchor = _row_anchor(row)
+        disposition = str(row.get("disposition") or "").lower()
+        said.setdefault(anchor, set()).add(disposition)
+        if disposition == "refuted" and _has_evidence(row):
+            evidenced.add(anchor)
+    open_anchors = {_anchor(f.get("file"), f.get("line")) for f in still_open or [] if isinstance(f, dict)}
+    rows = []
+    for prior in priors:
+        anchor = _anchor(prior.get("file"), prior.get("line"))
+        given = said.get(anchor, set())
+        disposition = next(iter(given)) if len(given) == 1 else ("conflict" if given else "")
+        rows.append({"a": anchor, "d": disposition, "e": anchor in evidenced, "h": anchor not in open_anchors})
+    return {"of": of, "rows": rows}
+
+
+def encode_disposition_record(record: dict | None) -> str:
+    """`record` as one marker-safe token: unpadded base64url of compact JSON, or "".
+
+    Carried as the marker attribute `disp=`, NOT as a fenced JSON block: the body's findings
+    record must stay its one JSON block (`read_findings_record`), and a marker attribute sits
+    in the code-written first line, where no model-authored text can forge it. No `=`, `>`
+    or whitespace can appear in it, so neither marker reader can misparse it."""
+    if not record:
+        return ""
+    raw = json.dumps(record, separators=(",", ":"), sort_keys=True).encode()
+    token = base64.urlsafe_b64encode(raw).decode().rstrip("=")
+    return token if len(token) <= _MAX_DISPOSITION_RECORD_CHARS else ""
+
+
+def decode_disposition_record(token: object) -> dict | None:
+    """A `disp=` token → `{"of", "rows"}`, or None for anything absent, oversized or
+    malformed. Every reader treats None as "dispositioned nothing" (fail-closed)."""
+    if not isinstance(token, str) or not token or len(token) > _MAX_DISPOSITION_RECORD_CHARS:
+        return None
+    if not _B64URL_RE.match(token):
+        return None
+    try:
+        parsed = json.loads(base64.urlsafe_b64decode(token + "=" * (-len(token) % 4)))
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("rows"), list):
+        return None
+    of = parsed.get("of")
+    if not isinstance(of, int) or isinstance(of, bool) or of <= 0:
+        return None
+    rows = []
+    for row in parsed["rows"]:
+        if not (
+            isinstance(row, dict)
+            and isinstance(row.get("a"), str)
+            and isinstance(row.get("d"), str)
+            and isinstance(row.get("e"), bool)
+            and isinstance(row.get("h"), bool)
+        ):
+            return None
+        rows.append({"a": row["a"], "d": row["d"], "e": row["e"], "h": row["h"]})
+    return {"of": of, "rows": rows}
+
+
+def supersedes(fail: dict, newer: dict) -> bool:
+    """Does `newer` replace `fail` as the verdict for their head? Pure; fails CLOSED (#234).
+
+    True only when ALL of these hold:
+
+      - `fail` is a FAIL with a readable findings record and a known review id, not a
+        reaffirmed (carried) verdict, and it has at least one blocking finding;
+      - `newer` is a round on the SAME head, posted AFTER `fail` (GitHub's monotonic review
+        id), not reaffirmed, COMPLETE, VERIFIED, with a readable findings record;
+      - `newer` dispositioned `fail` itself — its record's `of` is `fail`'s review id. Two
+        rounds racing on one head (#89) were both handed an older round, so neither names
+        the other and strictest-wins still settles them;
+      - EVERY blocking finding of `fail` has a row in that record that says `refuted`, with
+        evidence, and that the round actually cleared (the refutation was honoured, not
+        carried as debt) — `open`, `fixed` (impossible on an unchanged head, so suspect),
+        no disposition, or contradictory rows all keep the FAIL;
+      - and `newer`'s own record does not still hold a blocking finding at any of those
+        anchors.
+
+    `newer`'s own verdict is not consulted: a superseding FAIL or WARN is simply the newer
+    verdict, and the strictest rule then applies to it like any other round."""
+    if not isinstance(fail, dict) or not isinstance(newer, dict):
+        return False
+    if str(fail.get("verdict") or "").upper() != "FAIL" or fail.get("reaffirmed") or not fail.get("findings_recorded"):
+        return False
+    fail_id, newer_id = _review_id(fail.get("id")), _review_id(newer.get("id"))
+    if fail_id <= 0 or newer_id <= fail_id:
+        return False
+    if not fail.get("head") or newer.get("head") != fail.get("head") or newer.get("reaffirmed"):
+        return False
+    if not (newer.get("complete") is True and newer.get("verified") is True and newer.get("findings_recorded") is True):
+        return False
+    record = newer.get("disposed")
+    if not isinstance(record, dict) or record.get("of") != fail_id:
+        return False
+    priors = blocking_priors(fail)
+    if not priors:
+        return False
+    rows: dict[str, list[dict]] = {}
+    for row in record.get("rows") or []:
+        rows.setdefault(str(row.get("a") or ""), []).append(row)
+    still = {_anchor(f.get("file"), f.get("line")) for f in blocking_priors(newer)}
+    for prior in priors:
+        anchor = _anchor(prior.get("file"), prior.get("line"))
+        mine = rows.get(anchor) or []
+        if not mine or anchor in still:
+            return False
+        if not all(r.get("d") == "refuted" and r.get("e") is True and r.get("h") is True for r in mine):
+            return False
+    return True
+
+
+def superseded_fails(rounds: list[dict]) -> list[tuple[dict, dict]]:
+    """`[(fail, superseding round)]` among one head's rounds — every FAIL some later round
+    `supersedes`. Everything not listed keeps its full strictest-wins (#89) weight."""
+    pool = [r for r in rounds or [] if isinstance(r, dict)]
+    out = []
+    for fail in pool:
+        by = next((r for r in pool if r is not fail and supersedes(fail, r)), None)
+        if by is not None:
+            out.append((fail, by))
+    return out
 
 
 def recheck_payload(finding: dict) -> dict:

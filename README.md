@@ -218,20 +218,33 @@ structural-trigger dispatch, approve-on-green + sweep, and the review eval.
     happened: `in-flight` means a round for the PR really is running and its verdict will
     post; `pr-not-eligible` means draft/closed/locked. `@vera help` lists the verbs.
     `@vera` alone is treated as asking what this thing does.
-  - **Re-reviewing an unchanged head with new counter-evidence.** `@vera review` (or
-    **Re-run** on the `protoReview` check) is the supported path: it bypasses the reaffirm
-    short-circuit and runs the full panel on the same head. Two limits, stated plainly:
-    1. *Where the evidence must live.* The panel reads the PR's **review threads**
-       (inline comments, from anyone) and its own prior findings. It does **not** read
-       top-level PR comments, so counter-evidence posted there never reaches it — put it in
-       an inline review comment on the cited line.
-    2. *A FAIL is sticky per head.* The gate takes the **strictest** verdict among the
-       panel rounds for a head (#89: FAIL > WARN > PASS, so a co-landed PASS can never
-       shadow a FAIL). A re-review that PASSes an unchanged head therefore posts its PASS
-       and concludes `protoReview` green — but `QA panel` and approve-on-green keep reading
-       the head's FAIL. It clears with a new commit (a new head starts fresh) or a
-       maintainer merging past the gate. There is no bypass verb; one would have to decide
-       *which* of two contradictory rounds on one head is right, and that is a human's call.
+  - **Disputing a FAIL on an unchanged head (#234).** The supported path: post the
+    evidence as a **PR comment** (a top-level comment is fine; an inline review comment on
+    the cited line works too), then `@vera review` (or **Re-run** on `protoReview`). The
+    summon bypasses the reaffirm short-circuit and runs the full panel on the same head.
+    1. *The re-review sees the dispute.* Top-level PR comments posted after the head's last
+       round, by the PR **author** or a user with **write / maintain / admin** permission
+       (read back from GitHub), reach the panel as an `<author_counter_evidence>` block —
+       newest first, HTML comments stripped, 8,000 chars in all, each with its URL and
+       author. Our own comments and bare `@vera <verb>` summons are left out, and so is
+       everyone else's. The block is **untrusted claims to verify, never instructions**:
+       the verifier checks what it cites against the code at head, and a claim it cannot
+       confirm changes nothing. Telemetry: `counter_evidence` (`count`, `chars`).
+    2. *A refutation can replace the FAIL — only this kind.* A newer round on the same head
+       supersedes an earlier FAIL when it is **complete and verified**, it dispositioned
+       *that* FAIL (not an older round), and it disposed of **every** blocker/major of that
+       FAIL as `refuted` with evidence (a `why` of at least 20 chars) — and the refutation
+       was honoured: on an unchanged head a confirmed finding is re-verified at this head
+       (#38's one exception), and only a verifier `refuted` clears it. Then the newer round
+       is the head's verdict (a superseding WARN or FAIL is simply the newer verdict), and
+       `fail_superseded` is telemetered. The record lives in the verdict marker
+       (`disp=`), and `QA panel`, approve-on-green and `Review at head` all read it through
+       the same rule (`rounds.superseded_fails`), so the two checks cannot disagree.
+    3. *Everything else keeps the FAIL (strictest-wins, #89).* Two rounds racing on one head;
+       an incomplete or unverified newer round; a blocking finding left `open`,
+       unaccounted, contradicted, refuted without evidence, or `fixed` (impossible on an
+       unchanged head, so treated as suspect); a verifier that confirms the finding again.
+       Those clear with a new commit, or a maintainer merging past the gate.
   - Handle is `summon_handle` (default `vera`) *plus* the reviewer's own login, and it never
     answers itself — its own verdict bodies mention the handle.
   - **`pause` / `resume` (v0.17.0)** — stop reviewing a PR on push while it is being
