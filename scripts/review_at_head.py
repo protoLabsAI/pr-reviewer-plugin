@@ -51,18 +51,31 @@ the status description — the same shape as ``skip-changelog`` and ``gate-exemp
 exists because a required check that can never go green (panel outage, a PR the panel does
 not pick up) would otherwise wedge the queue with no way out but an admin merge.
 
-Stdlib + ``gh`` only, so CI needs no dependency install. Pure decision logic lives in
-``decide()`` and is covered by ``tests/test_review_at_head.py``; everything above it is I/O.
+**Which verdict speaks for a head (#234).** Several panel rounds can land on one head: two
+racing panels (#89), or a re-review an operator summoned to dispute a verdict. This gate
+reads them exactly as the plugin's own ``QA panel`` gate does — the STRICTEST round wins
+(FAIL > WARN > PASS; promotions are not rounds), except that a FAIL a later round
+*supersedes* drops out first: ``rounds.superseded_fails``, the plugin's own pure rule, loaded
+from this checkout. It used to read the LATEST marker, so after a FAIL a re-review PASS on
+the same head turned this check green while ``QA panel`` stayed red. If the plugin's rule
+cannot be loaded, nothing is superseded and the strictest round wins (fail-closed).
+
+Stdlib + ``gh`` only, so CI needs no dependency install (the plugin modules it loads are
+stdlib-only too). Pure decision logic lives in ``decide()`` and is covered by
+``tests/test_review_at_head.py``; everything above it is I/O.
 """
 
 from __future__ import annotations
 
+import importlib
+import importlib.util
 import json
 import os
 import re
 import subprocess
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 
 # The panel stamps every review body with a machine-readable marker, e.g.
 #   <!-- protoagent-qa-review head=4fec0e53… verdict=PASS promoted=true findings=1 -->
@@ -132,22 +145,106 @@ def parse_marker(body: str | None) -> dict[str, str] | None:
     return {m["key"]: m["value"] for m in _ATTR.finditer(found["attrs"])}
 
 
-def verdict_for_head(reviews: list[dict], head_sha: str) -> dict[str, str] | None:
-    """The LAST marker whose ``head`` is ``head_sha``, or None.
+_PLUGIN_ALIAS = "_pr_reviewer_plugin"
 
-    Last, not first: the panel posts COMMENTED and may later post an APPROVED promotion for
-    the same head, and the newest is the one that stands. Matching is on the full SHA — a
-    prefix match would let a review of a *different* commit satisfy the gate on a collision,
-    which is the whole failure this guards.
+
+def _plugin_rounds():
+    """The plugin's own `rounds` module, from this checkout — or None (then nothing is
+    superseded: fail-closed to strictest-wins). Reused when the plugin is already loaded as
+    `pr_reviewer` (the test suite), so the two checks run one copy of the rule."""
+    try:
+        if "pr_reviewer" in sys.modules:
+            return importlib.import_module("pr_reviewer.rounds")
+        if _PLUGIN_ALIAS not in sys.modules:
+            root = Path(__file__).resolve().parents[1]
+            spec = importlib.util.spec_from_file_location(
+                _PLUGIN_ALIAS, root / "__init__.py", submodule_search_locations=[str(root)]
+            )
+            if spec is None or spec.loader is None:
+                return None
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[_PLUGIN_ALIAS] = module
+            try:
+                spec.loader.exec_module(module)
+            except Exception:
+                sys.modules.pop(_PLUGIN_ALIAS, None)
+                raise
+        return importlib.import_module(f"{_PLUGIN_ALIAS}.rounds")
+    except Exception as exc:  # noqa: BLE001 — any failure ⇒ strictest-wins
+        print(f"review_at_head: supersede rule unavailable ({exc!r}); strictest verdict wins", file=sys.stderr)
+        return None
+
+
+# Strictest first. A marker with no verdict outranks everything, so it is picked and fails
+# ("carries no verdict"); an unknown verdict ranks with WARN.
+def _rank(attrs: dict[str, str]) -> int:
+    if "verdict" not in attrs:
+        return 3
+    verdict = attrs["verdict"].upper()
+    if verdict in BLOCKING_VERDICTS:
+        return 2
+    return {"PASS": 0, "WARN": 1}.get(verdict, 1)
+
+
+def _superseded(panel: list[tuple[dict, dict[str, str]]], rounds_module) -> set[int]:
+    """Indices into `panel` of FAIL rounds a later round supersedes (`rounds.supersedes`)."""
+    if rounds_module is None:
+        return set()
+    try:
+        built: list[tuple[int, dict]] = []
+        for index, (review, attrs) in enumerate(panel):
+            row = {
+                "head": attrs.get("head", ""),
+                "verdict": attrs.get("verdict", "").upper(),
+                "promoted": False,
+                "body": review.get("body") or "",
+                "id": review.get("id"),
+                "complete": attrs.get("complete", "true").lower() != "false",
+                "verified": attrs.get("verified", "true").lower() != "false",
+                "reaffirmed": attrs.get("reaffirmed", ""),
+                "disp": attrs.get("disp", ""),
+            }
+            for round_ in rounds_module.panel_rounds([row]):
+                built.append((index, round_))
+        gone = {id(fail) for fail, _by in rounds_module.superseded_fails([r for _i, r in built])}
+        return {index for index, round_ in built if id(round_) in gone}
+    except Exception as exc:  # noqa: BLE001 — a rule that cannot run supersedes nothing
+        print(f"review_at_head: supersede rule failed ({exc!r}); strictest verdict wins", file=sys.stderr)
+        return set()
+
+
+_UNSET = object()
+
+
+def verdict_for_head(reviews: list[dict], head_sha: str, *, rounds_module=_UNSET) -> dict[str, str] | None:
+    """The marker that speaks for ``head_sha``, or None when there is none.
+
+    The STRICTEST panel round for the head, after dropping any FAIL a later round supersedes
+    (#234) — the same answer the plugin's ``QA panel`` gate reaches (`strictest_head_round`).
+    Promotions (``promoted=true``) are not rounds; they speak only when the head has no
+    round at all, as the newest of them. Ties go to the newest. Matching is on the full SHA —
+    a prefix match would let a review of a *different* commit satisfy the gate on a
+    collision, which is the whole failure this guards.
     """
-    match = None
+    markers: list[tuple[dict, dict[str, str]]] = []
     for review in reviews:
         if (review.get("user") or {}).get("login") != REVIEWER_LOGIN:
             continue
         attrs = parse_marker(review.get("body"))
         if attrs and attrs.get("head") == head_sha:
-            match = attrs
-    return match
+            markers.append((review, attrs))
+    if not markers:
+        return None
+    panel = [(r, a) for r, a in markers if a.get("promoted", "false").lower() != "true"]
+    if not panel:
+        return markers[-1][1]
+    if rounds_module is _UNSET:
+        rounds_module = _plugin_rounds()
+    gone = _superseded(panel, rounds_module)
+    pool = [a for i, (_r, a) in enumerate(panel) if i not in gone]
+    worst = max(_rank(a) for a in pool)
+    pick = next(a for a in reversed(pool) if _rank(a) == worst)
+    return {**pick, "_superseded": str(len(gone))} if gone else pick
 
 
 def _contract_failure(attrs: dict[str, str], head_sha: str) -> str | None:
@@ -226,6 +323,8 @@ def decide(
         if reason is not None:
             return Decision("failure", reason)
 
+    if attrs.get("_superseded"):
+        return Decision("success", f"{verdict} at {head_sha[:12]} (an earlier FAIL was refuted with evidence)")
     return Decision("success", f"{verdict} at {head_sha[:12]}")
 
 

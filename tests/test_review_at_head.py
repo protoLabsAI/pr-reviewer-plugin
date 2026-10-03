@@ -102,11 +102,24 @@ def test_verdict_matching_is_case_insensitive():
     assert not rah.decide([review(MERGED, "fail")], MERGED, []).ok
 
 
-def test_the_LAST_marker_for_a_head_wins():
-    # The panel posts COMMENTED and may later promote the same head to APPROVED; a promotion
-    # must not be overridden by the earlier row, nor vice versa.
+def test_a_promotion_speaks_only_for_a_head_with_no_round():
+    # The panel posts COMMENTED and may later promote the same head to APPROVED. A promotion
+    # is not a round (#234, like `rounds.panel_rounds`): it counts only when it is all there
+    # is, and it never outvotes a round on the same head.
+    assert rah.decide([review(MERGED, "PASS", promoted="true")], MERGED, []).ok
+    assert rah.decide([review(MERGED, "PASS"), review(MERGED, "PASS", promoted="true")], MERGED, []).ok
     reviews = [review(MERGED, "FAIL"), review(MERGED, "PASS", promoted="true")]
-    assert rah.decide(reviews, MERGED, []).ok
+    assert not rah.decide(reviews, MERGED, []).ok
+
+
+def test_the_STRICTEST_round_for_a_head_wins_not_the_latest():
+    # #239's symptom (#234): after a FAIL, a re-review PASS on the same head used to turn this
+    # check green while `QA panel` (strictest per head, #89) stayed red. Without a refutation
+    # that supersedes the FAIL, both now read FAIL.
+    reviews = [review(MERGED, "FAIL"), review(MERGED, "PASS")]
+    decision = rah.decide(reviews, MERGED, [])
+    assert not decision.ok and "FAIL" in decision.description
+    assert rah.decide([review(MERGED, "PASS"), review(MERGED, "WARN")], MERGED, []).description.startswith("WARN")
 
 
 # ── what must NOT count as a verdict ───────────────────────────────────────────
