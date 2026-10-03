@@ -35,12 +35,14 @@ def _norm(text: str) -> str:
 
 
 def _norm_path(path: str) -> str:
-    """Strip a leading `./` PREFIX — never leading characters: `.github/x.yml` keeps its dot
-    (review on #194: `lstrip("./")` made every dot-prefixed file look untouched)."""
+    """Strip a leading `./` PREFIX and a leading `/` — never leading characters: `.github/x.yml`
+    keeps its dot (review on #194: `lstrip("./")` made every dot-prefixed file look untouched).
+    Same rule as `rounds._norm` (#247), so a claim keyed `/src/x.py` by one finder matches
+    `src/x.py` from another."""
     path = str(path or "").strip()
     while path.startswith("./"):
         path = path[2:]
-    return path
+    return path.removeprefix("/")
 
 
 _IDENTIFIER_TOKEN = re.compile(r"[A-Za-z_][\w.]*\(\)|[\w.-]*[_./:\[\]][\w.\-/:\[\]()]*|\b\d+\b|\b[a-z]+[A-Z]\w*")
