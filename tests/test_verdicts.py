@@ -981,7 +981,9 @@ def test_same_defect_fails_closed_on_an_empty_claim_or_a_missing_line():
 
 
 def test_identifier_tokens_pick_out_the_things_a_claim_names():
-    assert identifier_tokens("SQL built by concatenation from a request field in list_users()") == {"list_users()"}
+    # The call parens are trimmed like prose punctuation (#251): `list_users()` and a bare
+    # `list_users` name the same function.
+    assert identifier_tokens("SQL built by concatenation from a request field in list_users()") == {"list_users"}
     assert identifier_tokens(
         "taken from the raw directory basename without lowercasing, so for stacks/roxy-protoCLI it differs"
     ) == {"stacks/roxy-protocli"}

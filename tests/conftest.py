@@ -9,6 +9,8 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parent.parent
 PKG = "pr_reviewer"
 
@@ -77,8 +79,6 @@ class FakeRegistry:
 
 import re  # noqa: E402
 
-import pytest  # noqa: E402
-
 KNOWN_WRITES = (
     ("POST", re.compile(r"^repos/[^/]+/[^/]+/pulls/\d+/reviews$")),
     ("PUT", re.compile(r"^repos/[^/]+/[^/]+/pulls/\d+/reviews/\d+/dismissals$")),
@@ -107,3 +107,14 @@ def _no_unexpected_github_writes():
     yield
     seen, UNEXPECTED_WRITES[:] = list(UNEXPECTED_WRITES), []
     assert not seen, f"the code under test made a GitHub write no fake recognises: {seen}"
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_runtest_call(item):
+    """A test module that reads its data at import (the README, the recipe) keeps a load
+    failure in `_LOAD_ERROR` instead of raising during collection (#251). Every test in it
+    then FAILS with that error — a visible test failure, not a collection error, and never a
+    pass: a negative assertion over empty text would otherwise go green."""
+    error = getattr(getattr(item, "module", None), "_LOAD_ERROR", None)
+    if error is not None:
+        pytest.fail(f"{item.module.__name__}: test data could not be loaded: {error!r}", pytrace=False)
