@@ -41,14 +41,14 @@ from pr_reviewer.rounds import (
 )
 from pr_reviewer.verdicts import parse_verdict_marker, render_verdict_body
 
-from tests.test_dispatch import (
+from tests.dispatch_helpers import (
     HEAD,
     RoutedGH,
-    _verify_reply,
     facts,
     make,
     recheck_runner,
     report_with_dispositions,
+    verify_reply,
 )
 
 _SPEC = importlib.util.spec_from_file_location(
@@ -76,10 +76,10 @@ EVIDENCE = (
     "enum has no melee action, restore replays and compares the whole state (two audits)."
 )
 REFUTED = [{"prior": f"{FILE}:42", "disposition": "refuted", "why": EVIDENCE}]
-VERIFIER_REFUTES = _verify_reply(
+VERIFIER_REFUTES = verify_reply(
     {**{k: v for k, v in MAJOR.items() if k != "verdict"}, "verdict": "refuted", "note": "no caller reaches it"}
 )
-VERIFIER_CONFIRMS = _verify_reply(
+VERIFIER_CONFIRMS = verify_reply(
     {**{k: v for k, v in MAJOR.items() if k != "verdict"}, "verdict": "confirmed", "note": "reachable via restore"}
 )
 

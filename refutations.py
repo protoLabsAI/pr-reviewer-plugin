@@ -23,6 +23,9 @@ import re
 import time
 from pathlib import Path
 
+# The one tokenizer (#251) — re-exported here, where the stores and their tests import it.
+from .verdicts import identifier_tokens
+
 log = logging.getLogger("protoagent.plugins.pr_reviewer")
 
 DEFAULT_TTL_DAYS = 14
@@ -45,25 +48,15 @@ def _norm_path(path: str) -> str:
     return path.removeprefix("/")
 
 
-_IDENTIFIER_TOKEN = re.compile(r"[A-Za-z_][\w.]*\(\)|[\w.-]*[_./:\[\]][\w.\-/:\[\]()]*|\b\d+\b|\b[a-z]+[A-Z]\w*")
-
-
-def identifier_tokens(claim: str) -> frozenset[str]:
-    """The tokens in a claim that name a THING — `list_users()`, `scripts/x.sh`, `foo_bar`,
-    `Cargo.lock`, `v1`, camelCase, a bare number — as opposed to its prose."""
-    return frozenset(
-        t.strip(".,;:()").lower() for t in _IDENTIFIER_TOKEN.findall(str(claim or "")) if t.strip(".,;:()")
-    )
-
-
 def same_claim(a: str, b: str) -> bool:
     """Near-identical wording that names the same things: two claims about different
     sites share their boilerplate and differ exactly in an identifier (`list_users()` vs
-    `delete_user()`), and must never match however close the wording."""
+    `delete_user()`), and must never match however close the wording. Tokens come from the
+    RAW claims, as in `verdicts._same_defect` — lower-casing first would hide camelCase."""
     na, nb = _norm(a), _norm(b)
     if not na or not nb:
         return False
-    if identifier_tokens(na) != identifier_tokens(nb):
+    if identifier_tokens(a) != identifier_tokens(b):
         return False
     return na == nb or difflib.SequenceMatcher(None, na, nb).ratio() >= SAME_CLAIM_RATIO
 

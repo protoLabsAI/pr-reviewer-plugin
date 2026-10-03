@@ -382,11 +382,28 @@ SAME_DEFECT_LINES = 25  # … at a line that MOVED, not anywhere in the file
 _IDENTIFIER_TOKEN = re.compile(r"[A-Za-z_][\w.]*\(\)|[\w.-]*[_./:\[\]][\w.\-/:\[\]()]*|\b\d+\b|\b[a-z]+[A-Z]\w*")
 
 
+# Characters trimmed off a token's ends: sentence punctuation AND parentheses. The path
+# alternative of `_IDENTIFIER_TOKEN` may swallow a closing paren of the surrounding prose —
+# "(see foo_bar)" yields `foo_bar)` — and the call alternative yields `foo_bar()`; both name
+# the same thing as a bare `foo_bar`. Without the parens a claim's punctuation, not its
+# identifiers, decided whether two claims matched (#251: this module trimmed ".,;:" while
+# refutations.py trimmed ".,;:()", so the verdict readers and the refutation stores
+# disagreed about the same pair of claims). Interior characters are never touched, so
+# `items[0]` and `a.b` keep their shape.
+_TOKEN_STRIP = ".,;:()"
+
+
 def identifier_tokens(claim: str) -> frozenset[str]:
     """The tokens in a claim that name a THING — `list_users()`, `scripts/x.sh`, `foo_bar`,
     `Cargo.lock`, `v1`, `camelCase`, a bare number — as opposed to its prose. Two claims
-    about different sites differ exactly here, however much boilerplate they share."""
-    return frozenset(t.strip(".,;:").lower() for t in _IDENTIFIER_TOKEN.findall(str(claim or "")) if t.strip(".,;:"))
+    about different sites differ exactly here, however much boilerplate they share.
+
+    The ONE tokenizer: the verdict readers (`_same_defect`) and the refutation stores
+    (`refutations.py`) both use it, so they can never disagree about a pair of claims (#251).
+    Pass the RAW claim — camelCase is only recognisable before lower-casing."""
+    return frozenset(
+        t.strip(_TOKEN_STRIP).lower() for t in _IDENTIFIER_TOKEN.findall(str(claim or "")) if t.strip(_TOKEN_STRIP)
+    )
 
 
 def _same_defect(a: dict, b: dict) -> bool:

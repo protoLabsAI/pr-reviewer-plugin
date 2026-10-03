@@ -13,7 +13,14 @@ import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-README = (ROOT / "README.md").read_text()
+# Read at import, but a missing/unreadable README must FAIL the tests, not error the
+# collection (#251): the error is kept in `_LOAD_ERROR`, which tests/conftest.py turns into
+# a failure of every test in this module.
+try:
+    README = (ROOT / "README.md").read_text()
+    _LOAD_ERROR: Exception | None = None
+except OSError as exc:
+    README, _LOAD_ERROR = "", exc
 
 
 def _top_level_section(needle: str) -> str:
@@ -29,7 +36,10 @@ def _top_level_section(needle: str) -> str:
     return "\n".join(lines[start:end])
 
 
-CONTRACT = _top_level_section("draft").lower()
+try:
+    CONTRACT = _top_level_section("draft").lower()
+except AssertionError as exc:
+    CONTRACT, _LOAD_ERROR = "", _LOAD_ERROR or exc
 # Whitespace-collapsed copy so phrase regexes survive the README's line wrapping.
 CONTRACT_FLAT = re.sub(r"\s+", " ", CONTRACT)
 

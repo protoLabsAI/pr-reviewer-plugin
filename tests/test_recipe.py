@@ -7,11 +7,17 @@ from pathlib import Path
 
 import yaml
 
-RECIPE = yaml.safe_load(
-    (Path(__file__).resolve().parent.parent / "workflows" / "code-review-structural.yaml").read_text()
-)
-
-STEPS = {s["id"]: s for s in RECIPE["steps"]}
+# Read at import, but a missing or malformed recipe must FAIL the tests, not error the
+# collection (#251): the error is kept in `_LOAD_ERROR`, which tests/conftest.py turns into
+# a failure of every test in this module.
+try:
+    RECIPE = yaml.safe_load(
+        (Path(__file__).resolve().parent.parent / "workflows" / "code-review-structural.yaml").read_text()
+    )
+    STEPS = {s["id"]: s for s in RECIPE["steps"]}
+    _LOAD_ERROR: Exception | None = None
+except (OSError, yaml.YAMLError, KeyError, TypeError) as exc:
+    RECIPE, STEPS, _LOAD_ERROR = {}, {}, exc
 
 
 def test_recipe_shape():
