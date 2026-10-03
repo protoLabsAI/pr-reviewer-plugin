@@ -150,6 +150,12 @@ class Chokepoint:
         now = self._now()
         return any(now - taken < self.in_flight_ttl_s for taken in slots.values())
 
+    def held_shas(self, repo: str, pr: int) -> set[str]:
+        """The shas this PR's live slots are keyed by. Each is the sha its CALLER admitted
+        with, which for a webhook is the event's sha, not necessarily the head its round is
+        reviewing (#258). Read it as a hint, never as "the heads under review"."""
+        return set(self._in_flight.get(f"{repo}#{pr}") or {})
+
     def done(self, repo: str, pr: int, sha: str | None = None) -> None:
         """Release the in-flight slot the matching `admit` took. `sha=None` clears every
         slot for the PR — the legacy behaviour, safe when only one round is ever in flight."""

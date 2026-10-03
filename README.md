@@ -203,6 +203,15 @@ structural-trigger dispatch, approve-on-green + sweep, and the review eval.
     `superseded cancelled=true`, and hands its slot straight to the new head. The new head is
     admitted before the old slot is released, so there is never a moment with nothing in
     flight for promotion to slip into. An unreadable head cancels nothing.
+    The hint also arms an in-step poll (`supersede_poll_s`, default 30s, `0` disables), so
+    a round deep in a long finder stops within one interval rather than at the next step
+    boundary. Without a hint for a different head it makes no GitHub reads (#258).
+  - **One panel per PR, the backfill included (#258).** The sweep's backfill consults the
+    PR-wide in-flight state (chokepoint slots plus the panel queue), not a sha-keyed slot.
+    A webhook keys its slot by the *event's* sha while its round reviews the resolved head,
+    so a sha-keyed check let a backfill run a second panel on the very head under review
+    (protoAgent#4023). For a newer head, the backfill marks the running round instead, and
+    the handoff above reviews it.
   - **Bypasses the cooldown, not the in-flight guard** — the cooldown eats webhook bursts,
     and a human who typed a command is not a burst; two panels on one PR is still wrong.
     The guard can't wedge a PR, though: each panel attempt and each round is bounded
@@ -403,6 +412,7 @@ compose env (re-applied every roll) to keep the config volume disposable:
 | `PR_REVIEWER_PANEL_ATTEMPT_TIMEOUT` | `pr_reviewer.panel_attempt_timeout` | `1800` | Seconds one panel attempt may run (hard ceiling **3000** — size it as `finder_timeout_s` + 900 for the tail steps). Only the finders carry a step timeout, so a hung verifier/synthesis step used to hang the round. Past the budget the attempt is cancelled and counts as failed: retried, then concluded on the PR as **"QA panel timed out"**. |
 | `PR_REVIEWER_ROUND_TIMEOUT` | `pr_reviewer.round_timeout` | every attempt + 600 | Backstop for a whole round (every attempt plus the GitHub calls around them). Defaults to `(panel_retries + 1) × panel_attempt_timeout + 600`, so it never cuts a legitimate retry short. |
 | `PR_REVIEWER_BACKFILL_PER_PASS` | `pr_reviewer.backfill_per_pass` | `2` | Reviews the sweep may backfill per pass, across all repos. `0` disables backfill. |
+| `PR_REVIEWER_SUPERSEDE_POLL_S` | `pr_reviewer.supersede_poll_s` | `30` | Seconds between in-step checks for a superseded head (clamped 0–600, `0` disables). Reads GitHub only when an event has hinted at a newer head for the PR (#258). |
 | `PR_REVIEWER_SUMMON_IN_FLIGHT_GRACE_S` | `pr_reviewer.summon_in_flight_grace_s` | `10` | Seconds a summon waits for the PR's in-flight slot before answering `in-flight` (clamped 0–120). Covers a concurrent webhook that reaffirms/drops in under a second; a running round still drops the summon. |
 | `PR_REVIEWER_SUMMON` | `pr_reviewer.summon` | `true` | The comment-command surface (`@vera review` / `pause` / `resume` / `help`) **and** the pause check on the automated path. `false` costs nothing for a repo that never wants comment-driven behaviour. |
 | `PR_REVIEWER_EVIDENCE_GROUNDING` | `pr_reviewer.evidence_grounding` | `true` | A finding whose quoted code appears nowhere in the cited file at the reviewed head (nor in this PR's patch for it) is annotated `uncertain` — it still posts, it just can't carry a FAIL. Fails open on an unreadable blob or unquotable evidence. |

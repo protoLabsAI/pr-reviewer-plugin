@@ -697,7 +697,7 @@ class _RoundWatch:
     attempt task is cancelled and `superseded_by` names the head that replaced it.
     """
 
-    __slots__ = ("repo", "pr", "head", "task", "superseded_by", "checking", "phase", "check")
+    __slots__ = ("repo", "pr", "head", "task", "superseded_by", "checking", "phase", "check", "poll")
 
     def __init__(self, repo: str, pr: int, head: str):
         self.repo, self.pr, self.head = repo, pr, head
@@ -706,6 +706,7 @@ class _RoundWatch:
         self.checking = False
         self.phase = ""
         self.check: asyncio.Task | None = None  # the head read in progress, if any
+        self.poll: asyncio.TimerHandle | None = None  # the in-step supersede poll (#258)
 
 
 class PanelQueue(asyncio.Semaphore):
@@ -1551,6 +1552,17 @@ class Dispatcher:
             # The round's end (any outcome) is when we re-check the degraded state, so a
             # transition/escalation is caught even on a round that posted nothing (issue #209).
             self._evaluate_gateway()
+
+    @property
+    def supersede_poll_s(self) -> float:
+        """Seconds between in-step supersede checks (#258); 0 disables. A check reads
+        GitHub only when an event has hinted at a newer head for the PR. Clamped to 0..600."""
+        raw = self.cfg.get("supersede_poll_s", os.environ.get("PR_REVIEWER_SUPERSEDE_POLL_S", 30))
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            value = 30.0
+        return min(600.0, max(0.0, value))
 
     @property
     def summon_in_flight_grace_s(self) -> float:
@@ -2793,13 +2805,48 @@ class Dispatcher:
         try:
             phase = _phase_for_step(step)
             watch.phase = phase
-            hinted = f"{watch.repo}#{watch.pr}" in self._newer_head_hint
+            hinted = self._newer_head_hint.get(f"{watch.repo}#{watch.pr}") not in (None, watch.head)
             if watch.checking or watch.superseded_by or (phase not in _SUPERSEDE_CHECK_PHASES and not hinted):
                 return
             watch.checking = True
             watch.check = asyncio.get_running_loop().create_task(self._check_superseded(watch))
         except Exception:  # noqa: BLE001 — a supersede check must never fail the round
             watch.checking = False
+
+    def _arm_supersede_poll(self, watch: _RoundWatch, interval_s: float) -> None:
+        """Check for a superseded head INSIDE a long step, not only at its boundary (#258).
+
+        A step boundary can be 20+ minutes away when a finder is slow: on data-plugin#1 the
+        old round stopped at 07:57 although its head was superseded at 07:45. Every
+        `interval_s`, IF an event has hinted that a different head exists for this PR, this
+        runs the same fail-closed check the boundary runs. Without a hint it reads nothing,
+        so a PR nobody pushed to costs no GitHub calls. It also covers a host that never
+        calls `on_step`.
+
+        A loop timer (`call_later`), not a sleeping task. There is nothing to cancel and
+        await, and nothing can spin if `asyncio.sleep` misbehaves. `_review` cancels the
+        handle when the attempt ends. The check runs as `watch.check`, so a runner that
+        finishes while the read is out still sees the answer (`_review` waits for it).
+        """
+        if interval_s <= 0:
+            return
+        key = f"{watch.repo}#{watch.pr}"
+        loop = asyncio.get_running_loop()
+
+        def tick() -> None:
+            watch.poll = loop.call_later(interval_s, tick)  # re-arm first: a failure below never stops it
+            try:
+                hint = self._newer_head_hint.get(key)
+                if not hint or hint == watch.head or watch.checking or watch.superseded_by is not None:
+                    return
+                if watch.task is None or watch.task.done():
+                    return
+                watch.checking = True
+                watch.check = loop.create_task(self._check_superseded(watch))
+            except Exception:  # noqa: BLE001 — a supersede poll must never fail the round
+                watch.checking = False
+
+        watch.poll = loop.call_later(interval_s, tick)
 
     async def _check_superseded(self, watch: _RoundWatch) -> None:
         """Cancel the round's running attempt if the PR's head has moved past it (#245).
@@ -3160,9 +3207,13 @@ class Dispatcher:
                     # A task, so a supersede check can cancel THIS attempt without
                     # cancelling the round around it (#245).
                     watch.task = asyncio.ensure_future(runner(recipe, inputs, **step_kwargs))
+                    self._arm_supersede_poll(watch, self.supersede_poll_s)
                     try:
                         result = await watch.task
                     finally:
+                        if watch.poll is not None:
+                            watch.poll.cancel()
+                            watch.poll = None
                         await _settle_attempt(watch.task)
             except asyncio.CancelledError:
                 current = asyncio.current_task()
@@ -5221,18 +5272,28 @@ class Dispatcher:
         `build_routers` injected a `panel_sem`, the backfill queues behind the SAME
         cross-PR bound (#96); with none injected it runs unbounded, as before.
         """
-        # `supersede_stale`: a round in flight for a head the PR has since moved PAST must
-        # not suppress a first review of the CURRENT head (#209). The same-head guard still
-        # holds — a round already running on THIS head drops as in-flight, so a superseded
-        # round never blocks the head that will actually merge from being reviewed.
-        decision = self.chokepoint.admit(repo, pr, head, supersede_stale=True)
+        # PR-wide, not sha-keyed (#258). A chokepoint slot is keyed by the sha its caller
+        # admitted with, and the webhook admits with the EVENT's sha while its round reviews
+        # the head it resolves. A queued push for an older head (protoAgent#4023: `4c8ac0c1`)
+        # got its panel slot after the PR had moved on, so its round reviewed `9e890531`
+        # under a slot keyed `4c8ac0c1`. The backfill's sha-keyed `admit(9e890531,
+        # supersede_stale=True)` read that as an older head in flight and ran a SECOND panel
+        # on the same sha (the #89 duplicate). It also ran a parallel panel next to a
+        # genuinely older-head round (data-plugin#1). Now ANY round for the PR, running or
+        # queued (`_round_in_flight`: chokepoint + panel queue), keeps the backfill out.
+        # A newer head is not lost: the hint makes the running round check its head at its
+        # next boundary, or on the supersede poll, and hand its slot to the new head (#245).
+        # If that round finishes instead, the next sweep pass backfills the head as before.
+        if self._round_in_flight(repo, pr):
+            if head not in self.chokepoint.held_shas(repo, pr):
+                self._hint_newer_head(repo, pr, head)
+            self.telemetry.emit("drop", repo=repo, pr=pr, sha=head, reason=DROP_IN_FLIGHT, action=BACKFILL_ACTION)
+            return f"drop:{DROP_IN_FLIGHT}"
+        decision = self.chokepoint.admit(repo, pr, head)
         if decision != "accept":
             self.telemetry.emit("drop", repo=repo, pr=pr, sha=head, reason=decision, action=BACKFILL_ACTION)
             return f"drop:{decision}"
         self.telemetry.emit("backfill", repo=repo, pr=pr, sha=head)
-        # Admitted past an in-flight round for an older head (`supersede_stale`, #209)? That
-        # round's verdict can only land on a superseded head; let it notice and stop (#245).
-        self._hint_newer_head(repo, pr, head)
         sem = self.panel_sem
         try:
             if isinstance(sem, PanelQueue):

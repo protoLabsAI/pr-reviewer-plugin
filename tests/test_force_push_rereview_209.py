@@ -12,8 +12,11 @@ Three seams close it:
   1. `_post_verdict` posts a NON-BLOCKING comment (never REQUEST_CHANGES) when the head
      moved past the one the round pinned, and leaves the current head unreviewed so the
      sweep queues it.
-  2. the chokepoint's in-flight guard is keyed by the reviewed sha, so a backfill of the
-     CURRENT head is admitted even while a round for a SUPERSEDED head is still in flight.
+  2. the current head is not left unreviewed behind the superseded round. Originally a
+     backfill was admitted alongside it (sha-keyed slots). Since #258 the backfill instead
+     marks the old round superseded; that round stops and hands its slot to the current
+     head (#245), and once its slot frees, the next sweep pass backfills as before. No two
+     panels for one PR at once: that is how protoAgent#4023 ran the same sha twice.
   3. the current head's own round opens AND concludes its `protoReview` check.
 """
 
@@ -130,26 +133,30 @@ async def test_a_moved_head_never_blocks_even_when_the_delta_is_readable(tmp_pat
     assert "non-blocking comment against the superseded head" in post["body"]
 
 
-# ── r2: the sweep backfills the current head despite a superseded round in flight ──────
+# ── r2: the current head is backfilled once the superseded round lets go (#258) ──────
 
 
-async def test_sweep_backfills_the_current_head_while_a_superseded_round_is_in_flight(tmp_path):
+async def test_sweep_marks_a_superseded_round_and_backfills_once_its_slot_frees(tmp_path):
     # The current head (HEAD) has no completed review; a round for the head the PR moved past
-    # (OLD_HEAD) is still recorded as in flight and has NOT released its slot.
+    # (OLD_HEAD) is still in flight. Since #258 the sweep does NOT start a parallel panel next
+    # to it: it hints the newer head (the running round stops and hands off, #245) and drops.
     gh = RoutedGH(pr_facts=facts(head=HEAD), reviews=[], checks=GREEN)
     d = make(tmp_path, gh=gh)
-    d.chokepoint.admit("o/r", 1, OLD_HEAD)  # the superseded round, never done()
+    d.chokepoint.admit("o/r", 1, OLD_HEAD)  # the superseded round
 
     assert (await d.sweep_once()) == 1
-    await d.drain_backfills()  # the sweep detaches the backfill; wait for it to settle
+    await d.drain_backfills()
+    assert gh.reviews_posted == []  # no second panel beside the running one
+    assert d._newer_head_hint.get("o/r#1") == HEAD  # the running round will check and hand off
+    assert [e for e in _telemetry_events(tmp_path, "drop") if e.get("reason") == "in-flight"]
 
-    # The backfill ran and posted a verdict for the CURRENT head — not dropped as in-flight.
+    # The superseded round ends (here: its slot is released). The next pass backfills HEAD.
+    d.chokepoint.done("o/r", 1, OLD_HEAD)
+    assert (await d.sweep_once()) == 1
+    await d.drain_backfills()
     assert gh.reviews_posted, "the current head was never backfilled"
     assert parse_verdict_marker(gh.reviews_posted[-1]["body"])["head"] == HEAD
-    assert [e for e in _telemetry_events(tmp_path, "backfill") if e.get("sha") == HEAD]
-    assert not [e for e in _telemetry_events(tmp_path, "drop") if e.get("reason") == "in-flight"]
-    # The superseded round still holds its own slot — the backfill freed only the head it ran.
-    assert d.chokepoint.admit("o/r", 1, OLD_HEAD) == DROP_IN_FLIGHT
+    assert not d.chokepoint._in_flight
 
 
 async def test_sweep_still_holds_off_when_a_round_for_the_current_head_is_in_flight(tmp_path):
