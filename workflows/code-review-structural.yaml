@@ -539,6 +539,43 @@ steps:
          `"developer.env.TOKEN"`; it does not, because the fourth character is
          `e`, not `.`. That finding blocked a correct PR.
 
+      3. **Absence claims need a search, not a reading.** A finding that says
+         something is NOT there — "no test covers X", "`helper` is dead / unused /
+         never called", "not covered", "not exercised", "no `x.py` exists" — is a
+         claim about the WHOLE repository, and the diff is not the repository.
+         The PR's file list can be cut short: protoAgent#4025 was confirmed as
+         "no Python tests" from a 30-file list that had dropped every `tests/`
+         path, and the PR added two test files. Before confirming, search the
+         repo at head SHA "{{inputs.head_sha}}" for the named symbol, test or path
+         (the test directory, the callers, the import sites), and write in your
+         note WHAT you searched and WHERE, e.g. "searched tests/ for `call(`: no
+         use outside conftest.py". A reference found refutes the claim. If you
+         could not search, the finding is `uncertain`, never `confirmed`. The
+         plugin also greps the head checkout after you; a reference it finds
+         demotes a confirmed absence anyway.
+
+      4. **Library and language semantics need the library, not the claim.** A
+         finding whose conclusion turns on what a library, runtime or language
+         does ("DuckDB classifies DESCRIBE as its own statement type", "^0.0.x
+         allows only the exact patch", "this call raises when the file is
+         missing") is `confirmed` only when your note quotes that library's own
+         source, its documentation, or the output of actually running it.
+         Restating the behaviour is not evidence: data-plugin#1 went FAIL on two
+         majors whose note asserted DuckDB rejects `DESCRIBE`; on the locked
+         duckdb 1.5.6, `extract_statements('DESCRIBE SELECT * FROM t')[0].type`
+         is `StatementType.SELECT`. Code that says it deliberately mirrors
+         another implementation is a design choice unless you show the mirror is
+         wrong. Without that quote, mark it `uncertain`.
+
+      5. **A `confirmed` note cites what you found, not what the finding said.**
+         It must quote code you read (file:line and the exact text) or tool
+         output that the claim did not already contain. A note that reads the
+         claim back ("Verified: X calls Y, which rejects Z") is not evidence, and
+         the plugin downgrades such a note to `uncertain`. The rationale counts
+         too: if a finding justifies itself with a rule or config ("enforced via
+         ruff PLW1514"), check that the rule actually fires there, and correct
+         the rationale in your note when the defect is real but the reason is not.
+
       If evidence you cannot ground is the ONLY support for a finding, mark it
       `uncertain`, not `confirmed` — uncertain never blocks a merge on its own,
       and a finding you could not verify has not earned a block.

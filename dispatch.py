@@ -35,6 +35,8 @@ import time
 from collections import deque
 from urllib.parse import quote
 
+from . import absence_search as _absence
+from .absence_search import AbsenceSearcher, render_absence_search_footnote
 from .approve import (
     HOLD_NO_CLEAR_VERDICT,
     HOLD_NOT_OWNER,
@@ -57,6 +59,13 @@ from .checks import (
     queued_run,
 )
 from .chokepoint import DISPATCH_ACTIONS, DROP_IN_FLIGHT, Chokepoint
+from .evidence_guard import (
+    MANIFESTS,
+    apply_evidence_guard,
+    needs_dependencies,
+    parse_dependencies,
+    render_evidence_footnote,
+)
 from .gh_cli import bad_repo, gh_json_rows, run_gh
 from .grounding import (
     UNREADABLE,
@@ -356,6 +365,47 @@ def _remember(keys: dict[str, None], key: str, *, cap: int = 1024, keep: int = 5
     if len(keys) > cap:
         for old in list(keys)[: len(keys) - keep]:
             del keys[old]
+
+
+# The annotations the #259 checks write onto a verdict-input finding, and the flags that mark
+# one of theirs. `regrade_record` copies them onto the recorded row, so the posted array says
+# what the verdict read. #209's `absence_demoted` is deliberately not among the flags: that
+# pass has never written to the record, and this change does not alter what it carries.
+_REGRADE_FLAGS = (
+    "absence_refuted",
+    "absence_unsearched",
+    "absence_searched",
+    "evidence_restated",
+    "semantics_unquoted",
+)
+_REGRADE_KEYS = ("verdict", "note", "ungrounded", *_REGRADE_FLAGS)
+
+
+def regrade_record(reported: list[dict], findings: list[dict]) -> list[dict]:
+    """`reported` with each row a check demoted in `findings` replaced by an annotated copy.
+
+    The verdict list is no longer position-aligned with the record (confinement, nearby
+    scoping), and its rows are copies, so they are matched by (file, claim). A row is only
+    ever moved TOWARDS `uncertain` by this: the flags it copies are the demotions' own, and a
+    finding with none of them leaves its recorded row untouched (#259)."""
+    changed: dict[tuple[str, str], dict] = {}
+    for f in findings:
+        if any(f.get(k) for k in _REGRADE_FLAGS):
+            changed.setdefault((_norm_path(str(f.get("file") or "")), str(f.get("claim") or "")), f)
+    if not changed:
+        return reported
+    out = []
+    for row in reported:
+        src = changed.get((_norm_path(str(row.get("file") or "")), str(row.get("claim") or "")))
+        if src is None:
+            out.append(row)
+            continue
+        updated = dict(row)
+        for k in _REGRADE_KEYS:
+            if k in src:
+                updated[k] = src[k]
+        out.append(updated)
+    return out
 
 
 def _carry_anchor(finding: dict) -> str:
@@ -1139,6 +1189,7 @@ class Dispatcher:
         workflow_run=None,
         inbox_add=None,
         cfg_provider=None,
+        resolve_checkout=None,
     ):
         # Config is resolved LIVE, never snapshotted (issue #11). Every knob below used
         # to be read once in __init__, so an operator editing `repos` or flipping
@@ -1208,6 +1259,9 @@ class Dispatcher:
         # instead of piling on top of a burst. None ⇒ unbounded (a sweep-only wiring, or
         # a test that never built the routers); the dispatcher never creates or sizes it.
         self.panel_sem: asyncio.Semaphore | None = None
+        # The head checkout the absence search greps (#259): None ⇒ the structural pass's
+        # checkout cache (`absence_search.default_resolver`). Tests inject a local repo.
+        self._resolve_checkout = resolve_checkout
 
     # ── config, resolved live ────────────────────────────────────────────────
     #
@@ -1638,6 +1692,19 @@ class Dispatcher:
             if "evidence_grounding" in cfg
             else _env_bool("PR_REVIEWER_EVIDENCE_GROUNDING", True)
         )
+
+    @property
+    def absence_search_enabled(self) -> bool:
+        """Search the head checkout for what an absence claim says is missing (#259)."""
+        cfg = self.cfg
+        return bool(cfg["absence_search"]) if "absence_search" in cfg else _env_bool("PR_REVIEWER_ABSENCE_SEARCH", True)
+
+    @property
+    def evidence_guard_enabled(self) -> bool:
+        """Demote a `confirmed` whose note restates the claim, or asserts a declared library's
+        behaviour without quoting it (#259)."""
+        cfg = self.cfg
+        return bool(cfg["evidence_guard"]) if "evidence_guard" in cfg else _env_bool("PR_REVIEWER_EVIDENCE_GUARD", True)
 
     @property
     def diff_char_budget(self) -> int:
@@ -2286,6 +2353,31 @@ class Dispatcher:
             return None
         paths = {line.strip() for line in out.splitlines() if line.strip()}
         return paths or None
+
+    async def _head_dependencies(self, repo: str, head: str) -> set[str] | None:
+        """The dependency names the repo's root manifests declare at the reviewed head (#259),
+        or None when none could be read. Pinned to the head SHA like every other read here; a
+        manifest that does not exist is simply skipped."""
+        import base64
+
+        manifests: dict[str, str] = {}
+        for path in MANIFESTS:
+            rc, out, _err = await self._run_gh(
+                [
+                    "api",
+                    f"repos/{repo}/contents/{quote(path, safe='/')}?ref={quote(head, safe='')}",
+                    "--jq",
+                    '(.encoding // "") + "\\u0000" + (.content // "")',
+                ]
+            )
+            encoding, _, payload = out.partition("\x00")
+            if rc != 0 or encoding.strip() != "base64":
+                continue
+            try:
+                manifests[path] = base64.b64decode(payload.strip()).decode("utf-8", errors="replace")
+            except Exception:  # noqa: BLE001 — an undecodable manifest declares nothing
+                continue
+        return parse_dependencies(manifests) if manifests else None
 
     async def _diff_truncation(self, repo: str, pr: int) -> tuple[bool, list[str]]:
         """Did the reviewed diff exceed the panel's char budget, and which paths did that drop?
@@ -3620,6 +3712,47 @@ class Dispatcher:
                     dropped_paths=dropped_paths[:20] or None,
                     demoted=absence_demoted,
                 )
+        # Absence claims, searched (#259): a "no test" / "dead" / "never called" / "no such file"
+        # finding is a claim about the whole repo, so it is checked by a search of the head
+        # checkout. A reference found refutes it; a search that could not run leaves it
+        # `uncertain`, never `confirmed`. Then a `confirmed` whose note only restates the claim,
+        # or asserts a declared library's behaviour without quoting it, loses its gating power.
+        # Both demote and footnote — neither drops a finding.
+        absence_refuted: list[dict] = []
+        absence_unsearched: list[dict] = []
+        evidence_demoted: list[dict] = []
+        if self.grounding_enabled and self.absence_search_enabled and findings:
+            try:
+                searcher = AbsenceSearcher(
+                    self.cfg, resolve_checkout=self._resolve_checkout or _absence.default_resolver(self.cfg)
+                )
+                findings, absence_refuted, absence_unsearched = await searcher.check(repo, head, findings)
+            except Exception:  # noqa: BLE001 — a checker bug must never void the round (ADR 0078 D3)
+                log.exception("[pr-reviewer] absence search failed on %s#%s; findings left as verified", repo, pr)
+            if absence_refuted or absence_unsearched:
+                self.telemetry.emit(
+                    "absence_searched",
+                    repo=repo,
+                    pr=pr,
+                    sha=head,
+                    round=round_number,
+                    refuted=absence_refuted or None,
+                    unsearched=absence_unsearched or None,
+                )
+        if self.grounding_enabled and self.evidence_guard_enabled and findings:
+            try:
+                deps = await self._head_dependencies(repo, head) if needs_dependencies(findings) else None
+                findings, evidence_demoted = apply_evidence_guard(findings, deps)
+            except Exception:  # noqa: BLE001 — a checker bug must never void the round (ADR 0078 D3)
+                log.exception("[pr-reviewer] evidence guard failed on %s#%s; findings left as verified", repo, pr)
+            if evidence_demoted:
+                self.telemetry.emit(
+                    "evidence_guarded", repo=repo, pr=pr, sha=head, round=round_number, demoted=evidence_demoted
+                )
+        # Every demotion above is carried into the RECORD (the posted findings array), not only
+        # the verdict input: the next round reads its priors from the record, and a row the
+        # verdict treated as uncertain must not be recalled as a confirmed major (#259).
+        reported = regrade_record(reported, findings)
         verdict = verdict_for(findings)
         # Convergence (issue #23) sits AFTER the pure mapping, never inside it: ADR
         # 0078 C's rule is that findings decide the verdict, and that still holds —
@@ -3663,6 +3796,8 @@ class Dispatcher:
             + render_grounding_footnote(ungrounded)
             + render_unreadable_footnote(unreadable)
             + render_absence_footnote(absence_demoted)
+            + render_absence_search_footnote(absence_refuted, absence_unsearched)
+            + render_evidence_footnote(evidence_demoted)
             + render_nearby_footnote(nearby)
             + render_refuted_before_note(refuted_before)
         )
@@ -3815,6 +3950,11 @@ class Dispatcher:
             # demoted, and whether the panel's diff was truncated past the char budget. `None`
             # when no gating absence claim was raised, so the two reads were never spent.
             absence_demoted=len(absence_demoted) or None,
+            # Absence claims the head search refuted / could not search, and confirmed findings
+            # demoted for restated or unquoted-library evidence (#259). None when none were.
+            absence_refuted=len(absence_refuted) or None,
+            absence_unsearched=len(absence_unsearched) or None,
+            evidence_demoted=len(evidence_demoted) or None,
             diff_truncated=diff_truncated,
             dispositions=len(dispositions),
             unaccounted=len(unaccounted),

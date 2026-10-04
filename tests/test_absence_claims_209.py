@@ -32,6 +32,7 @@ from pr_reviewer.grounding import (
 from pr_reviewer.telemetry import Telemetry
 from pr_reviewer.verdicts import FAIL, WARN, verdict_for
 
+from tests.git_helpers import git_repo, resolver_for
 from tests.test_dispatch import HEAD, RoutedGH, facts, make
 
 # ── unit: recognising an absence claim ────────────────────────────────────────
@@ -388,18 +389,22 @@ async def test_absence_on_a_truncated_diff_is_nonblocking_with_a_truncation_note
 
 async def test_a_genuine_absence_still_requests_changes(tmp_path):
     # r3: no plausible test in a tree we read, and the diff fits the budget — the absence is
-    # established, so the major stands and gates the merge.
+    # established, so the major stands and gates the merge. Since #259 "established" also means
+    # SEARCHED: the head checkout is grepped for the module, and nothing in a test references it.
+    sha = git_repo(tmp_path / "repo", {"pkg/fetch.py": "def fetch():\n    pass\n", "README.md": "fetch\n"})
     gh = AbsenceGH(
         tree={"pkg/fetch.py", "README.md"},
         file_patches={"pkg/fetch.py": "diff" * 5},
         checks=[{"status": "completed", "conclusion": "failure"}],  # so a FAIL arms REQUEST_CHANGES
     )
+    gh.pr_facts = facts(head=sha)
 
     async def runner(name, inputs):
         return {"output": absence_report("pkg/fetch.py", "pkg/fetch.py is added with no test file."), "failed": []}
 
     d = make(tmp_path, cfg={"shadow_mode": False}, gh=gh, runner=runner)
-    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "reviewed:FAIL"
+    d._resolve_checkout = resolver_for(tmp_path / "repo")
+    assert (await d.handle_pr_event("o/r", 1, sha, "opened")) == "reviewed:FAIL"
     body = gh.reviews_posted[0]["body"]
     assert gh.posted[0]["event"] == "REQUEST_CHANGES"
     assert "downgraded to **uncertain**" not in body
