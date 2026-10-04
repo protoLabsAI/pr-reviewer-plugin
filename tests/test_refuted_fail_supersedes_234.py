@@ -206,7 +206,8 @@ async def test_a_refutation_the_verifier_does_not_share_leaves_the_fail(tmp_path
     await d.handle_summon("o/r", 1, "operator")
     assert len(calls) == 2
     posted = gh.reviews_posted[-1]["body"]
-    assert "Unaccounted prior finding" in posted
+    # Dispositioned `refuted`, so the table explains it — one state per prior (#260).
+    assert "refutation not honoured" in posted and "Unaccounted prior finding" not in posted
     assert decode_disposition_record(parse_verdict_marker(posted)["disp"]) == refuting(h=False)
     gh.reviews.append({"state": "COMMENTED", "body": posted, "id": 103})
     assert (await d.evaluate_promotion("o/r", 1)) == HOLD_NO_CLEAR_VERDICT
@@ -228,7 +229,7 @@ async def test_a_dispute_on_a_new_head_is_not_a_same_head_refutation(tmp_path):
     d = make(tmp_path, cfg=OWNER, gh=gh, runner=runner)
     await d.handle_pr_event("o/r", 1, HEAD, "synchronize")
     assert len(calls) == 1
-    assert "Unaccounted prior finding" in gh.reviews_posted[-1]["body"]
+    assert "refutation not honoured" in gh.reviews_posted[-1]["body"]
 
 
 # ── the pure rule, and both checks agreeing on it ──────────────────────────────

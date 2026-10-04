@@ -92,26 +92,33 @@ from .refutations import (
 from .rounds import (
     DEFAULT_CONVERGENCE_ROUNDS,
     MAX_PRIOR_RECHECK,
+    RECHECK_CONFIRMED_NOTE,
     VERIFY_RETRY_DUE,
     VERIFY_RETRY_EXHAUSTED,
     align_recheck,
     carried_debt,
     converge,
+    credited_minors,
     delta_ranges,
     diff_identity,
+    disposition_display,
     disposition_record,
     disputed_anchors,
     encode_disposition_record,
-    finding_anchor,
     in_delta,
     last_substantive_round,
+    ledger_debt,
+    matches_group,
     needs_recheck,
     normalize_relisted_priors,
     panel_rounds,
     parse_dispositions,
+    prior_ledger,
     recheck_clears,
     recheck_payload,
     relisted_blocking_priors,
+    render_credited_minors,
+    render_debt_verdict_note,
     render_deferred_note,
     render_degraded_note,
     render_evidence_gone_note,
@@ -124,11 +131,14 @@ from .rounds import (
     render_unaccounted_note,
     resolve_relisting,
     round_cap_reached,
+    row_names,
+    same_prior,
     spent_rounds,
     superseded_fails,
     supersedes,
-    unaccounted_priors,
+    undispositioned,
     unexplained_clearance,
+    verdict_with_debt,
     verify_retry_state,
 )
 from .telemetry import REAFFIRM_DIFF, REAFFIRM_HEAD, REAFFIRM_MISS, REAFFIRM_RECORDED, VERIFY_CONTRADICTED, Telemetry
@@ -406,13 +416,6 @@ def regrade_record(reported: list[dict], findings: list[dict]) -> list[dict]:
                 updated[k] = src[k]
         out.append(updated)
     return out
-
-
-def _carry_anchor(finding: dict) -> str:
-    """`file:line` (or the bare file) — how a prior is matched across the re-check lists."""
-    path = str(finding.get("file") or "").strip().removeprefix("./")
-    line = finding.get("line")
-    return f"{path}:{line}" if isinstance(line, int) else path
 
 
 def strictest_head_round(reviews: list[dict], head: str) -> dict | None:
@@ -3600,7 +3603,16 @@ class Dispatcher:
         if (dispositions or relistings) and prior:
             ranges = await self._delta_ranges(repo, prior["head"], head)
             since_ranges = await self._since_ranges(repo, history, head)
-        unaccounted = unaccounted_priors(history, dispositions, ranges=ranges, since_ranges=since_ranges, paths=paths)
+        # One entry per prior DEFECT, matched on file + claim within a line window (#260), with
+        # what the dispositions did to it. `unaccounted` is its debt view — the same set
+        # `unaccounted_priors` returns — and the ledger is what the table, the Findings carry
+        # and the footer all render from, so a prior has exactly one state in the body.
+        ledger = (
+            prior_ledger(history, dispositions, ranges=ranges, since_ranges=since_ranges, paths=paths)
+            if dispositions
+            else []
+        )
+        unaccounted = ledger_debt(ledger)
         # A re-review of the SAME head (#234): a prior the report refuted WITH EVIDENCE is
         # disputed, and gets a verifier re-check whose refutation may clear it even though it
         # was confirmed and the code has not moved (#38's one exception, `recheck_clears`).
@@ -3655,6 +3667,16 @@ class Dispatcher:
             round_number=round_number,
             disputed=disputed,
         )
+        # Prior minors the panel stopped raising on code the PR changed since — credited, not
+        # silently dropped (#260). Needs the delta; read it only when such a minor exists.
+        if (
+            prior
+            and ranges is None
+            and any(str(f.get("severity") or "").lower() in ("minor", "nit") for f in (prior.get("findings") or []))
+        ):
+            ranges = await self._delta_ranges(repo, prior["head"], head)
+            since_ranges = since_ranges or await self._since_ranges(repo, history, head)
+        credited = credited_minors(history, reported, ranges=ranges, since_ranges=since_ranges)
         # What became of the dispositioned round's blocking findings, for the marker (#234):
         # the record `rounds.supersedes` reads on both checks. Written from the CODE's outcome
         # (still carried or cleared), never from the model's say-so alone.
@@ -3842,6 +3864,36 @@ class Dispatcher:
         # never softens a FAIL and never withholds the verdict — it caps PASS at WARN.
         finding_verdict = verdict
         verdict = coverage_verdict(verdict, gaps)
+        # The owed priors face the same #259 evidence guard as this round's own findings: a
+        # carried "confirmed" major whose only support is an unquoted claim about a library's
+        # behaviour (data-plugin#1's DuckDB DESCRIBE/SUMMARIZE majors, confirmed on a rounds-old
+        # record and re-confirmed by the re-check) is `uncertain`, not gating debt. Demoted,
+        # never dropped: it is still carried, as uncertain, and still has to be accounted for.
+        guarded_priors: list[dict] = []
+        if self.grounding_enabled and self.evidence_guard_enabled and unaccounted:
+            try:
+                deps = await self._head_dependencies(repo, head) if needs_dependencies(unaccounted) else None
+                unaccounted, guarded_priors = apply_evidence_guard(unaccounted, deps)
+            except Exception:  # noqa: BLE001 — a checker bug must never void the round (ADR 0078 D3)
+                log.exception("[pr-reviewer] evidence guard failed on carried priors of %s#%s", repo, pr)
+            if guarded_priors:
+                self.telemetry.emit(
+                    "evidence_guarded",
+                    repo=repo,
+                    pr=pr,
+                    sha=head,
+                    round=round_number,
+                    demoted=guarded_priors,
+                    carried=True,
+                )
+        # Carried debt and the verdict must agree (#260). A carry of a prior a verifier
+        # CONFIRMED — still confirmed after every #259 demotion — says it "keeps gating", and
+        # it does, so the round is a FAIL whatever its own findings would have been.
+        # data-plugin#1@eb377e62 posted WARN beneath two such carries. An uncertain or
+        # never-verified carry, and a deferred re-listing (#232 ask 5), hold promotion
+        # (`carried_debt`) without deciding the verdict.
+        debt_verdict = verdict
+        verdict = verdict_with_debt(verdict, unaccounted)
         trailer = (
             render_notes_section(notes)
             + render_grounding_footnote(ungrounded)
@@ -3860,13 +3912,22 @@ class Dispatcher:
             trailer += render_evidence_gone_note(evidence_gone)
         if rechecked_cleared:
             trailer += render_recheck_cleared_note(rechecked_cleared)
+        if credited:
+            trailer += render_credited_minors(credited)
+        if guarded_priors:
+            trailer += render_evidence_footnote(guarded_priors)
+        if verdict != debt_verdict:
+            trailer += render_debt_verdict_note(debt_verdict, unaccounted)
         if deferred:
             trailer += render_deferred_note(deferred)
             # Recorded as carried debt, like an unaccounted prior: not blocking THIS verdict
             # (nobody verified it against this head), not cleared either (#232).
-            reported = merge_carried_findings(reported, deferred)
+            reported = merge_carried_findings(reported, deferred, deferred=True)
         if unaccounted:
-            trailer += render_unaccounted_note(unaccounted)
+            # The footer names only priors this round said NOTHING about; one it dispositioned
+            # (open, an unproven fix, a refutation #38 did not honour) is explained in the
+            # Prior requests table instead — one state per prior (#260).
+            trailer += render_unaccounted_note(undispositioned(ledger, unaccounted))
             # Write the recovered majors into the recorded findings, not just the prose
             # trailer — else `panel_rounds` rebuilds this round from the (de-escalated) array
             # and the next round launders the debt away (protoAgent#2283 r3). The carry
@@ -3908,7 +3969,12 @@ class Dispatcher:
             recipe,
             brief=brief,
             brief_found=brief_found,
-            dispositions=dispositions,
+            # What the gate did with each prior, not only what the report said (#260).
+            dispositions=disposition_display(
+                ledger, dispositions, still_owed=list(unaccounted) + list(deferred), cleared=rechecked_cleared
+            )
+            if ledger
+            else dispositions,
             truncated=truncated,
             confined=confined,
             notes=trailer,
@@ -4012,6 +4078,10 @@ class Dispatcher:
             # The targeted re-verification of priors (#218/#220/#232): how many it cleared, and
             # how many re-listings were deferred to carried debt because nobody re-verified them.
             recheck_cleared=len(rechecked_cleared) or None,
+            # A round posted FAIL because it carries owed prior debt (#260), and the minors it
+            # credited as addressed.
+            debt_failed=(verdict != debt_verdict) or None,
+            credited_minors=len(credited) or None,
             relisted_deferred=len(deferred) or None,
             latency_s=round(elapsed, 1),
             # Model/SDK gateway retries this round (issue #209): a slow gate looked identical to
@@ -4872,13 +4942,18 @@ class Dispatcher:
         re-checked even when it is confirmed on unmoved code, and a verifier `refuted` clears it.
         """
         disputed = disputed or set()
-        relisted_anchors = {_carry_anchor(p) for _, p in relistings}
+
+        def _disputed(prior: dict) -> bool:
+            # by `row_names`, so a dispute of a drifted anchor reaches its prior (#260)
+            return any(row_names({"prior": a}, prior) for a in disputed)
+
+        relisted_priors = [p for _, p in relistings]
         targets: list[tuple[str, int]] = [("relisted", k) for k in range(len(relistings))]
         targets += [
             ("prior", k)
             for k, m in enumerate(unaccounted)
-            if _carry_anchor(m) not in relisted_anchors
-            and needs_recheck(m, ranges, since_ranges, disputed=finding_anchor(m) in disputed)
+            if not any(same_prior(m, p) for p in relisted_priors)
+            and needs_recheck(m, ranges, since_ranges, disputed=_disputed(m))
         ]
         targets = targets[:MAX_PRIOR_RECHECK]
         candidates = [
@@ -4918,18 +4993,18 @@ class Dispatcher:
         deferred: list[dict] = []
         drop: set[int] = set()
         out = list(reported)
-        cleared_anchors: set[str] = set()  # priors a re-listing already settled
+        settled: list[dict] = []  # priors a re-listing already settled
         for k, (i, prior) in enumerate(relistings):
             ruling = ruling_for.get(("relisted", k))
             outcome, value = resolve_relisting(out[i], prior, ruling, ranges, since_ranges)
             if outcome == "cleared":
                 drop.add(i)
                 cleared.append({**prior, "recheck_note": (ruling or {}).get("note", "")})
-                cleared_anchors.add(_carry_anchor(prior))
+                settled.append(prior)
             elif outcome == "deferred":
                 drop.add(i)
                 deferred.append(value)
-                cleared_anchors.add(_carry_anchor(prior))  # carried by `deferred`, named once
+                settled.append(prior)  # carried by `deferred`, named once
             elif outcome in ("confirmed", "inherited"):
                 # The round's own finding, now with a ruling — judged by the verdict like any
                 # other; `carried_by: synthesizer` keeps it out of the verify-coverage count
@@ -4938,17 +5013,19 @@ class Dispatcher:
         out = [f for j, f in enumerate(out) if j not in drop]
         still: list[dict] = []
         for k, prior in enumerate(unaccounted):
-            if _carry_anchor(prior) in cleared_anchors:
+            if any(same_prior(prior, p) or matches_group(p, prior) for p in settled):
                 continue  # its re-listing was settled above — the same prior, one outcome
             ruling = ruling_for.get(("prior", k))
-            if ruling and recheck_clears(
-                prior, ruling["verdict"], ranges, since_ranges, disputed=finding_anchor(prior) in disputed
-            ):
+            if ruling and recheck_clears(prior, ruling["verdict"], ranges, since_ranges, disputed=_disputed(prior)):
                 cleared.append({**prior, "recheck_note": ruling.get("note", "")})
                 continue
             if ruling and ruling["verdict"] == "confirmed":
-                prior = {k2: v for k2, v in prior.items() if k2 != "raised_unverified"}
+                # The fresh ruling replaces the stale record, so a note that said "unverified —
+                # 404" no longer describes it (#260 `evidence_unverified`).
+                prior = {k2: v for k2, v in prior.items() if k2 not in ("raised_unverified", "source_unavailable")}
                 prior["verdict"] = "confirmed"
+                prior["note"] = f"{ruling.get('note') or ''} — {RECHECK_CONFIRMED_NOTE}".lstrip(" —")
+                prior["rechecked"] = "confirmed"
             still.append(prior)
         if candidates:
             verdicts = [r["verdict"] if r else "" for r in rulings]

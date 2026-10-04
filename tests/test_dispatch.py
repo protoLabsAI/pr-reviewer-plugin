@@ -3649,10 +3649,13 @@ async def test_a_warn_that_drops_a_prior_major_holds_the_block(tmp_path):
     )
     runner, _seen = capturing_runner(report_with_dispositions([{"prior": "other.py:1", "disposition": "fixed"}], nit))
     d = make(tmp_path, cfg={"shadow_mode": False, "evidence_grounding": False}, gh=gh, runner=runner)
+    # The prior was never verifier-confirmed (no verdict), so it is owed and holds the block,
+    # but it does not decide the verdict — only CONFIRMED debt does (#260, after #259).
     assert (await d.handle_pr_event("o/r", 1, HEAD, "synchronize")) == "reviewed:WARN"
     assert gh.dismissed == []  # the block stays up
     assert "Unaccounted prior finding" in gh.posted[0]["body"]
-    assert "real bug" in gh.posted[0]["body"]
+    assert "real bug" in gh.posted[0]["body"] and "not yet verified" in gh.posted[0]["body"]
+    assert "FAIL on carried debt" not in gh.posted[0]["body"]
 
 
 async def test_a_dispositioned_major_lets_the_verdict_clear(tmp_path):
@@ -3731,10 +3734,13 @@ async def test_a_hallucinated_fixed_disposition_holds_the_block_end_to_end(tmp_p
         report_with_dispositions([{"prior": "x.py:3", "disposition": "fixed", "why": "resolved in updated diff"}])
     )
     d = make(tmp_path, cfg={"shadow_mode": False, "evidence_grounding": False}, gh=gh, runner=runner)
-    assert (await d.handle_pr_event("o/r", 1, HEAD, "synchronize")) == "reviewed:PASS"
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "synchronize")) == "reviewed:PASS"  # unverified debt
     assert gh.dismissed == []  # the block is HELD — an unverified fix does not clear it
-    assert "Unaccounted prior finding" in gh.posted[0]["body"]
-    assert "real bug" in gh.posted[0]["body"]
+    body = gh.posted[0]["body"]
+    # One state per prior (#260): the table says the fix was not proven; the footer does
+    # not also call a dispositioned prior "unaccounted".
+    assert "fixed — not proven" in body and "Unaccounted prior finding" not in body
+    assert "real bug" in body
 
 
 async def test_a_false_disposition_still_holds_via_the_narrow_rule_when_the_block_is_absent(tmp_path):
@@ -3815,10 +3821,10 @@ async def test_a_confirmed_prior_on_untouched_code_is_not_re_drawn(tmp_path):
     report = report_with_dispositions([{"prior": f"{A2A_FILE}:371", "disposition": "fixed", "why": "resolved"}])
     runner, calls = recheck_runner(report, verify_reply({**A2A_MAJOR, "verdict": "refuted"}))
     d = make(tmp_path, cfg={"shadow_mode": False, "evidence_grounding": False}, gh=gh, runner=runner)
-    assert (await d.handle_pr_event("o/r", 1, HEAD, "synchronize")) == "reviewed:PASS"
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "synchronize")) == "reviewed:FAIL"  # carried debt (#260)
     assert len(calls) == 1  # no re-check
     assert gh.dismissed == []
-    assert "Unaccounted prior finding" in gh.reviews_posted[0]["body"]
+    assert "fixed — not proven" in gh.reviews_posted[0]["body"]
 
 
 async def test_a_refutation_on_a_line_the_delta_rewrote_drops_the_carried_row(tmp_path):
@@ -3860,9 +3866,12 @@ async def test_a_prior_carried_again_keeps_one_carry_note(tmp_path):
         report_with_dispositions([{"prior": f"{A2A_FILE}:371", "disposition": "open", "why": "unchanged"}])
     )
     d = make(tmp_path, cfg={"shadow_mode": False, "evidence_grounding": False}, gh=gh, runner=runner)
-    assert (await d.handle_pr_event("o/r", 1, HEAD, "synchronize")) == "reviewed:PASS"
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "synchronize")) == "reviewed:FAIL"
     [row] = _record(gh.reviews_posted[0]["body"])
-    assert row["carried"] is True and row["note"].count(CARRIED_NOTE) == 1
+    # One carry suffix, whichever: the old one is replaced, not appended to (#218), and the
+    # new one follows the disposition (`open`, #260).
+    assert row["carried"] is True and row["note"].count("carried from a prior round") == 1
+    assert CARRIED_NOTE not in row["note"] and "still open" in row["note"]
     assert row["since"] == OLD_HEAD and row["evidence"] == A2A_MAJOR["evidence"]
 
 
@@ -3881,7 +3890,7 @@ async def test_a_round_carrying_a_prior_is_verified_and_holds_on_the_debt_itself
         return {"output": report, "steps": dict(_CLEAN_STEPS), "failed": []}
 
     d = make(tmp_path, cfg={"shadow_mode": False, "evidence_grounding": False}, gh=gh, runner=runner)
-    assert (await d.handle_pr_event("o/r", 1, HEAD, "synchronize")) == "reviewed:PASS"
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "synchronize")) == "reviewed:FAIL"
     body = gh.reviews_posted[0]["body"]
     assert "verified=false" not in body.splitlines()[0]
     assert [r["carried"] for r in _record(body)] == [True]
@@ -3897,7 +3906,8 @@ async def test_a_round_carrying_a_prior_is_verified_and_holds_on_the_debt_itself
         checks=green,
     )
     d2 = make(tmp_path / "gate", cfg={"shadow_mode": False, "promotion_owner": True}, gh=gate)
-    assert (await d2.evaluate_promotion("o/r", 1)) == "hold:carried-prior"
+    # The carried debt now FAILs the round itself (#260), so the gate holds it as a FAIL.
+    assert (await d2.evaluate_promotion("o/r", 1)) == "hold:no-clear-verdict"
     assert gate.reviews_posted == []
 
 

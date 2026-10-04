@@ -578,9 +578,10 @@ def test_a_coverage_count_short_of_the_findings_is_unverified():
 
 
 def test_carried_findings_do_not_trip_the_coverage_rule():
-    """merge_carried_findings stamps `confirmed`, so durable debt stays verified."""
+    """A dispatcher carry is debt, not a finding this round's verifier missed — with or
+    without a verdict (#260 carries a never-verified prior verdict-less)."""
     carried = merge_carried_findings([], [{"file": "a.py", "line": 1, "claim": "x"}])
-    assert carried and all(f.get("verdict") for f in carried)
+    assert carried and carried[0]["raised_unverified"] is True and "verdict" not in carried[0]
     assert verification_ran(f"VERIFY_STATUS: annotated n={len(carried)}", carried) is True
 
 

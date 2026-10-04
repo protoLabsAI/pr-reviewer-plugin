@@ -275,11 +275,11 @@ def render_prior_requests(rounds: list[dict]) -> str:
         ),
         numbered[-1][1],
     )
-    latest = {
-        _anchor(f.get("file"), f.get("line"))
+    latest = [
+        f
         for f in (latest_round.get("findings") or [])
         if isinstance(f, dict) and str(f.get("verdict") or "").lower() != "refuted"
-    }
+    ]
     out = ["<prior_requests>"]
     for number, round_ in numbered:
         out.append(f'  <round number="{number}" verdict="{_attr(round_.get("verdict"))}">')
@@ -288,7 +288,7 @@ def render_prior_requests(rounds: list[dict]) -> str:
                 continue  # a nearby note (#232) was never a request of this PR
             if str(finding.get("verdict") or "").lower() == "refuted":
                 status = REQUEST_REFUTED
-            elif _anchor(finding.get("file"), finding.get("line")) in latest:
+            elif any(same_prior(finding, f) for f in latest):  # a drifted anchor is the same request (#260)
                 status = REQUEST_OPEN
             else:
                 status = REQUEST_NOT_IN_LATEST
@@ -550,7 +550,398 @@ def prior_touched(
 def _verifier_confirmed(prior: dict) -> bool:
     """Did a verifier ever confirm this prior? A carried row is stamped `confirmed` either
     way, so `raised_unverified` (set by `merge_carried_findings`) is what remembers it."""
-    return str(prior.get("verdict") or "").lower() == "confirmed" and not prior.get("raised_unverified")
+    return (
+        str(prior.get("verdict") or "").lower() == "confirmed"
+        and not prior.get("raised_unverified")
+        and not evidence_unverified(prior)
+    )
+
+
+# ── one prior, one state (#260) ────────────────────────────────────────────────────────────
+#
+# Priors used to be keyed by exact `file:line`. A panel that re-anchors a finding by a line
+# or two (protoLab#34: the same bare import at :51, :53 and :54 across rounds) turned one
+# defect into several priors, so a disposition of :54 left :51 and :53 "unaccounted", the
+# record carried duplicates, and the `disp=` marker held a row nobody dispositioned. A prior
+# is now matched on its FILE plus a near-identical claim or a shared code quote, within a
+# line window — the same keying the refutation stores use (`refutations.SAME_CLAIM_LINES`).
+
+# A disposition row carries no claim, only an anchor: it names a prior within this many lines.
+ANCHOR_WINDOW_LINES = 5
+
+# Markers in a finding's own evidence/note that say no verifier actually read the code. A
+# carry is never stamped `confirmed` over them (#260: a "confirmed" carry whose note read
+# "gap: unverified — PR head reads 404").
+_UNVERIFIED_RE = re.compile(
+    r"\bunverified\b|\b404\b|source unavailable|could not (?:be )?read|cannot confirm|not (?:be )?verified",
+    re.IGNORECASE,
+)
+
+
+def evidence_unverified(finding: dict) -> bool:
+    """Does the finding's own record say it was never actually verified? Fail-closed toward
+    "unverified": the flag set by grounding (`source_unavailable`) or any marker phrase in
+    its note or evidence."""
+    if finding.get("source_unavailable"):
+        return True
+    text = f"{finding.get('note') or ''}\n{finding.get('evidence') or ''}"
+    return bool(_UNVERIFIED_RE.search(text))
+
+
+def _same_file(a: object, b: object) -> bool:
+    """Same path, or one is the other qualified by directories (`verify_coherence.py` vs
+    `evals/graders/verify_coherence.py` — a panel that dropped the directory)."""
+    pa, pb = _norm(str(a or "")), _norm(str(b or ""))
+    if not pa or not pb:
+        return False
+    return pa == pb or pa.endswith("/" + pb) or pb.endswith("/" + pa)
+
+
+def _int_line(finding: dict) -> int | None:
+    line = finding.get("line")
+    return line if isinstance(line, int) and not isinstance(line, bool) and line > 0 else None
+
+
+def same_prior(a: dict, b: dict) -> bool:
+    """Are `a` and `b` the same prior finding? Same file (`_same_file`), and either the same
+    line, or the same defect worded alike at a moved line (`verdicts._same_defect`), or the
+    same quoted code within `ANCHOR_WINDOW_LINES`. File-level findings (no line) match only
+    each other, by the same claim."""
+    from .verdicts import _same_defect
+
+    if not _same_file(a.get("file"), b.get("file")):
+        return False
+    la, lb = _int_line(a), _int_line(b)
+    if la is None or lb is None:
+        if la is not None or lb is not None:
+            return False
+        return " ".join(str(a.get("claim") or "").lower().split()) == " ".join(
+            str(b.get("claim") or "").lower().split()
+        )
+    if la == lb:
+        return True
+    if _same_defect({**a, "file": b.get("file")}, b):
+        return True
+    if abs(la - lb) <= ANCHOR_WINDOW_LINES:
+        if set(quoted_snippets(a)) & set(quoted_snippets(b)):
+            return True
+        return _similar_claims(str(a.get("claim") or ""), str(b.get("claim") or ""))
+    return False
+
+
+def _similar_claims(a: str, b: str) -> bool:
+    """A looser same-defect test, only ever applied within `ANCHOR_WINDOW_LINES`: the claims
+    read alike (≥ 0.6) AND name mostly the same things (identifier Jaccard ≥ 0.5). The same
+    "SKIP path never sets `failed`" worded twice passes; "no test for /oauth/poll" beside
+    "no test for /oauth/start" shares the template, not the subject, and does not."""
+    import difflib
+
+    from .verdicts import identifier_tokens
+
+    ca, cb = " ".join(a.lower().split()), " ".join(b.lower().split())
+    if not ca or not cb or difflib.SequenceMatcher(None, ca, cb).ratio() < 0.6:
+        return False
+    ta, tb = identifier_tokens(a), identifier_tokens(b)
+    if not ta or not tb:
+        return False
+    return len(ta & tb) / len(ta | tb) >= 0.5
+
+
+def row_names(row: dict, prior: dict) -> bool:
+    """Does disposition `row` (an anchor, no claim) name `prior`? The exact anchor, or a line
+    within `ANCHOR_WINDOW_LINES` in the same file; a file-level row names every prior in it."""
+    file, line = _disposition_anchor(row)
+    if not _same_file(file, prior.get("file")):
+        return False
+    pl = _int_line(prior)
+    if line is None or line <= 0:
+        return True
+    if pl is None:
+        return False
+    return abs(line - pl) <= ANCHOR_WINDOW_LINES
+
+
+_SEVERITY_RANK = {"blocker": 3, "major": 2, "minor": 1, "nit": 0}
+
+
+def group_priors(priors: list[dict]) -> list[dict]:
+    """`priors` collapsed to one entry per defect (`same_prior`, transitively), in order.
+
+    Each entry is the group's representative — a freshly raised member before a carried one,
+    the highest severity of any member, `confirmed` only when some member was verifier-
+    confirmed with nothing in its own record saying otherwise, and the `since` of the oldest
+    raise among them (a carried member's) so a fix is proven over the whole window (#131) —
+    plus `members`, the anchors it stands for."""
+    groups: list[list[dict]] = []
+    for p in priors or []:
+        if not isinstance(p, dict):
+            continue
+        hit = [g for g in groups if any(same_prior(p, m) for m in g)]
+        if not hit:
+            groups.append([p])
+            continue
+        merged = hit[0]
+        merged.append(p)
+        for g in hit[1:]:
+            merged.extend(g)
+            groups.remove(g)
+    out = []
+    for g in groups:
+        ranked = sorted(g, key=lambda m: (not _verifier_confirmed(m), bool(m.get("carried"))))
+        rep = dict(ranked[0])
+        rep["severity"] = max(
+            (str(m.get("severity") or "").lower() for m in g), key=lambda s: _SEVERITY_RANK.get(s, -1)
+        )
+        if not _verifier_confirmed(rep) and str(rep.get("verdict") or "").lower() == "confirmed":
+            rep["raised_unverified"] = True  # stamped `confirmed` by a carry, never verified (#260)
+        carried_since = next((str(m.get("since")) for m in g if m.get("carried") and m.get("since")), "")
+        if carried_since:
+            rep["since"] = carried_since
+        rep["members"] = [finding_anchor(m) for m in g]
+        out.append(rep)
+    return out
+
+
+def matches_group(finding: dict, group: dict) -> bool:
+    """Does `finding` (a prior, a re-listing or a carry) belong to `group`?"""
+    if same_prior(finding, group):
+        return True
+    return finding_anchor(finding) in set(group.get("members") or [])
+
+
+DISPOSITION_FIXED = "fixed"
+DISPOSITION_REFUTED = "refuted"
+# What the gate did with a disposition — one state per prior (#260).
+OUTCOME_FIXED = "fixed"  # `fixed`, proven by the delta
+OUTCOME_REFUTED = "refuted"  # `refuted`, honoured
+OUTCOME_OPEN = "open"
+OUTCOME_FIXED_UNPROVEN = "fixed-unproven"  # `fixed`, but the cited line did not move
+OUTCOME_NOT_HONOURED = "refutation-not-honoured"  # #38: verifier-confirmed on unchanged code
+OUTCOME_CONFLICT = "conflict"  # rows disagree
+OUTCOME_NONE = "undispositioned"
+_CLEARED_OUTCOMES = (OUTCOME_FIXED, OUTCOME_REFUTED)
+
+
+def prior_ledger(
+    history: list[dict],
+    dispositions: list[dict],
+    *,
+    ranges: dict[str, list[tuple[int, int]]] | None = None,
+    since_ranges: dict[str, dict[str, list[tuple[int, int]]] | None] | None = None,
+    paths: list[str] | None = None,
+) -> list[dict]:
+    """Every gating prior of the last substantive round, ONE entry per defect, with what this
+    round's dispositions did to it: `{"prior", "rows", "outcome"}` (#260).
+
+    The rules are `unaccounted_priors`' (it is a view over this): `fixed` clears only when
+    the cited line moved since the prior was raised; `refuted` clears an `uncertain` or
+    never-verified prior, or one whose line moved (#218), and is otherwise NOT HONOURED
+    (#38); `open` never clears, and vetoes a clearing row that disagrees with it. Priors the
+    PR no longer changes, nearby notes, fabricated (ungrounded) and refuted ones are no debt."""
+    round_ = last_substantive_round(history)
+    if round_ is None:
+        return []
+    origin = str(round_.get("head") or "")
+    changed = {_norm(p) for p in paths or [] if p and p.strip()}
+    debt = []
+    for f in round_.get("findings") or []:
+        if not isinstance(f, dict) or f.get("ungrounded") or f.get("nearby"):
+            continue
+        if str(f.get("severity") or "").lower() not in _BLOCKING:
+            continue
+        if str(f.get("verdict") or "").lower() == "refuted":
+            continue
+        if changed and _norm(str(f.get("file") or "")) not in changed:
+            continue  # confinement keeps it out of every verdict — not this PR's debt
+        debt.append({**f, "since": str(f.get("since") or origin)})
+    ledger = []
+    for prior in group_priors(debt):
+        rows = [r for r in dispositions or [] if isinstance(r, dict) and row_names(r, prior)]
+        said = {str(r.get("disposition") or "").lower() for r in rows}
+        outcomes = set()
+        for r in rows:
+            d = str(r.get("disposition") or "").lower()
+            probe = {"file": prior.get("file"), "line": _disposition_anchor(r)[1] or _int_line(prior)}
+            moved = _line_moved(probe, prior, ranges, since_ranges)
+            if d == "open":
+                outcomes.add(OUTCOME_OPEN)
+            elif d == DISPOSITION_FIXED:
+                outcomes.add(OUTCOME_FIXED if moved else OUTCOME_FIXED_UNPROVEN)
+            elif d == DISPOSITION_REFUTED:
+                unconfirmed = str(prior.get("verdict") or "").lower() == "uncertain"
+                outcomes.add(OUTCOME_REFUTED if (unconfirmed or moved) else OUTCOME_NOT_HONOURED)
+        if not rows:
+            outcome = OUTCOME_NONE
+        elif OUTCOME_OPEN in outcomes:
+            outcome = OUTCOME_OPEN if len(said) == 1 else OUTCOME_CONFLICT
+        elif outcomes & set(_CLEARED_OUTCOMES):
+            outcome = next(o for o in _CLEARED_OUTCOMES if o in outcomes)
+        else:
+            outcome = next(iter(sorted(outcomes)))
+        ledger.append({"prior": prior, "rows": rows, "outcome": outcome})
+    return ledger
+
+
+def ledger_debt(ledger: list[dict]) -> list[dict]:
+    """The ledger's priors still owed — every entry whose outcome did not clear it."""
+    return [{**e["prior"], "owed": e["outcome"]} for e in ledger if e["outcome"] not in _CLEARED_OUTCOMES]
+
+
+def credited_minors(
+    history: list[dict],
+    reported: list[dict],
+    *,
+    ranges: dict[str, list[tuple[int, int]]] | None,
+    since_ranges: dict[str, dict[str, list[tuple[int, int]]] | None] | None = None,
+) -> list[dict]:
+    """Prior minor/nit findings this round credits as addressed (#260): no longer raised in
+    any form, near lines the PR changed since they were raised (`CREDIT_WINDOW_LINES`). Prior requests track only
+    blocker/majors, so a fixed minor used to vanish without a word. Non-gating, and worded
+    as what it is — the code moved and the panel stopped raising it, not a verified fix."""
+    round_ = last_substantive_round(history)
+    if round_ is None or ranges is None:
+        return []
+    origin = str(round_.get("head") or "")
+    out = []
+    for f in round_.get("findings") or []:
+        if not isinstance(f, dict) or f.get("nearby") or f.get("ungrounded"):
+            continue
+        if str(f.get("severity") or "").lower() not in ("minor", "nit"):
+            continue
+        if str(f.get("verdict") or "").lower() == "refuted":
+            continue
+        if any(isinstance(r, dict) and same_prior(r, f) for r in reported or []):
+            continue
+        prior = {**f, "since": str(f.get("since") or origin)}
+        proof = _proof(prior, ranges, since_ranges)
+        if proof is not None and _near_delta(prior, proof, CREDIT_WINDOW_LINES):
+            out.append(prior)
+    return out
+
+
+# Finders cite a minor's line loosely (data-plugin#1 round 1 put an `engine.py` field at :152
+# that sat at :143), and a credit gates nothing — so a change within this many lines counts.
+CREDIT_WINDOW_LINES = 25
+
+
+def _near_delta(finding: dict, ranges: dict[str, list[tuple[int, int]]], window: int) -> bool:
+    spans = ranges.get(_norm(str(finding.get("file") or "")))
+    if spans is None:
+        return False
+    line = _int_line(finding)
+    if not spans or line is None:
+        return True
+    return any(start - window <= line <= end + window for start, end in spans)
+
+
+def _in(prior: dict, pool: list[dict]) -> bool:
+    return any(isinstance(p, dict) and (same_prior(prior, p) or matches_group(p, prior)) for p in pool or [])
+
+
+def undispositioned(ledger: list[dict], still_owed: list[dict]) -> list[dict]:
+    """The owed priors this round said NOTHING about — the only ones the "unaccounted"
+    footer may name (#260). A prior dispositioned `open`, or `fixed`/`refuted` without the
+    gate honouring it, is explained in the Prior requests table, not called silent."""
+    silent = [e["prior"] for e in ledger if e["outcome"] == OUTCOME_NONE]
+    return [p for p in still_owed or [] if _in(p, silent)]
+
+
+_DISPLAY = {
+    OUTCOME_FIXED: ("✅", "fixed"),
+    OUTCOME_REFUTED: ("🚫", "refuted"),
+    OUTCOME_OPEN: ("🔴", "open"),
+    OUTCOME_FIXED_UNPROVEN: ("⏸", "fixed — not proven: the cited line did not change; still carried"),
+    OUTCOME_NOT_HONOURED: ("⚠️", "refutation not honoured — verifier-confirmed on unchanged code; still carried"),
+    OUTCOME_CONFLICT: ("⚠️", "contradictory dispositions — still carried"),
+}
+
+
+def disposition_display(
+    ledger: list[dict],
+    dispositions: list[dict],
+    *,
+    still_owed: list[dict],
+    cleared: list[dict] | None = None,
+) -> list[dict]:
+    """The dispositions as the body's Prior requests table shows them: one row per prior
+    (#260), labelled with what the GATE did, not only what the report said.
+
+    The report's rows are kept (its `why` is the human explanation), but a row whose prior
+    the gate still carries says so — "refutation not honoured", "fixed — not proven" — and a
+    prior cleared afterwards (evidence gone, re-verified as refuted) says that. Two rows for
+    one prior (a drifted anchor) collapse into the first; a row that names no gating prior
+    is labelled as such rather than read as a disposition of something real."""
+    out: list[dict] = []
+    used: set[int] = set()
+    for entry in ledger:
+        rows = entry["rows"]
+        if not rows or id(rows[0]) in used:
+            continue  # its row already speaks for an entry above — one line per row
+        prior = entry["prior"]
+        row = dict(rows[0])
+        used.update(id(r) for r in rows)
+        outcome = entry["outcome"]
+        if outcome in _CLEARED_OUTCOMES or not _in(prior, still_owed):
+            mark, label = _DISPLAY.get(outcome, ("✅", "cleared"))
+            if outcome not in _CLEARED_OUTCOMES:
+                why = next((c.get("recheck_note") for c in cleared or [] if _in(c, [prior])), None)
+                mark, label = (
+                    "✅",
+                    "cleared at this head — re-verified" if why is not None else "cleared at this head",
+                )
+        else:
+            rechecked = next((p for p in still_owed if same_prior(p, prior) and p.get("rechecked")), None)
+            mark, label = _DISPLAY.get(outcome, ("•", outcome))
+            if rechecked and outcome == OUTCOME_NOT_HONOURED:
+                label = "refutation not honoured — re-verified as confirmed at this head; still carried"
+        row["shown"] = (mark, label)
+        out.append(row)
+    for r in dispositions or []:
+        if isinstance(r, dict) and id(r) not in used:
+            out.append({**r, "shown": ("•", f"{str(r.get('disposition') or '?').lower()} — names no open prior")})
+    return out
+
+
+def gating_debt(carried: list[dict]) -> list[dict]:
+    """The carried priors that decide a verdict (#260): blocker/majors still CONFIRMED by a
+    verifier, after every demotion (#259's evidence guard, an unverified record). An uncertain
+    or never-verified carry is owed — it holds promotion through `carried_debt` — but it does
+    not make a round FAIL."""
+    return [
+        f
+        for f in carried or []
+        if isinstance(f, dict) and str(f.get("severity") or "").lower() in _BLOCKING and _verifier_confirmed(f)
+    ]
+
+
+def verdict_with_debt(verdict: str, carried: list[dict]) -> str:
+    """FAIL when this round carries `gating_debt`, else `verdict` unchanged (#260). Pure:
+    the carried set is the caller's fact."""
+    return "FAIL" if gating_debt(carried) else verdict
+
+
+def render_debt_verdict_note(was: str, carried: list[dict]) -> str:
+    """Why a round whose own findings came to `was` posts FAIL (#260)."""
+    n = len(gating_debt(carried))
+    return (
+        f"\n\n---\n**FAIL on carried debt.** This round's own findings come to **{was}**, but it carries "
+        f"{n} verifier-confirmed prior blocker/major finding(s) still owed (listed in Findings as `carried`). "
+        "A confirmed carry keeps "
+        "gating until a round fixes it (proven by the delta), refutes it, or re-verifies it away — so the "
+        "verdict says so too (#260)."
+    )
+
+
+def render_credited_minors(credited: list[dict]) -> str:
+    """A compact credit line for prior minors/nits the PR addressed (#260)."""
+    if not credited:
+        return ""
+    items = ", ".join(f"`{finding_anchor(f)}`" for f in credited[:20])
+    more = f" (+{len(credited) - 20} more)" if len(credited) > 20 else ""
+    return (
+        f"\n\n---\n**Addressed since the last round** ({len(credited)} minor/nit): {items}{more} — no "
+        "longer raised, and the PR changed the code around them since they were raised."
+    )
 
 
 def unaccounted_priors(
@@ -624,76 +1015,7 @@ def unaccounted_priors(
     """
     if not dispositions:
         return []
-
-    # Find the last substantive round first — we need prior finding verdicts to decide
-    # whether a `refuted` disposition is grounded enough to clear the block (issue #38).
-    last_round_findings: list[dict] = []
-    for round_ in reversed(history or []):
-        prior = [f for f in (round_.get("findings") or []) if isinstance(f, dict)]
-        if prior:
-            # `since`: a carried finding keeps the head it was raised at; a fresh one was
-            # raised at this round's head.
-            origin = str(round_.get("head") or "")
-            last_round_findings = [{**f, "since": str(f.get("since") or origin)} for f in prior]
-            break
-
-    # Index prior findings by anchor for O(1) verdict lookup during disposition processing.
-    prior_index: dict[str, dict] = {}
-    for f in last_round_findings:
-        prior_index[_anchor(f.get("file"), f.get("line"))] = f
-        prior_index.setdefault(_norm(str(f.get("file") or "")), f)
-
-    accounted: set[str] = set()
-    for row in dispositions:
-        disposition = str(row.get("disposition") or "").lower()
-        file, line = _disposition_anchor(row)
-        # The prior this row names — `file:line`, or the bare file for a file-level one.
-        anchor = f"{file}:{line}" if isinstance(line, int) else file
-        if disposition == "open":
-            # Still present by the panel's own admission — never clears a blocker/major.
-            continue
-        raised = prior_index.get(anchor) or prior_index.get(file)
-        if disposition == "refuted":
-            # A `refuted` against a *confirmed* prior is treated as `open`: the block stands
-            # until delta-verified `fixed` or operator dismissal (issue #38) — unless the
-            # flagged line moved since it was raised, which is a `fixed` by another name (#218).
-            # A prior graded `uncertain` can be cleared by refutation alone.
-            if raised is None:
-                continue  # names no prior we know — accounts for nothing
-            if str(raised.get("verdict") or "").lower() != "uncertain" and not _line_moved(
-                {"file": file, "line": line}, raised, ranges, since_ranges
-            ):
-                continue  # confirmed (or unknown verdict) on code that did not move → block held
-        if disposition == "fixed":
-            # An unverifiable "fixed" accounts for nothing — the finding stays a debt.
-            if not _line_moved({"file": file, "line": line}, raised or {}, ranges, since_ranges):
-                continue
-        accounted.add(anchor)
-        accounted.add(file)
-
-    if not last_round_findings:
-        return []
-    changed = {_norm(p) for p in paths or [] if p and p.strip()}
-    missing = []
-    for finding in last_round_findings:
-        if finding.get("ungrounded"):
-            # grounding already decided the evidence is fabricated — not a debt
-            continue
-        if finding.get("nearby"):
-            # a structural note on code the PR did not change (#232) — it never gated, so it
-            # is no debt either; if a later head touches that code, protoPatch re-raises it
-            continue
-        if changed and _norm(str(finding.get("file") or "")) not in changed:
-            continue  # confinement keeps it out of every verdict — not this PR's debt
-        severity = str(finding.get("severity") or "").lower()
-        if severity not in ("blocker", "major"):
-            continue
-        if str(finding.get("verdict") or "").lower() == "refuted":
-            continue
-        anchor = _anchor(finding.get("file"), finding.get("line"))
-        if anchor not in accounted and _norm(str(finding.get("file") or "")) not in accounted:
-            missing.append(dict(finding))
-    return missing
+    return ledger_debt(prior_ledger(history, dispositions, ranges=ranges, since_ranges=since_ranges, paths=paths))
 
 
 RELISTED_NOTE = (
@@ -819,7 +1141,6 @@ def relisted_blocking_priors(findings: list[dict], history: list[dict]) -> tuple
     re-listing used to restart that window at every round) and, when it quotes nothing of its
     own, the prior's `evidence`. Its verdict is left to the re-check (`resolve_relisting`).
     """
-    from .verdicts import _same_defect  # history layer over the pure mapping
 
     prior_round = next((r for r in reversed(history or []) if isinstance(r, dict) and r.get("findings")), None)
     out = [f for f in findings or [] if isinstance(f, dict)]
@@ -842,11 +1163,9 @@ def relisted_blocking_priors(findings: list[dict], history: list[dict]) -> tuple
     for i, finding in enumerate(out):
         if str(finding.get("severity") or "").lower() not in _BLOCKING or str(finding.get("verdict") or "").strip():
             continue
-        anchor = _anchor(finding.get("file"), finding.get("line"))
-        match = next(
-            (p for p in priors if _anchor(p.get("file"), p.get("line")) == anchor or _same_defect(finding, p)),
-            None,
-        )
+        # `same_prior` (#260): the same file, and the same claim or quoted code within a line
+        # window — a re-listing re-anchored by a line or two is still the prior it re-lists.
+        match = next((p for p in priors if same_prior(finding, p)), None)
         if match is None:
             continue
         prior = {**match, "since": str(match.get("since") or origin)}
@@ -990,23 +1309,19 @@ def disposition_record(dispositioned: dict | None, dispositions: list[dict], *, 
     priors = blocking_priors(dispositioned)
     if of <= 0 or not priors or len(priors) > MAX_DISPOSITION_RECORD_ROWS:
         return None
-    said: dict[str, set[str]] = {}
-    evidenced: set[str] = set()
-    for row in dispositions or []:
-        if not isinstance(row, dict):
-            continue
-        anchor = _row_anchor(row)
-        disposition = str(row.get("disposition") or "").lower()
-        said.setdefault(anchor, set()).add(disposition)
-        if disposition == "refuted" and _has_evidence(row):
-            evidenced.add(anchor)
-    open_anchors = {_anchor(f.get("file"), f.get("line")) for f in still_open or [] if isinstance(f, dict)}
+    # One prior per defect (#260): a row dispositioning `run_livecodebench.py:54` answers the
+    # same import flagged at :51 and :53, so all three record that answer — no phantom row
+    # with `d=""`. Still one record row per prior ANCHOR, the shape `supersedes` reads.
+    groups = group_priors(priors)
     rows = []
     for prior in priors:
-        anchor = _anchor(prior.get("file"), prior.get("line"))
-        given = said.get(anchor, set())
+        group = next((g for g in groups if matches_group(prior, g)), prior)
+        mine = [r for r in dispositions or [] if isinstance(r, dict) and row_names(r, group)]
+        given = {str(r.get("disposition") or "").lower() for r in mine}
         disposition = next(iter(given)) if len(given) == 1 else ("conflict" if given else "")
-        rows.append({"a": anchor, "d": disposition, "e": anchor in evidenced, "h": anchor not in open_anchors})
+        evidenced = any(str(r.get("disposition") or "").lower() == "refuted" and _has_evidence(r) for r in mine)
+        held = _in(group, still_open or [])
+        rows.append({"a": finding_anchor(prior), "d": disposition, "e": evidenced, "h": not held})
     return {"of": of, "rows": rows}
 
 
@@ -1239,12 +1554,19 @@ def render_unaccounted_note(missing: list[dict]) -> str:
     that dropped them — silence about a blocker is the thing being made loud."""
     if not missing:
         return ""
+
+    def _tag(m: dict) -> str:
+        # The state the record gives it (#260) — "confirmed" only when a verifier said so.
+        sev = m.get("severity") or "?"
+        if _verifier_confirmed(m):
+            return f"{sev}, confirmed"
+        return f"{sev}, uncertain" if str(m.get("verdict") or "").lower() == "uncertain" else f"{sev}, not yet verified"
+
     lines = "\n".join(
-        f"- `{_anchor(m.get('file'), m.get('line'))}` ({m.get('severity') or '?'}) — {str(m.get('claim') or '')[:220]}"
-        for m in missing
+        f"- `{_anchor(m.get('file'), m.get('line'))}` ({_tag(m)}) — {str(m.get('claim') or '')[:220]}" for m in missing
     )
     return (
-        "\n\n---\n**Unaccounted prior finding(s).** An earlier round of this panel confirmed "
+        "\n\n---\n**Unaccounted prior finding(s).** An earlier round of this panel raised "
         "the following, and this round neither reports them, nor says they were fixed, nor "
         "refutes them:\n"
         f"{lines}\n\n"
