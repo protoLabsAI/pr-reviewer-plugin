@@ -3813,13 +3813,34 @@ class Dispatcher:
         # never softens a FAIL and never withholds the verdict — it caps PASS at WARN.
         finding_verdict = verdict
         verdict = coverage_verdict(verdict, gaps)
-        # Carried debt and the verdict must agree (#260). A carry says it "keeps gating", and
-        # it does — the block stays up and promotion holds — so a round that carries a prior
-        # blocker/major a verifier confirmed, or that no round has verified yet, is a FAIL,
-        # whatever this round's own findings would have been. data-plugin#1@eb377e62 posted
-        # WARN beneath two such carries. A deferred re-listing (#232 ask 5) is the one
-        # exception by design: nobody verified it against this head, so it holds promotion
-        # without deciding the verdict.
+        # The owed priors face the same #259 evidence guard as this round's own findings: a
+        # carried "confirmed" major whose only support is an unquoted claim about a library's
+        # behaviour (data-plugin#1's DuckDB DESCRIBE/SUMMARIZE majors, confirmed on a rounds-old
+        # record and re-confirmed by the re-check) is `uncertain`, not gating debt. Demoted,
+        # never dropped: it is still carried, as uncertain, and still has to be accounted for.
+        guarded_priors: list[dict] = []
+        if self.grounding_enabled and self.evidence_guard_enabled and unaccounted:
+            try:
+                deps = await self._head_dependencies(repo, head) if needs_dependencies(unaccounted) else None
+                unaccounted, guarded_priors = apply_evidence_guard(unaccounted, deps)
+            except Exception:  # noqa: BLE001 — a checker bug must never void the round (ADR 0078 D3)
+                log.exception("[pr-reviewer] evidence guard failed on carried priors of %s#%s", repo, pr)
+            if guarded_priors:
+                self.telemetry.emit(
+                    "evidence_guarded",
+                    repo=repo,
+                    pr=pr,
+                    sha=head,
+                    round=round_number,
+                    demoted=guarded_priors,
+                    carried=True,
+                )
+        # Carried debt and the verdict must agree (#260). A carry of a prior a verifier
+        # CONFIRMED — still confirmed after every #259 demotion — says it "keeps gating", and
+        # it does, so the round is a FAIL whatever its own findings would have been.
+        # data-plugin#1@eb377e62 posted WARN beneath two such carries. An uncertain or
+        # never-verified carry, and a deferred re-listing (#232 ask 5), hold promotion
+        # (`carried_debt`) without deciding the verdict.
         debt_verdict = verdict
         verdict = verdict_with_debt(verdict, unaccounted)
         trailer = (
@@ -3842,6 +3863,8 @@ class Dispatcher:
             trailer += render_recheck_cleared_note(rechecked_cleared)
         if credited:
             trailer += render_credited_minors(credited)
+        if guarded_priors:
+            trailer += render_evidence_footnote(guarded_priors)
         if verdict != debt_verdict:
             trailer += render_debt_verdict_note(debt_verdict, unaccounted)
         if deferred:

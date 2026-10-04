@@ -18,6 +18,7 @@ from pr_reviewer.dispatch import Dispatcher
 from pr_reviewer.rounds import (
     OUTCOME_NOT_HONOURED,
     OUTCOME_OPEN,
+    OUTCOME_REFUTED,
     credited_minors,
     delta_ranges,
     disposition_display,
@@ -252,3 +253,80 @@ async def test_data_plugin_round_two_posts_one_state_per_prior(tmp_path):
     )
     assert all(CARRIED_NOTE not in f["note"] for f in carried)
     assert "Addressed since the last round" in body and "`engine.py:152`" in body
+
+
+# ── after #259/#263: only priors still CONFIRMED after the evidence guard decide the verdict ──
+
+
+def test_priors_demoted_by_the_library_guard_carry_no_gating_debt():
+    # Round 1's record as #263 now writes it: the DuckDB DESCRIBE/SUMMARIZE majors asserted
+    # library behaviour without quoting it, so the guard demoted them to `uncertain`.
+    from pr_reviewer.evidence_guard import apply_evidence_guard
+    from pr_reviewer.rounds import gating_debt
+
+    history = _history(DP_R1, 70)
+    regraded, demoted = apply_evidence_guard(history[0]["findings"], {"duckdb", "openpyxl"})
+    assert [d["detail"] for d in demoted] == ["duckdb", "duckdb"]
+    history = [{**history[0], "findings": regraded}]
+    ranges = delta_ranges(DP_COMPARE)
+    # Round 2 refuted them — and a refutation of an UNCERTAIN prior is honoured (#38 guards
+    # only confirmed ones), so they clear outright: one state, 🚫 refuted, nothing carried.
+    ledger = prior_ledger(history, DP_REFUTED, ranges=ranges)
+    assert [e["outcome"] for e in ledger] == [OUTCOME_REFUTED, OUTCOME_REFUTED]
+    assert ledger_debt(ledger) == []
+    # Even a round that called them `open` carries them only as uncertain debt: owed (demoted,
+    # never dropped), never gating, never a FAIL.
+    opened = [{**r, "disposition": "open"} for r in DP_REFUTED]
+    owed = ledger_debt(prior_ledger(history, opened, ranges=ranges))
+    assert sorted(p["line"] for p in owed) == [130, 155]
+    assert gating_debt(owed) == [] and verdict_with_debt("WARN", owed) == "WARN"
+    assert all(c["verdict"] == "uncertain" for c in merge_carried_findings([], owed))
+
+
+class _GuardedGH(_GH):
+    """The same round with grounding and the #259 evidence guard ON: the manifests are
+    readable at the head (duckdb is a declared dependency); file reads otherwise fail, which
+    grounding treats as could-not-verify and leaves alone."""
+
+    async def __call__(self, args, timeout=30):
+        joined = " ".join(args)
+        if "/contents/" in joined:
+            if "/contents/pyproject.toml" in joined:
+                import base64
+
+                text = '[project]\nname = "data-plugin"\ndependencies = ["duckdb>=1.4,<2", "openpyxl>=3.1"]\n'
+                return 0, "base64\x00" + base64.b64encode(text.encode()).decode(), ""
+            return 1, "", "404"
+        return await super().__call__(args, timeout=timeout)
+
+
+async def test_data_plugin_round_two_does_not_fail_on_library_claims_the_guard_demotes(tmp_path):
+    # The live round-1 record still says `confirmed`; the guard demotes the carried priors at
+    # round 2, so the round carries them as uncertain debt and posts its own verdict (WARN),
+    # not a FAIL on them.
+    fresh = [f for f in _record(DP_R2) if not f.get("carried")]
+    report = (
+        "<!-- brief -->\nRound 2.\n<!-- /brief -->\n\n```json\n"
+        + json.dumps(DP_REFUTED)
+        + "\n```\n\n```json\n"
+        + json.dumps(fresh)
+        + "\n```"
+    )
+
+    async def runner(name, inputs):
+        return {"output": report, "failed": []}
+
+    gh = _GuardedGH()
+    d = Dispatcher(
+        {"repos": ["o/r"], "cooldown_s": 30, "shadow_mode": False, "absence_search": False},
+        Telemetry(tmp_path),
+        run_gh_fn=gh,
+        workflow_run=runner,
+    )
+    out = await d.handle_pr_event("o/r", 1, DP_R2_HEAD, "synchronize")
+    body = next(p["body"] for p in gh.posted if "body" in p)
+    assert out != "reviewed:FAIL" and "FAIL on carried debt" not in body
+    carried = [f for f in json.loads(extract_findings_json(body)) if f.get("carried")]
+    assert sorted(f["line"] for f in carried) == [130, 155]
+    assert all(f["verdict"] == "uncertain" for f in carried)
+    assert "duckdb" in body  # the guard's footnote names why

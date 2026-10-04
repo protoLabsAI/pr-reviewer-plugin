@@ -902,26 +902,31 @@ def disposition_display(
     return out
 
 
-def verdict_with_debt(verdict: str, carried: list[dict]) -> str:
-    """FAIL when this round carries a prior blocker/major that still gates — one a verifier
-    confirmed, or one no round has verified yet — else `verdict` unchanged (#260). Pure:
-    the carried set is the caller's fact."""
-    gating = [
+def gating_debt(carried: list[dict]) -> list[dict]:
+    """The carried priors that decide a verdict (#260): blocker/majors still CONFIRMED by a
+    verifier, after every demotion (#259's evidence guard, an unverified record). An uncertain
+    or never-verified carry is owed — it holds promotion through `carried_debt` — but it does
+    not make a round FAIL."""
+    return [
         f
         for f in carried or []
-        if isinstance(f, dict)
-        and str(f.get("severity") or "").lower() in _BLOCKING
-        and str(f.get("verdict") or "").lower() not in ("uncertain", "refuted")
+        if isinstance(f, dict) and str(f.get("severity") or "").lower() in _BLOCKING and _verifier_confirmed(f)
     ]
-    return "FAIL" if gating else verdict
+
+
+def verdict_with_debt(verdict: str, carried: list[dict]) -> str:
+    """FAIL when this round carries `gating_debt`, else `verdict` unchanged (#260). Pure:
+    the carried set is the caller's fact."""
+    return "FAIL" if gating_debt(carried) else verdict
 
 
 def render_debt_verdict_note(was: str, carried: list[dict]) -> str:
     """Why a round whose own findings came to `was` posts FAIL (#260)."""
-    n = len([f for f in carried or [] if str(f.get("verdict") or "").lower() not in ("uncertain", "refuted")])
+    n = len(gating_debt(carried))
     return (
         f"\n\n---\n**FAIL on carried debt.** This round's own findings come to **{was}**, but it carries "
-        f"{n} prior blocker/major finding(s) still owed (listed in Findings as `carried`). A carry keeps "
+        f"{n} verifier-confirmed prior blocker/major finding(s) still owed (listed in Findings as `carried`). "
+        "A confirmed carry keeps "
         "gating until a round fixes it (proven by the delta), refutes it, or re-verifies it away — so the "
         "verdict says so too (#260)."
     )

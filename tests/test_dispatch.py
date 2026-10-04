@@ -3649,13 +3649,13 @@ async def test_a_warn_that_drops_a_prior_major_holds_the_block(tmp_path):
     )
     runner, _seen = capturing_runner(report_with_dispositions([{"prior": "other.py:1", "disposition": "fixed"}], nit))
     d = make(tmp_path, cfg={"shadow_mode": False, "evidence_grounding": False}, gh=gh, runner=runner)
-    # The round's own findings are a WARN; the carried major makes it a FAIL (#260) — a carry
-    # that "keeps gating" under a WARN header contradicted itself.
-    assert (await d.handle_pr_event("o/r", 1, HEAD, "synchronize")) == "reviewed:FAIL"
+    # The prior was never verifier-confirmed (no verdict), so it is owed and holds the block,
+    # but it does not decide the verdict — only CONFIRMED debt does (#260, after #259).
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "synchronize")) == "reviewed:WARN"
     assert gh.dismissed == []  # the block stays up
     assert "Unaccounted prior finding" in gh.posted[0]["body"]
-    assert "real bug" in gh.posted[0]["body"]
-    assert "FAIL on carried debt" in gh.posted[0]["body"] and "come to **WARN**" in gh.posted[0]["body"]
+    assert "real bug" in gh.posted[0]["body"] and "not yet verified" in gh.posted[0]["body"]
+    assert "FAIL on carried debt" not in gh.posted[0]["body"]
 
 
 async def test_a_dispositioned_major_lets_the_verdict_clear(tmp_path):
@@ -3734,7 +3734,7 @@ async def test_a_hallucinated_fixed_disposition_holds_the_block_end_to_end(tmp_p
         report_with_dispositions([{"prior": "x.py:3", "disposition": "fixed", "why": "resolved in updated diff"}])
     )
     d = make(tmp_path, cfg={"shadow_mode": False, "evidence_grounding": False}, gh=gh, runner=runner)
-    assert (await d.handle_pr_event("o/r", 1, HEAD, "synchronize")) == "reviewed:FAIL"
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "synchronize")) == "reviewed:PASS"  # unverified debt
     assert gh.dismissed == []  # the block is HELD — an unverified fix does not clear it
     body = gh.posted[0]["body"]
     # One state per prior (#260): the table says the fix was not proven; the footer does
