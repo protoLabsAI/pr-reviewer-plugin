@@ -75,6 +75,7 @@ from .grounding import (
     ground_absence_claims,
     ground_finding,
     is_absence_claim,
+    related_candidates,
     render_absence_footnote,
     render_grounding_footnote,
     render_unreadable_footnote,
@@ -175,6 +176,10 @@ DROP_VIEWER_UNKNOWN = "viewer-unknown"  # blind on our own IDENTITY — can't ru
 DROP_POST_REFUSED = "post-refused"  # GitHub keeps rejecting this verdict post (issue #78)
 DROP_ROUND_TIMEOUT = "round-timeout"  # a round outlived round_timeout_s and was cancelled
 DROP_SUPERSEDED = "superseded"  # the PR moved past this round's head mid-panel; cancelled (#245)
+# The PR merged / was closed while the round ran (#261): nothing is posted, and there is no head
+# to hand the slot to. `drop:superseded-merged` / `drop:superseded-closed`.
+DROP_SUPERSEDED_MERGED = "superseded-merged"
+DROP_SUPERSEDED_CLOSED = "superseded-closed"
 # Consecutive superseded-round handoffs one slot will make before leaving the rest to the
 # sweep's backfill (#245) — a bound on a pathological push storm, not a normal limit.
 MAX_SUPERSEDE_HANDOFFS = 5
@@ -302,6 +307,14 @@ def ineligible_reason(facts: dict | None) -> str | None:
     return None
 
 
+def pr_ended(facts: dict | None) -> str | None:
+    """ "merged" / "closed" when READABLE PR facts say the PR is no longer open, else None.
+    Unreadable facts are None: an unknown never stops a round or withholds a verdict (#261)."""
+    if not facts or not facts.get("state") or facts.get("state") == "open":
+        return None
+    return "merged" if facts.get("merged") else "closed"
+
+
 def is_own_login(author: str, viewer: str) -> bool:
     """Is `author` our own account, given our login `viewer`? Case-insensitive.
 
@@ -367,11 +380,12 @@ def _remember(keys: dict[str, None], key: str, *, cap: int = 1024, keep: int = 5
             del keys[old]
 
 
-# The annotations the #259 checks write onto a verdict-input finding, and the flags that mark
-# one of theirs. `regrade_record` copies them onto the recorded row, so the posted array says
-# what the verdict read. #209's `absence_demoted` is deliberately not among the flags: that
-# pass has never written to the record, and this change does not alter what it carries.
+# The annotations the post-panel checks write onto a verdict-input finding, and the flags that
+# mark one of theirs. `regrade_record` copies them onto the recorded row, so the posted array says
+# what the verdict read: the #259 checks, and #209's absence demotion (#265), which used to demote
+# only the verdict's copy and post the row `confirmed`.
 _REGRADE_FLAGS = (
+    "absence_demoted",
     "absence_refuted",
     "absence_unsearched",
     "absence_searched",
@@ -379,18 +393,23 @@ _REGRADE_FLAGS = (
     "semantics_unquoted",
 )
 _REGRADE_KEYS = ("verdict", "note", "ungrounded", *_REGRADE_FLAGS)
+# A re-anchored line (#261): the record carries the evidence's real line, and the panel's own.
+_LINE_KEYS = ("line", "line_original", "line_corrected")
+MAX_RELATED_READS = 10  # files read per round because a finding names them in its evidence (#261)
 
 
 def regrade_record(reported: list[dict], findings: list[dict]) -> list[dict]:
-    """`reported` with each row a check demoted in `findings` replaced by an annotated copy.
+    """`reported` with each row a check demoted or re-anchored in `findings` replaced by an
+    annotated copy.
 
     The verdict list is no longer position-aligned with the record (confinement, nearby
-    scoping), and its rows are copies, so they are matched by (file, claim). A row is only
-    ever moved TOWARDS `uncertain` by this: the flags it copies are the demotions' own, and a
-    finding with none of them leaves its recorded row untouched (#259)."""
+    scoping), and its rows are copies, so they are matched by (file, claim). A demotion only
+    ever moves a row TOWARDS `uncertain`: the keys copied are the demotions' own, and a finding
+    with none of them leaves its recorded row's verdict untouched. A re-anchor copies only the
+    line keys (#259, #261, #265)."""
     changed: dict[tuple[str, str], dict] = {}
     for f in findings:
-        if any(f.get(k) for k in _REGRADE_FLAGS):
+        if any(f.get(k) for k in _REGRADE_FLAGS) or "line_original" in f:
             changed.setdefault((_norm_path(str(f.get("file") or "")), str(f.get("claim") or "")), f)
     if not changed:
         return reported
@@ -401,7 +420,10 @@ def regrade_record(reported: list[dict], findings: list[dict]) -> list[dict]:
             out.append(row)
             continue
         updated = dict(row)
-        for k in _REGRADE_KEYS:
+        keys = (_REGRADE_KEYS if any(src.get(k) for k in _REGRADE_FLAGS) else ()) + (
+            _LINE_KEYS if "line_original" in src else ()
+        )
+        for k in keys:
             if k in src:
                 updated[k] = src[k]
         out.append(updated)
@@ -747,12 +769,13 @@ class _RoundWatch:
     attempt task is cancelled and `superseded_by` names the head that replaced it.
     """
 
-    __slots__ = ("repo", "pr", "head", "task", "superseded_by", "checking", "phase", "check", "poll")
+    __slots__ = ("repo", "pr", "head", "task", "superseded_by", "closed", "checking", "phase", "check", "poll")
 
     def __init__(self, repo: str, pr: int, head: str):
         self.repo, self.pr, self.head = repo, pr, head
         self.task: asyncio.Task | None = None
         self.superseded_by: str | None = None
+        self.closed: str | None = None  # "merged" / "closed" once a check saw the PR end (#261)
         self.checking = False
         self.phase = ""
         self.check: asyncio.Task | None = None  # the head read in progress, if any
@@ -1251,6 +1274,10 @@ class Dispatcher:
         # was in flight (a hint that makes every step boundary check, not only the tail), and
         # repo#pr -> the head a cancelled round was superseded by, for the slot handoff.
         self._newer_head_hint: dict[str, str] = {}
+        # repo#pr -> a `closed` webhook arrived (#261): the supersede poll (#258) reads the PR
+        # while this is set, so a PR merged mid-finder stops within one poll interval. A hint
+        # only — the round stops on a READABLE closed state, never on the event alone.
+        self._ended_hint: dict[str, None] = {}
         self._superseded_to: dict[str, str] = {}
         self._installation_repos: list[str] = []  # last good App-installation scope
         self._installation_repos_at: float = 0.0
@@ -1610,7 +1637,8 @@ class Dispatcher:
     @property
     def supersede_poll_s(self) -> float:
         """Seconds between in-step supersede checks (#258); 0 disables. A check reads
-        GitHub only when an event has hinted at a newer head for the PR. Clamped to 0..600."""
+        GitHub only when an event has hinted at a newer head for the PR, or that it closed (#261).
+        Clamped to 0..600."""
         raw = self.cfg.get("supersede_poll_s", os.environ.get("PR_REVIEWER_SUPERSEDE_POLL_S", 30))
         try:
             value = float(raw)
@@ -1994,7 +2022,7 @@ class Dispatcher:
                 "api",
                 f"repos/{repo}/pulls/{pr}",
                 "--jq",
-                "{head: .head.sha, base_ref: .base.ref, state: .state, draft: .draft, locked: .locked, "
+                "{head: .head.sha, base_ref: .base.ref, state: .state, merged: .merged, draft: .draft, locked: .locked, "
                 "changed_files: .changed_files, additions: .additions, deletions: .deletions, "
                 "author: .user.login}",
             ],
@@ -2260,7 +2288,7 @@ class Dispatcher:
         return [str(b or "") for b in rows] if rows is not None else []
 
     async def _finding_sources(
-        self, repo: str, pr: int, head: str, findings: list[dict]
+        self, repo: str, pr: int, head: str, findings: list[dict], *, patches_out: dict | None = None
     ) -> dict[str, tuple[str, str | object | None]]:
         """{file: (blob, combined)} for the files the findings cite.
 
@@ -2298,6 +2326,8 @@ class Dispatcher:
             for row in gh_json_rows(out) or []:
                 if isinstance(row, dict) and row.get("f"):
                     patches[str(row["f"])] = str(row.get("p") or "")
+        if patches_out is not None:
+            patches_out.update(patches)  # the whole patch, for grounding's related text (#261)
         sources: dict[str, tuple[str, str | object | None]] = {}
         for file in {str(f.get("file") or "") for f in findings if f.get("file")}:
             ref = quote(head, safe="")
@@ -2341,6 +2371,37 @@ class Dispatcher:
             combined: str | object = f"{blob}\n{patches.get(file, '')}" if read_ok else UNREADABLE
             sources[file] = (blob, combined)
         return sources
+
+    async def _related_sources(self, repo: str, head: str, findings: list[dict], known: dict) -> dict[str, str]:
+        """{path: text at head} for the files the findings NAME in their own evidence (#261) —
+        `tests/conftest.py defines …` — so a quote attributed there is looked for there before
+        it is called missing. Pinned to the head like every read here; a path that does not
+        exist or cannot be read is simply absent. At most `MAX_RELATED_READS` reads a round."""
+        import base64
+
+        wanted: dict[str, None] = {}
+        for f in findings:
+            for path in related_candidates(f):
+                if path not in known:
+                    wanted.setdefault(path, None)
+        out: dict[str, str] = {}
+        for path in list(wanted)[:MAX_RELATED_READS]:
+            rc, raw, _err = await self._run_gh(
+                [
+                    "api",
+                    f"repos/{repo}/contents/{quote(path, safe='/')}?ref={quote(head, safe='')}",
+                    "--jq",
+                    '(.encoding // "") + "\\u0000" + (.content // "")',
+                ]
+            )
+            encoding, _, payload = raw.partition("\x00")
+            if rc != 0 or encoding.strip() != "base64":
+                continue
+            try:
+                out[path] = base64.b64decode(payload.strip()).decode("utf-8", errors="replace")
+            except Exception:  # noqa: BLE001 — an undecodable file grounds nothing
+                continue
+        return out
 
     async def _head_tree(self, repo: str, head: str) -> set[str] | None:
         """The blob paths in the head commit's tree, or None (unreadable). Read PINNED to the
@@ -2839,6 +2900,12 @@ class Dispatcher:
 
     # ── the review path ───────────────────────────────────────────────────────
 
+    def _hint_ended(self, repo: str, pr: int) -> None:
+        """Note that a `closed` event arrived for this PR while a round may be running (#261)."""
+        self._ended_hint[f"{repo}#{pr}"] = None
+        if len(self._ended_hint) > 1024:
+            self._ended_hint = dict.fromkeys(list(self._ended_hint)[-512:])
+
     def _hint_newer_head(self, repo: str, pr: int, head: str) -> None:
         """Note that an event named `head` for this PR while a round may be running (#245).
         Only a hint: the round confirms against GitHub before it stops anything."""
@@ -2898,7 +2965,12 @@ class Dispatcher:
             phase = _phase_for_step(step)
             watch.phase = phase
             hinted = self._newer_head_hint.get(f"{watch.repo}#{watch.pr}") not in (None, watch.head)
-            if watch.checking or watch.superseded_by or (phase not in _SUPERSEDE_CHECK_PHASES and not hinted):
+            if (
+                watch.checking
+                or watch.superseded_by
+                or watch.closed
+                or (phase not in _SUPERSEDE_CHECK_PHASES and not hinted)
+            ):
                 return
             watch.checking = True
             watch.check = asyncio.get_running_loop().create_task(self._check_superseded(watch))
@@ -2929,7 +3001,9 @@ class Dispatcher:
             watch.poll = loop.call_later(interval_s, tick)  # re-arm first: a failure below never stops it
             try:
                 hint = self._newer_head_hint.get(key)
-                if not hint or hint == watch.head or watch.checking or watch.superseded_by is not None:
+                newer = bool(hint) and hint != watch.head
+                ended = key in self._ended_hint  # a `closed` event: did it merge mid-step? (#261)
+                if not (newer or ended) or watch.checking or watch.superseded_by is not None or watch.closed:
                     return
                 if watch.task is None or watch.task.done():
                     return
@@ -2949,6 +3023,14 @@ class Dispatcher:
         differs from the round's head stops it."""
         try:
             facts = await self._pr_facts(watch.repo, watch.pr)
+            if ended := pr_ended(facts):
+                # Merged or closed before the expensive tail (#261): nothing this round can
+                # post is wanted. A READABLE closed state only; an unreadable PR stops nothing.
+                watch.closed = ended
+                task = watch.task
+                if task is not None and not task.done():
+                    task.cancel()
+                return
             current = str((facts or {}).get("head") or "")
             if not current or current == watch.head or ineligible_reason(facts):
                 return
@@ -2976,8 +3058,10 @@ class Dispatcher:
             # A close is not a dispatch, but it is the last event this head will ever get:
             # give a still-waiting `QA panel` run its terminal state now (#153). Behind the
             # same allowlist gate as everything else — no GitHub call for an unmanaged repo.
-            if action == "closed" and head_sha and not (bad_repo(repo) or (self.repos and repo not in self.repos)):
-                await self._publish_qa_check(repo, head_sha, closed_run(), only_if_open=True)
+            if action == "closed" and not (bad_repo(repo) or (self.repos and repo not in self.repos)):
+                self._hint_ended(repo, pr)
+                if head_sha:
+                    await self._publish_qa_check(repo, head_sha, closed_run(), only_if_open=True)
             self.telemetry.emit("drop", repo=repo, pr=pr, reason="not-a-dispatch-action", action=action)
             return "drop:not-a-dispatch-action"
         if bad_repo(repo) or (self.repos and repo not in self.repos):
@@ -3278,6 +3362,9 @@ class Dispatcher:
         # (protoAgent's engine does; a test fake / older host does not, so this stays {}).
         if self._newer_head_hint.get(f"{repo}#{pr}") == head:
             self._newer_head_hint.pop(f"{repo}#{pr}", None)  # this round IS the newer head
+        # The round opened on an OPEN PR, so a `closed` hint from before it (a close, then a
+        # reopen) is stale. One that arrives from here on is this round's to act on (#261).
+        self._ended_hint.pop(f"{repo}#{pr}", None)
         watch = _RoundWatch(repo, pr, head)
         step_kwargs = (
             {"on_step": functools.partial(self._watch_step, watch)} if _accepts_keyword(runner, "on_step") else {}
@@ -3309,8 +3396,12 @@ class Dispatcher:
                         await _settle_attempt(watch.task)
             except asyncio.CancelledError:
                 current = asyncio.current_task()
-                if watch.superseded_by is None or (current is not None and current.cancelling()):
+                if (watch.superseded_by is None and watch.closed is None) or (
+                    current is not None and current.cancelling()
+                ):
                     raise  # the round itself is being cancelled (round timeout, shutdown)
+                if watch.closed:
+                    return await self._abandon_ended(repo, pr, head, watch.closed, watch.phase, review_check_id)
                 return await self._abandon_superseded(repo, pr, head, watch, review_check_id)
             except Exception as exc:  # noqa: BLE001 — the attempt's own TimeoutError included
                 timed_out = isinstance(exc, TimeoutError) and attempt_bound.expired()
@@ -3346,6 +3437,9 @@ class Dispatcher:
                 # the read may say this head was superseded (#246 review). It is one bounded
                 # `gh` call, and it never cancels the round.
                 await asyncio.wait({watch.check})
+            if watch.closed:
+                # The PR merged/closed while the panel ran (#261): the result is discarded.
+                return await self._abandon_ended(repo, pr, head, watch.closed, watch.phase, review_check_id)
             if watch.superseded_by is not None:
                 # Superseded: the host swallowed the cancel and returned anyway, or the attempt
                 # finished while the head read was out. Either way the result is a superseded
@@ -3684,10 +3778,17 @@ class Dispatcher:
         recorded_kept = list(findings)
         raw: dict = {}
         if self.grounding_enabled and findings:
-            raw = await self._finding_sources(repo, pr, head, findings)
+            pr_patches: dict[str, str] = {}
+            raw = await self._finding_sources(repo, pr, head, findings, patches_out=pr_patches)
             blobs = {f: v[0] for f, v in raw.items()}
             grounding_sources = {f: v[1] for f, v in raw.items()}
-            grounded_findings, ungrounded, unreadable = apply_grounding(findings, grounding_sources)
+            # Before a quote is called missing it is looked for in the files the finding names
+            # and in the rest of the PR's patch (#261) — a real quote attributed to the wrong
+            # file is not a fabrication. Related reads never replace a finding's own source.
+            related = await self._related_sources(repo, head, findings, grounding_sources)
+            grounded_findings, ungrounded, unreadable = apply_grounding(
+                findings, {**related, **grounding_sources}, patches="\n".join(pr_patches.values())
+            )
             grounding_checked = len(findings)
             # Grounding annotates COPIES; the record must carry the same annotation. Before
             # this, the posted findings array kept a fabricated blocker as `confirmed` with no
@@ -3898,6 +3999,11 @@ class Dispatcher:
             )
         elapsed = time.monotonic() - started
         self.report_phase("posting")  # runner done; posting the verdict is the dispatcher's step
+        # The last moment a merge can be caught (#261): data-plugin#1 r2 posted 9 minutes after
+        # the PR merged, protoAgent#4025 3 minutes after. A merged or closed PR gets no review;
+        # an unreadable PR posts as before (a lost verdict is worse than a late one).
+        if ended := pr_ended(await self._pr_facts(repo, pr)):
+            return await self._abandon_ended(repo, pr, head, ended, "posting", review_check_id)
         round_verified = verification_ran(str(steps_out.get("verify") or ""), reported)
         posted = await self._post_verdict(
             repo,
@@ -4181,6 +4287,34 @@ class Dispatcher:
             f"was stopped before posting. The new head is reviewed on its own round.",
         )
         return f"drop:{DROP_SUPERSEDED}"
+
+    async def _abandon_ended(
+        self, repo: str, pr: int, head: str, ended: str, phase: str, review_check_id: int | None
+    ) -> str:
+        """End a round whose PR merged or was closed while it ran (#261). Posts NO review and
+        hands off nothing: there is no head left to review. Recorded as `superseded` with
+        `superseded: merged|closed`, and the round's `protoReview` run is concluded `neutral`
+        so it does not dangle in_progress (#153)."""
+        self._newer_head_hint.pop(f"{repo}#{pr}", None)
+        self._ended_hint.pop(f"{repo}#{pr}", None)
+        self.telemetry.emit(
+            "superseded",
+            repo=repo,
+            pr=pr,
+            sha=head,
+            superseded=ended,
+            phase=phase,
+            cancelled=phase != "posting",
+            model_retries=self._round_retries(),
+        )
+        await self._conclude_review_check(
+            repo,
+            review_check_id,
+            NEUTRAL,
+            f"PR {ended} — no verdict",
+            f"The PR was {ended} while the panel was reviewing `{head[:12]}`, so this round posted nothing.",
+        )
+        return f"drop:{DROP_SUPERSEDED_MERGED if ended == 'merged' else DROP_SUPERSEDED_CLOSED}"
 
     async def _stale_head_guard(
         self, repo: str, pr: int, head: str, findings: list[dict]
