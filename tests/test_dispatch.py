@@ -2857,7 +2857,7 @@ async def test_sweep_backfills_a_never_reviewed_pr(tmp_path):
     assert (await d.sweep_once()) == 1
     await d.drain_backfills()  # the sweep starts the panel and moves on
     assert ran == ["1"]  # the sweep created the first review itself
-    assert gh.posted and "verdict=FAIL" in gh.posted[0]["body"]
+    assert gh.reviews_posted and "verdict=FAIL" in gh.reviews_posted[0]["body"]
 
 
 async def test_backfill_still_honours_the_self_authored_rail(tmp_path):

@@ -470,6 +470,7 @@ publishes one, named **`QA panel`**, driven by the same decision as approve-on-g
 | Clear verdict, findings resolved (or already promoted) | ✅ success |
 | Findings still open — unresolved review threads | ❌ failure |
 | `FAIL` verdict standing against this head | ❌ failure |
+| A panel round is running on this head | ⏳ in progress — *"Panel reviewing this head"*, opened when the round starts; never over a run that already concluded (#268) |
 | No verdict yet / stale head | ⏳ in progress |
 | Clear verdict on an **incomplete pass** (a lane did not run) | ⚪ neutral — passes a required check; auto-approve still withheld until a complete pass (#130). The verdict is WARN-capped for the same gap (#117); the review body names the lanes |
 | CI pending, red, or unreadable | ⏳ in progress — CI already blocks; we don't say it twice |
@@ -477,6 +478,14 @@ publishes one, named **`QA panel`**, driven by the same decision as approve-on-g
 
 Note the WARN rule is unchanged: a WARN whose threads are all resolved goes **green**.
 What blocks is feedback nobody addressed.
+
+**When it updates** (#268). A round that ends re-publishes the check as soon as its slots
+free — a PASS goes green in the same moment the review posts, not on the next sweep pass
+(which can be ~9 min away for a given PR). A FAIL writes the check itself, inline, so no
+refresh follows it. A review thread resolving or reopening refreshes it too (#111), and so
+does **another check on the head completing** (CI going green is half of approve-on-green)
+— that last one needs the App subscribed to **Check run** events. The sweep stays the
+backstop for anything a webhook misses.
 
 **To make it enforce**, add `QA panel` to the branch's required status checks (ruleset →
 *Require status checks to pass*). Everything inherits it — a human's PR, and
