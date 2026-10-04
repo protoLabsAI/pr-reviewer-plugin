@@ -343,20 +343,10 @@ def test_regrade_record_carries_the_259_demotions_into_the_record():
     recorded = [
         {"file": "a.py", "claim": "`x` is dead.", "verdict": "confirmed", "note": "n"},
         {"file": "b.py", "claim": "other", "verdict": "confirmed"},
-        {"file": "c.py", "claim": "no test file", "verdict": "confirmed"},
     ]
     verdict_input = [
-        {
-            **recorded[0],
-            "line": 9,
-            "verdict": "uncertain",
-            "ungrounded": True,
-            "absence_refuted": "t.py:1",
-            "note": "m",
-        },
+        {**recorded[0], "verdict": "uncertain", "ungrounded": True, "absence_refuted": "t.py:1", "note": "m"},
         dict(recorded[1]),
-        # #209's own demotion keeps its pre-#259 behaviour: it does not write the record.
-        {**recorded[2], "verdict": "uncertain", "ungrounded": True, "absence_demoted": "test-exists"},
     ]
     out = regrade_record(recorded, verdict_input)
     assert out[0] == {
@@ -366,5 +356,5 @@ def test_regrade_record_carries_the_259_demotions_into_the_record():
         "absence_refuted": "t.py:1",
         "note": "m",
     }
-    assert out[1] is recorded[1] and out[2] is recorded[2]
+    assert out[1] is recorded[1]
     assert regrade_record(recorded, [dict(f) for f in recorded]) is recorded

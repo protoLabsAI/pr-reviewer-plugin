@@ -146,6 +146,18 @@ structural-trigger dispatch, approve-on-green + sweep, and the review eval.
   matches, and the finding stands. It catches the fabricated-quote class; a finding that
   quotes real code and reasons wrongly about it (a prefix that doesn't actually match) is
   the verify prompt's half.
+  Since issue #261 the quotes come from the finding's **evidence** (the claim's only when the
+  evidence quotes nothing), with any suggested fix cut off first ("Fix: … e.g. `…`", "should
+  be `…`", "replace `a` with `b`" keeps `a`): grounding a proposed replacement downgraded a true
+  finding. Before a quote is called missing it is also looked for in the files the evidence
+  names (read at head) and in the rest of the PR's patch. A grounded finding's `line` is
+  re-anchored to where its evidence starts in the file (`line_original` keeps the panel's), in
+  the posted record as well, so carried priors and nearby scoping use the real location.
+- **No review after merge (issue #261)** — at the synthesize/verify step boundary and again
+  just before posting, a round re-reads the PR; if it was merged or closed meanwhile, nothing
+  is posted, the round's `protoReview` run is concluded neutral, and telemetry records
+  `superseded` with `superseded: merged|closed` (`drop:superseded-merged`). An unreadable PR
+  posts as before.
 
 - **A `confirmed` must rest on a search or a quote (issue #259)** — an audit of 34 findings
   from Vera's v0.54–v0.56.1 reviews found 10 false, 9 of them `confirmed`, in two classes the

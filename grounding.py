@@ -43,6 +43,7 @@ while a genuine fabrication, sharing no fragment with the file, still downgrades
 
 from __future__ import annotations
 
+import bisect
 import re
 
 # Backtick spans (single or triple) — how the findings contract renders quoted code.
@@ -188,32 +189,115 @@ def _present(quote: str, haystack: str) -> bool:
     return True
 
 
-def quoted_snippets(finding: dict) -> list[str]:
-    """Checkable code quotes from a finding's `claim` + `evidence`, normalized.
+# A finding's text often goes on to say what the code SHOULD be — protoPatch appends a
+# "Fix: Replace `secrets: inherit` with … e.g. `secrets:\n  discord_webhook: …`", finders write
+# "should be `x`". That is the suggested replacement, which by definition is not in the file, and
+# grounding it downgraded a TRUE finding (data-plugin#1@eb377e62 `release.yml:26`, issue #261).
+# Everything from the first fix/recommendation marker on is dropped before quotes are taken...
+_FIX_MARKER_RE = re.compile(
+    r"(?:^|(?<=[\s.;:,)\]—–-]))(?:(?:suggested|recommended|proposed|possible|the)\s+)?"
+    r"(?:fix|remediation|recommendation|suggestion|mitigation)\s*:"
+    r"|\bto\s+fix\s+(?:this|it)\b",
+    re.IGNORECASE,
+)
+# ...and a quote introduced as the replacement ("…with `b`", "should be `x`", "e.g. `y`") is not
+# a claim about the file either. The quote it replaces ("replace `a` with") is, and is kept.
+_PRESCRIPTIVE_TAIL_RE = re.compile(
+    r"(?:\be\.g\.|\bfor\s+example|\bshould\s+(?:be|read|use|become)|\binstead\s+use|\buse\s+instead"
+    r"|\breplac\w*\b[^.;]{0,80}\bwith|\bchang\w*\b[^.;]{0,60}\bto|\brewrit\w*\b[^.;]{0,60}\bas)"
+    r"\s*[:,]?\s*(?:something\s+like\s*)?$",
+    re.IGNORECASE,
+)
 
-    Only spans that are long enough AND look like code survive — everything else is
-    prose, and prose is not a claim about what the file contains.
-    """
-    blob = f"{finding.get('claim') or ''}\n{finding.get('evidence') or ''}"
+
+def descriptive_text(text: str) -> str:
+    """`text` without its suggested fix: everything from the first fix/recommendation marker on."""
+    m = _FIX_MARKER_RE.search(text or "")
+    return text[: m.start()] if m else (text or "")
+
+
+def _snippets(text: str) -> list[str]:
     out: list[str] = []
-    for fenced, inline in _TICKS_RE.findall(blob):
-        raw = fenced or inline
-        text = _normalize(raw)
-        if not (MIN_QUOTE_CHARS <= len(text) <= MAX_QUOTE_CHARS):
+    for m in _TICKS_RE.finditer(text):
+        if _PRESCRIPTIVE_TAIL_RE.search(text[max(0, m.start() - 120) : m.start()]):
+            continue  # the replacement the finding proposes, not code it says is there
+        raw = m.group(1) or m.group(2) or ""
+        text_ = _normalize(raw)
+        if not (MIN_QUOTE_CHARS <= len(text_) <= MAX_QUOTE_CHARS):
             continue
-        if len(text.split()) > MAX_QUOTE_TOKENS or _PROSE_RE.search(text):
+        if len(text_.split()) > MAX_QUOTE_TOKENS or _PROSE_RE.search(text_):
             continue  # a sentence about the code, not a claim about the file's text
-        if _is_connective_prose(text):
+        if _is_connective_prose(text_):
             continue  # the model's own narration, captured as if it were evidence
-        if _CODE_HINT_RE.search(text) and _STATEMENT_RE.search(text):
-            out.append(text)
+        if _CODE_HINT_RE.search(text_) and _STATEMENT_RE.search(text_):
+            out.append(text_)
     return out
 
 
-def ground_finding(finding: dict, source: str | None) -> tuple[bool, list[str]]:
+def quoted_snippets(finding: dict) -> list[str]:
+    """Checkable code quotes from a finding, normalized — taken from its EVIDENCE (issue #261).
+
+    The evidence field is where the finding says what the file contains; the claim states the
+    conclusion and, like a fix, may name code that is not there yet. Suggested-fix text is cut
+    from it first (`descriptive_text`), and replacement quotes are skipped. Only when the
+    evidence carries no checkable quote at all does the claim's own quote get checked: a claim
+    that quotes fabricated code with prose-only evidence must still meet the #25 guard, or
+    removing the claim from the haystack would let exactly that fabrication through.
+
+    Only spans that are long enough AND look like code survive — everything else is prose,
+    and prose is not a claim about what the file contains.
+    """
+    quotes = _snippets(descriptive_text(str(finding.get("evidence") or "")))
+    if quotes:
+        return quotes
+    return _snippets(descriptive_text(str(finding.get("claim") or "")))
+
+
+# A file the finding names in its own text (`tests/conftest.py defines …`). A quote it attributes
+# to that file is checked there too before it is called missing (issue #261: `def call(tool,
+# **kw)` was searched in the cited `tests/test_plugin.py`; it lives in `tests/conftest.py`).
+_PATH_MENTION_RE = re.compile(
+    r"(?<![\w/.-])((?:[\w.-]+/)*[\w-][\w.-]*\.(?:py|pyi|js|jsx|ts|tsx|mjs|cjs|go|rs|rb|java|kt|sh|bash|"
+    r"ya?ml|toml|json|cfg|ini|sql|c|h|cc|cpp|hpp|cs|php|swift|lua|vue|svelte))(?![\w/-])"
+)
+MAX_RELATED_PATHS = 3
+
+
+def mentioned_paths(finding: dict) -> list[str]:
+    """Repo paths (or bare file names) the finding's claim/evidence names, other than its own
+    `file`, in order — at most `MAX_RELATED_PATHS`. A bare name is resolved by the reader."""
+    own = str(finding.get("file") or "").lstrip("./")
+    seen: dict[str, None] = {}
+    blob = f"{finding.get('evidence') or ''}\n{finding.get('claim') or ''}"
+    for m in _PATH_MENTION_RE.finditer(blob):
+        path = m.group(1).lstrip("./")
+        if path and path != own and "://" not in path and not path.startswith(".."):
+            seen.setdefault(path, None)
+    return list(seen)[:MAX_RELATED_PATHS]
+
+
+def related_candidates(finding: dict) -> list[str]:
+    """The repo paths to read for `mentioned_paths`: a name with a directory as written, a bare
+    name next to the cited file first and then at the root."""
+    own = str(finding.get("file") or "").lstrip("./")
+    base = own.rsplit("/", 1)[0] if "/" in own else ""
+    out: dict[str, None] = {}
+    for path in mentioned_paths(finding):
+        if "/" not in path and base:
+            out.setdefault(f"{base}/{path}", None)
+        out.setdefault(path, None)
+    return [p for p in out if p != own]
+
+
+def ground_finding(finding: dict, source: str | None, related: str = "") -> tuple[bool, list[str]]:
     """(grounded?, quotes that were absent). `source` should be the file at the reviewed
     head PLUS the PR's patch for it — a removed-behaviour finding legitimately quotes
     code the head no longer has, and must not be downgraded for being right.
+
+    `related` is more text a quote may be found in before it is called missing (issue #261):
+    the files the finding names in its own evidence, read at the same head, and the rest of the
+    PR's patch. A fabricated quote is in none of them; a real one attributed to a neighbouring
+    file is.
 
     `source` is text that was ACTUALLY READ (or `None` for "no source to check"). A FETCH
     FAILURE is a different animal — see `UNREADABLE`; `apply_grounding` handles it, and this
@@ -224,6 +308,9 @@ def ground_finding(finding: dict, source: str | None) -> tuple[bool, list[str]]:
         return True, []  # nothing to check against, or nothing checkable — fail open
     haystack = _normalize(source)
     missing = [q for q in quotes if not _present(q, haystack)]
+    if missing and related:
+        extra = _normalize(related)
+        missing = [q for q in missing if not _present(q, extra)]
     if len(missing) < len(quotes):
         return True, []  # at least one quote landed — the finding is anchored in reality
     return False, missing
@@ -246,8 +333,18 @@ SOURCE_UNAVAILABLE_NOTE = (
 )
 
 
+def related_text(finding: dict, sources: dict[str, str | object | None], patches: str = "") -> str:
+    """The text a finding's quote may also be found in (issue #261): every successfully READ
+    source for a path the finding names (`related_candidates`), plus `patches` — the PR's
+    whole patch. Unreadable or unread paths contribute nothing."""
+    parts = [sources[p] for p in related_candidates(finding) if isinstance(sources.get(p), str)]
+    if patches:
+        parts.append(patches)
+    return "\n".join(parts)
+
+
 def apply_grounding(
-    findings: list[dict], sources: dict[str, str | object | None]
+    findings: list[dict], sources: dict[str, str | object | None], patches: str = ""
 ) -> tuple[list[dict], list[dict], list[dict]]:
     """(findings, downgraded, unreadable). Three dispositions, kept deliberately distinct:
 
@@ -281,7 +378,7 @@ def apply_grounding(
             out.append(annotated)
             unreadable.append({"file": file, "severity": str(finding.get("severity") or "")})
             continue
-        grounded, missing = ground_finding(finding, source)
+        grounded, missing = ground_finding(finding, source, related_text(finding, sources, patches))
         if grounded:
             out.append(finding)
             continue
@@ -295,14 +392,71 @@ def apply_grounding(
     return out, downgraded, unreadable
 
 
-def correct_line_numbers(findings: list[dict], blobs: dict[str, str]) -> list[dict]:
-    """Correct mislocated line numbers using the raw blob (without the patch).
+def _locate(quote: str, lines: list[str]) -> list[int]:
+    """1-based lines where `quote` STARTS in the file, matching across line breaks the way
+    `_present` does (a quote copied from a wrapped statement spans several lines). Each line is
+    normalized on its own and the lines are joined with one space, so a character offset maps
+    back to the line it came from. An ellipsis quote is located by its first fragment."""
+    starts: list[int] = []
+    parts: list[str] = []
+    offset = 0
+    for ln in lines:
+        starts.append(offset)
+        text = _normalize(ln)
+        parts.append(text)
+        offset += len(text) + 1
+    joined = " ".join(parts)
+    needle = quote
+    if "..." in quote:
+        fragments = [f for f in _ELLIPSIS_RE.split(quote) if len(f) >= _MIN_FRAGMENT]
+        if not fragments or not _present(quote, joined):
+            return []
+        needle = fragments[0]
+    hits: list[int] = []
+    pos = joined.find(needle)
+    while pos >= 0:
+        line = bisect.bisect_right(starts, pos)  # the 1-based line whose span holds `pos`
+        while line - 1 < len(parts) and not parts[line - 1]:
+            line += 1  # an offset on an empty line's separator belongs to the next real line
+        if line not in hits:
+            hits.append(line)
+        pos = joined.find(needle, pos + 1)
+    return hits
 
-    For each grounded finding, locate WHERE in the blob the longest matched quote
-    actually appears. Exactly one match → set ``finding['line']`` to the real line
-    and emit ``line_corrected = True``. Multiple matches → ambiguous, leave as-is
-    (fail-open). Ungrounded findings and findings with no usable quotes are left
-    untouched. This never downgrades, never removes, never changes severity.
+
+def anchor_quotes(finding: dict) -> list[str]:
+    """The quotes a finding's LINE is re-anchored by: its checkable quotes, or — when its
+    evidence is bare code with no backticks, the shape protoPatch emits (`out = subprocess.run(`
+    on its own line) — the evidence's first code-like line. Used only to locate, never to
+    downgrade: bare evidence was never a grounding input and does not become one here."""
+    quotes = quoted_snippets(finding)
+    if quotes:
+        return quotes
+    evidence = descriptive_text(str(finding.get("evidence") or ""))
+    if "`" in evidence:
+        return []
+    for raw in evidence.splitlines():
+        line = _normalize(raw)
+        if not (MIN_QUOTE_CHARS <= len(line) <= MAX_QUOTE_CHARS) or len(line.split()) > MAX_QUOTE_TOKENS:
+            continue
+        if _PROSE_RE.search(line) or not _CODE_HINT_RE.search(line) or not _STATEMENT_RE.search(line):
+            continue
+        return [line]
+    return []
+
+
+def correct_line_numbers(findings: list[dict], blobs: dict[str, str]) -> list[dict]:
+    """Re-anchor each grounded finding's line to where its quoted EVIDENCE is (issue #261).
+
+    The panel's anchors drift 5–70 lines and sometimes point at pre-existing code; the carried-
+    prior keying and nearby scoping both read the line. For each grounded finding the quotes are
+    tried longest first, and the first that occurs exactly ONCE in the raw blob (the file at
+    head, without the patch) sets ``finding['line']`` — a quote spanning several lines anchors
+    on the line it starts. ``line_corrected = True`` is emitted, and when the line actually
+    moved the panel's own line is kept as ``line_original``. A quote found more than once is
+    ambiguous and the next one is tried; none unique → left as-is (fail-open). Ungrounded
+    findings and findings with no usable quotes are left untouched. This never downgrades,
+    never removes, never changes severity, and never changes the finding's file.
     """
     out: list[dict] = []
     for finding in findings:
@@ -311,23 +465,26 @@ def correct_line_numbers(findings: list[dict], blobs: dict[str, str]) -> list[di
             continue
         file = str(finding.get("file") or "")
         blob = blobs.get(file, "")
-        if not blob:
-            out.append(finding)
-            continue
-        quotes = quoted_snippets(finding)
+        quotes = anchor_quotes(finding) if blob else []
         if not quotes:
             out.append(finding)
             continue
-        best = max(quotes, key=len)
         lines = blob.splitlines()
-        hits = [i + 1 for i, ln in enumerate(lines) if _present(best, _normalize(ln))]
-        if len(hits) == 1:
-            corrected = dict(finding)
-            corrected["line"] = hits[0]
-            corrected["line_corrected"] = True
-            out.append(corrected)
-        else:
+        hit = None
+        for quote in sorted(quotes, key=len, reverse=True):
+            found = _locate(quote, lines)
+            if len(found) == 1:
+                hit = found[0]
+                break
+        if hit is None:
             out.append(finding)
+            continue
+        corrected = dict(finding)
+        if finding.get("line") != hit and "line_original" not in corrected:
+            corrected["line_original"] = finding.get("line")
+        corrected["line"] = hit
+        corrected["line_corrected"] = True
+        out.append(corrected)
     return out
 
 
