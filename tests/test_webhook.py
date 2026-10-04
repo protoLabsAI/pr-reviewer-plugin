@@ -374,7 +374,9 @@ def test_a_non_rerequest_check_run_is_ignored(tmp_path):
     """Our own `created`/`completed` events (we open and conclude the check) must not
     loop the panel — only the human-initiated `rerequested` acts."""
     app, dispatcher, _posted = summon_app(tmp_path)
-    assert post_check_run(app, check_run_payload(action="completed")).json()["reason"] == "not-a-rerequest"
+    assert post_check_run(app, check_run_payload(action="created")).json()["reason"] == "not-a-rerequest"
+    # A `completed` for our OWN check refreshes nothing either (#268 acts on foreign checks only).
+    assert post_check_run(app, check_run_payload(action="completed")).json()["reason"] == "own-check"
     assert dispatcher.summons == []
 
 

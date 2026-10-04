@@ -322,6 +322,24 @@ def queued_run(ahead: int, eta_s: float | None) -> CheckRun:
     )
 
 
+def reviewing_run() -> CheckRun:
+    """What the check says while a panel round runs on this head (issue #268).
+
+    Before this, a head the panel was reviewing had NO `QA panel` run at all until the
+    verdict landed — and, on a PASS, until the next sweep pass after that. A required check
+    with no run reads only "expected" on GitHub, indistinguishable from a reviewer that is
+    down, so an operator bypassed branch protection 3 minutes after a PASS. An `in_progress`
+    run says the panel is working on it; `evaluate_promotion` moves it forward on the SAME
+    run when the round ends.
+    """
+    return CheckRun(
+        IN_PROGRESS,
+        None,
+        "Panel reviewing this head",
+        "A QA panel round is running on this commit. The check updates as soon as its verdict posts; nothing to do.",
+    )
+
+
 def closed_run() -> CheckRun:
     """What a still-open run says once its PR closes or merges (#153, #130).
 

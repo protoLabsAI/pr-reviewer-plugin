@@ -285,18 +285,28 @@ def build_routers(dispatcher, telemetry, get_secret, run_gh_fn=None):
             log.warning("[pr-reviewer] re-evaluate after thread %s failed on %s#%s", action, repo, pr, exc_info=True)
 
     async def _handle_check_run(body: bytes) -> dict:
-        """A `check_run` webhook. We act ONLY on `rerequested` for our own `protoReview`
-        gate — a human clicked "Re-run" on the required check — and re-run the panel, the
-        same force posture as a summon. Making the check a required status is pointless if
-        a red X can only be cleared by pushing a dummy commit; this is how it is re-driven.
+        """A `check_run` webhook. Two actions matter.
 
-        Every other action is ignored, deliberately: our own `created`/`completed` events
-        (we open and conclude the check ourselves) would otherwise loop the panel."""
+        `rerequested` for our own `protoReview` gate — a human clicked "Re-run" on the
+        required check — re-runs the panel, the same force posture as a summon. Making the
+        check a required status is pointless if a red X can only be cleared by pushing a
+        dummy commit; this is how it is re-driven.
+
+        `completed` for SOMEONE ELSE's check (CI) refreshes the gate (#268): approve-on-green
+        waits for the head's checks to go terminal-green, and before this only the next sweep
+        pass noticed CI finishing. It never runs a panel — `request_gate_refresh` re-reads
+        state and republishes, coalesced per PR so a suite of ten checks costs two passes.
+        Our OWN checks' events are ignored, deliberately: we open and conclude them
+        ourselves, and reacting to them would loop. Needs the App subscribed to "Check run"
+        events; without that GitHub never delivers these, and the sweep still covers it."""
         from .dispatch import REVIEW_CHECK_NAME
 
         try:
             payload = json.loads(body)
-            if str(payload.get("action") or "") != "rerequested":
+            action = str(payload.get("action") or "")
+            if action == "completed":
+                return _check_completed(payload)
+            if action != "rerequested":
                 return {"ok": True, "dispatched": False, "reason": "not-a-rerequest"}
             check_run = payload["check_run"]
             if str(check_run.get("name") or "") != REVIEW_CHECK_NAME:
@@ -317,6 +327,24 @@ def build_routers(dispatcher, telemetry, get_secret, run_gh_fn=None):
         telemetry.emit("summon", repo=repo, pr=pr, actor=actor, verb="check-rerequest")
         asyncio.get_running_loop().create_task(_safe_summon(repo, pr, actor))
         return {"ok": True, "dispatched": True, "reason": "check-run-rerequest"}
+
+    def _check_completed(payload: dict) -> dict:
+        """Refresh the gate of every PR a completed foreign check belongs to (#268)."""
+        from .checks import CHECK_NAME
+        from .dispatch import REVIEW_CHECK_NAME
+
+        check_run = payload["check_run"]
+        if str(check_run.get("name") or "") in (CHECK_NAME, REVIEW_CHECK_NAME):
+            return {"ok": True, "dispatched": False, "reason": "own-check"}
+        repo = str(payload["repository"]["full_name"])
+        prs = [int(p["number"]) for p in (check_run.get("pull_requests") or []) if p.get("number")]
+        if not prs:
+            return {"ok": True, "dispatched": False, "reason": "check-run-no-pr"}
+        refresh = getattr(dispatcher, "request_gate_refresh", None)
+        if refresh is None:
+            return {"ok": True, "dispatched": False, "reason": "no-gate-refresh"}
+        pending = [pr for pr in prs if refresh(repo, pr, reason="check-completed")]
+        return {"ok": True, "dispatched": bool(pending), "reason": "check-completed"}
 
     async def _handles() -> list[str]:
         """Names this reviewer answers to: the configured handle plus its own login, so

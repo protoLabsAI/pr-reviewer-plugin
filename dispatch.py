@@ -40,6 +40,7 @@ from .absence_search import AbsenceSearcher, render_absence_search_footnote
 from .approve import (
     HOLD_NO_CLEAR_VERDICT,
     HOLD_NOT_OWNER,
+    HOLD_ROUND_IN_FLIGHT,
     HOLD_THREADS_UNRESOLVED,
     HOLD_UNVERIFIED,
     PROMOTE,
@@ -57,6 +58,7 @@ from .checks import (
     check_for,
     closed_run,
     queued_run,
+    reviewing_run,
 )
 from .chokepoint import DISPATCH_ACTIONS, DROP_IN_FLIGHT, Chokepoint
 from .evidence_guard import (
@@ -585,6 +587,14 @@ VERIFY_RETRY_ACTION = "verify-retry"
 VERIFY_RETRY_STARTED = "verify-retry:started"
 VERIFY_RETRY_RAN = "verify-retry:ran"
 VERIFY_RETRY_GAVE_UP = "verify-retry:exhausted"
+# Re-publishing the gate the moment a round ends (issue #268). Before, a PASS only reached
+# the `QA panel` check on the next sweep pass for that PR — ~9 min on homelab-iac#292 —
+# while a FAIL wrote it inline. The refresh waits for the round's slots to free (a gate
+# evaluated while its own round still counts as in flight just reports
+# `hold:round-in-flight`), but never longer than this: past it, a NEWER round holds the PR
+# and will refresh the gate itself, and the sweep stays the backstop either way.
+GATE_REFRESH_WAIT_S = 30.0
+GATE_REFRESH_POLL_S = 0.25
 
 # How long an enumerated GitHub App installation scope is reused before re-reading it.
 # The sweep ticks every ~3 min and installation membership changes rarely, so this
@@ -1268,6 +1278,12 @@ class Dispatcher:
         # `backfill_per_pass` so successive passes cannot pile an unbounded queue onto the
         # panel semaphore.
         self._backfills: set[asyncio.Task] = set()
+        # Gate refreshes (#268), one task per repo#pr. A request for a PR whose refresh is
+        # already pending marks it dirty instead of stacking a second task, so a CI suite
+        # finishing ten checks at once costs at most two evaluations, and a request that
+        # lands after the running evaluation read its facts is never lost.
+        self._gate_refreshes: dict[str, asyncio.Task] = {}
+        self._gate_dirty: set[str] = set()
         # repo#pr@head keys whose one automatic unverified re-run (#220) this process has
         # started / whose exhaustion it has escalated — so a re-run that crashes without
         # posting cannot be re-scheduled every sweep tick, and an escalation fires once.
@@ -3091,9 +3107,11 @@ class Dispatcher:
             self.telemetry.emit("drop", repo=repo, pr=pr, sha=head_sha, reason=decision)
             return f"drop:{decision}"
         try:
-            return await self._review_in_slot(repo, pr, head_sha, push_triggered=True)
+            outcome = await self._review_in_slot(repo, pr, head_sha, push_triggered=True)
         finally:
             self.chokepoint.done(repo, pr, head_sha)
+        self._refresh_after_round(repo, pr, outcome)
+        return outcome
 
     async def handle_summon(self, repo: str, pr: int, actor: str) -> str:
         """An operator asked for a review (issue #28). Same panel, two differences.
@@ -3141,9 +3159,11 @@ class Dispatcher:
         # override the flood guard, and the operator has implicitly acknowledged the cost.
         self._round_cap.pop(f"{repo}#{pr}", None)
         try:
-            return await self._review_in_slot(repo, pr, slot_sha, force=True)
+            outcome = await self._review_in_slot(repo, pr, slot_sha, force=True)
         finally:
             self.chokepoint.done(repo, pr, slot_sha)
+        self._refresh_after_round(repo, pr, outcome)
+        return outcome
 
     async def _review(self, repo: str, pr: int, *, force: bool = False, push_triggered: bool = False) -> str:
         started = time.monotonic()
@@ -3314,6 +3334,11 @@ class Dispatcher:
         # (r1). The id threads through to `_post_verdict` / the exhaustion path, whichever
         # concludes it. Keyed on the SERVER-resolved head, never the webhook's `head_sha`.
         review_check_id = await self._start_review_check(repo, head)
+        # The gate says "reviewing" from the same moment (#268), so a required `QA panel`
+        # is visibly pending rather than absent. Promotion-owner only, like every other
+        # `QA panel` write: a shadow repo must never get a gate nobody concludes.
+        if self.promotion_owner and not self.shadow:
+            await self._publish_qa_check(repo, head, reviewing_run(), never_reopen=True)
         # Server-resolved refs ride along: finders pin code reads to the head SHA
         # and policy-doc reads to the base ref (a PR must not rewrite the rules it
         # is judged by). A host recipe without these declared just ignores them.
@@ -5484,7 +5509,14 @@ class Dispatcher:
         await self._publish_qa_check(repo, head, queued_run(ahead, eta_s), only_if_unstarted=True)
 
     async def _publish_qa_check(
-        self, repo: str, sha: str, run: CheckRun, *, only_if_open: bool = False, only_if_unstarted: bool = False
+        self,
+        repo: str,
+        sha: str,
+        run: CheckRun,
+        *,
+        only_if_open: bool = False,
+        only_if_unstarted: bool = False,
+        never_reopen: bool = False,
     ) -> None:
         """Publish (or update) this head's `QA panel` check run. Degrades, never raises.
 
@@ -5501,6 +5533,11 @@ class Dispatcher:
         that has not started, but must NEVER move one BACKWARDS — once the panel opened this
         head's check `in_progress` (or concluded it), a late/duplicate queued write would rewrite
         a live check to "Queued behind N" that no round then advances.
+
+        `never_reopen` is for the round-start `reviewing` publish (#268): it may create a run or
+        advance a queued/in-progress one, but leaves a CONCLUDED verdict alone — a summon on a
+        cleared head must not flip its green check back to pending; the gate refresh after the
+        round writes whatever that round decides.
         """
         if not self.qa_check:
             return
@@ -5523,6 +5560,8 @@ class Dispatcher:
             # create one, rather than subscripting whatever came back.
             existing = parsed if isinstance(parsed, dict) else {}
         if only_if_open and (not existing.get("id") or existing.get("status") == COMPLETED):
+            return
+        if never_reopen and existing.get("status") == COMPLETED:
             return
         if only_if_unstarted and existing.get("id") and existing.get("status") in (IN_PROGRESS, COMPLETED):
             # The head's panel has already opened (or concluded) this check; a `queued` write
@@ -5651,17 +5690,20 @@ class Dispatcher:
                 # The tracked slot registers this backfill in the queue's running/waiter
                 # view (so GET /queue sees it) and emits its own `queued` telemetry.
                 async with sem.slot(repo=repo, pr=pr, head=head, kind=BACKFILL_ACTION):
-                    return await self._review_in_slot(repo, pr, head)
-            # A raw semaphore (a test injection) or None — the legacy path, unchanged:
-            # `locked()` is True exactly when no slot is free, i.e. this panel WILL wait —
-            # the queue-depth signal the operator reads out of the panel stats.
-            if sem is not None and sem.locked():
-                self.telemetry.emit("queued", kind=BACKFILL_ACTION, repo=repo, pr=pr, sha=head)
-            slot = sem if sem is not None else contextlib.nullcontext()
-            async with slot:
-                return await self._review_in_slot(repo, pr, head)
+                    outcome = await self._review_in_slot(repo, pr, head)
+            else:
+                # A raw semaphore (a test injection) or None — the legacy path, unchanged:
+                # `locked()` is True exactly when no slot is free, i.e. this panel WILL wait —
+                # the queue-depth signal the operator reads out of the panel stats.
+                if sem is not None and sem.locked():
+                    self.telemetry.emit("queued", kind=BACKFILL_ACTION, repo=repo, pr=pr, sha=head)
+                slot = sem if sem is not None else contextlib.nullcontext()
+                async with slot:
+                    outcome = await self._review_in_slot(repo, pr, head)
         finally:
             self.chokepoint.done(repo, pr, head)
+        self._refresh_after_round(repo, pr, outcome)
+        return outcome
 
     def _detach_backfill(self, repo: str, pr: int, head: str) -> str:
         """Start a backfill panel WITHOUT waiting for it, so the sweep pass moves on.
@@ -5689,6 +5731,82 @@ class Dispatcher:
 
         task.add_done_callback(_settled)
         return BACKFILL_STARTED
+
+    def _refresh_after_round(self, repo: str, pr: int, outcome: str) -> None:
+        """Refresh the gate once a round has ended and freed its slot (#268) — unless it FAILed.
+
+        A FAIL writes its own gate inline, before it returns (`_retract_promotion`: the check
+        red, every standing approval withdrawn). A refresh after it adds nothing and can only
+        race it: GitHub can serve the reviews list without the FAIL just posted (and a FAIL
+        that failed to post leaves the older PASS standing), so `evaluate_promotion` would
+        read a clear verdict and APPROVE beside the FAIL — the #217 shape. Every other
+        outcome (PASS/WARN, a reaffirm, a drop) leaves the gate to the refresh.
+        """
+        if outcome.rsplit(":", 1)[-1] == FAIL:
+            return
+        self.request_gate_refresh(repo, pr, reason=outcome)
+
+    def request_gate_refresh(self, repo: str, pr: int, *, reason: str = "") -> bool:
+        """Re-publish this PR's gate (`evaluate_promotion`) now, not on the next sweep (#268).
+
+        Called when a round ends (`_refresh_after_round`: every outcome but a FAIL, which
+        writes its own gate) and when another check on the PR completes (CI going green is
+        half of approve-on-green). Fire-and-forget: returns at once, never
+        raises, and the sweep remains the backstop for anything this misses. Returns whether a
+        refresh is now pending. A no-op when we do not own promotion or run in shadow:
+        `evaluate_promotion` would only telemeter `hold:not-promotion-owner` there.
+        """
+        if not (self.promotion_owner and not self.shadow):
+            return False
+        # The allowlist gate, as on every event path: a check_run webhook for a repo we do
+        # not manage must not trigger PR reads on our credentials.
+        if bad_repo(repo) or (self.repos and repo not in self.repos):
+            return False
+        key = f"{repo}#{pr}"
+        pending = self._gate_refreshes.get(key)
+        if pending is not None and not pending.done():
+            self._gate_dirty.add(key)
+            return True
+        try:
+            task = asyncio.get_running_loop().create_task(self._refresh_gate(repo, pr, key, reason))
+        except RuntimeError:  # no running loop (a sync caller in tests) — the sweep covers it
+            return False
+        self._gate_refreshes[key] = task
+
+        def _settled(t: asyncio.Task) -> None:
+            if self._gate_refreshes.get(key) is t:
+                del self._gate_refreshes[key]
+
+        task.add_done_callback(_settled)
+        return True
+
+    async def _refresh_gate(self, repo: str, pr: int, key: str, reason: str) -> None:
+        while True:
+            self._gate_dirty.discard(key)
+            # The round that asked for this may still hold a slot for a moment: a summon's
+            # panel-queue slot is released by its caller after `handle_summon` returns.
+            # Evaluated now, the gate would read its own round as in flight.
+            deadline = time.monotonic() + GATE_REFRESH_WAIT_S
+            while self._round_in_flight(repo, pr):
+                if time.monotonic() >= deadline:
+                    # A newer round holds the PR; it refreshes the gate when it ends.
+                    self.telemetry.emit("gate_refresh", repo=repo, pr=pr, reason=reason, decision=HOLD_ROUND_IN_FLIGHT)
+                    return
+                await asyncio.sleep(GATE_REFRESH_POLL_S)
+            try:
+                decision = await self.evaluate_promotion(repo, pr)
+            except Exception:  # noqa: BLE001 — a refresh must never take anything down
+                log.warning("[pr-reviewer] gate refresh failed on %s#%s", repo, pr, exc_info=True)
+                return
+            self.telemetry.emit("gate_refresh", repo=repo, pr=pr, reason=reason, decision=decision)
+            if key not in self._gate_dirty:
+                return
+            reason = "coalesced"
+
+    async def drain_gate_refreshes(self) -> None:
+        """Wait for every pending gate refresh to settle — shutdown, and tests."""
+        while self._gate_refreshes:
+            await asyncio.gather(*list(self._gate_refreshes.values()), return_exceptions=True)
 
     async def drain_backfills(self) -> None:
         """Wait for every detached backfill to settle — shutdown, and tests."""
@@ -5796,12 +5914,15 @@ class Dispatcher:
         try:
             if isinstance(sem, PanelQueue):
                 async with sem.slot(repo=repo, pr=pr, head=head, kind=VERIFY_RETRY_ACTION):
-                    return await self._bounded_review(repo, pr, force=True)
-            slot = sem if sem is not None else contextlib.nullcontext()
-            async with slot:
-                return await self._bounded_review(repo, pr, force=True)
+                    outcome = await self._bounded_review(repo, pr, force=True)
+            else:
+                slot = sem if sem is not None else contextlib.nullcontext()
+                async with slot:
+                    outcome = await self._bounded_review(repo, pr, force=True)
         finally:
             self.chokepoint.done(repo, pr, head)
+        self._refresh_after_round(repo, pr, outcome)
+        return outcome
 
     async def sweep_once(self) -> int:
         """The 3-minute level pass: every open PR in every managed repo reconciled
