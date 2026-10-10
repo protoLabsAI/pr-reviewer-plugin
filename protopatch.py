@@ -707,6 +707,30 @@ SCRATCH_DIRNAME = "scratch"
 SCRATCH_KEEP_FAILED_S = 6 * 3600
 
 
+# The residual paths of an epic PR reviewed by its residual only (#273), keyed by the
+# SERVER-resolved (repo, pr, head). The dispatcher sets it when it scopes a round; the structural
+# pass, which the panel reaches through a model-called tool that only carries (pr, repo), reads it
+# back after resolving the head itself — so the scope can never come from the model. A different
+# head finds nothing and plans from the whole PR diff, as before. Bounded: rounds overwrite.
+_STRUCTURAL_SCOPES: dict[tuple[str, int, str], frozenset[str]] = {}
+_STRUCTURAL_SCOPES_MAX = 256
+
+
+def set_structural_scope(repo: str, pr: int, head: str, paths: list[str] | None) -> None:
+    """Scope this head's structural pass to `paths`, or (None) clear it so it plans the whole diff."""
+    key = (repo, int(pr), head)
+    _STRUCTURAL_SCOPES.pop(key, None)
+    if paths is None:
+        return
+    _STRUCTURAL_SCOPES[key] = frozenset(_norm_path(p) for p in paths if p)
+    while len(_STRUCTURAL_SCOPES) > _STRUCTURAL_SCOPES_MAX:
+        _STRUCTURAL_SCOPES.pop(next(iter(_STRUCTURAL_SCOPES)))
+
+
+def structural_scope(repo: str, pr: int, head: str) -> frozenset[str] | None:
+    return _STRUCTURAL_SCOPES.get((repo, int(pr), head))
+
+
 class ProtoPatchRunner:
     """The orchestration the tool calls — every step degrades to `unavailable(...)`."""
 
@@ -841,7 +865,14 @@ class ProtoPatchRunner:
         return parse_numstat(out) if rc == 0 else None
 
     async def _plan(
-        self, checkout: Path, base_sha: str, state_dir: Path, env: dict, deadline: float, changed: set[str] | None
+        self,
+        checkout: Path,
+        base_sha: str,
+        state_dir: Path,
+        env: dict,
+        deadline: float,
+        changed: set[str] | None,
+        scope: frozenset[str] | None = None,
     ):
         """Map the checkout into this pass's state dir and pick the features to review (#232).
 
@@ -865,6 +896,8 @@ class ProtoPatchRunner:
             lines = await self._changed_lines(checkout, base_sha)
             if lines is None or changed is None or not any(isinstance(f.get("ownedFiles"), list) for f in features):
                 return None  # nothing mapped, or a record shape this planner does not know: let clawpatch pick
+            if scope is not None:
+                lines = {path: n for path, n in lines.items() if path in scope}  # epic residual (#273)
             # Every file the name-only diff lists is in the plan, even one numstat did not count: a
             # plan built from an incomplete diff must never decide that nothing needs reviewing.
             for path in changed:
@@ -950,6 +983,11 @@ class ProtoPatchRunner:
             return unavailable(f"checkout failed: {exc}")
 
         changed = await self._changed_files(checkout, base_sha)
+        # An epic reviewed by its residual (#273): plan, select and confine to the residual commits'
+        # files only, so the attested slices neither fill the feature cap nor cost the budget.
+        scope = structural_scope(repo, pr, head_sha)
+        if scope is not None and changed is not None:
+            changed = {p for p in changed if _norm_path(p) in scope}
 
         repo_dir = self.state_root / repo.replace("/", "-")
         repo_dir.mkdir(parents=True, exist_ok=True)
@@ -977,7 +1015,13 @@ class ProtoPatchRunner:
         started = time.monotonic()
         deadline = started + self.budget_s
         record.update(sha=head_sha, base=base_sha, budget_s=self.budget_s, jobs=self.jobs, cap=self.max_features)
-        plan = await self._plan(checkout, base_sha, state_dir, env, deadline, changed) if self.plan_features else None
+        if scope is not None:
+            record["scoped_paths"] = len(scope)
+        plan = (
+            await self._plan(checkout, base_sha, state_dir, env, deadline, changed, scope)
+            if self.plan_features
+            else None
+        )
         render = dict(
             pr=pr,
             repo=repo,

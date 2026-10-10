@@ -478,7 +478,10 @@ first-parent chain (`base..head`, read from a real checkout) is attributed:
   commits (out of scope) and the residual commits' combined diff (a conflict merge contributes
   only its resolution — the diff from git's automatic merge to what was committed). In-diff
   confinement holds findings to the residual files, and the body lists what was attested and
-  what was reviewed.
+  what was reviewed. The protoPatch structural pass is scoped the same way (#273): it plans,
+  selects and confines its features from the residual files only, so the attested slices never
+  fill its feature cap. The scope is handed over server-side, keyed by the head SHA (the tool the
+  model calls carries only `pr`/`repo`); the `structural_plan` event records `scoped_paths`.
 - **Fails closed**: a `gh` read that fails, an unreadable slice history, a checkout or git
   command that fails, or more than 300 commits ⇒ the normal full review. An `@vera review`
   summon always reviews the whole PR.
