@@ -771,12 +771,19 @@ def test_coverage_gaps_fold_the_three_recorded_signals():
     assert coverage_gaps(["find_crossfile"], ["find_conventions", "find_crossfile"], True) == {
         "find_crossfile": "hit its time budget",  # the engine's own reason wins
         "find_conventions": "did not complete a real pass",
-        "find_structural": "structural pass unavailable or cut short",
+        "find_structural": "structural pass unavailable",
     }
 
 
+def test_a_cut_short_structural_pass_is_not_named_an_outage():
+    """#274: "unavailable or cut short" on a feature-cap partial read as a protoPatch outage."""
+    reason = "16 of 66 features reviewed — feature cap reached"
+    gaps = coverage_gaps([], [], True, reason, structural_partial=True)
+    assert gaps == {"find_structural": f"structural pass cut short: {reason}"}
+
+
 def test_a_coverage_gap_caps_pass_at_warn_and_never_touches_warn_or_fail():
-    gap = {"find_structural": "structural pass unavailable or cut short"}
+    gap = {"find_structural": "structural pass unavailable"}
     assert coverage_verdict(PASS, gap) == WARN
     assert coverage_verdict(PASS, {}) == PASS
     assert coverage_verdict(PASS, None) == PASS
@@ -802,7 +809,7 @@ def test_a_gapped_round_never_says_it_came_back_clean():
     assert "not a clean review" in body
     assert "2 of 5 review lane(s)" in body
     assert "`find_conventions` (did not complete a real pass)" in body
-    assert "`find_structural` (structural pass unavailable or cut short)" in body
+    assert "`find_structural` (structural pass unavailable)" in body
     assert body.index("Coverage incomplete") < body.index("No coverage gaps")  # the record precedes the brief
     assert json.loads(extract_findings_json(body)) == []  # recall still reads an explicit []
     assert parse_verdict_marker(body)["complete"] is False

@@ -3739,7 +3739,7 @@ class Dispatcher:
         # marked EVERY small-diff review incomplete — all four finders "did not complete",
         # structural "unavailable" — which held its promotion and would cap it at WARN
         # below. A result with no `steps` at all (an older host) says nothing either way.
-        structural_unavailable = "find_structural" in steps_out and (
+        structural_gap = "find_structural" in steps_out and (
             # Either marker: a relay that OBEYS the tool writes the Gap line and an empty
             # array, not the tool's own prefix — which read as a clean structural pass, so
             # 33 rounds with protoPatch down were recorded complete and 22 auto-approved.
@@ -3761,7 +3761,13 @@ class Dispatcher:
             and s not in degraded
             and not finder_completed(str(steps_out.get(s) or ""))
         ]
-        complete = not structural_unavailable and not degraded and not incomplete_finders
+        # A gap is one of two things, and they must not share a name (#274): a pass that was cut
+        # short (feature cap or budget) still ran and its finished features' findings are IN the
+        # round, while an unavailable lane delivered nothing. Labelling both "unavailable" made a
+        # feature-cap partial read as a protoPatch outage in the banner and in telemetry.
+        structural_partial = structural_gap and is_partial_output(structural_out)
+        structural_unavailable = structural_gap and not structural_partial
+        complete = not structural_gap and not degraded and not incomplete_finders
         lanes = len({str(s) for s in (*steps_out, *degraded) if str(s).startswith(FINDER_STEP_PREFIX)})
         output = str(result.get("output") or "")
         # The raw output is read for BLOCKS and never published as text (protoAgent#2439
@@ -3805,10 +3811,11 @@ class Dispatcher:
         gaps = coverage_gaps(
             degraded,
             incomplete_finders,
-            structural_unavailable,
+            structural_gap,
             outage_reason(structural_out),
             verify_undelivered,
             overran=overran,
+            structural_partial=structural_partial,
         )
         brief, brief_found = extract_brief(output)
         # A report that dropped its brief (#168: 5 of 150 posted reviews, every one a clean
@@ -4350,12 +4357,11 @@ class Dispatcher:
             structural_unavailable=structural_unavailable or None,
             # WHY the structural lane was out, as a countable class (#205): a clawpatch
             # per-request gateway timeout, our own budget SIGKILL, auth, a missing binary…
-            structural_reason=(classify_outage(outage_reason(structural_out)) or None)
-            if structural_unavailable
-            else None,
+            structural_reason=(classify_outage(outage_reason(structural_out)) or None) if structural_gap else None,
             # The lane was cut short but its finished features' findings are IN the round (#205):
-            # still a gap (complete=False, WARN cap), so a partial pass is countable apart from an outage.
-            structural_partial=(structural_unavailable and is_partial_output(structural_out)) or None,
+            # still a gap (complete=False, WARN cap), counted apart from an outage — a partial row
+            # does NOT also carry `structural_unavailable` (#274), so a gap is either flag.
+            structural_partial=structural_partial or None,
             verify_undelivered=verify_undelivered or None,
             # A clean PASS posted as WARN because a lane did not deliver a full pass (#117).
             coverage_capped=(verdict != finding_verdict) or None,

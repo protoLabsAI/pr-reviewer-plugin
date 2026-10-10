@@ -1734,7 +1734,7 @@ async def test_a_structural_gateway_failure_stamps_complete_false_and_caps_the_p
     assert out == "reviewed:WARN"
     body = gh.reviews_posted[0]["body"]
     assert "complete=false" in body
-    assert "`find_structural` (structural pass unavailable or cut short" in body  # …then its reason (#140)
+    assert "`find_structural` (structural pass unavailable" in body  # …then its reason (#140)
     assert "came back clean" not in body
 
 
@@ -1759,7 +1759,7 @@ async def test_a_relay_that_obeys_the_tool_still_reads_as_a_structural_outage(tm
     assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "reviewed:WARN"  # not a clean PASS
     body = gh.reviews_posted[0]["body"]
     assert "complete=false" in body  # so the promotion gate will not auto-approve it
-    assert "`find_structural` (structural pass unavailable or cut short" in body  # …then its reason (#140)
+    assert "`find_structural` (structural pass unavailable" in body  # …then its reason (#140)
     (row,) = _telemetry_events(tmp_path, "reviewed")
     assert row["structural_unavailable"] is True and row["complete"] is False
 
@@ -1782,7 +1782,7 @@ async def test_the_outage_reason_reaches_the_coverage_banner(tmp_path):
     d = make(tmp_path, cfg={"shadow_mode": False}, gh=gh, runner=runner)
     assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "reviewed:WARN"
     body = gh.reviews_posted[0]["body"]
-    assert "structural pass unavailable or cut short: clawpatch exit 4" in body
+    assert "structural pass unavailable: clawpatch exit 4" in body
     assert "/sandbox/" not in body and "(path)" in body  # never the reviewer's filesystem layout
 
 
@@ -1838,10 +1838,11 @@ async def test_a_partial_structural_lane_is_a_gap_not_a_clean_pass(tmp_path, how
     assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "reviewed:WARN"  # never a clean PASS
     body = gh.reviews_posted[0]["body"]
     assert "complete=false" in body and "came back clean" not in body
-    assert "`find_structural` (structural pass unavailable or cut short" in body
+    assert "`find_structural` (structural pass cut short" in body
+    assert "unavailable" not in body.split("find_structural", 1)[1].split(")", 1)[0]  # not an outage (#274)
     (row,) = _telemetry_events(tmp_path, "reviewed")
-    assert row["complete"] is False and row["structural_unavailable"] is True
-    assert row["structural_partial"] is True  # countable apart from a lane that never ran
+    assert row["complete"] is False and row["structural_partial"] is True
+    assert row.get("structural_unavailable") is None  # countable apart from a lane that never ran (#274)
     assert _telemetry_events(tmp_path, "panel_retry") == []  # a partial lane is delivered, not re-run
 
 
@@ -2006,7 +2007,7 @@ async def test_blind_lanes_cap_a_clean_pass_at_warn_and_the_body_names_them(tmp_
     assert "3 of 5 review lane(s)" in body
     assert "`find_crossfile` (hit its time budget)" in body
     assert "`find_conventions` (did not complete a real pass)" in body
-    assert "`find_structural` (structural pass unavailable or cut short)" in body
+    assert "`find_structural` (structural pass unavailable)" in body
     assert "`find_correctness`" not in body  # a lane that ran is not swept in
     assert "came back clean" not in body
     # The code-authored record comes first; the model's overclaim is below it.
@@ -2034,7 +2035,7 @@ async def test_a_coverage_gap_never_softens_a_fail(tmp_path):
 
     d = make(tmp_path, cfg={"shadow_mode": False}, gh=gh, runner=runner)
     assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "reviewed:FAIL"
-    assert "`find_structural` (structural pass unavailable or cut short)" in gh.reviews_posted[0]["body"]
+    assert "`find_structural` (structural pass unavailable)" in gh.reviews_posted[0]["body"]
     assert _events(tmp_path, "reviewed")[-1]["coverage_capped"] is None  # FAIL was not capped
 
 
