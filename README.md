@@ -56,7 +56,9 @@ The deterministic half of protoAgent's PR-review QA tier
     on …`, and a `Gap: structural pass partial — N of M features reviewed — <reason>` line) instead of
     being thrown away with the whole pass. It is still a lane gap: the round is incomplete and the
     verdict stays capped at WARN, so a pass that covered less never reads as a clean PASS; the
-    telemetry row carries `structural_partial: true` (and the usual `structural_reason`). With nothing
+    telemetry row carries `structural_partial: true` (and the usual `structural_reason`) but NOT
+    `structural_unavailable`, which means the lane delivered nothing (#274) — count a structural gap as
+    either flag. The banner says `structural pass cut short`, not `unavailable`. With nothing
     finished it is the outage it always was. The scratch state dir of a partial pass is kept for a
     postmortem like any failed pass.
   - **Lint-rule claims are checked with the repo's own linter (#232).** A finding whose claim cites a

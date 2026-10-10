@@ -821,22 +821,25 @@ def overrun_lanes(failed: list[str] | None, steps: dict | None) -> list[str]:
 def coverage_gaps(
     degraded: list[str] | None,
     incomplete_finders: list[str] | None,
-    structural_unavailable: bool,
+    structural_gap: bool,
     structural_reason: str = "",
     verify_undelivered: bool = False,
     overran: list[str] | None = None,
+    structural_partial: bool = False,
 ) -> dict[str, str]:
     """{lane: why} for every lane that did not deliver a full pass — the signals the
-    dispatcher already records (`degraded`, `incomplete_finders`,
-    `structural_unavailable`, and a verify step that returned nothing on a clean round),
+    dispatcher already records (`degraded`, `incomplete_finders`, the structural lane
+    unavailable or cut short, and a verify step that returned nothing on a clean round),
     as the one record the coverage cap and note read."""
     gaps = {str(s): "hit its time budget" for s in (degraded or [])}
     for s in overran or []:
         gaps[str(s)] = "overran the model's context window — read more than it could hold"
     for s in incomplete_finders or []:
         gaps.setdefault(str(s), "did not complete a real pass")
-    if structural_unavailable:
-        why = "structural pass unavailable or cut short"
+    if structural_gap:
+        # Name which gap it was (#274): "unavailable or cut short" on a feature-cap partial read
+        # as a protoPatch outage to anyone skimming the banner.
+        why = "structural pass cut short" if structural_partial else "structural pass unavailable"
         # The lane's own reason, when it gave one (#140): without it the synthesizer guessed
         # a cause per round — "auth error", "provider error" — for what was one fault, and a
         # reader could not tell a wrong gateway key from an unusable model reply.
