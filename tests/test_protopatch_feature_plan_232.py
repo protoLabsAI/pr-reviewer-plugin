@@ -614,3 +614,55 @@ async def test_a_capped_planned_pass_still_drops_a_lint_claim_the_pinned_ruff_re
     assert out.startswith(PARTIAL_PREFIX) and classify_outage(outage_reason(out)) == "feature-cap"
     assert fenced(out) == []  # the F841 claim was refuted and dropped, before the relay
     assert "1 lint claim(s) refuted by the repo's pinned ruff 0.15.10" in out
+
+
+# --- #273: an epic reviewed by its residual plans the structural pass from the residual only ---
+
+
+@pytest.fixture
+def clear_scopes():
+    pp._STRUCTURAL_SCOPES.clear()
+    yield
+    pp._STRUCTURAL_SCOPES.clear()
+
+
+async def test_an_epic_scope_plans_and_confines_to_the_residual_files_only(tmp_path, clear_scopes):
+    # 10 features own a changed file; only m1.py and m2.py are in the residual commits.
+    features = [feature(f"feat_{i:02d}", owned=[f"m{i}.py"]) for i in range(10)]
+    lines = {f"m{i}.py": 100 - i for i in range(10)}
+    pp.set_structural_scope("o/r", 1, SHA_HEAD, ["m1.py", "./m2.py"])
+    claw = FakeClawpatch(features)
+    tele = Recorder()
+    out = await runner(tmp_path, claw, lines, cfg={"structural_max_features": 3}, telemetry=tele).review(1, "o/r")
+
+    assert claw.listed == ["feat_01", "feat_02"]  # the attested slices' features never fill the cap
+    assert not any(m in out for m in STRUCTURAL_GAP_MARKERS)  # complete: the cap was not reached
+    assert {f["file"] for f in fenced(out)} == {"m1.py", "m2.py"}
+    assert "scope: 2 changed file(s)" in out
+    [(_, row)] = tele.events
+    assert (row["eligible"], row["selected"], row["scoped_paths"]) == (2, 2, 2)
+
+
+async def test_a_scope_for_another_head_or_a_cleared_scope_plans_the_whole_diff(tmp_path, clear_scopes):
+    features = [feature(f"feat_{i:02d}", owned=[f"m{i}.py"]) for i in range(4)]
+    lines = {f"m{i}.py": 10 - i for i in range(4)}
+    pp.set_structural_scope("o/r", 1, "f" * 40, ["m1.py"])  # a different head: not this pass's
+    claw = FakeClawpatch(features)
+    tele = Recorder()
+    await runner(tmp_path, claw, lines, telemetry=tele).review(1, "o/r")
+    assert claw.listed == ["feat_00", "feat_01", "feat_02", "feat_03"]
+    assert "scoped_paths" not in tele.events[0][1]
+
+    pp.set_structural_scope("o/r", 1, SHA_HEAD, ["m1.py"])
+    pp.set_structural_scope("o/r", 1, SHA_HEAD, None)  # a forced / non-epic round at this head clears it
+    claw = FakeClawpatch(features)
+    await runner(tmp_path, claw, lines).review(1, "o/r")
+    assert claw.listed == ["feat_00", "feat_01", "feat_02", "feat_03"]
+
+
+def test_the_scope_registry_is_bounded(clear_scopes):
+    for i in range(pp._STRUCTURAL_SCOPES_MAX + 10):
+        pp.set_structural_scope("o/r", i, SHA_HEAD, ["a.py"])
+    assert len(pp._STRUCTURAL_SCOPES) == pp._STRUCTURAL_SCOPES_MAX
+    assert pp.structural_scope("o/r", 0, SHA_HEAD) is None  # the oldest went first
+    assert pp.structural_scope("o/r", pp._STRUCTURAL_SCOPES_MAX + 9, SHA_HEAD) == frozenset({"a.py"})

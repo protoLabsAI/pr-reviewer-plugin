@@ -1,6 +1,8 @@
 __pycache__/
 *.pyc
 .venv*/
+# a symlinked venv is a file, which `.venv*/` does not match
+.venv
 .pytest_cache/
 .ruff_cache/
 *.egg-info/

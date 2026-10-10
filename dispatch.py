@@ -84,7 +84,13 @@ from .grounding import (
     render_grounding_footnote,
     render_unreadable_footnote,
 )
-from .protopatch import STRUCTURAL_GAP_MARKERS, classify_outage, is_partial_output, outage_reason
+from .protopatch import (
+    STRUCTURAL_GAP_MARKERS,
+    classify_outage,
+    is_partial_output,
+    outage_reason,
+    set_structural_scope,
+)
 from .refutations import _norm_path as _norm_ref_path
 from .refutations import (
     refuted_before_marks,
@@ -3469,6 +3475,10 @@ class Dispatcher:
         }
         if epic_scope is not None:
             inputs["review_scope"] = _epic.render_scope_block(epic_scope)
+        # The structural pass is reached through a tool the model calls with (pr, repo) only, so its
+        # half of the residual scope goes server-side, keyed by this head (#273). Set or CLEARED on
+        # every round: a forced or non-epic round at the same head must plan the whole diff.
+        set_structural_scope(repo, pr, head, epic_scope.residual_paths if epic_scope is not None else None)
         if self.finder_timeout_s:
             inputs["finder_timeout"] = self.finder_timeout_s  # else the recipe's default (#93)
         if self.synthesize_timeout_s:

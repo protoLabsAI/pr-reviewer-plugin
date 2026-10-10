@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 from pr_reviewer import epic
 from pr_reviewer.dispatch import Dispatcher
+from pr_reviewer.protopatch import structural_scope
 from pr_reviewer.telemetry import Telemetry
 from pr_reviewer.verdicts import parse_verdict_marker, render_verdict_body
 
@@ -418,6 +419,8 @@ async def test_an_epic_with_residual_commits_runs_the_panel_on_the_residual_only
     assert recipe == "code-review-structural"  # the recipe that reads `review_scope`
     scope = inputs["review_scope"]
     assert "DIRECT_PUSH" in scope and "RESOLVED-two" in scope and "SLICE_ONE" not in scope
+    # The structural pass's half of the scope (#273): the residual commits' files, server-side by head.
+    assert structural_scope("o/r", 1, sha["head"]) == frozenset({"direct.py", "f.txt"})
     [posted] = gh.reviews_posted
     body = posted["body"]
     assert "Epic attestation" in body and "reviewed only the residual diff of the other 2 commit(s)" in body
@@ -434,6 +437,7 @@ async def test_an_unreadable_lookup_falls_back_to_a_full_review(tmp_path):
     assert await d._review("o/r", 1) == "reviewed:PASS"
     [(_recipe, inputs)] = calls
     assert "review_scope" not in inputs  # the WHOLE PR, never an attested PASS
+    assert structural_scope("o/r", 1, sha["head"]) is None  # and the structural pass plans all of it (#273)
     assert "Epic attestation" not in gh.reviews_posted[0]["body"]
 
 
