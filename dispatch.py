@@ -33,9 +33,11 @@ import os
 import re
 import time
 from collections import deque
+from pathlib import Path
 from urllib.parse import quote
 
 from . import absence_search as _absence
+from . import epic as _epic
 from .absence_search import AbsenceSearcher, render_absence_search_footnote
 from .approve import (
     HOLD_NO_CLEAR_VERDICT,
@@ -1766,6 +1768,14 @@ class Dispatcher:
         return bool(cfg["evidence_guard"]) if "evidence_guard" in cfg else _env_bool("PR_REVIEWER_EVIDENCE_GUARD", True)
 
     @property
+    def epic_attestation(self) -> bool:
+        """Review only the residual of an `epic/*` → default-branch PR (see `epic.py`)."""
+        cfg = self.cfg
+        if "epic_attestation" in cfg:
+            return str(cfg["epic_attestation"]).strip().lower() not in ("false", "0", "no", "off")
+        return _env_bool("PR_REVIEWER_EPIC_ATTESTATION", True)
+
+    @property
     def diff_char_budget(self) -> int:
         """The review panel's per-review diff char budget — the size past which the workflow
         engine truncates the base↔head diff (issue #209). Read here only to detect that the
@@ -2043,7 +2053,8 @@ class Dispatcher:
                 "--jq",
                 "{head: .head.sha, base_ref: .base.ref, state: .state, merged: .merged, draft: .draft, locked: .locked, "
                 "changed_files: .changed_files, additions: .additions, deletions: .deletions, "
-                "author: .user.login}",
+                "author: .user.login, head_ref: .head.ref, head_repo: .head.repo.full_name, "
+                "base_sha: .base.sha, default_branch: .base.repo.default_branch}",
             ],
         )
         if rc != 0:
@@ -2106,6 +2117,98 @@ class Dispatcher:
             return None
         merge_base_tree = await self._merge_base_tree(repo, base, head)
         return diff_identity(merge_base_tree, head_tree)
+
+    async def _epic_scope(self, repo: str, pr: int, facts: dict, head: str) -> _epic.EpicScope | None:
+        """Attribute an `epic/*` → default-branch PR's commits (see `epic.py`), or None.
+
+        None means "review the whole PR as usual" — the feature is off, this is not an epic
+        PR, or ANY fact could not be read: a checkout that would not resolve, a git command
+        that failed, a `commits/{sha}/pulls` read or a slice's review history that came back
+        unreadable. Every one of those fails CLOSED to a full review, never to an attested
+        PASS. A slice's verdict is read exactly as the `QA panel` gate reads one: our own
+        marker-bearing reviews (`_our_reviews`), folded by `strictest_head_round`.
+        """
+        if not self.epic_attestation or not _epic.is_epic_pr(facts, repo):
+            return None
+        epic_ref = str(facts.get("head_ref") or "")
+
+        async def pulls_for(sha: str) -> list[dict]:
+            rc, out, _err = await self._run_gh(
+                [
+                    "api",
+                    f"repos/{repo}/commits/{sha}/pulls",
+                    "--paginate",
+                    "--jq",
+                    ".[] | {number: .number, merged_at: .merged_at, merge_commit_sha: .merge_commit_sha, "
+                    "base: .base.ref, head: .head.sha}",
+                ]
+            )
+            rows = gh_json_rows(out) if rc == 0 else None
+            if rows is None:
+                raise _epic.AttestationUnavailable(f"commits/{sha[:12]}/pulls unreadable (rc {rc})")
+            return [r for r in rows if isinstance(r, dict)]
+
+        async def slice_round(number: int, slice_head: str) -> dict | None:
+            reviews = await self._our_reviews(repo, number)
+            if reviews is None:
+                raise _epic.AttestationUnavailable(f"reviews of slice #{number} unreadable")
+            return strictest_head_round(reviews, slice_head)
+
+        try:
+            resolve = self._resolve_checkout or _absence.default_resolver({**self.cfg, "absence_search_clone": True})
+            checkout = await resolve(repo, head)
+            if checkout is None:
+                raise _epic.AttestationUnavailable("no checkout of the head")
+            from .checkout_cache import _default_run_git
+
+            scope = await _epic.build_scope(
+                _default_run_git,
+                Path(checkout),
+                epic_ref=epic_ref,
+                base_ref=str(facts.get("base_ref") or ""),
+                base_sha=str(facts.get("base_sha") or ""),
+                head=head,
+                pulls_for=pulls_for,
+                slice_round=slice_round,
+                diff_budget=self.diff_char_budget,
+            )
+        except Exception as exc:  # noqa: BLE001 — any failure ⇒ a full review (fail closed)
+            why = str(exc) if isinstance(exc, _epic.AttestationUnavailable) else f"{type(exc).__name__}: {exc}"
+            log.warning("[pr-reviewer] epic attestation unavailable on %s#%s (%s); full review", repo, pr, why)
+            self.telemetry.emit("epic_attestation", repo=repo, pr=pr, sha=head, outcome="unavailable", why=why[:300])
+            return None
+        self.telemetry.emit(
+            "epic_attestation",
+            repo=repo,
+            pr=pr,
+            sha=head,
+            outcome="all-attested" if scope.all_attested else "scoped",
+            commits=len(scope.commits),
+            attested=len(scope.attested),
+            residual=[a.sha[:12] for a in scope.residual] or None,
+            diff_truncated=scope.diff_truncated or None,
+        )
+        return scope
+
+    async def _post_attested(
+        self, repo: str, pr: int, head: str, scope: _epic.EpicScope, history: list[dict], diff_id: str | None
+    ) -> str:
+        """Post the all-attested PASS through the normal verdict path, so the head carries a
+        real marker that every downstream gate reads. Nothing new was judged on this PR, so a
+        standing block from an earlier FAIL round here is NOT dismissed (`hold_blocks`)."""
+        posted = await self._post_verdict(
+            repo,
+            pr,
+            head,
+            PASS,
+            [],
+            "epic-attestation",
+            brief=_epic.render_attested_brief(scope),
+            notes=_epic.render_attestation_notes(scope),
+            hold_blocks=any(r.get("verdict") == FAIL for r in history),
+            diff_id=diff_id,
+        )
+        return f"attested:{PASS}" if posted else f"error:post-failed:{PASS}"
 
     def _reaffirm_by_diff(self, repo: str, pr: int, head: str, prior: dict, current_id: str | None) -> str | None:
         """Reuse `prior`'s verdict when the PR's current diff (`current_id`) is byte-identical
@@ -3247,6 +3350,9 @@ class Dispatcher:
         }
         fires, reasons = structural_trigger(**size, changed_paths=paths)
         recipe = "code-review-structural" if fires else "code-review"
+        # What in-diff confinement holds findings to — the PR's changed paths, or for an epic
+        # reviewed by its residual only, the residual commits' paths.
+        confine_paths = paths
 
         ours = await self._our_reviews(repo, pr)
         if ours is None:
@@ -3289,6 +3395,19 @@ class Dispatcher:
             if reaffirmed is not None:
                 await self._record_reaffirmed(repo, pr, head, history[-1], diff_id)
                 return reaffirmed
+        # Epic attestation: an `epic/*` → default-branch PR whose every commit was already
+        # reviewed in a slice PR (or is a clean base sync) gets a PASS without a panel; one
+        # with residual commits gets the panel over the residual diff only. `force` (an
+        # operator disputing the verdict) always reviews the whole PR.
+        epic_scope = None if force else await self._epic_scope(repo, pr, facts, head)
+        if epic_scope is not None and epic_scope.all_attested:
+            return await self._post_attested(repo, pr, head, epic_scope, history, diff_id)
+        if epic_scope is not None:
+            # Only the structural recipe declares `review_scope` (the core four-finder one lives
+            # in protoAgent), so a scoped epic review always runs it.
+            recipe = "code-review-structural"
+            reasons = [*reasons, f"epic residual: {len(epic_scope.residual)} commit(s)"]
+            confine_paths = epic_scope.residual_paths
         prior = history[-1] if history else None
         round_number = len(history) + 1
         # Max-rounds cap: arm on the first push-triggered review that exceeds the limit so
@@ -3348,6 +3467,8 @@ class Dispatcher:
             "head_sha": head,
             "base_ref": str(facts.get("base_ref") or ""),
         }
+        if epic_scope is not None:
+            inputs["review_scope"] = _epic.render_scope_block(epic_scope)
         if self.finder_timeout_s:
             inputs["finder_timeout"] = self.finder_timeout_s  # else the recipe's default (#93)
         if self.synthesize_timeout_s:
@@ -3800,7 +3921,7 @@ class Dispatcher:
         # the record `rounds.supersedes` reads on both checks. Written from the CODE's outcome
         # (still carried or cleared), never from the model's say-so alone.
         disposed = disposition_record(dispositioned, dispositions, still_open=list(unaccounted) + list(deferred))
-        findings, confined = confine_findings(reported, paths)
+        findings, confined = confine_findings(reported, confine_paths)
         if confined:
             # Server-side in-diff enforcement — prompt discipline made a promise,
             # this keeps it. The drops are telemetered (eval evidence) and footnoted
@@ -4030,6 +4151,8 @@ class Dispatcher:
             + render_nearby_footnote(nearby)
             + render_refuted_before_note(refuted_before)
         )
+        if epic_scope is not None:
+            trailer += _epic.render_attestation_notes(epic_scope)
         if degraded:
             trailer += render_degraded_note(degraded)
         if incomplete_finders:

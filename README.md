@@ -454,6 +454,34 @@ compose env (re-applied every roll) to keep the config volume disposable:
 | `PR_REVIEWER_CONVERGENCE_ROUNDS` | `pr_reviewer.convergence_rounds` | `3` | The round from which an all-minor, all-in-delta WARN retires to PASS-with-notes. `0` disables the rule — the panel keeps re-reviewing rather than ever floor a minor. |
 | `PR_REVIEWER_QA_CHECK` | `pr_reviewer.qa_check` | `true` | Publish the **`QA panel` check run** (below). Rides the promotion-owner gate, so a shadow repo publishes nothing. `false` keeps approve-on-green without the check. |
 | `PR_REVIEWER_REGATE` | `pr_reviewer.regate` | `true` | Master switch for step 2 below. `false` stops arming blocks while KEEPING the formal seat, promotion and backfill — the lever to pull when the panel is emitting false FAILs. |
+| `PR_REVIEWER_EPIC_ATTESTATION` | `pr_reviewer.epic_attestation` | `true` | **Epic attestation** (below): an `epic/*` → default-branch PR is reviewed by its **residual** only — the commits no slice PR already reviewed. All commits attested ⇒ a PASS whose body is the attestation table, no panel. Any unreadable lookup ⇒ a full review, never an attested PASS. `false` reviews the whole epic diff. |
+
+### Epic attestation — an epic is not reviewed twice
+
+Large features land on long-lived `epic/*` branches: each slice PR (base `epic/<name>`) gets
+the full panel and is squash-merged into the epic. The epic → default-branch PR then carries
+the WHOLE epic diff, every line of which was already reviewed slice by slice. For a PR whose
+head is this repo's `epic/*` and whose base is the default branch, every commit on the epic's
+first-parent chain (`base..head`, read from a real checkout) is attributed:
+
+| Attribution | When | Reviewed again? |
+|---|---|---|
+| **slice** | the merge commit of a merged PR into this epic (`GET /commits/{sha}/pulls`, `merge_commit_sha` = the commit) whose strictest panel round at its final head is a **complete, verified PASS** — read from our own verdict markers exactly as the `QA panel` gate reads them. A WARN, an incomplete pass (the check's ⚪ neutral), an unverified pass or no verdict does not attest. A slice merged with a merge commit must also have merged its reviewed head cleanly. | no |
+| **sync** | a merge whose second parent is on the base branch and whose tree is exactly `git merge-tree --write-tree` of its parents — it adds nothing of its own | no |
+| **residual** | everything else: direct pushes, conflict-resolution merges, merges of any other branch, unattested slices | **yes** |
+
+- **Every commit attested** ⇒ a PASS is posted at the head through the normal verdict path (a
+  real marker, so `Review at head` and the `QA panel` gate see a verdict), its body the
+  attestation table: commit → slice PR → that PR's verdict. No panel runs. A standing FAIL
+  block from an earlier round on the epic PR is not dismissed by it.
+- **Some residual** ⇒ the structural panel runs with a `<review_scope>` block: the attested
+  commits (out of scope) and the residual commits' combined diff (a conflict merge contributes
+  only its resolution — the diff from git's automatic merge to what was committed). In-diff
+  confinement holds findings to the residual files, and the body lists what was attested and
+  what was reviewed.
+- **Fails closed**: a `gh` read that fails, an unreadable slice history, a checkout or git
+  command that fails, or more than 300 commits ⇒ the normal full review. An `@vera review`
+  summon always reviews the whole PR.
 
 ### The `QA panel` check run — the verdict as an enforceable gate
 

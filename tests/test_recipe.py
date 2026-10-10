@@ -36,6 +36,7 @@ def test_recipe_shape():
         "refuted_before",
         "author_counter_evidence",
         "existing_threads",
+        "review_scope",
     }
     assert RECIPE["output"] == "{{steps.report.output}}"
 
@@ -44,6 +45,15 @@ def test_llm_finders_see_existing_threads_and_ci_enforcement():
     for sid in ("find_correctness", "find_removed_behavior", "find_crossfile", "find_conventions"):
         assert "{{inputs.existing_threads}}" in STEPS[sid]["prompt"], sid
     assert "check test enforcement specifically" in STEPS["find_conventions"]["prompt"]
+
+
+def test_finders_and_synthesizer_read_the_epic_review_scope():
+    # Epic attestation: the dispatcher scopes an epic → default-branch review to its residual
+    # diff through this input; a lane that never reads it would re-review the whole epic.
+    for sid in ("find_correctness", "find_removed_behavior", "find_crossfile", "find_conventions", "synthesize"):
+        assert "{{inputs.review_scope}}" in STEPS[sid]["prompt"], sid
+    default = next(i["default"] for i in RECIPE["inputs"] if i["name"] == "review_scope")
+    assert "whole PR diff" in default
 
 
 def test_llm_finders_get_server_resolved_refs_and_wrapped_prior_findings():
