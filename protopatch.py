@@ -731,6 +731,35 @@ def structural_scope(repo: str, pr: int, head: str) -> frozenset[str] | None:
     return _STRUCTURAL_SCOPES.get((repo, int(pr), head))
 
 
+# The repo a review round is BOUND to, keyed by PR number (#279). The structural pass is
+# reached through a model-called tool that carries only (pr, repo); when the model omits
+# `repo`, the tool must fall back to THIS round's bound repo, never the agent's default_repo
+# — on protoContent#596 (default_repo set elsewhere) an omitted repo silently resolved the
+# structural pass against another repo's PR. The dispatcher registers the binding when it
+# scopes a round; a round for the same PR number in another repo overwrites it, and a direct
+# tool call outside any round finds nothing and falls back to default_repo as before.
+# Bounded LRU, same as `_STRUCTURAL_SCOPES`.
+_BOUND_REPOS: dict[int, str] = {}
+_BOUND_REPOS_MAX = 256
+
+
+def set_bound_repo(repo: str, pr: int) -> None:
+    """Bind this PR's round to `repo` (#279) so the structural tool, called with `repo`
+    omitted, resolves to it instead of the agent default. Empty `repo` clears the binding."""
+    key = int(pr)
+    _BOUND_REPOS.pop(key, None)
+    if not str(repo or "").strip():
+        return
+    _BOUND_REPOS[key] = str(repo).strip()
+    while len(_BOUND_REPOS) > _BOUND_REPOS_MAX:
+        _BOUND_REPOS.pop(next(iter(_BOUND_REPOS)))
+
+
+def bound_repo(pr: int) -> str:
+    """The repo the round for this PR is bound to, or `""` when none is (a direct tool call)."""
+    return _BOUND_REPOS.get(int(pr), "")
+
+
 class ProtoPatchRunner:
     """The orchestration the tool calls — every step degrades to `unavailable(...)`."""
 
@@ -1237,7 +1266,11 @@ def get_tools(cfg: dict) -> list:
     @tool
     async def protopatch_review(pr: int, repo: str = "") -> str:
         """Run the protoPatch structural analysis engine over a pull request and return its findings as the standard fenced findings JSON (each item carries source: "protopatch"). Head and base SHAs are resolved from the PR server-side. Expensive (an LLM-backed engine, minutes): call it at most ONCE per review. If it reports PROTOPATCH UNAVAILABLE, relay the Gap it describes and an empty findings array — never retry, never invent findings. Args: pr = the pull-request number; repo = owner/name (omit to use the configured default)."""
-        target = (repo or "").strip() or default_repo
+        # When this PR is being reviewed by a bound round, an omitted repo resolves to THAT
+        # round's repo, never `default_repo` (#279): default_repo pointing at another repo
+        # must not silently run the structural pass over the wrong PR. An explicit repo still
+        # wins, and a direct call outside any round falls back to default_repo as before.
+        target = (repo or "").strip() or bound_repo(int(pr)) or default_repo
         try:
             return await runner.review(int(pr), target)
         except Exception as exc:  # noqa: BLE001 — the panel must degrade, never crash

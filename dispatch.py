@@ -89,6 +89,7 @@ from .protopatch import (
     classify_outage,
     is_partial_output,
     outage_reason,
+    set_bound_repo,
     set_structural_scope,
 )
 from .refutations import _norm_path as _norm_ref_path
@@ -167,6 +168,7 @@ from .verdicts import (
     demote_stale_findings,
     extract_brief,
     finder_completed,
+    lane_repo_violation,
     mark_nearby,
     mentions_any,
     merge_carried_findings,
@@ -1404,6 +1406,14 @@ class Dispatcher:
             log.warning("[pr-reviewer] installation covers NO repositories — the sweep has nothing to do")
         self._installation_repos, self._installation_repos_at = found, now
         return found
+
+    @property
+    def agent_default_repo(self) -> str:
+        """The repo a bare, repo-less github call resolves to — the configured `default_repo`
+        the structural tool already falls back to. Read only to judge a finder lane that
+        OMITTED the repo on a repo-scoped call (#279): when this is not the round's bound
+        repo, such a call read the wrong tree, so the lane cannot count as a clean pass."""
+        return str(self.cfg.get("default_repo") or "")
 
     @property
     def shadow(self) -> bool:
@@ -3479,6 +3489,9 @@ class Dispatcher:
         # half of the residual scope goes server-side, keyed by this head (#273). Set or CLEARED on
         # every round: a forced or non-epic round at the same head must plan the whole diff.
         set_structural_scope(repo, pr, head, epic_scope.residual_paths if epic_scope is not None else None)
+        # Bind this PR to the round's repo (#279) so the structural tool, if the model omits
+        # `repo`, resolves to it and never to a stray default_repo pointing at another repo.
+        set_bound_repo(repo, pr)
         if self.finder_timeout_s:
             inputs["finder_timeout"] = self.finder_timeout_s  # else the recipe's default (#93)
         if self.synthesize_timeout_s:
@@ -3771,6 +3784,36 @@ class Dispatcher:
             and s not in degraded
             and not finder_completed(str(steps_out.get(s) or ""))
         ]
+        # Lane repo binding (#279): a finder that read a repo OTHER than the one this round is
+        # bound to — or omitted the repo on a repo-scoped call while the agent default is not
+        # the bound repo, so the call silently resolved elsewhere — reviewed the WRONG codebase.
+        # protoContent#596 reported zero findings while every `find_conventions` tool call hit
+        # protoAgent's tree, and counted as coverage: a clean PASS on the wrong repo. Only the
+        # lane's recorded tool calls tell that from an honest clean pass (its reply looks the
+        # same), so this reads them like `finder_completed` reads the status line. A violating
+        # lane joins `incomplete_finders` (so it caps the PASS and records complete=false) with
+        # a Gap naming the wrong repo. Degraded/absent calls (an older host records none) are a
+        # no-op. NOT gated on STATUS_LINE_RECIPES: reading the wrong repo voids any recipe's lane.
+        lane_calls = result.get("tool_calls") if isinstance(result.get("tool_calls"), dict) else {}
+        lane_repo_gaps: dict[str, str] = {}
+        for s in LLM_FINDER_STEPS:
+            if s not in steps_out or s in degraded:
+                continue
+            why = lane_repo_violation(lane_calls.get(s) or [], repo, self.agent_default_repo)
+            if why:
+                lane_repo_gaps[s] = why
+        if lane_repo_gaps:
+            already = set(incomplete_finders)
+            incomplete_finders = [s for s in LLM_FINDER_STEPS if s in already or s in lane_repo_gaps]
+            self.telemetry.emit(
+                "lane_repo_unbound",
+                repo=repo,
+                pr=pr,
+                sha=head,
+                round=round_number,
+                bound_repo=repo,
+                lanes=[s for s in LLM_FINDER_STEPS if s in lane_repo_gaps],
+            )
         # A gap is one of two things, and they must not share a name (#274): a pass that was cut
         # short (feature cap or budget) still ran and its finished features' findings are IN the
         # round, while an unavailable lane delivered nothing. Labelling both "unavailable" made a
@@ -3826,6 +3869,7 @@ class Dispatcher:
             verify_undelivered,
             overran=overran,
             structural_partial=structural_partial,
+            lane_reasons=lane_repo_gaps,
         )
         brief, brief_found = extract_brief(output)
         # A report that dropped its brief (#168: 5 of 150 posted reviews, every one a clean

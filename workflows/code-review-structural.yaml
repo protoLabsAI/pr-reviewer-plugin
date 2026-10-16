@@ -76,7 +76,11 @@ inputs:
     description: The pull-request number to review.
     required: true
   - name: repo
-    description: Repository as owner/name (omit to use the configured default repo).
+    description: >-
+      Repository as owner/name. The dispatcher pins this to the PR's own repo and
+      every lane MUST pass it on each repo-scoped tool call — an omitted repo reads
+      the agent's default repo instead, a different codebase (#279). Empty only for a
+      manual, repo-less invocation, which then falls back to the configured default.
     default: ""
   - name: prior_findings
     description: >-
@@ -147,8 +151,12 @@ steps:
     subagent: review-finder
     timeout: "{{inputs.finder_timeout}}"
     prompt: |
-      Review PR #{{inputs.pr}} (repo: "{{inputs.repo}}" — empty means the
-      default repo). Your assigned angle: **correctness**. Logic errors,
+      Review PR #{{inputs.pr}} in repo "{{inputs.repo}}" at head SHA
+      "{{inputs.head_sha}}". Pass `repo="{{inputs.repo}}"` on EVERY repo-scoped
+      tool call (every github_* read) — NEVER omit it: an omitted repo silently
+      resolves to the agent's own default repo, a DIFFERENT codebase, and a lane
+      that reads the wrong repo is discarded as unreviewed, never counted as a
+      clean pass. Your assigned angle: **correctness**. Logic errors,
       off-by-ones, broken edge cases, error-handling gaps, races, wrong
       conditionals, unhandled None/empty/failure paths — does this code do what
       it claims under all inputs it will actually see?
@@ -210,8 +218,12 @@ steps:
     subagent: review-finder
     timeout: "{{inputs.finder_timeout}}"
     prompt: |
-      Review PR #{{inputs.pr}} (repo: "{{inputs.repo}}" — empty means the
-      default repo). Your assigned angle: **removed or changed behavior**. Read
+      Review PR #{{inputs.pr}} in repo "{{inputs.repo}}" at head SHA
+      "{{inputs.head_sha}}". Pass `repo="{{inputs.repo}}"` on EVERY repo-scoped
+      tool call (every github_* read) — NEVER omit it: an omitted repo silently
+      resolves to the agent's own default repo, a DIFFERENT codebase, and a lane
+      that reads the wrong repo is discarded as unreviewed, never counted as a
+      clean pass. Your assigned angle: **removed or changed behavior**. Read
       the DELETED and rewritten lines: what did the old code do that the new
       code silently doesn't? Dropped guards, lost fallbacks, narrowed
       conditions, deleted call sites, semantics changed without the callers
@@ -274,8 +286,12 @@ steps:
     subagent: review-finder
     timeout: "{{inputs.finder_timeout}}"
     prompt: |
-      Review PR #{{inputs.pr}} (repo: "{{inputs.repo}}" — empty means the
-      default repo). Your assigned angle: **cross-file consistency**. Signatures
+      Review PR #{{inputs.pr}} in repo "{{inputs.repo}}" at head SHA
+      "{{inputs.head_sha}}". Pass `repo="{{inputs.repo}}"` on EVERY repo-scoped
+      tool call (every github_* read) — NEVER omit it: an omitted repo silently
+      resolves to the agent's own default repo, a DIFFERENT codebase, and a lane
+      that reads the wrong repo is discarded as unreviewed, never counted as a
+      clean pass. Your assigned angle: **cross-file consistency**. Signatures
       changed but callers not updated, contracts/schemas drifting from their
       consumers, config keys renamed on one side only, docs/tests contradicting
       the new behavior. Use github_read_file on the files the diff touches
@@ -345,8 +361,12 @@ steps:
     subagent: review-finder
     timeout: "{{inputs.finder_timeout}}"
     prompt: |
-      Review PR #{{inputs.pr}} (repo: "{{inputs.repo}}" — empty means the
-      default repo). Your assigned angle: **conventions and hygiene**. The
+      Review PR #{{inputs.pr}} in repo "{{inputs.repo}}" at head SHA
+      "{{inputs.head_sha}}". Pass `repo="{{inputs.repo}}"` on EVERY repo-scoped
+      tool call (every github_* read) — NEVER omit it: an omitted repo silently
+      resolves to the agent's own default repo, a DIFFERENT codebase, and a lane
+      that reads the wrong repo is discarded as unreviewed, never counted as a
+      clean pass. Your assigned angle: **conventions and hygiene**. The
       repo's own documented rules first — read its CLAUDE.md / PROTO.md /
       contributor docs with github_read_file at the BASE ref below (or the
       default branch when it's empty), never at the PR head — then: naming that
@@ -418,10 +438,12 @@ steps:
     subagent: structural-finder
     timeout: "{{inputs.finder_timeout}}"
     prompt: |
-      Run the structural pass on PR #{{inputs.pr}} (repo: "{{inputs.repo}}" —
-      empty means the default repo): call protopatch_review once and relay its
-      findings verbatim. If the engine is unavailable, report the Gap it
-      prescribes and an empty findings array — the panel proceeds without you.
+      Run the structural pass on PR #{{inputs.pr}} in repo "{{inputs.repo}}":
+      call protopatch_review once, passing `repo="{{inputs.repo}}"` (NEVER omit
+      it — an omitted repo resolves to the agent's default repo, a different
+      codebase), and relay its findings verbatim. If the engine is unavailable,
+      report the Gap it prescribes and an empty findings array — the panel
+      proceeds without you.
 
   - id: synthesize
     subagent: review-synthesizer
@@ -480,8 +502,11 @@ steps:
     timeout: "{{inputs.verify_timeout}}"
     depends_on: [synthesize]
     prompt: |
-      Verify these code-review findings against PR #{{inputs.pr}} (repo:
-      "{{inputs.repo}}" — empty means the default repo). Re-read the actual
+      Verify these code-review findings against PR #{{inputs.pr}} in repo
+      "{{inputs.repo}}" at head SHA "{{inputs.head_sha}}". Pass
+      `repo="{{inputs.repo}}"` on every github_* call — NEVER omit it, an
+      omitted repo reads the agent's default repo, a different codebase, instead
+      of this one. Re-read the actual
       diff with github_pr_diff (and github_read_file where a claim depends on
       surrounding code); annotate every finding with verdict
       confirmed/refuted/uncertain + a one-line note. Return the same fenced

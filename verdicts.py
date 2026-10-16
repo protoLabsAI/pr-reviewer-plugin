@@ -791,6 +791,92 @@ def undelivered_stages(
     return stages
 
 
+# ── a lane must read the repo it is BOUND to (#279) ─────────────────────────────
+#
+# A review round is pinned to one server-resolved `owner/repo` (the PR's). A finder that
+# reads a DIFFERENT repo — or that omits the repo on a repo-scoped call while the agent's
+# default repo is not the bound one, so the call silently resolves to whatever the agent
+# defaults to — reviewed the wrong codebase. On protoContent#596 (repos: [], default_repo:
+# ''), every `find_conventions` github call omitted `repo`, resolved to the agent's default
+# (protoAgent), came back with no findings, and counted as coverage: a clean PASS on the
+# wrong tree. The lane's reply looked identical to an honest clean pass, so nothing but its
+# recorded tool calls can tell the two apart — the same shape as `finder_completed`.
+
+
+def _norm_repo(repo: object) -> str:
+    """`owner/name` normalized for comparison — GitHub is case-insensitive, and a trailing
+    slash is noise. Empty/non-string ⇒ `""` (an omitted or malformed repo)."""
+    return str(repo or "").strip().rstrip("/").lower() if isinstance(repo, str) else ""
+
+
+def _call_tool_name(call: dict) -> str:
+    for key in ("tool", "name", "tool_name"):
+        value = call.get(key)
+        if value:
+            return str(value)
+    return ""
+
+
+def _call_args(call: dict) -> dict:
+    for key in ("args", "arguments", "input"):
+        value = call.get(key)
+        if isinstance(value, dict):
+            return value
+    return {}
+
+
+def _call_repo(call: dict) -> str:
+    """The repo the model passed on this call, or `""` when it omitted one. A top-level
+    `repo` wins; otherwise it rides inside the call's argument dict."""
+    if isinstance(call.get("repo"), str):
+        return call["repo"]
+    value = _call_args(call).get("repo")
+    return value if isinstance(value, str) else ""
+
+
+def _is_repo_scoped(call: object) -> bool:
+    """Does this recorded call read a repo? The host records the calls each lane made; a
+    `repo` argument (even an empty one) or a `github_*` tool name marks a repo-scoped one.
+    A call carrying neither is some non-repo tool and is left alone."""
+    if not isinstance(call, dict):
+        return False
+    if "repo" in call or "repo" in _call_args(call):
+        return True
+    return "github" in _call_tool_name(call).lower()
+
+
+def lane_repo_violation(calls: object, bound_repo: str, agent_default_repo: str = "") -> str | None:
+    """Did a finder lane's repo-scoped tool calls read a repo other than the bound one?
+
+    `calls` is the lane's recorded tool calls (each a dict carrying the tool name and the
+    args the model passed; absent on a host that records none — then there is nothing to
+    check). Returns a short reason NAMING the offending repo, for the coverage Gap, or None
+    when every repo-scoped call targeted `bound_repo`.
+
+    Fail-closed, two ways a call can be a violation:
+
+      - it named a repo OTHER than the bound one — it read the wrong codebase outright; or
+      - it OMITTED the repo while `agent_default_repo` is not provably the bound repo, so
+        the call resolved to the agent default (a different repo, or an unknown/empty one).
+        We required an explicit repo precisely so this can never silently pass.
+    """
+    bound = _norm_repo(bound_repo)
+    if not bound:
+        return None  # no bound repo to check against — never happens on a real round
+    default = _norm_repo(agent_default_repo)
+    for call in calls or []:
+        if not _is_repo_scoped(call):
+            continue
+        named = _norm_repo(_call_repo(call))
+        if named:
+            if named != bound:
+                return f"read repo `{_call_repo(call)}`, not the bound `{bound_repo}`"
+        elif default != bound:
+            where = f"the agent default `{agent_default_repo}`" if agent_default_repo else "the agent default"
+            return f"omitted the repo on a repo-scoped call — it resolved to {where}, not the bound `{bound_repo}`"
+    return None
+
+
 # ── coverage gaps cap a clean PASS (issue #117) ─────────────────────────────────
 
 
@@ -826,16 +912,22 @@ def coverage_gaps(
     verify_undelivered: bool = False,
     overran: list[str] | None = None,
     structural_partial: bool = False,
+    lane_reasons: dict[str, str] | None = None,
 ) -> dict[str, str]:
     """{lane: why} for every lane that did not deliver a full pass — the signals the
     dispatcher already records (`degraded`, `incomplete_finders`, the structural lane
     unavailable or cut short, and a verify step that returned nothing on a clean round),
-    as the one record the coverage cap and note read."""
+    as the one record the coverage cap and note read.
+
+    `lane_reasons` overrides the generic "did not complete a real pass" wording for a named
+    lane (#279): a lane marked incomplete because it read the WRONG repo gets a Gap naming
+    that repo, not the blanket reason, so the coverage note says which codebase it read."""
+    lane_reasons = lane_reasons or {}
     gaps = {str(s): "hit its time budget" for s in (degraded or [])}
     for s in overran or []:
         gaps[str(s)] = "overran the model's context window — read more than it could hold"
     for s in incomplete_finders or []:
-        gaps.setdefault(str(s), "did not complete a real pass")
+        gaps.setdefault(str(s), lane_reasons.get(str(s), "did not complete a real pass"))
     if structural_gap:
         # Name which gap it was (#274): "unavailable or cut short" on a feature-cap partial read
         # as a protoPatch outage to anyone skimming the banner.
