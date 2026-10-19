@@ -3138,15 +3138,15 @@ def test_the_hard_ceilings_still_clamp_an_unbounded_overlay_and_say_so(tmp_path,
     # warning naming the key, the requested value and the value used.
     from pr_reviewer.dispatch import MAX_PANEL_ATTEMPT_TIMEOUT_S, MAX_ROUND_TIMEOUT_S
 
-    assert MAX_PANEL_ATTEMPT_TIMEOUT_S == 3000
-    assert MAX_ROUND_TIMEOUT_S == 6600  # derived: (1+1)*3000 + 600
+    assert MAX_PANEL_ATTEMPT_TIMEOUT_S == 4200
+    assert MAX_ROUND_TIMEOUT_S == 9000  # derived: (1+1)*4200 + 600
     with caplog.at_level("WARNING"):
         d = make(tmp_path, cfg={"finder_timeout_s": 9000, "panel_attempt_timeout": 7200})
-        assert d.panel_attempt_timeout_s == 3000
-        assert d.finder_timeout_s == 2940  # a minute under the CLAMPED attempt
-        assert d.round_timeout_s == 6600
-    assert "panel_attempt_timeout=7200" in caplog.text and "using 3000s" in caplog.text
-    assert "finder_timeout_s=9000" in caplog.text and "using 2940s" in caplog.text
+        assert d.panel_attempt_timeout_s == 4200
+        assert d.finder_timeout_s == 4140  # a minute under the CLAMPED attempt
+        assert d.round_timeout_s == 9000
+    assert "panel_attempt_timeout=7200" in caplog.text and "using 4200s" in caplog.text
+    assert "finder_timeout_s=9000" in caplog.text and "using 4140s" in caplog.text
     assert (d.panel_retries + 1) * d.panel_attempt_timeout_s + 600 <= MAX_ROUND_TIMEOUT_S
 
 
@@ -3155,8 +3155,8 @@ def test_the_default_round_bound_is_unchanged_and_an_oversized_round_timeout_is_
     # CEILING must not move the default — and an explicit oversized round_timeout is clamped.
     assert make(tmp_path / "default").round_timeout_s == 4200
     with caplog.at_level("WARNING"):
-        assert make(tmp_path / "big", cfg={"round_timeout": 20000}).round_timeout_s == 6600
-    assert "round_timeout=20000" in caplog.text and "using 6600s" in caplog.text
+        assert make(tmp_path / "big", cfg={"round_timeout": 20000}).round_timeout_s == 9000
+    assert "round_timeout=20000" in caplog.text and "using 9000s" in caplog.text
 
 
 async def test_a_timed_out_critical_step_voids_the_round_and_posts_no_verdict(tmp_path):
@@ -5320,13 +5320,21 @@ def test_classify_outage_names_the_timeout_class_apart_from_auth():
         )
         == "exit-4:gateway-timeout"
     )
-    assert classify_outage("clawpatch exit 4 (gateway provider failure: …): HTTP 401 Unauthorized") == "exit-4:provider"
+    assert (
+        classify_outage("clawpatch exit 4 (gateway provider failure: …): HTTP 401 Unauthorized") == "exit-4:gateway-401"
+    )
+    assert classify_outage("clawpatch exit 4 (gateway provider failure: …): gateway status 502") == "exit-4:gateway-502"
+    # a bare number is a token count as often as a status: only a labelled one is read
+    assert (
+        classify_outage("clawpatch exit 4 (…): response was not parseable JSON (completion_tokens=503)")
+        == "exit-4:provider"
+    )
     assert classify_outage("clawpatch exit 5 (gateway quota/rate limit): 429") == "exit-5"
     assert classify_outage("timed out after 300s (budget exceeded; review proceeds without it)") == "budget-timeout"
     assert classify_outage("`clawpatch` is not installed (npm: @protolabsai/protopatch)") == "not-installed"
     assert classify_outage("no gateway credentials (GATEWAY_API_KEY / OPENAI_API_KEY unset…)") == "no-credentials"
     assert classify_outage("checkout failed: clone timed out") == "checkout"
-    assert classify_outage("something new") == "other"
+    assert classify_outage("something new") == "unclassified"
     assert classify_outage("") == ""
 
 
@@ -5337,6 +5345,89 @@ async def test_reviewed_row_records_the_structural_outage_class(tmp_path, monkey
     reason = "clawpatch exit 4 (gateway provider failure: auth, HTTP error, or an unusable model reply): no reply within the 270000ms gateway timeout"
     lane = unavailable(reason)
     assert classify_outage(outage_reason(lane)) == "exit-4:gateway-timeout"
+
+
+# A lane that gave NO reason still gets a class (Vera 2026-10-18/19: two of twelve gaps were `None`).
+# Both shapes are verbatim from Vera's workflow run records.
+_RELAY_LOOPED_TO_MAX_TURNS = (
+    "[structural-finder hard-stopped at max_turns: workflow code-review-structural:find_structural — PARTIAL "
+    "output; unverified remainder is a Gap]\n\n\n\nI don't see any content to evaluate. Could you please share "
+    "what you'd like me to look at?"
+)
+_RELAY_NEVER_CALLED = (
+    "[structural-finder ended without its deliverable: workflow code-review-structural:find_structural — "
+    "INCOMPLETE output; treat this lane as a Gap, not a verdict]\n\n\n\nI'm ready to help. What would you like "
+    "me to do?"
+)
+
+
+@pytest.mark.parametrize(
+    ("lane", "cls", "detail"),
+    [
+        (_RELAY_LOOPED_TO_MAX_TURNS, "no-output:max-turns", "I don't see any content to evaluate."),
+        (_RELAY_NEVER_CALLED, "no-output", "I'm ready to help."),
+        ("", "no-output", ""),
+        ("Gap: structural pass unavailable", "unclassified", "Gap: structural pass unavailable"),
+        ("PROTOPATCH UNAVAILABLE — a brand new failure", "unclassified", "a brand new failure"),
+        ("PROTOPATCH UNAVAILABLE — timed out after 1500s (budget exceeded)", "budget-timeout", None),
+        ("PROTOPATCH UNAVAILABLE — `clawpatch` is not installed (npm: x)", "not-installed", None),
+    ],
+)
+def test_every_structural_gap_gets_a_class(lane, cls, detail):
+    from pr_reviewer.protopatch import structural_outage
+
+    got_cls, got_detail = structural_outage(lane)
+    assert got_cls == cls
+    if detail is None:
+        assert got_detail == ""  # a recognised protoPatch class needs no snippet
+    else:
+        assert got_detail.startswith(detail)
+        assert "[structural-finder" not in got_detail  # the core header is the class, not the detail
+
+
+def test_structural_detail_is_display_safe():
+    from pr_reviewer.protopatch import DETAIL_LIMIT, structural_outage
+
+    hostile = (
+        "PROTOPATCH UNAVAILABLE — weird: see https://gw.internal:4000/v1 at /sandbox/x/y.log "
+        "api_key=sk-abcdef1234567890 Bearer abcdefghijklmnop `**md**` " + "z" * 400
+    )
+    cls, detail = structural_outage(hostile)
+    assert cls == "unclassified"
+    assert "gw.internal" not in detail and "/sandbox" not in detail
+    assert "sk-abcdef1234567890" not in detail and "abcdefghijklmnop" not in detail
+    assert "`" not in detail and "*" not in detail
+    assert len(detail) <= DETAIL_LIMIT
+
+
+@pytest.mark.parametrize(
+    ("lane", "cls"),
+    [(_RELAY_LOOPED_TO_MAX_TURNS, "no-output:max-turns"), (_RELAY_NEVER_CALLED, "no-output")],
+)
+async def test_reviewed_row_names_a_relay_that_delivered_nothing(tmp_path, lane, cls):
+    gh = _structural_gh()
+
+    async def runner(name, inputs):
+        return {"output": CLEAN_REPORT, "failed": [], "steps": _panel_steps(find_structural=lane)}
+
+    d = make(tmp_path, cfg={"shadow_mode": False}, gh=gh, runner=runner)
+    await d.handle_pr_event("o/r", 1, HEAD, "opened")
+    (row,) = _telemetry_events(tmp_path, "reviewed")
+    assert row["structural_unavailable"] is True and row["complete"] is False
+    assert row["structural_reason"] == cls  # was None: counted as "?" by the health check
+    assert row["structural_detail"] and "[structural-finder" not in row["structural_detail"]
+
+
+async def test_a_clean_structural_lane_records_no_reason_or_detail(tmp_path):
+    gh = _structural_gh()
+
+    async def runner(name, inputs):
+        return {"output": CLEAN_REPORT, "failed": [], "steps": _panel_steps()}
+
+    d = make(tmp_path, cfg={"shadow_mode": False}, gh=gh, runner=runner)
+    await d.handle_pr_event("o/r", 1, HEAD, "opened")
+    (row,) = _telemetry_events(tmp_path, "reviewed")
+    assert row.get("structural_reason") is None and row.get("structural_detail") is None
 
 
 # ── the first sweep pass waits for the App token (issue #99) ─────────────────

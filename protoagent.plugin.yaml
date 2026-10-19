@@ -51,10 +51,12 @@ config:
                                # to 900. Env fallback: PR_REVIEWER_VERIFY_TIMEOUT.
   # panel_attempt_timeout (overlay or PR_REVIEWER_PANEL_ATTEMPT_TIMEOUT env; default 1800) — budget for
   # ONE panel attempt (one recipe run), the backstop for a hang outside the step timeouts above. HARD
-  # CEILING 3000s (issue #209) = a 2100s finder + 900s of tail steps: a configured value above it is
-  # clamped to it with a log.warning naming the key, so no overlay can make one attempt outlast 50 min.
+  # CEILING 4200s (issue #209) = a 3150s finder (a 32-feature structural pass: a 3000s time_budget_s
+  # + the relay) + 900s of tail steps + 150s headroom; it was 3000s for a 16-feature pass. A configured
+  # value above it is clamped to it with a log.warning naming the key, so no overlay can make one attempt
+  # outlast 70 min.
   # round_timeout (overlay or PR_REVIEWER_ROUND_TIMEOUT env; default (panel_retries+1)×panel_attempt+600)
-  # — a whole round's in-flight slot bound. HARD CEILING 6600s (= 2×3000+600), clamped with a log.warning.
+  # — a whole round's in-flight slot bound. HARD CEILING 9000s (= 2×4200+600), clamped with a log.warning.
   # The finder budget is clamped a minute under the attempt. Size the attempt as finder_timeout_s + 900
   # (the three tail steps at their 300s default) or a slow finder leaves the tail no room and the
   # attempt is cancelled mid-verify (qaEngineer#94). The shipped defaults are unchanged.

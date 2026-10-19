@@ -132,8 +132,11 @@ def classify_outage(reason: str) -> str:
     Classes: `budget-timeout` (our SIGKILL), `feature-cap` (the plan left features unreviewed, #232),
     `not-installed`, `no-credentials`, `checkout`,
     `exit-N` for a clawpatch exit code, refined for exit 4 into `exit-4:gateway-timeout`
-    (clawpatch's own provider timeout) or `exit-4:provider` (anything else in that class),
-    and `other` for a reason this does not recognise.
+    (clawpatch's own provider timeout), `exit-4:gateway-<status>` (an HTTP error status the
+    detail names — 401 is auth, 5xx the gateway) or `exit-4:provider` (anything else in that
+    class), and `unclassified` for a reason this does not recognise (the reason itself then
+    rides in `structural_detail`, see `structural_outage`). A lane that gave NO reason is
+    `structural_outage`'s job, not this one's.
     """
     text = _PARTIAL_LEAD_RE.sub("", (reason or "").strip(), count=1)  # "33 of 36 features reviewed — "
     if not text:
@@ -153,9 +156,69 @@ def classify_outage(reason: str) -> str:
     if m:
         code = int(m.group(1))
         if code == 4:
-            return "exit-4:gateway-timeout" if "gateway timeout" in lowered else "exit-4:provider"
+            if "gateway timeout" in lowered:
+                return "exit-4:gateway-timeout"
+            status = _HTTP_STATUS_RE.search(text)
+            return f"exit-4:gateway-{status.group(1)}" if status else "exit-4:provider"
         return f"exit-{code}"
-    return "other"
+    return "unclassified"
+
+
+# An HTTP error status named in a clawpatch exit-4 detail ("HTTP 401 Unauthorized", "status 502").
+# Only a labelled number counts: a bare 3-digit run is as likely a token count as a status.
+_HTTP_STATUS_RE = re.compile(r"\b(?:HTTP|status)[\s:=]*([45]\d\d)\b", re.IGNORECASE)
+
+# The headers protoAgent's subagent runner (graph/agent.py) puts on a relay that did not finish. The
+# relay is a model told to call `protopatch_review` once and relay its answer verbatim; when it
+# instead loops on the tool until max_turns, or answers without calling it at all, the lane carries
+# no Gap line and no findings array — so there is no reason to read, and the round used to record
+# `structural_reason: None` (two of twelve gaps on Vera, 2026-10-18/19).
+_RELAY_MAX_TURNS = "hard-stopped at max_turns"
+_RELAY_HEADER_RE = re.compile(r"^\s*\[[^\]\n]*\]\s*(?:--[^\n]*)?")
+DETAIL_LIMIT = 160
+_SECRET_RE = re.compile(
+    r"((?:api[_-]?key|token|secret|password|authorization|bearer)\s*[:=]?\s*)[A-Za-z0-9._~+/=-]{8,}",
+    re.IGNORECASE,
+)
+
+
+def _display_snippet(text: str, limit: int = DETAIL_LIMIT) -> str:
+    """Untrusted lane text made fit for telemetry: the core's bracketed header dropped (it is the
+    same on every such lane; the class already says which), URLs and absolute paths replaced, any
+    `key=`/`Bearer` secret masked, markdown stripped, whitespace collapsed, clipped."""
+    body = _RELAY_HEADER_RE.sub("", text or "", count=1)
+    body = _ABS_PATH_RE.sub("(path)", _URL_RE.sub("(url)", body))
+    body = _SECRET_RE.sub(r"\1***", body)
+    body = " ".join(_MARKDOWN_RE.sub("", body).split())
+    return body if len(body) <= limit else body[: limit - 1].rstrip() + "…"
+
+
+def structural_outage(structural_output: str) -> tuple[str, str]:
+    """(class, detail) for a structural lane that did NOT deliver a full pass — the class is never "".
+
+    `classify_outage` reads the reason a Gap line gave. A lane can also fail without one: the relay
+    model looped on the tool until the core hard-stopped it at max_turns (protoAgent#4322, ten
+    complete passes and then "I don't see any content to evaluate"), or replied without calling the
+    tool at all (protoAgent#4358, "I'm ready to help"). Those are relay failures, not protoPatch
+    outages, and they are counted as such:
+
+      - `no-output:max-turns` — the core's max_turns header, no Gap line and no findings array;
+      - `no-output` — anything else that delivered neither (the relay answered off-contract);
+      - `unclassified` — a Gap marker with no readable reason, or a reason no class matches.
+
+    `detail` is "" for a recognised protoPatch class (the class says it all) and otherwise a short,
+    display-safe snippet of what the lane said (`_display_snippet`), so the next unknown shape can be
+    named from telemetry instead of a container log that a restart has already rotated away."""
+    text = structural_output or ""
+    reason = outage_reason(text)
+    if reason:
+        cls = classify_outage(reason)
+        return cls, (_display_snippet(reason) if cls == "unclassified" else "")
+    if _RELAY_MAX_TURNS in text:
+        return "no-output:max-turns", _display_snippet(text)
+    if any(m in text for m in STRUCTURAL_GAP_MARKERS):
+        return "unclassified", _display_snippet(text)
+    return "no-output", _display_snippet(text)
 
 
 def unavailable(reason: str) -> str:

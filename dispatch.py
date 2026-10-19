@@ -86,11 +86,11 @@ from .grounding import (
 )
 from .protopatch import (
     STRUCTURAL_GAP_MARKERS,
-    classify_outage,
     is_partial_output,
     outage_reason,
     set_bound_repo,
     set_structural_scope,
+    structural_outage,
 )
 from .refutations import _norm_path as _norm_ref_path
 from .refutations import (
@@ -287,7 +287,13 @@ CRITICAL_PANEL_STEPS = ("synthesize", "verify", "report")
 # 1200–2300s (Vera, 2026-09: p90 1167s, max 2262s, all complete), so the clamp turned
 # finders that finish into finders cut mid-work — the failure `finder_timeout_s` exists to
 # avoid. The SHIPPED default stays 1800s; only the ceiling an operator may raise it to moves.
-MAX_PANEL_ATTEMPT_TIMEOUT_S = 3000  # one attempt = one runner(recipe, inputs) call
+#
+# Raised 3000 → 4200s (2026-10-19) so a 32-feature structural pass fits: protoPatch's feature cap
+# went 16 → 32 on Vera, and at 4 concurrent jobs her protoAgent passes take ~353s per feature slot
+# at p90 (86 passes), so 8 slots ≈ 2824s. A 3000s time_budget_s + 150s for the relay = a 3150s
+# finder, + 900s of tail steps = a 4050s attempt. 4200 leaves 150s of headroom over that and
+# still bounds a round: (1 + 1) × 4200 + 600 = 9000s.
+MAX_PANEL_ATTEMPT_TIMEOUT_S = 4200  # one attempt = one runner(recipe, inputs) call
 MAX_STEP_TIMEOUT_S = 900  # any single synthesize/verify/report step
 MAX_ROUND_TIMEOUT_S = 2 * MAX_PANEL_ATTEMPT_TIMEOUT_S + 600  # a whole round: (1 + 1) attempts + 600
 
@@ -3819,6 +3825,8 @@ class Dispatcher:
         # round, while an unavailable lane delivered nothing. Labelling both "unavailable" made a
         # feature-cap partial read as a protoPatch outage in the banner and in telemetry.
         structural_partial = structural_gap and is_partial_output(structural_out)
+        # Every gap gets a class (never None): see `structural_outage`.
+        structural_class, structural_detail = structural_outage(structural_out) if structural_gap else ("", "")
         structural_unavailable = structural_gap and not structural_partial
         complete = not structural_gap and not degraded and not incomplete_finders
         lanes = len({str(s) for s in (*steps_out, *degraded) if str(s).startswith(FINDER_STEP_PREFIX)})
@@ -4411,7 +4419,10 @@ class Dispatcher:
             structural_unavailable=structural_unavailable or None,
             # WHY the structural lane was out, as a countable class (#205): a clawpatch
             # per-request gateway timeout, our own budget SIGKILL, auth, a missing binary…
-            structural_reason=(classify_outage(outage_reason(structural_out)) or None) if structural_gap else None,
+            structural_reason=structural_class or None,
+            # What the lane actually said, when its class alone cannot (an `unclassified` reason, or
+            # a relay that delivered nothing — `no-output*`): short, URL/path/secret-scrubbed.
+            structural_detail=structural_detail or None,
             # The lane was cut short but its finished features' findings are IN the round (#205):
             # still a gap (complete=False, WARN cap), counted apart from an outage — a partial row
             # does NOT also carry `structural_unavailable` (#274), so a gap is either flag.

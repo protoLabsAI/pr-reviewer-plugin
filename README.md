@@ -61,6 +61,13 @@ The deterministic half of protoAgent's PR-review QA tier
     either flag. The banner says `structural pass cut short`, not `unavailable`. With nothing
     finished it is the outage it always was. The scratch state dir of a partial pass is kept for a
     postmortem like any failed pass.
+  - **Every structural gap has a class.** The `reviewed` row's `structural_reason` is never empty
+    when the lane did not deliver a full pass: `budget-timeout`, `feature-cap`, `not-installed`,
+    `no-credentials`, `checkout`, `exit-N` (exit 4 refined into `exit-4:gateway-timeout`,
+    `exit-4:gateway-<status>` or `exit-4:provider`), `no-output:max-turns` / `no-output` (the relay
+    model looped on the tool until max_turns, or answered without calling it — no Gap line and no
+    findings array), and `unclassified`. For `unclassified` and `no-output*` the row also carries
+    `structural_detail`: what the lane said, ≤160 chars, URLs, paths and secrets scrubbed.
   - **Lint-rule claims are checked with the repo's own linter (#232).** A finding whose claim cites a
     ruff rule code (F841, E501, …) on a `.py`/`.pyi` file is run past the ruff version the repo's
     `.github/workflows/*.yml` pin (`ruff==X.Y.Z`, `ruff@X.Y.Z`, or ruff-action's `version:`), with
@@ -443,7 +450,7 @@ compose env (re-applied every roll) to keep the config volume disposable:
 | `PR_REVIEWER_FINDER_TIMEOUT` | `pr_reviewer.finder_timeout_s` | recipe default (`900`) | Seconds each parallel finder may run before the engine degrades it to a Gap. **Calibrate it to your model** — just above the slow finders' p95 in the telemetry `step_s` — because a budget tuned on one lane silently truncates productive finders on a slower one (#93). Clamped a minute under `panel_attempt_timeout`. Needs protoAgent ≥ 0.170.0. |
 | `PR_REVIEWER_VERIFY_RERUNS` | `pr_reviewer.verify_reruns` | `1` | How many times a verifier that answered `nothing-to-verify` over a synthesis carrying findings is re-run **alone** — seeded with the finders' and synthesizer's outputs, seconds instead of a fresh panel (#167). A round that stays contradicted posts `verified=false` and holds, as before. `0` disables. Needs a host whose runner takes `seed_outputs` (protoAgent#3571); on an older host the contradiction is only counted (`verify-contradicted` telemetry). |
 | `PR_REVIEWER_PRIOR_RECHECK` | `pr_reviewer.prior_recheck` | `true` | Re-verify prior blocker/majors at the new head, **alone** (one seeded verify step), before they are re-asserted: a verdict-less re-listing of a prior, and an undispositioned prior that was never verified or whose file moved since it was raised (#218, #220, #232). A `refuted` there clears the prior; a re-listing nobody re-verified on a line the delta changed never blocks — it is carried as debt, and promotion holds `hold:carried-prior`. `false` carries priors as before. Needs a host whose runner takes `seed_outputs` (protoAgent#3571). |
-| `PR_REVIEWER_PANEL_ATTEMPT_TIMEOUT` | `pr_reviewer.panel_attempt_timeout` | `1800` | Seconds one panel attempt may run (hard ceiling **3000** — size it as `finder_timeout_s` + 900 for the tail steps). Only the finders carry a step timeout, so a hung verifier/synthesis step used to hang the round. Past the budget the attempt is cancelled and counts as failed: retried, then concluded on the PR as **"QA panel timed out"**. |
+| `PR_REVIEWER_PANEL_ATTEMPT_TIMEOUT` | `pr_reviewer.panel_attempt_timeout` | `1800` | Seconds one panel attempt may run (hard ceiling **4200** — size it as `finder_timeout_s` + 900 for the tail steps). Only the finders carry a step timeout, so a hung verifier/synthesis step used to hang the round. Past the budget the attempt is cancelled and counts as failed: retried, then concluded on the PR as **"QA panel timed out"**. |
 | `PR_REVIEWER_ROUND_TIMEOUT` | `pr_reviewer.round_timeout` | every attempt + 600 | Backstop for a whole round (every attempt plus the GitHub calls around them). Defaults to `(panel_retries + 1) × panel_attempt_timeout + 600`, so it never cuts a legitimate retry short. |
 | `PR_REVIEWER_BACKFILL_PER_PASS` | `pr_reviewer.backfill_per_pass` | `2` | Reviews the sweep may backfill per pass, across all repos. `0` disables backfill. |
 | `PR_REVIEWER_SUPERSEDE_POLL_S` | `pr_reviewer.supersede_poll_s` | `30` | Seconds between in-step checks for a superseded head (clamped 0–600, `0` disables). Reads GitHub only when an event has hinted at a newer head for the PR (#258). |
