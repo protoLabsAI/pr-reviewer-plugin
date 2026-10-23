@@ -3810,22 +3810,56 @@ async def test_a_fix_beside_the_cited_line_is_cleared_by_re_verification_not_car
     assert (event["ran"], event["refuted"], event["cleared"]) == (True, 1, 1)
 
 
-async def test_a_confirmed_prior_on_untouched_code_is_not_re_drawn(tmp_path):
-    # #38 kept: nothing moved in the prior's file, and a verifier confirmed it — a re-check
-    # could only be one draw against another, so none is spent and the block holds.
+@pytest.mark.parametrize(
+    ("disposition", "ruling", "enabled", "clears", "rechecks"),
+    [
+        ("fixed", "refuted", True, True, True),
+        ("fixed", "confirmed", True, False, True),
+        ("fixed", "uncertain", True, False, True),
+        ("fixed", "", True, False, True),
+        ("fixed", "refuted", False, False, False),
+        ("open", "refuted", True, False, False),
+        ("refuted", "refuted", True, False, False),
+    ],
+)
+async def test_a_fixed_prior_on_untouched_code_requires_a_real_recheck(
+    tmp_path, disposition, ruling, enabled, clears, rechecks
+):
     gh = RoutedGH(
         pr_facts=facts(),
         reviews=[review_row(OLD_HEAD, "FAIL", state="CHANGES_REQUESTED", findings_json=json.dumps([A2A_MAJOR]), id=77)],
         compare=[{"filename": "other.ts", "patch": "@@ -1,2 +1,3 @@\n a\n+b\n c\n"}],
         files=f"{A2A_FILE}\nother.ts\n",
     )
-    report = report_with_dispositions([{"prior": f"{A2A_FILE}:371", "disposition": "fixed", "why": "resolved"}])
-    runner, calls = recheck_runner(report, verify_reply({**A2A_MAJOR, "verdict": "refuted"}))
-    d = make(tmp_path, cfg={"shadow_mode": False, "evidence_grounding": False}, gh=gh, runner=runner)
-    assert (await d.handle_pr_event("o/r", 1, HEAD, "synchronize")) == "reviewed:FAIL"  # carried debt (#260)
-    assert len(calls) == 1  # no re-check
-    assert gh.dismissed == []
-    assert "fixed — not proven" in gh.reviews_posted[0]["body"]
+    # These report-authored fields must never substitute for the independent verifier.
+    report = report_with_dispositions(
+        [
+            {
+                "prior": f"{A2A_FILE}:371",
+                "disposition": disposition,
+                "why": "resolved",
+                "verified": True,
+                "verdict": "refuted",
+            }
+        ]
+    )
+    runner, calls = recheck_runner(report, verify_reply({**A2A_MAJOR, "verdict": ruling}))
+    d = make(
+        tmp_path,
+        cfg={"shadow_mode": False, "evidence_grounding": False, "prior_recheck": enabled},
+        gh=gh,
+        runner=runner,
+    )
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "synchronize")) == ("reviewed:PASS" if clears else "reviewed:FAIL")
+    assert len(calls) == (2 if rechecks else 1)
+    body = gh.reviews_posted[0]["body"]
+    assert bool(gh.dismissed) is clears
+    assert bool(_record(body)) is not clears
+    if clears:
+        assert "fixed — not proven" not in body
+        assert "cleared by re-verification" in body
+    elif disposition == "fixed":
+        assert "fixed — not proven" in body
 
 
 async def test_a_refutation_on_a_line_the_delta_rewrote_drops_the_carried_row(tmp_path):

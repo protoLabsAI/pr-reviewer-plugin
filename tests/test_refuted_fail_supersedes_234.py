@@ -186,7 +186,10 @@ async def test_a_round_that_does_not_refute_the_major_with_evidence_leaves_the_f
     runner, calls = recheck_runner(report, VERIFIER_REFUTES)
     d = make(tmp_path, cfg=OWNER, gh=gh, runner=runner)
     await d.handle_summon("o/r", 1, "operator")
-    assert len(calls) == 1  # nothing disputed ⇒ #38 holds, no re-draw is spent
+    # #278 re-checks fixed claims even without a delta. This does not expand #234:
+    # only an evidenced refutation can supersede a standing FAIL on the same head.
+    fixed = any(row["disposition"] == "fixed" for row in dispositions)
+    assert len(calls) == (2 if fixed else 1)
     posted = gh.reviews_posted[-1]["body"]
     gh.reviews.append({"state": "COMMENTED", "body": posted, "id": 103})
 

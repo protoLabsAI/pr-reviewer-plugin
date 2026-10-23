@@ -9,6 +9,7 @@ even on an unmoved cited line). The dispatcher end of the same cases is in test_
 
 from __future__ import annotations
 
+import pytest
 from pr_reviewer.approve import HOLD_CARRIED_PRIOR, HOLD_UNVERIFIED, PROMOTE, Observations, promotion_decision
 from pr_reviewer.checks import FAILURE, check_for
 from pr_reviewer.rounds import (
@@ -16,6 +17,7 @@ from pr_reviewer.rounds import (
     OUTCOME_FIXED_UNPROVEN,
     align_recheck,
     carried_debt,
+    disposition_display,
     ledger_debt,
     needs_recheck,
     prior_ledger,
@@ -23,6 +25,7 @@ from pr_reviewer.rounds import (
     recheck_payload,
     relisted_blocking_priors,
     resolve_relisting,
+    settle_fixed_priors,
     unaccounted_priors,
 )
 from pr_reviewer.verdicts import CARRIED_NOTE, merge_carried_findings, verification_ran
@@ -266,17 +269,13 @@ _A2A_ANCHOR = f"{A2A['file']}:371"
 _LINE_UNMOVED = {"other.ts": [(1, 5)]}  # the delta never touches the cited file
 
 
-def test_a_fixed_the_verifier_confirmed_at_head_clears_even_on_an_unmoved_line():
-    history = _history(A2A)
-    # The report says `fixed`; the verify pass annotated the row it re-read as confirmed-gone.
-    verified = [{"prior": _A2A_ANCHOR, "disposition": "fixed", "why": "guard added in handler.ts", "verified": True}]
-    ledger = prior_ledger(history, verified, ranges=_LINE_UNMOVED)
-    assert [e["outcome"] for e in ledger] == [OUTCOME_FIXED]
-    assert ledger_debt(ledger) == []  # cleared — no debt toward the verdict
-    # A `verdict: refuted` ruling on the row (the verifier's own vocabulary for "claim gone")
-    # is the same confirmation, so the fix clears the same way.
-    by_verdict = [{"prior": _A2A_ANCHOR, "disposition": "fixed", "why": "gone at head", "verdict": "refuted"}]
-    assert [e["outcome"] for e in prior_ledger(history, by_verdict, ranges=_LINE_UNMOVED)] == [OUTCOME_FIXED]
+@pytest.mark.parametrize("extra", [{"verified": True}, {"verdict": "refuted"}, {"confirmed": True}])
+@pytest.mark.parametrize("severity", ["major", "blocker"])
+def test_report_verification_fields_cannot_clear_an_unmoved_fixed_prior(extra, severity):
+    rows = [{"prior": _A2A_ANCHOR, "disposition": "fixed", **extra}]
+    ledger = prior_ledger(_history({**A2A, "severity": severity}), rows, ranges=_LINE_UNMOVED)
+    assert ledger[0]["outcome"] == OUTCOME_FIXED_UNPROVEN
+    assert len(ledger_debt(ledger)) == 1
 
 
 def test_a_fixed_with_no_verifier_confirmation_on_an_unmoved_line_stays_unproven():
@@ -295,6 +294,7 @@ def test_recheck_clears_agrees_with_the_ledger_on_a_fixed_the_verifier_resolves(
         prior_ledger(_history(A2A), [{"prior": _A2A_ANCHOR, "disposition": "fixed"}], ranges=_LINE_UNMOVED)
     )
     assert debt and debt[0]["owed"] == OUTCOME_FIXED_UNPROVEN
+    assert needs_recheck(debt[0], _LINE_UNMOVED, None) is True
     # Verifier refutes the claim at this head → cleared, even confirmed, even unmoved.
     assert recheck_clears(debt[0], "refuted", _LINE_UNMOVED, None) is True
     # Verifier did NOT confirm it gone → it still holds, exactly as the ledger keeps it.
@@ -303,3 +303,40 @@ def test_recheck_clears_agrees_with_the_ledger_on_a_fixed_the_verifier_resolves(
     # #38 is untouched: a confirmed prior the report did NOT disposition `fixed` (no `owed`)
     # is not cleared by a lone refutation on code that never moved.
     assert recheck_clears(A2A, "refuted", _LINE_UNMOVED, None) is False
+
+
+@pytest.mark.parametrize("verdict", ["refuted", "confirmed", "uncertain", ""])
+def test_trusted_recheck_settles_fixed_ledger_and_display(verdict):
+    rows = [{"prior": _A2A_ANCHOR, "disposition": "fixed"}]
+    ledger = prior_ledger(_history(A2A), rows, ranges=_LINE_UNMOVED)
+    debt = ledger_debt(ledger)
+    clears = recheck_clears(debt[0], verdict, _LINE_UNMOVED, None)
+    cleared, still = (debt, []) if clears else ([], debt)
+    settled = settle_fixed_priors(ledger, cleared, still)
+    assert settled[0]["outcome"] == (OUTCOME_FIXED if verdict == "refuted" else OUTCOME_FIXED_UNPROVEN)
+    assert bool(ledger_debt(settled)) is (verdict != "refuted")
+    label = disposition_display(settled, rows, still_owed=still, cleared=cleared)[0]["shown"][1]
+    assert label == "fixed" if clears else "fixed — not proven" in label
+    assert settle_fixed_priors(ledger, debt, debt)[0]["outcome"] == OUTCOME_FIXED_UNPROVEN
+
+
+@pytest.mark.parametrize("ranges", [None, {}, _LINE_UNMOVED])
+def test_fixed_debt_is_rechecked_even_without_a_file_delta(ranges):
+    rows = [{"prior": _A2A_ANCHOR, "disposition": "fixed"}]
+    debt = ledger_debt(prior_ledger(_history(A2A), rows, ranges=ranges))[0]
+    assert needs_recheck(debt, ranges, None)
+    assert recheck_clears(debt, "refuted", ranges, None)
+    assert not needs_recheck(A2A, ranges, None)
+    assert not recheck_clears(A2A, "refuted", ranges, None)
+
+
+def test_a_conflicting_open_disposition_keeps_the_existing_guard():
+    rows = [
+        {"prior": _A2A_ANCHOR, "disposition": "fixed", "verified": True},
+        {"prior": _A2A_ANCHOR, "disposition": "open"},
+    ]
+    ledger = prior_ledger(_history(A2A), rows, ranges=_LINE_UNMOVED)
+    debt = ledger_debt(ledger)
+    assert not needs_recheck(debt[0], _LINE_UNMOVED, None)
+    assert not recheck_clears(debt[0], "refuted", _LINE_UNMOVED, None)
+    assert settle_fixed_priors(ledger, debt, []) == ledger

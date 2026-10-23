@@ -145,6 +145,7 @@ from .rounds import (
     round_cap_reached,
     row_names,
     same_prior,
+    settle_fixed_priors,
     spent_rounds,
     superseded_fails,
     supersedes,
@@ -3903,10 +3904,10 @@ class Dispatcher:
         # explicit dispositions block the same debt is visible at any verdict. A recipe
         # that emits no block falls back to the narrower rule rather than losing the guard.
         dispositions = parse_dispositions(output) if self.hold_unexplained else []
-        # A `fixed` disposition is only honoured if the flagged line actually moved
+        # A `fixed` disposition initially clears only if the flagged line actually moved
         # (issue: protoAgent#2208 shipped a major to main on a hallucinated "fixed" that
         # left the line byte-identical). We need the delta prior-head→head to verify that.
-        # Fail-closed: an unreadable delta means `fixed` can't be verified, so it isn't trusted.
+        # Otherwise it stays debt unless the targeted verifier re-check below refutes it.
         ranges = None
         since_ranges = None
         if (dispositions or relistings) and prior:
@@ -3976,6 +3977,7 @@ class Dispatcher:
             round_number=round_number,
             disputed=disputed,
         )
+        ledger = settle_fixed_priors(ledger, rechecked_cleared, list(unaccounted) + list(deferred))
         # Prior minors the panel stopped raising on code the PR changed since — credited, not
         # silently dropped (#260). Needs the delta; read it only when such a minor exists.
         if (
