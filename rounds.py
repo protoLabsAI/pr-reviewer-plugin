@@ -712,7 +712,7 @@ def matches_group(finding: dict, group: dict) -> bool:
 DISPOSITION_FIXED = "fixed"
 DISPOSITION_REFUTED = "refuted"
 # What the gate did with a disposition — one state per prior (#260).
-OUTCOME_FIXED = "fixed"  # `fixed`, proven by the delta
+OUTCOME_FIXED = "fixed"  # `fixed`, proven by the delta or targeted re-verification
 OUTCOME_REFUTED = "refuted"  # `refuted`, honoured
 OUTCOME_OPEN = "open"
 OUTCOME_FIXED_UNPROVEN = "fixed-unproven"  # `fixed`, but the cited line did not move
@@ -733,11 +733,12 @@ def prior_ledger(
     """Every gating prior of the last substantive round, ONE entry per defect, with what this
     round's dispositions did to it: `{"prior", "rows", "outcome"}` (#260).
 
-    The rules are `unaccounted_priors`' (it is a view over this): `fixed` clears only when
-    the cited line moved since the prior was raised; `refuted` clears an `uncertain` or
-    never-verified prior, or one whose line moved (#218), and is otherwise NOT HONOURED
-    (#38); `open` never clears, and vetoes a clearing row that disagrees with it. Priors the
-    PR no longer changes, nearby notes, fabricated (ungrounded) and refuted ones are no debt."""
+    `fixed` clears here only when the cited line moved since the prior was raised.
+    Otherwise it stays fixed-unproven until the targeted verifier re-check resolves it
+    (`settle_fixed_priors`, #278). Disposition rows are untrusted report output, including
+    any extra verification fields. `refuted` clears an uncertain prior or one whose line
+    moved (#218), and is otherwise not honoured (#38). `open` vetoes clearing rows.
+    Priors outside the PR, nearby notes, ungrounded and refuted findings are no debt."""
     round_ = last_substantive_round(history)
     if round_ is None:
         return []
@@ -785,6 +786,22 @@ def prior_ledger(
 def ledger_debt(ledger: list[dict]) -> list[dict]:
     """The ledger's priors still owed — every entry whose outcome did not clear it."""
     return [{**e["prior"], "owed": e["outcome"]} for e in ledger if e["outcome"] not in _CLEARED_OUTCOMES]
+
+
+def settle_fixed_priors(ledger: list[dict], cleared: list[dict], still_owed: list[dict]) -> list[dict]:
+    """Apply this head's trusted re-check results, never report fields, to fixed debt (#278).
+
+    `cleared` comes from the dispatcher's targeted verifier pass. Keep all other ledger
+    outcomes, including open/conflicting dispositions, and any prior still carried.
+    """
+    return [
+        {**entry, "outcome": OUTCOME_FIXED}
+        if entry["outcome"] == OUTCOME_FIXED_UNPROVEN
+        and _in(entry["prior"], cleared)
+        and not _in(entry["prior"], still_owed)
+        else entry
+        for entry in ledger
+    ]
 
 
 def credited_minors(
@@ -1184,10 +1201,10 @@ def relisted_blocking_priors(findings: list[dict], history: list[dict]) -> tuple
 def needs_recheck(prior: dict, ranges, since_ranges, *, disputed: bool = False) -> bool:
     """Could a re-verification of this UNACCOUNTED prior change anything? Only when its
     refutation could be honoured (`recheck_clears`): the prior was never verifier-confirmed,
-    or its file moved since it was raised, or (#234) this same-head round DISPUTES it — see
-    `disputed_anchors`. Otherwise a confirmed prior on untouched code stays debt whatever
+    or its file moved since it was raised, or a fixed claim needs proof (#278), or (#234)
+    this same-head round DISPUTES it — see `disputed_anchors`. Otherwise a confirmed prior on untouched code stays debt whatever
     one more draw says (#38), so re-checking it would only spend a verify step."""
-    if disputed:
+    if disputed or str(prior.get("owed") or "") == OUTCOME_FIXED_UNPROVEN:
         return True
     return not _verifier_confirmed(prior) or prior_touched(prior, ranges, since_ranges, line_level=False) is True
 
@@ -1201,14 +1218,24 @@ def recheck_clears(prior: dict, verdict: str, ranges, since_ranges, *, disputed:
     protoAgent#3811's finding landed thirteen lines from the line it cited). A refutation of
     a verifier-confirmed finding on code that has not moved does not override it (#38).
 
-    `disputed` (#234) is the one exception to #38, and it is narrow: a re-review of the SAME
+    `disputed` (#234) is one exception to #38, and it is narrow: a re-review of the SAME
     head whose report refuted this prior WITH EVIDENCE (`disputed_anchors`), typically after
     the author posted counter-evidence. The verifier's refutation at this head is then a
     second, independent refutation, not a lone re-draw — and without it a FAIL on correct
-    code could only be cleared by a cosmetic push (mythxengine-sdk#409)."""
+    code could only be cleared by a cosmetic push (mythxengine-sdk#409).
+
+    #278 is the same shape from the other side, so the ledger and this verdict agree: a prior
+    the report dispositioned `fixed` whose cited line did not move (`OUTCOME_FIXED_UNPROVEN`,
+    carried as `owed`) clears when this head's verifier refutes it. The report's fix claim and
+    the verifier's independent "the claim no longer holds" agree, even though the fix landed
+    off the cited line (another file, a base update) — which `prior_touched` cannot see. It
+    stays narrow to a `fixed`-dispositioned prior: a lone refutation of a confirmed prior the
+    report did NOT call fixed is still #38 and does not override it."""
     if str(verdict or "").lower() != "refuted":
         return False
     if disputed:
+        return True
+    if str(prior.get("owed") or "") == OUTCOME_FIXED_UNPROVEN:
         return True
     return not _verifier_confirmed(prior) or prior_touched(prior, ranges, since_ranges, line_level=False) is True
 
