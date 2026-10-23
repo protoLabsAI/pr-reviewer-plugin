@@ -5809,9 +5809,9 @@ class Dispatcher:
         )
 
     async def _map_checks_for_promotion(self, repo: str, sha: str) -> str | None:
-        state = await self._checks_state(repo, sha)
-        # 'no-checks' is terminal but NEVER green for promotion (fails closed).
-        return "failed" if state == "no-checks" else state
+        # Preserve no-checks as a distinct hold: terminal for the QA check, but
+        # NEVER green for promotion (fails closed).
+        return await self._checks_state(repo, sha)
 
     # ── backfill: a first review for a PR no live event ever reached (issue #17) ──
 

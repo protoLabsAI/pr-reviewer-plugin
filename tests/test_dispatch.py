@@ -2280,7 +2280,7 @@ async def test_promotion_fails_closed_on_unreadable_checks_and_no_checks(tmp_pat
 
     gh2 = RoutedGH(pr_facts=facts(), reviews=[review_row(HEAD, "PASS")], checks=[])  # no checks at all
     d2 = make(tmp_path, cfg={"shadow_mode": False, "promotion_owner": True}, gh=gh2)
-    assert (await d2.evaluate_promotion("o/r", 1)) == "hold:checks-failed"
+    assert (await d2.evaluate_promotion("o/r", 1)) == "hold:no-checks"
 
 
 async def test_sweep_covers_open_prs(tmp_path):

@@ -28,6 +28,7 @@ PROMOTE = "promote"
 HOLD_CHECKS_PENDING = "hold:checks-pending"
 HOLD_CHECKS_FAILED = "hold:checks-failed"
 HOLD_CHECKS_UNKNOWN = "hold:checks-unknown"
+HOLD_NO_CHECKS = "hold:no-checks"
 HOLD_THREADS_UNRESOLVED = "hold:threads-unresolved"
 HOLD_THREADS_UNKNOWN = "hold:threads-unknown"
 HOLD_NO_CLEAR_VERDICT = "hold:no-clear-verdict"
@@ -45,7 +46,7 @@ class Observations:
     """Facts as observed RIGHT NOW; None always means 'could not read' (fails closed)."""
 
     head_sha: str  # the PR's current head
-    checks_state: str | None  # "green" | "pending" | "failed" | None (unreadable)
+    checks_state: str | None  # "green" | "pending" | "failed" | "no-checks" | None (unreadable)
     unresolved_threads: int | None  # count | None (unreadable)
     # Head SHA our latest CLEAR (non-blocking: PASS or WARN) verdict names; None = no
     # clear verdict. Quinn's semantics, kept: WARN explicitly "does NOT block merge" —
@@ -114,6 +115,8 @@ def promotion_decision(obs: Observations) -> str:
         return HOLD_CHECKS_UNKNOWN
     if obs.checks_state == "pending":
         return HOLD_CHECKS_PENDING
+    if obs.checks_state == "no-checks":
+        return HOLD_NO_CHECKS
     if obs.checks_state != "green":
         return HOLD_CHECKS_FAILED
     if obs.unresolved_threads is None:

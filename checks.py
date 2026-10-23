@@ -51,6 +51,7 @@ from .approve import (
     HOLD_CHECKS_PENDING,
     HOLD_CHECKS_UNKNOWN,
     HOLD_INCOMPLETE,
+    HOLD_NO_CHECKS,
     HOLD_NO_CLEAR_VERDICT,
     HOLD_ROUND_IN_FLIGHT,
     HOLD_STALE_HEAD,
@@ -268,6 +269,15 @@ def _check_for(
             "A finder did not run, so the clear verdict covers less than the whole diff. The "
             "review body names the lanes that did not complete. Auto-approve is withheld until "
             "a complete pass; the merge is not.",
+        )
+    if decision == HOLD_NO_CHECKS:
+        # No external CI can ever clear this hold. Like incomplete coverage (#130),
+        # withhold auto-approve without leaving the required QA check pending forever.
+        return CheckRun(
+            COMPLETED,
+            NEUTRAL,
+            "No CI configured — not blocking",
+            "No external CI checks were found for this head. Auto-approve is withheld; the merge is not.",
         )
     if decision in (HOLD_CHECKS_PENDING, HOLD_CHECKS_FAILED, HOLD_CHECKS_UNKNOWN):
         # CI's business. It already blocks the merge; the panel just hasn't cleared the

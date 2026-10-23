@@ -10,12 +10,14 @@ from __future__ import annotations
 
 import json
 
+import pytest
 from pr_reviewer.approve import (
     HOLD_ALREADY_PROMOTED,
     HOLD_CHECKS_FAILED,
     HOLD_CHECKS_PENDING,
     HOLD_CHECKS_UNKNOWN,
     HOLD_INCOMPLETE,
+    HOLD_NO_CHECKS,
     HOLD_NO_CLEAR_VERDICT,
     HOLD_STALE_HEAD,
     HOLD_THREADS_UNKNOWN,
@@ -177,18 +179,27 @@ async def test_our_own_check_is_not_a_check_we_wait_on(tmp_path):
     assert (await d.evaluate_promotion("o/r", 1)) == "promote"
 
 
-async def test_a_repo_whose_only_check_is_ours_still_never_promotes(tmp_path):
+@pytest.mark.parametrize("names", [[], [CHECK_NAME], [CHECK_NAME, "protoReview"]])
+async def test_a_checkless_repo_concludes_neutral_without_promoting(tmp_path, names):
     """Excluding ourselves must not manufacture a green: with our check filtered out
     there are NO checks, and a checkless head has never been promotable (it fails
     closed). The exclusion removes a deadlock, not the gate."""
     gh = ChecksGH(
         pr_facts=facts(),
         reviews=[review_row(HEAD, "PASS")],
-        checks=[{"status": "in_progress", "conclusion": None, "name": CHECK_NAME}],
+        checks=[{"status": "in_progress", "conclusion": None, "name": name} for name in names],
     )
     d = owned(tmp_path, gh)
     assert (await d._checks_state("o/r", HEAD)) == "no-checks"
-    assert (await d.evaluate_promotion("o/r", 1)) == "hold:checks-failed"
+    assert (await d.evaluate_promotion("o/r", 1)) == HOLD_NO_CHECKS
+    assert gh.reviews_posted == []
+    assert len(gh.writes) == 1
+    write = gh.writes[0]
+    assert write["name"] == CHECK_NAME and write["head_sha"] == HEAD
+    assert (write["status"], write["conclusion"]) == ("completed", "neutral")
+    assert "No CI" in write["output[title]"]
+    assert "auto-approve is withheld" in write["output[summary]"].lower()
+    assert "the merge is not" in write["output[summary]"]
 
 
 async def test_promotion_publishes_a_green_check_for_the_head(tmp_path):
@@ -430,3 +441,27 @@ def test_a_cleared_check_carries_no_hold_line():
     assert "Hold:" not in check_for(HOLD_ALREADY_PROMOTED).summary
     external = check_for(HOLD_THREADS_UNRESOLVED, unresolved=2, panel_unresolved=0)
     assert external.conclusion == "success" and "Hold:" not in external.summary
+
+
+@pytest.mark.parametrize(
+    "status, conclusion, decision",
+    [("in_progress", None, HOLD_CHECKS_PENDING), ("completed", "failure", HOLD_CHECKS_FAILED)],
+)
+async def test_real_ci_still_holds_the_check_in_progress(tmp_path, status, conclusion, decision):
+    gh = ChecksGH(
+        pr_facts=facts(),
+        reviews=[review_row(HEAD, "PASS")],
+        checks=[
+            {"status": "in_progress", "conclusion": None, "name": CHECK_NAME},
+            {"status": "in_progress", "conclusion": None, "name": "protoReview"},
+            {"status": status, "conclusion": conclusion, "name": "CI"},
+        ],
+    )
+    d = owned(tmp_path, gh)
+    assert (await d.evaluate_promotion("o/r", 1)) == decision
+    assert gh.reviews_posted == []
+    assert len(gh.writes) == 1
+    write = gh.writes[0]
+    assert write["status"] == "in_progress"
+    assert "conclusion" not in write
+    assert write["output[title]"] == "Waiting on CI"
