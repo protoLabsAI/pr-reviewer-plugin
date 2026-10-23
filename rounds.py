@@ -722,6 +722,22 @@ OUTCOME_NONE = "undispositioned"
 _CLEARED_OUTCOMES = (OUTCOME_FIXED, OUTCOME_REFUTED)
 
 
+def _fix_verified_at_head(row: dict) -> bool:
+    """Did the verify pass confirm, at the current head, that a `fixed` disposition's claim no
+    longer holds — the proof `_line_moved` cannot give when the cause was fixed OUTSIDE the
+    cited line (another file, or a base update)? (#278, protoLabsAI/protoAgent#4135, where an
+    unmoved cited line forced a hand merge past a FAIL.)
+
+    The report emits only `{prior, disposition, why}` (`parse_dispositions`); the verify pass
+    annotates the row it re-read with its ruling — an explicit `verified: true`, or a `verdict`
+    of `refuted` (the cited claim is gone at head). Either clears a `fixed` whatever the cited
+    line did. A plain `fixed` with no such confirmation stays unproven and keeps gating — the
+    hallucinated-`fixed` guard (#2208) is untouched."""
+    if row.get("verified") is True:
+        return True
+    return str(row.get("verdict") or "").lower() == "refuted"
+
+
 def prior_ledger(
     history: list[dict],
     dispositions: list[dict],
@@ -733,11 +749,13 @@ def prior_ledger(
     """Every gating prior of the last substantive round, ONE entry per defect, with what this
     round's dispositions did to it: `{"prior", "rows", "outcome"}` (#260).
 
-    The rules are `unaccounted_priors`' (it is a view over this): `fixed` clears only when
-    the cited line moved since the prior was raised; `refuted` clears an `uncertain` or
-    never-verified prior, or one whose line moved (#218), and is otherwise NOT HONOURED
-    (#38); `open` never clears, and vetoes a clearing row that disagrees with it. Priors the
-    PR no longer changes, nearby notes, fabricated (ungrounded) and refuted ones are no debt."""
+    The rules are `unaccounted_priors`' (it is a view over this): `fixed` clears when the
+    cited line moved since the prior was raised, OR the verify pass confirmed at this head that
+    the claim no longer holds (`_fix_verified_at_head`, #278) — a fix off the cited line still
+    clears; `refuted` clears an `uncertain` or never-verified prior, or one whose line moved
+    (#218), and is otherwise NOT HONOURED (#38); `open` never clears, and vetoes a clearing row
+    that disagrees with it. Priors the PR no longer changes, nearby notes, fabricated
+    (ungrounded) and refuted ones are no debt."""
     round_ = last_substantive_round(history)
     if round_ is None:
         return []
@@ -766,7 +784,7 @@ def prior_ledger(
             if d == "open":
                 outcomes.add(OUTCOME_OPEN)
             elif d == DISPOSITION_FIXED:
-                outcomes.add(OUTCOME_FIXED if moved else OUTCOME_FIXED_UNPROVEN)
+                outcomes.add(OUTCOME_FIXED if (moved or _fix_verified_at_head(r)) else OUTCOME_FIXED_UNPROVEN)
             elif d == DISPOSITION_REFUTED:
                 unconfirmed = str(prior.get("verdict") or "").lower() == "uncertain"
                 outcomes.add(OUTCOME_REFUTED if (unconfirmed or moved) else OUTCOME_NOT_HONOURED)
@@ -1205,10 +1223,20 @@ def recheck_clears(prior: dict, verdict: str, ranges, since_ranges, *, disputed:
     head whose report refuted this prior WITH EVIDENCE (`disputed_anchors`), typically after
     the author posted counter-evidence. The verifier's refutation at this head is then a
     second, independent refutation, not a lone re-draw — and without it a FAIL on correct
-    code could only be cleared by a cosmetic push (mythxengine-sdk#409)."""
+    code could only be cleared by a cosmetic push (mythxengine-sdk#409).
+
+    #278 is the same shape from the other side, so the ledger and this verdict agree: a prior
+    the report dispositioned `fixed` whose cited line did not move (`OUTCOME_FIXED_UNPROVEN`,
+    carried as `owed`) clears when this head's verifier refutes it. The report's fix claim and
+    the verifier's independent "the claim no longer holds" agree, even though the fix landed
+    off the cited line (another file, a base update) — which `prior_touched` cannot see. It
+    stays narrow to a `fixed`-dispositioned prior: a lone refutation of a confirmed prior the
+    report did NOT call fixed is still #38 and does not override it."""
     if str(verdict or "").lower() != "refuted":
         return False
     if disputed:
+        return True
+    if str(prior.get("owed") or "") == OUTCOME_FIXED_UNPROVEN:
         return True
     return not _verifier_confirmed(prior) or prior_touched(prior, ranges, since_ranges, line_level=False) is True
 

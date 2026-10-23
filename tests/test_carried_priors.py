@@ -2,8 +2,9 @@
 
 The pure layer of #218 (a fixed/refuted prior still carried, its carry note duplicated),
 #220's refinement (carried priors read as a verifier failure, so the head held at
-`hold:unverified` for good) and #232 ask 5 (a re-listed prior blocking a round on a line the
-delta had just rewritten). The dispatcher end of the same cases is in test_dispatch.py.
+`hold:unverified` for good), #232 ask 5 (a re-listed prior blocking a round on a line the
+delta had just rewritten) and #278 (a `fixed` the verifier confirms resolved at head clears
+even on an unmoved cited line). The dispatcher end of the same cases is in test_dispatch.py.
 """
 
 from __future__ import annotations
@@ -11,9 +12,13 @@ from __future__ import annotations
 from pr_reviewer.approve import HOLD_CARRIED_PRIOR, HOLD_UNVERIFIED, PROMOTE, Observations, promotion_decision
 from pr_reviewer.checks import FAILURE, check_for
 from pr_reviewer.rounds import (
+    OUTCOME_FIXED,
+    OUTCOME_FIXED_UNPROVEN,
     align_recheck,
     carried_debt,
+    ledger_debt,
     needs_recheck,
+    prior_ledger,
     recheck_clears,
     recheck_payload,
     relisted_blocking_priors,
@@ -251,3 +256,50 @@ def test_a_nearby_or_ungrounded_prior_is_not_a_ruling_to_inherit():
     for flag in ("nearby", "ungrounded"):
         _f, pairs = relisted_blocking_priors([F841_RELISTED], _history({**F841, flag: True}))
         assert pairs == []
+
+
+# ── #278: a `fixed` the verifier confirms resolved at head clears off the cited line ──────────
+# protoLabsAI/protoAgent#4135: the cause was fixed in ANOTHER file, so the cited line was
+# byte-identical and `fixed` read "fixed — not proven" forever — a hand merge past a FAIL.
+
+_A2A_ANCHOR = f"{A2A['file']}:371"
+_LINE_UNMOVED = {"other.ts": [(1, 5)]}  # the delta never touches the cited file
+
+
+def test_a_fixed_the_verifier_confirmed_at_head_clears_even_on_an_unmoved_line():
+    history = _history(A2A)
+    # The report says `fixed`; the verify pass annotated the row it re-read as confirmed-gone.
+    verified = [{"prior": _A2A_ANCHOR, "disposition": "fixed", "why": "guard added in handler.ts", "verified": True}]
+    ledger = prior_ledger(history, verified, ranges=_LINE_UNMOVED)
+    assert [e["outcome"] for e in ledger] == [OUTCOME_FIXED]
+    assert ledger_debt(ledger) == []  # cleared — no debt toward the verdict
+    # A `verdict: refuted` ruling on the row (the verifier's own vocabulary for "claim gone")
+    # is the same confirmation, so the fix clears the same way.
+    by_verdict = [{"prior": _A2A_ANCHOR, "disposition": "fixed", "why": "gone at head", "verdict": "refuted"}]
+    assert [e["outcome"] for e in prior_ledger(history, by_verdict, ranges=_LINE_UNMOVED)] == [OUTCOME_FIXED]
+
+
+def test_a_fixed_with_no_verifier_confirmation_on_an_unmoved_line_stays_unproven():
+    # The #2208 hallucinated-`fixed` guard is untouched: an unproven fix keeps gating.
+    history = _history(A2A)
+    plain = [{"prior": _A2A_ANCHOR, "disposition": "fixed", "why": "looks resolved to me"}]
+    ledger = prior_ledger(history, plain, ranges=_LINE_UNMOVED)
+    assert [e["outcome"] for e in ledger] == [OUTCOME_FIXED_UNPROVEN]
+    assert [p["line"] for p in ledger_debt(ledger)] == [371]  # still debt
+
+
+def test_recheck_clears_agrees_with_the_ledger_on_a_fixed_the_verifier_resolves():
+    # The ledger emits a fixed-unproven prior as debt stamped `owed`; recheck_clears reads the
+    # same fact, so the re-verification and the ledger agree the fix landed.
+    debt = ledger_debt(
+        prior_ledger(_history(A2A), [{"prior": _A2A_ANCHOR, "disposition": "fixed"}], ranges=_LINE_UNMOVED)
+    )
+    assert debt and debt[0]["owed"] == OUTCOME_FIXED_UNPROVEN
+    # Verifier refutes the claim at this head → cleared, even confirmed, even unmoved.
+    assert recheck_clears(debt[0], "refuted", _LINE_UNMOVED, None) is True
+    # Verifier did NOT confirm it gone → it still holds, exactly as the ledger keeps it.
+    assert recheck_clears(debt[0], "confirmed", _LINE_UNMOVED, None) is False
+    assert recheck_clears(debt[0], "uncertain", _LINE_UNMOVED, None) is False
+    # #38 is untouched: a confirmed prior the report did NOT disposition `fixed` (no `owed`)
+    # is not cleared by a lone refutation on code that never moved.
+    assert recheck_clears(A2A, "refuted", _LINE_UNMOVED, None) is False
