@@ -117,6 +117,12 @@ seeded verify step), before being re-asserted. A `refuted` clears the prior. A r
 re-verified on a line the delta changed never blocks: it is carried as debt, and promotion holds
 `hold:carried-prior`.
 
+Some findings are about the PR's text, such as a title that misstates the version bump. Fixing
+the text never moves the cited code line, so the re-check is the only way such a finding clears.
+The verifier therefore receives the PR's current title and description as an untrusted
+`<pr_description>` block and checks a text claim against it. If the misstatement is gone, the
+finding is refuted, and a `fixed` disposition clears (#291).
+
 ## Coverage gaps
 
 An explicit `[]` means "looked, found nothing". No array at all means nothing reached that boundary.

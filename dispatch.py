@@ -84,6 +84,7 @@ from .grounding import (
     render_grounding_footnote,
     render_unreadable_footnote,
 )
+from .pr_description import render as render_pr_description
 from .protopatch import (
     STRUCTURAL_GAP_MARKERS,
     is_partial_output,
@@ -2075,7 +2076,7 @@ class Dispatcher:
                 f"repos/{repo}/pulls/{pr}",
                 "--jq",
                 "{head: .head.sha, base_ref: .base.ref, state: .state, merged: .merged, draft: .draft, locked: .locked, "
-                "changed_files: .changed_files, additions: .additions, deletions: .deletions, "
+                "changed_files: .changed_files, additions: .additions, deletions: .deletions, title: .title, body: .body, "
                 "author: .user.login, head_ref: .head.ref, head_repo: .head.repo.full_name, "
                 "base_sha: .base.sha, default_branch: .base.repo.default_branch}",
             ],
@@ -3521,6 +3522,11 @@ class Dispatcher:
             counter_block = await self._counter_evidence_block(repo, pr, head, facts, ours)
             if counter_block:
                 inputs["author_counter_evidence"] = counter_block
+        # The PR's text as it reads now (#291): a finding about the title or description is
+        # checked against it, so a corrected description can clear a `fixed-unproven` prior.
+        description_block = render_pr_description(facts.get("title"), facts.get("body"))
+        if description_block:
+            inputs["pr_description"] = description_block
         # Claims this repo already refuted (#207), for the synthesizer to mark rather than
         # the verifier to re-check. `pr_ranges` is what decides, after the run, whether a
         # mark holds; None (no memory, or an unreadable diff) ⇒ no mark can hold.

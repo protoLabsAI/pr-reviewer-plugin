@@ -35,6 +35,7 @@ def test_recipe_shape():
         "base_ref",
         "refuted_before",
         "author_counter_evidence",
+        "pr_description",
         "existing_threads",
         "review_scope",
     }
