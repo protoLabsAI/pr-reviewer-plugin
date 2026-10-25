@@ -1,676 +1,84 @@
 # pr-reviewer-plugin
 
-The deterministic half of protoAgent's PR-review QA tier
-([ADR 0078](https://github.com/protoLabsAI/protoAgent/blob/main/docs/adr/0078-fleet-pr-review-qa-tier.md)).
+A **protoAgent plugin** that reviews pull requests the way a careful second engineer would,
+and can hold the merge button until it is satisfied. It is the deterministic half of
+protoAgent's PR-review QA tier ([ADR 0078](https://github.com/protoLabsAI/protoAgent/blob/main/docs/adr/0078-fleet-pr-review-qa-tier.md),
+findings contract [ADR 0077](https://github.com/protoLabsAI/protoAgent/blob/main/docs/adr/0077-adversarial-code-review-workflow.md)).
 
-## What it ships (Phase B2)
+A GitHub App delivers PR events to this plugin. For each one it runs a **five-finder
+review panel** (four LLM finders plus a non-LLM structural engine, [protoPatch](https://github.com/protoLabsAI/protoPatch)),
+dedups and ranks the findings, **independently verifies** each one, checks the claims
+against the actual code, and posts a verdict: `PASS`, `WARN` or `FAIL`. Optionally it then
+approves and arms auto-merge when everything is green.
 
-- **`protopatch_review`** — runs the [protoPatch](https://github.com/protoLabsAI/protoPatch)
-  (`clawpatch`) structural analysis engine over a pull request and returns its findings
-  in the ADR 0077 findings contract with `source: "protopatch"`.
-  - Head/base SHAs resolved **server-side** from the PR (never model-supplied refs).
-  - A content-addressed checkout cache: blobless partial clones (`--filter=blob:none`)
-    keyed on `repo@headSha`, 1h TTL, LRU `prune()` under entry/byte caps.
-  - `clawpatch init` + `map` into a per-review state dir, then `clawpatch review --provider gateway
-    --json --state-dir <per-review> --feature-list <plan> --jobs <n>` under a hard wall-clock budget
-    (SIGKILL past it). `structural_plan: false` restores the old single
-    `clawpatch ci … --since <baseSha>` run (the rollback switch; also the fallback when `map` fails).
-  - **The plugin plans the features (#232).** `ci --since` reviews every feature that owns a changed
-    file *or lists one as context*, and clawpatch's Python mapper lists `pyproject.toml` as context of
-    every Python feature: a one-line version bump on protoAgent planned 276 of 361 features and could
-    not finish at any budget. Now a lockfile, generated file, changelog fragment or dependency
-    manifest (`uv.lock`, `package-lock.json`, `pnpm-lock.yaml`, `THIRD_PARTY_LICENSES.md`,
-    `changelog.d/`, `pyproject.toml`, `package.json`, `Cargo.toml`, `requirements*.txt`, …) never
-    pulls a feature in as context (its findings are confined to the diff anyway); the remaining
-    features are ranked by changed lines in files they own, then in their context files, and at most
-    `structural_max_features` (default 16; `0` = no cap) are reviewed. **Features the cap leaves out
-    are a coverage gap**, never a silent drop: the pass comes back partial (`N of M features
-    reviewed — feature cap reached …`, `structural_reason: feature-cap`), the round is incomplete and
-    the verdict capped at WARN. Every pass writes a `structural_plan` telemetry event: features
-    mapped / eligible / selected / dropped / out of scope, and per planned feature its owned and
-    context changed lines, file count, prompt size, `elapsed_s` and how it ended (`finished`,
-    `error`, `killed` = in flight at the kill, `not-started`), so an over-planned pass can be told
-    from a hang without the container log.
-  - **Concurrency is capped (#221).** `structural_jobs` (default 4) is clawpatch's `--jobs`. Left
-    alone clawpatch reviews about half the host's cores of features at once (max 10) — each a
-    50-115k-token prompt — so one big PR floods the model lane's KV cache and everything on it
-    times out. 95% of passes have ≤ 3 features and are untouched by 4. A pass takes
-    `ceil(features / jobs)` waves, so if you lower it raise `time_budget_s` too. `0` = no `--jobs`
-    (clawpatch's own default): the rollback switch. Values above 10 are clamped; a mistyped value
-    falls back to the default with a warning.
-  - **One state dir per review (#223).** Each pass runs clawpatch with its own state dir under
-    the repo's (`<state_root>/<owner-name>/scratch/<head>-<id>`), so concurrent reviews of one repo
-    can no longer fail each other's feature claims (`exit 7`, `feature locked`), one PR's findings
-    can no longer surface on another that touches the same file, and a redeploy that kills a run
-    leaves no lock behind. A successful pass deletes its dir; a failed one keeps it for a
-    postmortem and it is pruned after 6 h (and at startup). What should persist stays in the repo's
-    own dir: `refuted.json` and `provider-failures/` (captures of unusable model replies).
-  - Findings read from that state dir, confined to the PR's changed files,
-    severity mapped (critical/high/medium/low → blocker/major/minor/nit), category
-    preserved verbatim.
-  - **Every failure degrades** (`PROTOPATCH UNAVAILABLE` + a prescribed Gap line) —
-    a starved structural pass must never void the panel review (ADR 0078 D3).
-  - **A cut-short pass keeps what finished (#205).** When the budget kills the pass or a feature
-    errors, but at least one claimed feature had already finished, the findings those features wrote
-    come back as a **partial** result (`PROTOPATCH PARTIAL`, header `protoPatch structural pass partial
-    on …`, and a `Gap: structural pass partial — N of M features reviewed — <reason>` line) instead of
-    being thrown away with the whole pass. It is still a lane gap: the round is incomplete and the
-    verdict stays capped at WARN, so a pass that covered less never reads as a clean PASS; the
-    telemetry row carries `structural_partial: true` (and the usual `structural_reason`) but NOT
-    `structural_unavailable`, which means the lane delivered nothing (#274) — count a structural gap as
-    either flag. The banner says `structural pass cut short`, not `unavailable`. With nothing
-    finished it is the outage it always was. The scratch state dir of a partial pass is kept for a
-    postmortem like any failed pass.
-  - **Every structural gap has a class.** The `reviewed` row's `structural_reason` is never empty
-    when the lane did not deliver a full pass: `budget-timeout`, `feature-cap`, `not-installed`,
-    `no-credentials`, `checkout`, `exit-N` (exit 4 refined into `exit-4:gateway-timeout`,
-    `exit-4:gateway-<status>` or `exit-4:provider`), `no-output:max-turns` / `no-output` (the relay
-    model looped on the tool until max_turns, or answered without calling it — no Gap line and no
-    findings array), and `unclassified`. For `unclassified` and `no-output*` the row also carries
-    `structural_detail`: what the lane said, ≤160 chars, URLs, paths and secrets scrubbed.
-  - **Lint-rule claims are checked with the repo's own linter (#232).** A finding whose claim cites a
-    ruff rule code (F841, E501, …) on a `.py`/`.pyi` file is run past the ruff version the repo's
-    `.github/workflows/*.yml` pin (`ruff==X.Y.Z`, `ruff@X.Y.Z`, or ruff-action's `version:`), with
-    `--select <code>` on that file in the checkout. If ruff reports no such diagnostic at (±3 lines
-    of) the cited line, about the name the claim cites, the finding is dropped and the header says
-    so (protoAgent#4017 r1: F841 on a tuple-unpack target, which F841 never flags). Each version is
-    pip-installed once (`--only-binary=:all: --no-deps`, exact digits-and-dots version) into
-    `~/.protoagent/pr-reviewer/tools/ruff/`. Both subprocesses get a token-free environment, ruff
-    runs with `--no-cache`, and the check is bounded by `lint_check_budget_s` (90). No pin, two
-    different pins, no line, a failed install, a ruff error or a timeout leave the finding as it
-    was. `lint_check: false` turns it off.
-- **`structural-finder`** — the subagent seat: calls the tool once, relays the findings
-  verbatim, reports the Gap on unavailability. A relay, not a reviewer.
-- **`workflows/code-review-structural.yaml`** — the five-finder panel recipe: the four
-  core LLM finders + the structural seat → dedup/rank → independent verify → report.
-  protoPatch findings get the same adversarial verify as everything else — the edge
-  over wiring the engine straight into a verdict.
+## What you get
 
-Phase C shipped the deterministic loop around the panel: webhook chokepoint,
-structural-trigger dispatch, approve-on-green + sweep, and the review eval.
+- **A panel, not a prompt.** Four parallel LLM finders and a structural pass feed one
+  dedup → verify → report pipeline. See [overview](docs/overview.md).
+- **Findings that are checked, not trusted.** Quoted code must exist, "no test" claims are
+  grepped, lint-rule claims are re-run, out-of-diff findings are dropped.
+  See [verdicts and precision guards](docs/verdicts.md).
+- **A review loop with an exit.** Prior requests are remembered and low-severity churn
+  converges to a pass. See [verdicts](docs/verdicts.md#convergence).
+- **Enforceable checks.** `QA panel` and `protoReview` check runs a ruleset can require, so
+  an unreviewed merge shows up as red. See [checks](docs/checks.md).
+- **Approve-on-green.** A complete, verified, current PASS with green CI and no open threads
+  is approved and queued for squash auto-merge. See [promotion](docs/promotion.md).
+- **Comment commands.** `@vera review`, `pause`, `resume`, `help`. See [usage](docs/usage.md).
+- **Shadow mode by default.** It ships disabled, and when enabled it only comments until you
+  say otherwise.
 
-- **In-diff confinement (v0.4.0)** — parsed findings whose `file` isn't one of the
-  PR's changed paths are dropped server-side before the verdict mapping (telemetered,
-  footnoted in the posted body). The panel prompts promise in-diff discipline; the
-  dispatcher now enforces it. Fails open when the changed-path list is unreadable —
-  a failed GitHub read must never launder a FAIL into a PASS.
-- **Structural scoping (#232)** — confinement's line-level step, for `source: protopatch`
-  findings only. protoPatch reviews whole features, so on a touched file it also reports code
-  that was already there (protoAgent#4017: seven findings in a file whose only hunk was a
-  comment). A structural finding outside the PR's changed lines (±5) — and, in a Python file,
-  outside every function those lines sit in — is a **nearby note**: listed in the body, flagged
-  `nearby: true` in the findings record, left out of the verdict, and never carried as a prior
-  debt. It fails closed (the finding gates as before) on no line, an unreadable patch or head
-  file, a file without a patch, or Python that does not parse. The LLM lanes are not scoped: they
-  read the diff itself, so a line they cite outside a hunk is usually the change's consequence.
-  protoPatch anchors a multi-location finding at a location the PR changed when it has one.
-- **Existing-thread awareness (v0.5.0)** — the dispatcher fetches the PR's inline
-  review threads (Quinn's, CodeRabbit's, humans'), renders them as one escaped
-  `<pr_review_threads>` data block (closing-tag neutralization, login-grammar
-  validation, body truncation), and passes it as the `existing_threads` recipe
-  input; finders suppress candidates that overlap a live thread. Unreadable
-  threads degrade to "(none)" — awareness never blocks a review.
-- **Re-review convergence (v0.8.0)** — a review loop now has an exit. Three parts,
-  all in `rounds.py` (issue #23; the case was projectBoard-plugin#88, eight rounds
-  on a small store fix where the panel kept reviewing changes it had itself demanded):
-  - **Rounds, not reviews.** Recall reads the PR's *panel rounds*. A promotion body
-    carries our marker and no findings, so taking the newest marker-bearing review as
-    "the prior review" meant that after any approve-on-green the next round recalled
-    an empty `prior_findings` and silently re-reviewed **cold**. A re-gate's verbatim
-    re-post no longer double-counts a head either.
-  - **Prior-request memory** — every round's findings ride along as one escaped
-    `<prior_requests>` block plus `review_round`. A finder can see that the line it is
-    about to flag exists *because the panel asked for it*: it verifies the change was
-    implemented correctly instead of re-litigating it as unexplained new scope. A
-    wrong, partial or defect-introducing fix is still a finding.
-  - **The exit rule** — from round 3 (`PR_REVIEWER_CONVERGENCE_ROUNDS`), a **WARN**
-    whose findings are *all* minor/nit **and** *all* anchored to lines that moved since
-    the previous reviewed head becomes **PASS with notes**: the findings still post, as
-    a follow-up checklist, they just stop holding the verdict. Fails closed in every
-    direction — a FAIL never converges, an uncertain major never converges, a finding
-    on code the review never touched never converges, and an unreadable compare grants
-    no relief at all.
+> **Undrafting a PR is the act of shipping it.** On a watched repo, marking a PR ready for
+> review hands it to the panel, and a current, complete PASS can arm squash auto-merge.
+> Keep a PR in draft until it is ready to land. Draft PRs are skipped and can never promote.
+> The full contract, including every guard a PASS must clear, is in [promotion](docs/promotion.md).
 
-- **Unexplained-clearance hold (v0.9.0)** — a zero-finding PASS is the highest-consequence
-  verdict this machinery posts: it dismisses our own `REQUEST_CHANGES` and clears the
-  promotion path. On protoAgent#2141 the panel confirmed a major on one head, returned
-  PASS with zero findings on the next with the code unchanged, and the defect merged 44
-  seconds later. A miss cannot be caught the way a hallucination can — there is no claim
-  to re-ground, and `findings=0` reads identically whether the code is clean or nobody
-  looked — so the rule is structural: a blocker/major that *disappears* without being
-  fixed, carried, or refuted is treated as unproven, and the block stays up. The verdict
-  still posts, names the dropped finding, and a **second consecutive** clean PASS lifts
-  the block automatically (two independent draws are evidence; one is a coin flip).
+## Quick start
 
-- **Evidence grounding (v0.10.0)** — the verify pass exists to kill plausible-but-wrong
-  findings, and twice on 2026-07-22 it did the opposite: it *confirmed* claims about code
-  that isn't in the file, escalating one to a blocker on a head where the operator had
-  already posted the refuting blob **and** a passing test asserting the behaviour. The
-  panel wasn't missing the evidence, it was discounting evidence in view — which is why
-  this is code and not only prompt discipline (the `confine_findings` lesson, applied to
-  the evidence itself). A finding whose quoted code appears nowhere in the cited file at
-  the reviewed head, nor in this PR's patch for it, is annotated `uncertain`; nothing is
-  ever dropped, and `verdict_for` already refuses to turn `uncertain` into a FAIL.
-  Fail-open throughout — unreadable blob, no quotable evidence, or any one quote that
-  matches, and the finding stands. It catches the fabricated-quote class; a finding that
-  quotes real code and reasons wrongly about it (a prefix that doesn't actually match) is
-  the verify prompt's half.
-  Since issue #261 the quotes come from the finding's **evidence** (the claim's only when the
-  evidence quotes nothing), with any suggested fix cut off first ("Fix: … e.g. `…`", "should
-  be `…`", "replace `a` with `b`" keeps `a`): grounding a proposed replacement downgraded a true
-  finding. Before a quote is called missing it is also looked for in the files the evidence
-  names (read at head) and in the rest of the PR's patch. A grounded finding's `line` is
-  re-anchored to where its evidence starts in the file (`line_original` keeps the panel's), in
-  the posted record as well, so carried priors and nearby scoping use the real location.
-- **No review after merge (issue #261)** — at the synthesize/verify step boundary and again
-  just before posting, a round re-reads the PR; if it was merged or closed meanwhile, nothing
-  is posted, the round's `protoReview` run is concluded neutral, and telemetry records
-  `superseded` with `superseded: merged|closed` (`drop:superseded-merged`). An unreadable PR
-  posts as before.
+```bash
+python -m server plugin install https://github.com/protoLabsAI/pr-reviewer-plugin --ref main
+npm i -g @protolabsai/protopatch     # the structural engine (clawpatch)
+```
 
-- **A `confirmed` must rest on a search or a quote (issue #259)** — an audit of 34 findings
-  from Vera's v0.54–v0.56.1 reviews found 10 false, 9 of them `confirmed`, in two classes the
-  verify step reads instead of tests. Two post-verify checks demote such a finding to
-  `uncertain` (never dropped, footnoted, written into the posted findings record):
-  - **Absence claims are searched** ("no test", "dead", "never called", "not covered", "no
-    `x.py` exists"). The claim's backticked subjects and the cited module are grepped
-    (`git grep`, bounded by `absence_search_budget_s`, 120) in a checkout of the head: the
-    structural pass's own cache entry when there is one, else a blobless clone into the same
-    cache (`absence_search_clone: false` skips the clone). A reference in another test file,
-    a non-definition use, or the named file existing refutes the claim; a search that could
-    not run leaves a `confirmed` absence `uncertain`. A dead local or field (no definition to
-    anchor on) and a code-shape absence ("without validation") are not searched.
-  - **Evidence guard.** A confirmed note that quotes no code and restates the claim, or that
-    asserts what a library the repo declares in `pyproject.toml` / `requirements*.txt` /
-    `package.json` does ("DuckDB's parser classifies DESCRIBE…") without quoting its source,
-    docs or a run of it.
-  The labelled audit set is `tests/fixtures/audit_259.json`; `tests/test_precision_259.py`
-  scores the checks on it (confirmed findings 32 with 9 false → 25 with 2 false; no true
-  finding demoted).
+Installing does not enable it. Create a GitHub App, point its webhook at your agent, then
+enable **PR reviewer** in **Settings → Plugins**:
 
-- **Prior-finding dispositions (v0.11.0)** — the general form of the clearance hold. The
-  report pass must state, per prior **blocker/major**, whether it was `fixed` (naming the
-  change), is still `open`, or was `refuted` (on evidence). A confirmed major that simply
-  stops being mentioned holds any standing block, **whatever the new verdict is** — the
-  v0.9.0 rule could only guard a zero-finding PASS, because silence there is unambiguous,
-  and protoAgent#2150 showed a major vanishing into a WARN about unrelated nits instead.
-  The two guards are a **fallback chain**: when dispositions are present they are the
-  authority (re-applying the clean-PASS heuristic on top would hold a block the panel just
-  explained); a recipe that emits no block keeps the narrower v0.9.0 rule.
-  A carried prior is also **cleared by the delta** (v0.49.0, issue #196): when the lines
-  it flagged moved since it was raised and every code quote in it is absent from the file
-  at the reviewed head *and* the PR's patch, it was fixed — the same read grounding applies
-  to a fresh finding, and stronger than a `fixed` the model asserts. Fail-closed on an
-  unreadable delta or file, and on a prior that quotes nothing checkable.
+```yaml
+# config/langgraph-config.yaml
+plugins:
+  enabled: [github, pr-reviewer]
 
-- **Panel latency work (v0.12.0)** — the five finders are one parallel stage, but the
-  host's `subagent_max_concurrency` defaults to **4**, so the stage silently ran as
-  **4+1** and paid the slowest finder twice. Measured over 60 reviews: the five-finder
-  recipe's p50 was **458s** against **322s** for the otherwise-identical four-finder one,
-  which solves to ~136s per finder and ~186s for the sequential tail. The recipe now
-  declares `max_concurrency: 5` (needs protoAgent#2168; an older host ignores it). The
-  dispatcher also records the engine's per-step `timings`, and the eval report shows a
-  p50 per step plus a slowest-step histogram — "the panel is slow" was never an
-  actionable number across nine steps.
+pr_reviewer:
+  repos: [my-org/my-repo]     # empty = every repo the App installation covers
+  shadow_mode: true           # verdicts post as comments only; flip to false to formally block
+  viewer_login: "my-reviewer[bot]"
+```
 
-- **A promoted WARN carries its findings (v0.13.0)** — approve-on-green promotes WARN by
-  design (a WARN "does NOT block merge"), so a confirmed finding could land and the PR
-  read **APPROVED** thirty seconds later with the finding having no consumer at all; that
-  is how projectBoard-plugin#80 shipped a malformed-label defect. The approval body now
-  restates the open findings and the marker gains `findings=N`, so merge tooling can gate
-  on "approved WITH findings" without parsing prose. Deliberately **not** a block:
-  making WARN gate would have hard-blocked a correct PR on the hallucinated blocker this
-  panel produced twice in one night — gate rigidity must not outrun verdict reliability.
-  The promotion path also now reads panel *rounds* rather than `ours[-1]`, which could be
-  our own promotion body (marker-bearing, findings-free) — the same shadowing #24 fixed
-  for delta recall.
+Secrets (`webhook_secret`, `app_private_key`) go in Settings, which routes them to the
+untracked secrets overlay. Step-by-step setup, App permissions and events, and a smoke test
+are in [install](docs/install.md).
 
-- **On-demand review (v0.15.0, slice 1 of #28)** — `@vera review` in a PR comment runs the
-  panel now. Every review before this was triggered by a push or the sweep, so the cheapest
-  way to ask a question about a PR was to alter the artifact you were asking about — and a
-  refutation of a wrong finding had nowhere to go (protoAgent#2138: the operator posted a
-  blob citation *and* a passing test, and nothing consumed either).
-  - **Admin only, resolved server-side** via the collaborator-permission API — never from
-    the payload's `author_association`, which is caller-supplied. Fails closed. The gate is
-    about cost: a summon spends five subagents for 5–9 minutes.
-  - **A summon overrides the reaffirm short-circuit.** An unchanged head normally reaffirms
-    without re-spending the panel; `@vera review` on that head is precisely the "I think you
-    got this wrong" case, and reaffirming would answer with the answer under dispute.
-  - **A push mid-round stops the old round (#245).** A `synchronize` that arrives while a
-    panel runs on an older head is dropped `in-flight`, but it tells the running round to
-    check. At its next step boundary (and always before synthesize and verify), the round
-    reads the PR's head. If the head has moved, the round cancels its attempt, posts
-    **nothing**, concludes its `protoReview` run `neutral` ("Superseded"), records
-    `superseded cancelled=true`, and hands its slot straight to the new head. The new head is
-    admitted before the old slot is released, so there is never a moment with nothing in
-    flight for promotion to slip into. An unreadable head cancels nothing.
-    The hint also arms an in-step poll (`supersede_poll_s`, default 30s, `0` disables), so
-    a round deep in a long finder stops within one interval rather than at the next step
-    boundary. Without a hint for a different head it makes no GitHub reads (#258).
-  - **One panel per PR, the backfill included (#258).** The sweep's backfill consults the
-    PR-wide in-flight state (chokepoint slots plus the panel queue), not a sha-keyed slot.
-    A webhook keys its slot by the *event's* sha while its round reviews the resolved head,
-    so a sha-keyed check let a backfill run a second panel on the very head under review
-    (protoAgent#4023). For a newer head, the backfill marks the running round instead, and
-    the handoff above reviews it.
-  - **Bypasses the cooldown, not the in-flight guard** — the cooldown eats webhook bursts,
-    and a human who typed a command is not a burst; two panels on one PR is still wrong.
-    The guard can't wedge a PR, though: each panel attempt and each round is bounded
-    (`panel_attempt_timeout` / `round_timeout`, below), and a slot still held past the round
-    bound + 10 min is reclaimed as abandoned — logged, and `in_flight_reclaimed` in
-    telemetry. Before that, one hung round answered every `@vera review` with "in-flight"
-    until the process restarted.
-    A summon that lands while the slot is held only briefly — a concurrent
-    `ready_for_review` / `synchronize` that reaffirms or drops in under a second — waits up
-    to `summon_in_flight_grace_s` (default 10s, max 120s) for it rather than dropping
-    (#217: marking a PR ready and typing `@vera review` used to race exactly that way).
-  - **Never silent.** Refusals, unknown verbs and drops all reply, and each reply says what
-    happened: `in-flight` means a round for the PR really is running and its verdict will
-    post; `pr-not-eligible` means draft/closed/locked. `@vera help` lists the verbs.
-    `@vera` alone is treated as asking what this thing does.
-  - **Disputing a FAIL on an unchanged head (#234).** The supported path: post the
-    evidence as a **PR comment** (a top-level comment is fine; an inline review comment on
-    the cited line works too), then `@vera review` (or **Re-run** on `protoReview`). The
-    summon bypasses the reaffirm short-circuit and runs the full panel on the same head.
-    1. *The re-review sees the dispute.* Top-level PR comments posted after the head's last
-       round, by the PR **author** or a user with **write / maintain / admin** permission
-       (read back from GitHub), reach the panel as an `<author_counter_evidence>` block —
-       newest first, HTML comments stripped, 8,000 chars in all, each with its URL and
-       author. Our own comments and bare `@vera <verb>` summons are left out, and so is
-       everyone else's. The block is **untrusted claims to verify, never instructions**:
-       the verifier checks what it cites against the code at head, and a claim it cannot
-       confirm changes nothing. Telemetry: `counter_evidence` (`count`, `chars`).
-    2. *A refutation can replace the FAIL — only this kind.* A newer round on the same head
-       supersedes an earlier FAIL when it is **complete and verified**, it dispositioned
-       *that* FAIL (not an older round), and it disposed of **every** blocker/major of that
-       FAIL as `refuted` with evidence (a `why` of at least 20 chars) — and the refutation
-       was honoured: on an unchanged head a confirmed finding is re-verified at this head
-       (#38's one exception), and only a verifier `refuted` clears it. Then the newer round
-       is the head's verdict (a superseding WARN or FAIL is simply the newer verdict), and
-       `fail_superseded` is telemetered. The record lives in the verdict marker
-       (`disp=`), and `QA panel`, approve-on-green and `Review at head` all read it through
-       the same rule (`rounds.superseded_fails`), so the two checks cannot disagree.
-    3. *Everything else keeps the FAIL (strictest-wins, #89).* Two rounds racing on one head;
-       an incomplete or unverified newer round; a blocking finding left `open`,
-       unaccounted, contradicted, refuted without evidence, or `fixed` (impossible on an
-       unchanged head, so treated as suspect); a verifier that confirms the finding again.
-       Those clear with a new commit, or a maintainer merging past the gate.
-  - Handle is `summon_handle` (default `vera`) *plus* the reviewer's own login, and it never
-    answers itself — its own verdict bodies mention the handle.
-  - **`pause` / `resume` (v0.17.0)** — stop reviewing a PR on push while it is being
-    reworked; an explicit `@vera review` still runs, because "stop reviewing every push"
-    and "never look at this again" are different requests. State rides in a marker on a
-    posted comment, so GitHub is the store (ADR 0078 D5) and a restart cannot forget it.
-    The **last** marker wins, not a tally — pause → resume → pause ends paused.
-  - ⚠️ **Requires GitHub App events.** A summon arrives as `issue_comment` (and, for
-    inline replies, `pull_request_review_comment`). An App subscribed only to
-    `pull_request` — as ours was when this shipped — makes every summon vanish with no
-    error at all: correct code, no event. `GET /api/plugins/pr-reviewer/summon/health`
-    reports exactly which events are missing.
+## Documentation
 
-- **Replay mode (v0.18.0)** — run the panel against a **pinned checkout+diff**, findings
-  to JSON instead of GitHub, for the model A/B (qaEngineer#20, protoLab#26). Same finders,
-  verify pass, and guards as the live path (it reuses the exact functions, not a fork);
-  the model is a per-run gateway alias (`protolabs/fast` vs `protolabs/smart`) — that's the
-  entire A/B knob. **Side-effect-free**: reads blobs/diffs, never writes. Truncation is
-  first-class — a model that burns its budget on hidden reasoning and emits no answer
-  (`findings=[] & truncated=true`) is distinguished from a clean pass (an emitted `[]`), so
-  a truncated run isn't scored as "found nothing". `python -m pr_reviewer.replay_cli
-  --manifest replay_manifest.jsonl --model protolabs/fast`.
+Everything lives in [`docs/`](docs/README.md):
 
-- **Findings render as a table (v0.19.0)** — the posted review shows a scannable
-  severity-sorted markdown table (severity · location · finding · verified) instead of a
-  raw JSON dump. The machine-readable JSON is kept in a collapsed `<details>` — prior-round
-  recall reads it back out of the body, so it can't be removed. A clean pass (`[]`) or a
-  prose-only report is left untouched.
-
-- **Absent is not empty; a blind lane is not a clean pass (issues #113, #117)** — an
-  explicit `[]` means "looked, found nothing"; *no array at all* means nothing reached that
-  boundary. Both used to parse as `[]`, so a lost payload posted PASS with "the review came
-  back clean" (#113), and a PASS over one real lane of five was promoted and merged (#117).
-  - **An absent payload is an incomplete round, never a verdict.** If no finder lane
-    delivered a findings array (a timeout Gap, a `PROTOPATCH UNAVAILABLE` relay, or a
-    `FINDER_STATUS: blocked` lane is not a delivery), or the synthesize step or the final
-    report emitted none, the panel is re-run (`panel_retries`); if it still delivers
-    nothing it ends like an exhausted panel — no review posted, `protoReview` red ("QA
-    panel incomplete — no verdict"), the operator escalated, an `exhaustion` event with
-    `undelivered: [...]`, and the sweep's backfill retries the head later. A missing
-    `FINDER_STATUS` line alone never voids a lane: that is a coverage gap, below.
-  - **A coverage gap caps a clean PASS at WARN.** Any lane the engine timed out, any LLM
-    finder that did not declare `FINDER_STATUS: reviewed`, or a structural relay that was
-    unavailable or cut short: `complete=false` (promotion holds, as before), a
-    code-authored **coverage line above the brief** naming each lane and why (it
-    supersedes any claim of full coverage in the model-written brief), no "came back
-    clean" line, and PASS posted as **WARN** (`coverage_capped` in telemetry). Not FAIL
-    and not "no verdict": a gap means the review covered less, not that the code is bad,
-    and the structural lane gaps on most large protoAgent reviews today (#119). Lanes are
-    judged only where the recipe ran them under that contract — the small-diff
-    `code-review` recipe has no structural seat and asks for no status line.
-  - **A verify step that hands nothing back on a clean round is a gap too (#151).** With
-    findings, a dead verifier already shows (nothing is annotated → `verified=false`).
-    With none it could not: "nothing to check" and "stopped at its preamble" looked the
-    same, and the round posted "came back clean" above a report saying the verifier never
-    ran. Now a zero-finding round whose `verify` output carries no fenced array and no
-    `VERIFY_STATUS` line names `verify` in the coverage line and posts WARN
-    (`verify_undelivered` in telemetry). `complete` stays true — every finder covered the
-    diff — and the round is not retried: nothing went unverified.
-
-## The draft → ready contract — undrafting a PR is the act of shipping it
-
-On a repository this plugin watches, a PR's **draft** state is its merge gate. Read
-this before you mark a PR ready for review.
-
-- **Draft PRs are skipped by the panel.** A PR in the draft state is dropped before
-  the panel runs — the same eligibility gate that skips a closed or a locked
-  conversation (telemetered `pr-not-eligible`, `why=draft`). No review is posted, no
-  verdict is produced, and nothing can promote while the PR stays draft.
-- **Marking a PR ready for review hands it to the QA pipeline.** The draft→ready
-  transition is a review trigger: on a watched, `main`-targeting PR the panel runs,
-  and once it posts a **current, complete PASS** and the promotion guards are all
-  green, approve-on-green posts a formal APPROVE **and arms native GitHub squash
-  auto-merge** (`gh pr merge --auto --squash`). Arming is best-effort and scoped to
-  `main`-targeting PRs (stacked PRs are excluded); a repo with auto-merge disabled
-  simply declines.
-
-So the practical contract is: **undraft a PR only when it is ready to ship, not when
-you merely want eyes on it.** The moment the panel is satisfied, an eligible
-ready-for-review PR with a promoted current PASS lands on its own.
-
-### A PASS does not bypass the guards
-
-Auto-merge is armed only when a clear PASS/WARN verdict clears **every** fail-closed
-guard in `promotion_decision` — approve-on-green is exactly as conservative as the
-panel, and a PASS is not a skeleton key past any of these:
-
-- this agent **owns promotion** for the repo and is **not in shadow mode**;
-- a **clear verdict** (PASS or WARN) exists for the PR's **current head SHA** — a
-  verdict for a superseded head is **stale** and holds (`hold:stale-head`), so a PASS
-  never lands a commit the panel never saw;
-- that verdict has **not already been promoted** (per-head dedup);
-- **no panel round for the PR is still running or queued** (`hold:round-in-flight`,
-  #217) — the clear verdict is the newest *finished* round, and a round still running on
-  the same head (a summon, a check re-run) may FAIL it. The `QA panel` check reads
-  *"Re-review in progress"* meanwhile. The converse is handled when that round posts: a
-  FAIL withdraws (dismisses) our earlier approval, writes `QA panel` red and turns off
-  GitHub auto-merge on the PR (#235, escalated if GitHub refuses) at once, rather
-  than leaving an APPROVED review and a green check standing beside the FAIL until the
-  next sweep (which skips a PR that has gone back to draft);
-- the pass was **verified** (the verify pass ran) over **complete** coverage (every
-  finder lane delivered a full pass — none timed out, came back blocked or without its
-  status line, or found its structural engine down) — an incomplete pass is "nobody
-  looked", not "nothing there", and holds;
-- **CI is terminal-green** — checks unknown, pending, or failing all hold; and
-- there are **zero unresolved review threads**.
-
-Every unknown (unreadable checks, unreadable threads, no verdict) falls through to a
-typed hold and the sweep re-evaluates next pass. Even once armed, native GitHub
-auto-merge still waits on branch protection and required status checks (including
-`QA panel` / `protoReview` where required) before it merges — arming it is not
-merging it.
-
-### Holding a PR that is reviewed but must not ship yet
-
-There is no separate "reviewed but held" state today. If a PR is complete and wants
-scrutiny but must **not** land yet — it shares a file with another PR in flight, waits
-on a sibling landing first, a release window, or a coordinated rollout — **keep it in
-draft** (or do not undraft it) until that dependency or sequencing is resolved. A
-draft is skipped by the panel and can never promote, so draft is the safe hold:
-nothing arms auto-merge while the PR stays draft. Undraft only once it is genuinely
-clear to ship.
-
-## Requirements
-
-- protoAgent ≥ the version carrying the findings `source` field (see the manifest pin).
-- `git`, `gh` (authenticated, or `GITHUB_TOKEN`/`GH_TOKEN`), and the `clawpatch` CLI
-  (`npm i -g @protolabsai/protopatch`).
-- Gateway credentials in the host env: `GATEWAY_API_KEY` or `OPENAI_API_KEY`
-  (+ `OPENAI_BASE_URL` / `pr_reviewer.gateway_base_url` for a non-default gateway).
-
-## Config (env fallbacks)
-
-Every key below is resolved **live on each use** (v0.14.0, issue #11) through the host's
-`live_config` view — editing `repos` or flipping `shadow_mode` in Settings takes effect
-without a restart. They previously snapshotted at boot, so an operator saw *"config
-saved / reloaded"* and got a silent no-op; believing you are formal-blocking a repo you
-are not is the dangerous direction. (`cooldown_s` is the exception — the chokepoint owns
-in-flight state and can't be rebuilt per read.)
-
-The operator-tunable state reads **config first, env as a fallback** — the same
-posture as `webhook_secret`, for headless config-as-code deployments where the
-config volume is seed-once and can't be re-edited on an image roll. A config key
-present always wins; the env only fills an unset/empty key. Put these in the
-compose env (re-applied every roll) to keep the config volume disposable:
-
-| Env | Config key | Default | Notes |
-|---|---|---|---|
-| `PR_REVIEWER_REPOS` | `pr_reviewer.repos` | `[]` | Managed allowlist; comma/space/newline separated. Config wins only when non-empty (seed ships `repos: []` → env applies). |
-| `PR_REVIEWER_SHADOW_MODE` | `pr_reviewer.shadow_mode` | `true` | `1/true/yes/on` ⇒ shadow. A present config bool (incl. `false`) wins over the env. |
-| `PR_REVIEWER_PROMOTION_OWNER` | `pr_reviewer.promotion_owner` | `false` | Same tri-state semantics. |
-| `PR_REVIEWER_PANEL_RETRIES` | `pr_reviewer.panel_retries` | `1` | Re-runs of a recipe whose panel reported a failed step, before D3 escalation. `0` restores the old give-up-on-first-failure behaviour. |
-| `PR_REVIEWER_FINDER_TIMEOUT` | `pr_reviewer.finder_timeout_s` | recipe default (`900`) | Seconds each parallel finder may run before the engine degrades it to a Gap. **Calibrate it to your model** — just above the slow finders' p95 in the telemetry `step_s` — because a budget tuned on one lane silently truncates productive finders on a slower one (#93). Clamped a minute under `panel_attempt_timeout`. Needs protoAgent ≥ 0.170.0. |
-| `PR_REVIEWER_VERIFY_RERUNS` | `pr_reviewer.verify_reruns` | `1` | How many times a verifier that answered `nothing-to-verify` over a synthesis carrying findings is re-run **alone** — seeded with the finders' and synthesizer's outputs, seconds instead of a fresh panel (#167). A round that stays contradicted posts `verified=false` and holds, as before. `0` disables. Needs a host whose runner takes `seed_outputs` (protoAgent#3571); on an older host the contradiction is only counted (`verify-contradicted` telemetry). |
-| `PR_REVIEWER_PRIOR_RECHECK` | `pr_reviewer.prior_recheck` | `true` | Re-verify prior blocker/majors at the new head, **alone** (one seeded verify step), before they are re-asserted: a verdict-less re-listing of a prior, and an undispositioned prior that was never verified or whose file moved since it was raised (#218, #220, #232). A `refuted` there clears the prior; a re-listing nobody re-verified on a line the delta changed never blocks — it is carried as debt, and promotion holds `hold:carried-prior`. `false` carries priors as before. Needs a host whose runner takes `seed_outputs` (protoAgent#3571). |
-| `PR_REVIEWER_PANEL_ATTEMPT_TIMEOUT` | `pr_reviewer.panel_attempt_timeout` | `1800` | Seconds one panel attempt may run (hard ceiling **4200** — size it as `finder_timeout_s` + 900 for the tail steps). Only the finders carry a step timeout, so a hung verifier/synthesis step used to hang the round. Past the budget the attempt is cancelled and counts as failed: retried, then concluded on the PR as **"QA panel timed out"**. |
-| `PR_REVIEWER_ROUND_TIMEOUT` | `pr_reviewer.round_timeout` | every attempt + 600 | Backstop for a whole round (every attempt plus the GitHub calls around them). Defaults to `(panel_retries + 1) × panel_attempt_timeout + 600`, so it never cuts a legitimate retry short. |
-| `PR_REVIEWER_BACKFILL_PER_PASS` | `pr_reviewer.backfill_per_pass` | `2` | Reviews the sweep may backfill per pass, across all repos. `0` disables backfill. |
-| `PR_REVIEWER_SUPERSEDE_POLL_S` | `pr_reviewer.supersede_poll_s` | `30` | Seconds between in-step checks for a superseded head (clamped 0–600, `0` disables). Reads GitHub only when an event has hinted at a newer head for the PR (#258). |
-| `PR_REVIEWER_SUMMON_IN_FLIGHT_GRACE_S` | `pr_reviewer.summon_in_flight_grace_s` | `10` | Seconds a summon waits for the PR's in-flight slot before answering `in-flight` (clamped 0–120). Covers a concurrent webhook that reaffirms/drops in under a second; a running round still drops the summon. |
-| `PR_REVIEWER_SUMMON` | `pr_reviewer.summon` | `true` | The comment-command surface (`@vera review` / `pause` / `resume` / `help`) **and** the pause check on the automated path. `false` costs nothing for a repo that never wants comment-driven behaviour. |
-| `PR_REVIEWER_EVIDENCE_GROUNDING` | `pr_reviewer.evidence_grounding` | `true` | A finding whose quoted code appears nowhere in the cited file at the reviewed head (nor in this PR's patch for it) is annotated `uncertain` — it still posts, it just can't carry a FAIL. Fails open on an unreadable blob or unquotable evidence. |
-| `PR_REVIEWER_ABSENCE_SEARCH` | `pr_reviewer.absence_search` | `true` | Grep the head checkout for what an absence claim ("no test", "dead", "never called", "no `x.py` exists") says is missing; a hit, or a search that could not run, leaves the finding `uncertain` (#259). Needs evidence grounding on. `absence_search_budget_s` (120) bounds it; `absence_search_clone: false` uses only a checkout the structural pass already made. |
-| `PR_REVIEWER_EVIDENCE_GUARD` | `pr_reviewer.evidence_guard` | `true` | A `confirmed` whose note restates the claim without quoting code, or asserts a declared dependency's behaviour without quoting its source/docs/a run, becomes `uncertain` (#259). Needs evidence grounding on. |
-| `PR_REVIEWER_HOLD_UNEXPLAINED_CLEARANCE` | `pr_reviewer.hold_unexplained_clearance` | `true` | A zero-finding PASS does not dismiss our standing block when a prior round confirmed a blocker/major it neither reports nor explains. A second consecutive clean PASS lifts it. `false` restores the old always-dismiss behaviour. |
-| `PR_REVIEWER_CONVERGENCE_ROUNDS` | `pr_reviewer.convergence_rounds` | `3` | The round from which an all-minor, all-in-delta WARN retires to PASS-with-notes. `0` disables the rule — the panel keeps re-reviewing rather than ever floor a minor. |
-| `PR_REVIEWER_QA_CHECK` | `pr_reviewer.qa_check` | `true` | Publish the **`QA panel` check run** (below). Rides the promotion-owner gate, so a shadow repo publishes nothing. `false` keeps approve-on-green without the check. |
-| `PR_REVIEWER_REGATE` | `pr_reviewer.regate` | `true` | Master switch for step 2 below. `false` stops arming blocks while KEEPING the formal seat, promotion and backfill — the lever to pull when the panel is emitting false FAILs. |
-| `PR_REVIEWER_EPIC_ATTESTATION` | `pr_reviewer.epic_attestation` | `true` | **Epic attestation** (below): an `epic/*` → default-branch PR is reviewed by its **residual** only — the commits no slice PR already reviewed. All commits attested ⇒ a PASS whose body is the attestation table, no panel. Any unreadable lookup ⇒ a full review, never an attested PASS. `false` reviews the whole epic diff. |
-
-### Epic attestation — an epic is not reviewed twice
-
-Large features land on long-lived `epic/*` branches: each slice PR (base `epic/<name>`) gets
-the full panel and is squash-merged into the epic. The epic → default-branch PR then carries
-the WHOLE epic diff, every line of which was already reviewed slice by slice. For a PR whose
-head is this repo's `epic/*` and whose base is the default branch, every commit on the epic's
-first-parent chain (`base..head`, read from a real checkout) is attributed:
-
-| Attribution | When | Reviewed again? |
-|---|---|---|
-| **slice** | the merge commit of a merged PR into this epic (`GET /commits/{sha}/pulls`, `merge_commit_sha` = the commit) whose strictest panel round at its final head is a **complete, verified PASS** — read from our own verdict markers exactly as the `QA panel` gate reads them. A WARN, an incomplete pass (the check's ⚪ neutral), an unverified pass or no verdict does not attest. A slice merged with a merge commit must also have merged its reviewed head cleanly. | no |
-| **sync** | a merge whose second parent is on the base branch and whose tree is exactly `git merge-tree --write-tree` of its parents — it adds nothing of its own | no |
-| **residual** | everything else: direct pushes, conflict-resolution merges, merges of any other branch, unattested slices | **yes** |
-
-- **Every commit attested** ⇒ a PASS is posted at the head through the normal verdict path (a
-  real marker, so `Review at head` and the `QA panel` gate see a verdict), its body the
-  attestation table: commit → slice PR → that PR's verdict. No panel runs. A standing FAIL
-  block from an earlier round on the epic PR is not dismissed by it.
-- **Some residual** ⇒ the structural panel runs with a `<review_scope>` block: the attested
-  commits (out of scope) and the residual commits' combined diff (a conflict merge contributes
-  only its resolution — the diff from git's automatic merge to what was committed). In-diff
-  confinement holds findings to the residual files, and the body lists what was attested and
-  what was reviewed. The protoPatch structural pass is scoped the same way (#273): it plans,
-  selects and confines its features from the residual files only, so the attested slices never
-  fill its feature cap. The scope is handed over server-side, keyed by the head SHA (the tool the
-  model calls carries only `pr`/`repo`); the `structural_plan` event records `scoped_paths`.
-- **Fails closed**: a `gh` read that fails, an unreadable slice history, a checkout or git
-  command that fails, or more than 300 commits ⇒ the normal full review. An `@vera review`
-  summon always reviews the whole PR.
-
-### The `QA panel` check run — the verdict as an enforceable gate
-
-An App's **approval never satisfies a required approving review**: GitHub counts
-approvals from reviewers with write access, and an App is not one (its reviews carry
-`author_association: NONE`). So on a repo that requires review, the panel could approve
-and the merge stayed `BLOCKED` — the verdict had no way to gate anything.
-
-A **check run** from the same App is a first-class required status, so the panel now
-publishes one, named **`QA panel`**, driven by the same decision as approve-on-green:
-
-| The panel's state | The check |
+| Start here | |
 |---|---|
-| Clear verdict, findings resolved (or already promoted) | ✅ success |
-| Findings still open — unresolved review threads | ❌ failure |
-| `FAIL` verdict standing against this head | ❌ failure |
-| A panel round is running on this head | ⏳ in progress — *"Panel reviewing this head"*, opened when the round starts; never over a run that already concluded (#268) |
-| No verdict yet / stale head | ⏳ in progress |
-| Clear verdict on an **incomplete pass** (a lane did not run) | ⚪ neutral — passes a required check; auto-approve still withheld until a complete pass (#130). The verdict is WARN-capped for the same gap (#117); the review body names the lanes |
-| CI pending, red, or unreadable | ⏳ in progress — CI already blocks; we don't say it twice |
-| PR closed or merged while the check was still in progress | ⚪ neutral — every wait above ends with the PR; a run that already concluded is left as it stands (#153) |
+| [install](docs/install.md) | Requirements, the GitHub App, webhook, enabling, smoke test |
+| [overview](docs/overview.md) | How a review happens, end to end |
+| [usage](docs/usage.md) | Comment commands, disputing a FAIL, the sweep |
+| [configuration](docs/configuration.md) | Every config key, default, env fallback |
+| [tools](docs/tools.md) · [api](docs/api.md) | Agent tools and HTTP routes |
 
-Note the WARN rule is unchanged: a WARN whose threads are all resolved goes **green**.
-What blocks is feedback nobody addressed.
+## Development
 
-**When it updates** (#268). A round that ends re-publishes the check as soon as its slots
-free — a PASS goes green in the same moment the review posts, not on the next sweep pass
-(which can be ~9 min away for a given PR). A FAIL writes the check itself, inline, so no
-refresh follows it. A review thread resolving or reopening refreshes it too (#111), and so
-does **another check on the head completing** (CI going green is half of approve-on-green)
-— that last one needs the App subscribed to **Check run** events. The sweep stays the
-backstop for anything a webhook misses.
-
-**To make it enforce**, add `QA panel` to the branch's required status checks (ruleset →
-*Require status checks to pass*). Everything inherits it — a human's PR, and
-projectBoard-plugin's auto-merge, which gates on `mergeStateStatus`.
-
-Requires the App installation to carry **Checks: read & write**; without it the write
-logs a warning naming that permission and the panel otherwise behaves as before. The
-check is written only where this agent owns promotion — a *required* check that nobody
-drives would block every merge in that repo forever.
-
-### The `protoReview` check run — verdicts you can require on every merge
-
-`QA panel` above answers *"is this head cleared for merge?"*, and only where this agent
-**owns promotion** — so a shadow deployment publishes nothing, and an **exhausted** panel
-(no verdict) leaves it sitting *in progress*, indistinguishable from a head still under
-review. That is exactly the gap that let **12 PRs merge unreviewed** in one deployment
-(lifetime 29): the verdict was an *advisory* GitHub review, and an exhausted panel that
-posts no review is indistinguishable from an approved one.
-
-**`protoReview`** closes it. It is a check run of a different kind — it tracks the
-**dispatch lifecycle itself**, not the promotion decision:
-
-| Moment | The check |
-|---|---|
-| Panel dispatched (past the drop/skip gates) | ⏳ in progress |
-| `PASS` / `WARN` verdict posted | ✅ success |
-| `FAIL` verdict posted | ❌ failure |
-| **Panel exhausted / crashed** (no verdict) | ❌ failure — *the key new signal* |
-| Panel delivered **no findings payload** — absent, not `[]` (no verdict) | ❌ failure |
-| Verdict produced but the post was refused | ❌ failure (not left dangling) |
-| Dropped (draft, closed, allowlist miss) | *no check — the panel never ran* |
-
-Because the **same review that opens the check also concludes it**, `protoReview` never
-dangles — so, unlike `QA panel`, it is published for **every** panel that runs regardless
-of shadow mode or promotion ownership, and is safe to require everywhere. Its `head_sha`
-is resolved **server-side** from the PR (never the webhook's ref), and the concluding
-`output.summary` carries the verdict text or the exhaustion reason.
-
-**To make it enforce**, add **`protoReview`** to the branch's required status checks
-(ruleset → *Require status checks to pass*). An exhausted panel then leaves a **red X**
-that blocks the merge, instead of the silence a merge would sail straight through — a
-human's PR and projectBoard-plugin's auto-merge (which gates on `mergeStateStatus`) alike.
-
-**Re-running it.** A red `protoReview` is cleared by pushing a fix (a new head re-triggers
-the panel), or by clicking **Re-run** on the check itself — GitHub delivers that as a
-`check_run` *rerequested* event, which re-runs the panel with the same force posture as a
-manual summon. That needs the App subscribed to the **`check_run`** event (like
-`issue_comment` for summons); without it the push path still works.
-
-**Clearing it by resolving the threads.** When the check reads *"N unresolved review
-threads"*, resolving them re-publishes the gate directly — GitHub delivers that as a
-`pull_request_review_thread` *resolved* event and the handler re-runs `evaluate_promotion`
-(a state re-read and a check publish; no panel, no model call). Re-opening a thread takes
-it back to red the same way.
-
-⚠️ **This needs the App subscribed to the `pull_request_review_thread` event.** Without it
-the check still asks you to resolve the threads and doing so will not clear it — the exact
-contradiction issue #111 was filed for, which cost protoAgent#3415 ten hours of stale red
-and burned board coder attempts against a signal no code change could fix.
-
-Requires the App installation to carry **Checks: read & write**. Without it the create
-logs a warning naming that permission and the whole lifecycle no-ops — the review still
-posts as before (bookkeeping must never cost the verdict).
-
-### `GET /api/plugins/pr-reviewer/queue` — panel throughput, at a glance
-
-All three panel paths — webhook dispatch, `@vera` summons / check re-requests, and the
-sweep's backfill — share one **`PanelQueue`** (limit = `max_concurrent_panels`). When every
-slot is busy the overflow **queues** rather than dropping, but until now the only signal was
-a best-effort `queued` telemetry event, so a waiting PR's `Review at head` read *"no QA panel
-verdict"* with nothing saying it was in line. This gated GET route (same auth as `/eval` and
-`/summon/health`) reports the queue from **in-memory state only — no GitHub, no network:**
-
-```jsonc
-{
-  "generated_at": 1727470000.0,
-  "limit": 3,
-  "running": [
-    { "repo": "o/r", "pr": 12, "head": "abc123…", "kind": "webhook",
-      "started_at": 1727469900.0, "elapsed_s": 100.0,
-      "attempt": 1, "phase": "verify", "model_retries": 0 }
-  ],
-  "queued": [
-    { "repo": "o/r", "pr": 15, "head": "def456…", "kind": "summon",
-      "enqueued_at": 1727469990.0, "position": 1, "eta_start_s": 45.0 }
-  ],
-  "depth": 1,
-  "p50_panel_s": 180.0,          // rolling, from recent completed rounds; null until there is data
-  "p90_panel_s": 300.0,
-  "gateway_degraded": false,     // placeholder until the gateway-telemetry card
-  "gateway_retry_rate_5m": null, // idem
-  "oldest_queued_s": 10.0
-}
-```
-
-- **`kind`** is `webhook` | `summon` | `sweep-backfill` | `verify-retry`. **`phase`** is the running step —
-  `finders` | `structural` | `verify` | `synthesize` | `posting` — updated as the panel
-  progresses (`posting` is the dispatcher writing the verdict after the runner returns).
-- **`position`** is the FIFO place in line (1 = next to start); **`depth`** is `len(queued)`.
-- **ETA.** `eta_start_s` for position *k* is the *k*-th smallest of `max(0, p50 − elapsed_s)`
-  across running panels, plus `(⌈k/limit⌉ − 1) × p50` for each later wave; it uses **p90 when
-  `gateway_degraded`**. All ETAs are **null until there is duration data**.
-
-**Per-PR lookup:** `GET /api/plugins/pr-reviewer/queue?repo=owner/name&pr=N` →
-
-```jsonc
-{ "state": "running" | "queued" | "idle",
-  "position": 1, "eta_start_s": 45.0, "eta_verdict_s": 225.0, "head": "def456…" }
-```
-
-`eta_verdict_s = eta_start_s + p50` (and both null without data); a `running` PR reports
-`eta_start_s: 0` with `eta_verdict_s` its estimated time-to-verdict, and an `idle` PR (neither
-running nor queued) reports nulls.
-
-### What the sweep does (every `sweep_interval_s`, default 180s)
-
-Each open PR in each managed repo is reconciled in this order — cheapest and most
-decisive first:
-
-1. **Backfill** — no verdict for the current head ⇒ review it. Dispatch actions only
-   fire for live webhook events, so a PR opened before the reviewer existed (or while
-   it was down, or whose panel exhausted) would otherwise hold `no-clear-verdict`
-   forever and never become promotable. Budgeted by `backfill_per_pass`.
-2. **Re-gate** — a FAIL standing against the current head that isn't blocking yet, now
-   that checks are terminal ⇒ post the stored verdict as `REQUEST_CHANGES`. A verdict
-   must decide its review event when the panel lands, and #863 forbids blocking against
-   pending CI, so a fast reviewer's FAIL posts as a comment and the gate never arms.
-   This is the mirror of the stale-block dismissal: that lifts a block, this arms one.
-3. **Promote** — the existing approve-on-green path. When it holds at `hold:unverified`
-   (the round's verifier flaked), the sweep runs **one** fresh round for that head on its
-   own — the same panel a `@vera review` summon runs, queued and budgeted like a backfill,
-   skipped on a paused PR. If that round is unverified too, it stops: the `QA panel` check
-   reads "Verifier failed twice — summon @vera review or push" and the operator is
-   escalated once (#220). Every held check names its `hold:*` reason in the summary.
-
-A PR that was just backfilled skips 2 and 3 for that pass; the fresh review posts its
-own verdict through the normal path and the next tick sees settled state.
-
-## Dev
-
-```
+```bash
 pip install -r requirements-dev.txt
-ruff check . && pytest -q
+ruff check . && ruff format --check . && pytest -q
 ```
 
-Host-free: the suite stubs `graph.subagents.config` and never shells out.
+The suite is host-free: it stubs `graph.*` and never shells out. Conventions for agents and
+contributors are in [PROTO.md](PROTO.md); layout and release notes in
+[development](docs/development.md).
 
-_Reviewed by its own machinery — see ADR 0078._
+_Reviewed by its own machinery. See ADR 0078._
