@@ -1,8 +1,8 @@
-"""The README documents the draft→ready lifecycle contract (issue #98).
+"""docs/promotion.md documents the draft→ready lifecycle contract (issue #98).
 
 Docs-as-code: undrafting a watched PR hands it to the QA panel, which arms native
 squash auto-merge on a promoted current PASS. That contract is nowhere in code to
-assert against, so we assert the README states it — and, crucially, that the wording
+assert against, so we assert the doc states it — and, crucially, that the wording
 does NOT imply a PASS bypasses the stale-head / completeness / CI / unresolved-thread
 guards `promotion_decision` enforces.
 """
@@ -13,11 +13,11 @@ import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-# Read at import, but a missing/unreadable README must FAIL the tests, not error the
+# Read at import, but a missing/unreadable doc must FAIL the tests, not error the
 # collection (#251): the error is kept in `_LOAD_ERROR`, which tests/conftest.py turns into
 # a failure of every test in this module.
 try:
-    README = (ROOT / "README.md").read_text()
+    README = (ROOT / "docs" / "promotion.md").read_text()
     _LOAD_ERROR: Exception | None = None
 except OSError as exc:
     README, _LOAD_ERROR = "", exc
