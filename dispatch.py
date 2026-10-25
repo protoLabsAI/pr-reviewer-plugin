@@ -387,6 +387,57 @@ def coverage_only_round(round_: dict) -> bool:
     )
 
 
+@contextlib.asynccontextmanager
+async def _review_session(key: str):
+    """Give every model call made inside this block ONE gateway session id (#286).
+
+    The protolabs gateway pins a request carrying `x-litellm-session-id` to the replica lane
+    that served that session's first request, so the panel's passes (they share one large PR
+    diff as a prompt prefix) stay on a lane whose prefix cache already holds it. The host
+    derives the id from the LangGraph `thread_id` or, failing that, the tracing session. A
+    workflow run started from a webhook has neither, so every pass went out with no id and
+    could land on either lane and re-prefill the diff.
+
+    `tracing.trace_session` sets that session contextvar even when Langfuse is off. A caller's
+    own session wins (a review run inside a chat turn keeps the turn's id), and a host without
+    `observability` (the test suite) runs the block unscoped: affinity is a latency
+    optimisation and must never fail or delay a review.
+    """
+    try:
+        from observability import tracing
+
+        if tracing.current_session_id():
+            scope = contextlib.nullcontext()
+        else:
+            scope = tracing.trace_session(key, name="pr-review", metadata={"review_session": key})
+    except Exception:  # noqa: BLE001 — optimisation only
+        scope = contextlib.nullcontext()
+    if hasattr(scope, "__aenter__"):
+        async with scope:
+            yield
+    else:
+        with scope:
+            yield
+
+
+def _in_review_session(runner, repo: str, pr: int, head: str):
+    """`runner`, with every call made inside one session keyed on repo + PR + head.
+
+    All passes of one head share the key, including retries, verify re-runs and the fallback
+    panel; a new push is a new head and gets a new id. Never per request or per pass: the
+    gateway needs the id stable to pin a lane. `functools.wraps` keeps the signature
+    visible, so `_accepts_keyword(runner, "seed_outputs" | "on_step")` still sees through it.
+    """
+    key = f"pr-review:{repo}#{pr}@{head}"
+
+    @functools.wraps(runner)
+    async def scoped(*args, **kwargs):
+        async with _review_session(key):
+            return await runner(*args, **kwargs)
+
+    return scoped
+
+
 def _accepts_keyword(fn, name: str) -> bool:
     """Does `fn` take keyword `name`? The host runner grew `seed_outputs` in
     protoAgent#3571; an older host's (and a test fake's) does not, and calling it so
@@ -3460,6 +3511,7 @@ class Dispatcher:
         if runner is None:
             self.telemetry.emit("drop", repo=repo, pr=pr, reason=DROP_NO_RUNNER, model_retries=self._round_retries())
             return f"drop:{DROP_NO_RUNNER}"
+        runner = _in_review_session(runner, repo, pr, head)
         self.telemetry.emit(
             "dispatch",
             repo=repo,
