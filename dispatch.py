@@ -170,6 +170,7 @@ from .verdicts import (
     demote_stale_findings,
     extract_brief,
     finder_completed,
+    format_stage_causes,
     lane_repo_violation,
     mark_nearby,
     mentions_any,
@@ -181,6 +182,7 @@ from .verdicts import (
     render_verdict_body,
     report_hard_stopped,
     restate_findings,
+    stage_causes,
     structural_relay_ok,
     undelivered_stages,
     verdict_for,
@@ -3613,8 +3615,10 @@ class Dispatcher:
         # whatever starved the stage), and a round that still delivers nothing ends with
         # NO verdict below — never one that reads as clean.
         undelivered: list[str] = []
+        per_attempt: list[list[dict]] = []
         for attempt in range(1, self.panel_retries + 2):
             last = attempt == self.panel_retries + 1
+            per_attempt.append([])  # Preserve attempt numbers when a runner crashes before returning.
             # Bounded: a hung attempt must end as a failed attempt (retried, then reported
             # on the PR), not hold the round — and with it the PR's slot — forever.
             attempt_bound = asyncio.timeout(self.panel_attempt_timeout_s)
@@ -3725,6 +3729,14 @@ class Dispatcher:
             )
             if not failed and not undelivered:
                 break
+            per_attempt[-1] = stage_causes(
+                steps_now,
+                str(result.get("output") or ""),
+                failed,
+                result.get("degraded"),
+                result.get("timings"),
+                unavailable_prefix=STRUCTURAL_GAP_MARKERS,
+            )
             if not last:
                 retry_why = {"failed": failed} if failed else {"undelivered": undelivered}
                 self.telemetry.emit(
@@ -3749,7 +3761,7 @@ class Dispatcher:
                 "QA panel exhausted — no verdict",
                 f"The review panel failed on head `{head[:12]}` after {self.panel_retries + 1} "
                 f"attempt(s) (step(s) {', '.join(str(s) for s in failed)}). No verdict was posted; "
-                f"push a fix to re-trigger the review.",
+                f"push a fix to re-trigger the review.\n\n{format_stage_causes(per_attempt)}",
             )
             await self._escalate(
                 f"pr-reviewer: panel step(s) {failed} failed on {repo}#{pr} "
@@ -3760,7 +3772,14 @@ class Dispatcher:
                 head_sha=head,
             )
             self.telemetry.emit(
-                "exhaustion", repo=repo, pr=pr, sha=head, failed=failed, attempts=self.panel_retries + 1, **size
+                "exhaustion",
+                repo=repo,
+                pr=pr,
+                sha=head,
+                failed=failed,
+                attempts=self.panel_retries + 1,
+                causes=per_attempt,
+                **size,
             )
             return "error:panel-exhausted"
         if undelivered:
@@ -3778,7 +3797,8 @@ class Dispatcher:
                 "QA panel incomplete — no verdict",
                 f"The review panel ran on head `{head[:12]}` but delivered no findings payload at "
                 f"stage(s) {stages} after {attempts} attempt(s). An absent payload is not a clean "
-                f"result, so no verdict was posted; push a fix or comment `@vera review` to re-trigger the review.",
+                f"result, so no verdict was posted; push a fix or comment `@vera review` to re-trigger the review.\n\n"
+                f"{format_stage_causes(per_attempt)}",
             )
             await self._escalate(
                 f"pr-reviewer: panel delivered no findings payload ({stages}) on {repo}#{pr} "
@@ -3796,6 +3816,7 @@ class Dispatcher:
                 failed=[],
                 undelivered=undelivered,
                 attempts=attempts,
+                causes=per_attempt,
                 **size,
             )
             return "error:panel-incomplete"
