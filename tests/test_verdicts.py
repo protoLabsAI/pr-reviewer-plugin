@@ -20,11 +20,13 @@ from pr_reviewer.verdicts import (
     extract_findings_json,
     finder_completed,
     findings_payload_present,
+    format_stage_causes,
     identifier_tokens,
     merge_carried_findings,
     parse_verdict_marker,
     render_verdict_body,
     report_hard_stopped,
+    stage_causes,
     structural_relay_ok,
     undelivered_stages,
     verdict_for,
@@ -740,6 +742,89 @@ def test_a_missing_status_line_alone_never_voids_a_lane():
 def test_a_partial_hard_stopped_lane_still_delivered_what_it_found():
     partial = "[review-finder hard-stopped at max_turns: w:find_a — PARTIAL output; unverified remainder is a Gap]\n\n```json\n[]\n```"
     assert undelivered_stages(HEALTHY, {"find_a": partial, "synthesize": HEALTHY}, [], UNAVAILABLE_PREFIX) == []
+
+
+# ── why a round carried no verdict (#289 ask 3) ─────────────────────────────────
+
+NO_ARRAY = "Let me read the files."  # non-blank, but no fenced findings array
+
+
+def test_a_degraded_stage_reads_as_a_timeout():
+    rows = stage_causes({"synthesize": ""}, HEALTHY, [], ["synthesize"], {"synthesize": 212})
+    assert rows == [{"stage": "synthesize", "cause": "timeout", "seconds": 212}]
+
+
+def test_a_promoted_critical_step_reads_as_a_timeout_not_a_bare_empty():
+    """A critical step the dispatcher promoted out of a degradation is failed with empty
+    output (the engine degrades a timed-out critical step to empty) — still a timeout."""
+    rows = stage_causes({"find_a": HEALTHY, "synthesize": HEALTHY}, "", ["report"], [], {"report": 4})
+    assert rows == [{"stage": "report", "cause": "timeout", "seconds": 4}]
+
+
+def test_a_blank_stage_reads_as_empty():
+    rows = stage_causes({"find_a": HEALTHY, "synthesize": ""}, HEALTHY, [], [], {})
+    assert rows == [{"stage": "synthesize", "cause": "empty", "seconds": None}]
+
+
+def test_a_stage_that_spoke_but_delivered_no_array_reads_as_no_array():
+    rows = stage_causes({"find_a": HEALTHY, "synthesize": NO_ARRAY}, HEALTHY, [], [], {})
+    assert rows == [{"stage": "synthesize", "cause": "no-array", "seconds": None}]
+
+
+def test_any_other_failed_step_reads_as_failed():
+    """A step that failed yet still delivered a findings array is the catch-all `failed`."""
+    rows = stage_causes({"find_a": HEALTHY}, HEALTHY, ["find_a"], [], {"find_a": 30})
+    assert rows == [{"stage": "find_a", "cause": "failed", "seconds": 30}]
+
+
+def test_seconds_come_from_timings_and_are_none_when_absent():
+    base = ({"synthesize": ""}, HEALTHY, [], ["synthesize"])
+    assert stage_causes(*base, {"synthesize": 212})[0]["seconds"] == 212
+    assert stage_causes(*base, {})[0]["seconds"] is None  # empty timings
+    assert stage_causes(*base, {"verify": 9})[0]["seconds"] is None  # missing this stage
+    assert stage_causes(*base, None)[0]["seconds"] is None  # no timings at all
+
+
+def test_the_undelivered_stages_line_up_with_undelivered_stages():
+    steps = {"find_a": NO_ARRAY, "find_b": NO_ARRAY, "synthesize": ""}
+    output = "Brief only, no JSON."
+    undelivered = undelivered_stages(output, steps, [], ())
+    rows = stage_causes(steps, output, [], [], {})
+    assert [row["stage"] for row in rows] == undelivered == ["finders", "synthesize", "report"]
+
+
+def test_an_undelivered_finders_aggregate_is_classified_from_its_lanes():
+    # A degraded lane makes the aggregate a timeout; otherwise all-blank is empty.
+    timed = stage_causes({"find_a": NO_ARRAY, "find_b": ""}, HEALTHY, [], ["find_b"], {})
+    assert timed == [{"stage": "finders", "cause": "timeout", "seconds": None}]
+    blank = stage_causes({"find_a": "", "find_b": ""}, HEALTHY, [], [], {})
+    assert blank == [{"stage": "finders", "cause": "empty", "seconds": None}]
+
+
+def test_format_stage_causes_renders_each_attempt_in_order():
+    per_attempt = [
+        [
+            {"stage": "synthesize", "cause": "no-array", "seconds": 212},
+            {"stage": "report", "cause": "empty", "seconds": 4},
+        ],
+        [{"stage": "finders", "cause": "timeout", "seconds": 900}],
+    ]
+    assert format_stage_causes(per_attempt) == (
+        "attempt 1: synthesize no-array (212s), report empty (4s); attempt 2: finders timeout (900s)"
+    )
+
+
+def test_format_stage_causes_omits_seconds_when_none_and_marks_an_empty_attempt():
+    rendered = format_stage_causes([[{"stage": "synthesize", "cause": "empty", "seconds": None}], []])
+    assert rendered == "attempt 1: synthesize empty; attempt 2: none"
+    assert "(" not in rendered
+
+
+def test_format_stage_causes_truncates_within_max_chars():
+    rows = [{"stage": f"find_{i}", "cause": "no-array", "seconds": i} for i in range(40)]
+    rendered = format_stage_causes([rows], max_chars=30)
+    assert len(rendered) <= 30
+    assert rendered.endswith("…")
 
 
 # ── a coverage gap caps a clean PASS (#117) ────────────────────────────────────

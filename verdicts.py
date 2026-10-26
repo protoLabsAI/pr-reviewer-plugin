@@ -791,6 +791,128 @@ def undelivered_stages(
     return stages
 
 
+# ── why a round carried no verdict (#289 ask 3) ─────────────────────────────────
+#
+# `undelivered_stages`/`failed` say WHICH boundaries a round died at; this says WHY, so an
+# exhausted or incomplete round is legible from the PR instead of an opaque "no verdict".
+# The critical panel steps a timed-out degradation is promoted INTO a FAILED step at
+# (dispatch's `panel_step_timeout`): the engine degrades such a step to empty output, so a
+# critical step that is failed-and-empty reads as the timeout it was, not a bare "empty".
+
+_CRITICAL_PANEL_STEPS = ("synthesize", "verify", "report")
+
+
+def _blank(text: object) -> bool:
+    return not str(text or "").strip()
+
+
+def _stage_order(stage: str) -> tuple[int, str]:
+    """Pipeline position, so causes read in the order the panel runs them: the finder
+    lanes (the `finders` aggregate first), then synthesize, verify, report, then anything
+    unrecognized last."""
+    if stage == "finders":
+        return (0, "")
+    if stage.startswith(FINDER_STEP_PREFIX):
+        return (1, stage)
+    return ({"synthesize": 2, "verify": 3, "report": 4}.get(stage, 5), stage)
+
+
+def _finders_cause(steps: dict, degraded: set[str]) -> str:
+    """The cause for an undelivered `finders` aggregate — no lane delivered a payload. A
+    timed-out (degraded) lane makes it a timeout; otherwise every lane blank is empty, and
+    a lane that said something but no array is no-array."""
+    lanes = [str(s) for s in steps if str(s).startswith(FINDER_STEP_PREFIX)]
+    if any(s in degraded for s in lanes):
+        return "timeout"
+    if all(_blank(steps.get(s)) for s in lanes):
+        return "empty"
+    return "no-array"
+
+
+def _cause_for(stage: str, text: str, failed: set[str], degraded: set[str]) -> str:
+    """Classify one stage, timeout first (it outranks the empty output a promoted timeout
+    leaves behind), then empty, then a delivered-but-arrayless output, then the catch-all."""
+    if stage in degraded:
+        return "timeout"
+    if stage in _CRITICAL_PANEL_STEPS and stage in failed and _blank(text):
+        return "timeout"
+    if _blank(text):
+        return "empty"
+    if not findings_payload_present(text):
+        return "no-array"
+    return "failed"
+
+
+def stage_causes(
+    steps: dict | None,
+    output: str,
+    failed: list[str] | None,
+    degraded: list[str] | None,
+    timings: dict | None,
+    *,
+    unavailable_prefix: str | tuple[str, ...] = (),
+) -> list[dict]:
+    """Why each failed or undelivered stage carried no payload, in pipeline order.
+
+    For every stage that `failed` OR that `undelivered_stages` reports absent, a
+    `{"stage", "cause", "seconds"}` row. The cause is one of:
+
+    - `timeout`: the stage is in `degraded`, or it is a critical panel step the dispatcher
+      promoted out of a degradation (synthesize/verify/report, now failed with empty output
+      — the engine degrades a timed-out critical step to empty, see dispatch);
+    - `empty`: the stage output is blank or whitespace only;
+    - `no-array`: the output is non-empty but delivered no findings array
+      (`findings_payload_present` is false);
+    - `failed`: any other failed step.
+
+    `report` is judged on `output`; `synthesize`/`verify`/finders read `steps`. `seconds`
+    is `timings[stage]` when present and None otherwise (a `{}` or missing `timings`, and
+    the `finders` aggregate, which has no single timing). Pure — no I/O; the undelivered
+    set lines up with `undelivered_stages` for the same input.
+    """
+    steps = steps or {}
+    failed_set = {str(s) for s in (failed or [])}
+    degraded_set = {str(s) for s in (degraded or [])}
+    timings = timings if isinstance(timings, dict) else {}
+    undelivered = undelivered_stages(output, steps, degraded, unavailable_prefix)
+
+    stages = sorted({*failed_set, *undelivered}, key=_stage_order)
+    rows: list[dict] = []
+    for stage in stages:
+        if stage == "finders":
+            cause = _finders_cause(steps, degraded_set)
+        elif stage == "report":
+            cause = _cause_for(stage, output, failed_set, degraded_set)
+        else:
+            cause = _cause_for(stage, str(steps.get(stage) or ""), failed_set, degraded_set)
+        rows.append({"stage": stage, "cause": cause, "seconds": timings.get(stage)})
+    return rows
+
+
+def _render_cause(row: dict) -> str:
+    base = f"{row['stage']} {row['cause']}"
+    seconds = row.get("seconds")
+    if seconds is None:
+        return base
+    return f"{base} ({seconds:g}s)"
+
+
+def format_stage_causes(per_attempt: list[list[dict]], max_chars: int = 500) -> str:
+    """Render each attempt's `stage_causes` rows into one line for the PR, e.g.
+    "attempt 1: synthesize no-array (212s), report empty (4s); attempt 2: …".
+
+    Seconds are omitted when None. The whole string stays within `max_chars`, truncated
+    with a trailing ellipsis when it would overflow."""
+    segments: list[str] = []
+    for i, attempt in enumerate(per_attempt or [], start=1):
+        parts = ", ".join(_render_cause(row) for row in (attempt or []))
+        segments.append(f"attempt {i}: {parts or 'none'}")
+    rendered = "; ".join(segments)
+    if len(rendered) > max_chars:
+        rendered = rendered[: max(0, max_chars - 1)].rstrip() + "…"
+    return rendered
+
+
 # ── a lane must read the repo it is BOUND to (#279) ─────────────────────────────
 #
 # A review round is pinned to one server-resolved `owner/repo` (the PR's). A finder that
