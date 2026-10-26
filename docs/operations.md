@@ -12,7 +12,7 @@ meet most:
 | `drop` | The event was not acted on. `reason` is typed: `bad-signature`, `not-a-pr-event`, `malformed-payload`, `pr-not-eligible` (with `why`), `in-flight`, `round-timeout`, `superseded-merged`, and others |
 | `reaffirm` / `reaffirm-diff` / `reaffirm-miss` / `reaffirm-recorded` | Head or diff unchanged; verdict carried without a panel, or the attempt declined |
 | `promotion` / `regate` | A promote or re-gate decision, with its `hold:*` |
-| `exhaustion` | Panel ended with no verdict. `undelivered: [...]` names lanes |
+| `exhaustion` | Panel ended with no verdict. `undelivered: [...]` names lanes. `causes` lists per-attempt arrays of `{stage, cause, seconds}`: cause is `timeout`, `empty`, `no-array`, or `failed`; seconds is null when the host supplies no timing (an attempt that crashed before returning has an empty array) |
 | `queued` / `superseded` | Queue wait; a round stood down for a newer head |
 | `structural_plan` | Per-pass feature plan and outcomes |
 | `counter_evidence` | `count`, `chars` of dispute comments passed to a re-review |

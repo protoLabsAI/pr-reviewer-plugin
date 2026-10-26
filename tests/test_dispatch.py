@@ -2152,6 +2152,87 @@ async def test_an_undelivered_synthesis_is_retried_then_posts_no_verdict(tmp_pat
     assert _events(tmp_path, "reviewed") == []
 
 
+@pytest.mark.parametrize("with_timings", [True, False])
+@pytest.mark.parametrize("final_failed", [True, False])
+async def test_no_verdict_causes_preserve_each_attempt(tmp_path, with_timings, final_failed):
+    """Both no-verdict exits retain earlier causes, including promoted critical timeouts."""
+    gh = _structural_gh()
+    incomplete = {
+        "output": "",
+        "steps": _panel_steps(synthesize="No findings array arrived"),
+        "failed": [],
+        "timings": {"synthesize": 212.0, "report": 4.0} if with_timings else {},
+    }
+    failed = {
+        "output": CLEAN_REPORT,
+        "steps": _panel_steps(verify=""),
+        "failed": ["find_crossfile"],
+        "degraded": ["verify"],
+        "timings": {"find_crossfile": 12.0, "verify": 90.0} if with_timings else {},
+    }
+    results = [incomplete, failed] if final_failed else [failed, incomplete]
+    pending = iter(results)
+
+    async def runner(name, inputs):
+        return next(pending)
+
+    d = make(tmp_path, gh=gh, runner=runner)
+    outcome = "exhausted" if final_failed else "incomplete"
+    assert await d.handle_pr_event("o/r", 1, HEAD, "opened") == f"error:panel-{outcome}"
+    assert gh.reviews_posted == []
+    patch = [w for w in gh.check_writes if w["method"] == "PATCH"][-1]
+    assert patch["conclusion"] == "failure"
+    assert patch["output[title]"] == f"QA panel {outcome} — no verdict"
+    incomplete_causes = [
+        {"stage": "synthesize", "cause": "no-array", "seconds": 212.0 if with_timings else None},
+        {"stage": "report", "cause": "empty", "seconds": 4.0 if with_timings else None},
+    ]
+    failed_causes = [
+        {"stage": "find_crossfile", "cause": "failed", "seconds": 12.0 if with_timings else None},
+        {"stage": "verify", "cause": "timeout", "seconds": 90.0 if with_timings else None},
+    ]
+    incomplete_text = (
+        "synthesize no-array (212s), report empty (4s)" if with_timings else "synthesize no-array, report empty"
+    )
+    failed_text = (
+        "find_crossfile failed (12s), verify timeout (90s)" if with_timings else "find_crossfile failed, verify timeout"
+    )
+    ordered_text = [incomplete_text, failed_text] if final_failed else [failed_text, incomplete_text]
+    assert patch["output[summary]"].endswith(f"attempt 1: {ordered_text[0]}; attempt 2: {ordered_text[1]}")
+    (event,) = _events(tmp_path, "exhaustion")
+    assert event["causes"] == (
+        [incomplete_causes, failed_causes] if final_failed else [failed_causes, incomplete_causes]
+    )
+    assert event["repo"] == "o/r" and event["pr"] == 1 and event["sha"] == HEAD
+    assert event["attempts"] == 2
+    assert event["failed"] == (["find_crossfile", "verify"] if final_failed else [])
+    if final_failed:
+        assert "undelivered" not in event
+    else:
+        assert event["undelivered"] == ["synthesize", "report"]
+
+
+async def test_no_verdict_causes_keep_attempt_numbers_after_a_crash(tmp_path):
+    gh = _structural_gh()
+    calls = 0
+
+    async def runner(name, inputs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("transient")
+        return {"output": "", "steps": _panel_steps(), "failed": [], "timings": {}}
+
+    d = make(tmp_path, gh=gh, runner=runner)
+    assert await d.handle_pr_event("o/r", 1, HEAD, "opened") == "error:panel-incomplete"
+    patch = [w for w in gh.check_writes if w["method"] == "PATCH"][-1]
+    assert patch["output[summary]"].endswith("attempt 1: none; attempt 2: report empty")
+    (event,) = _events(tmp_path, "exhaustion")
+    assert event["causes"] == [[], [{"stage": "report", "cause": "empty", "seconds": None}]]
+    assert event["attempts"] == calls == 2
+    assert gh.reviews_posted == []
+
+
 async def test_a_report_with_no_findings_array_is_not_a_clean_pass(tmp_path):
     """The final boundary, on a host result with no per-step outputs at all: parsing an
     absent array as `[]` would post a clean PASS."""
