@@ -63,6 +63,8 @@ never the main YAML.
 | `panel_attempt_timeout` | `1800` | `PR_REVIEWER_PANEL_ATTEMPT_TIMEOUT` | Budget for **one** panel attempt: the backstop for a hang outside the step timeouts. **Hard ceiling 4200**; a larger value is clamped with a warning naming the key. Size it as `finder_timeout_s` + 900 for the tail steps, or a slow finder leaves the tail no room. Past the budget the attempt counts as failed |
 | `round_timeout` | attempts + 600 | `PR_REVIEWER_ROUND_TIMEOUT` | Backstop for a whole round: `(panel_retries + 1) × panel_attempt_timeout + 600`. **Hard ceiling 9000** |
 | `backfill_per_pass` | `2` | `PR_REVIEWER_BACKFILL_PER_PASS` | Reviews the sweep may backfill per pass, across all repos. `0` disables backfill |
+| `exhaustion_backoff` | `900` | `PR_REVIEWER_EXHAUSTION_BACKOFF` | Seconds the sweep waits before backfilling a head whose panel just exhausted. Doubles with each further exhaustion of that head. A new head, a push or a summon is never held. `0` disables the backoff |
+| `exhaustion_backoff_max` | `14400` | `PR_REVIEWER_EXHAUSTION_BACKOFF_MAX` | Ceiling on that doubling backoff |
 | `sweep_interval_s` | `180` | | Sweep cadence |
 | `supersede_poll_s` | `30` | `PR_REVIEWER_SUPERSEDE_POLL_S` | Seconds between in-step checks for a superseded head (0 to 600; `0` disables) |
 | `summon_in_flight_grace_s` | `10` | `PR_REVIEWER_SUMMON_IN_FLIGHT_GRACE_S` | How long a summon waits for the in-flight slot before answering `in-flight` (0 to 120) |

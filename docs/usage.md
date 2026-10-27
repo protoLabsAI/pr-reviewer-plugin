@@ -109,7 +109,9 @@ and most decisive first:
    live events, so a PR opened before the reviewer existed, or while it was down, or whose panel
    exhausted, would otherwise hold `no-clear-verdict` forever. Budgeted by `backfill_per_pass`
    (default 2 across all repos). A backfill never starts a second panel on a PR that already has
-   one in flight; for a newer head it marks the running round instead.
+   one in flight; for a newer head it marks the running round instead. A head whose panel
+   exhausted is retried on a doubling backoff (`exhaustion_backoff`: 15 min, 30 min, 1 h, … up to
+   4 h), so a deterministic failure or a long outage does not re-run the panel every pass.
 2. **Re-gate.** A FAIL standing against the current head that is not blocking yet, now that checks
    are terminal, is posted as `REQUEST_CHANGES`. A verdict decides its review event when the panel
    lands, and blocking against pending CI is forbidden, so a fast reviewer's FAIL posts as a

@@ -202,6 +202,7 @@ DROP_VIEWER_UNKNOWN = "viewer-unknown"  # blind on our own IDENTITY — can't ru
 DROP_POST_REFUSED = "post-refused"  # GitHub keeps rejecting this verdict post (issue #78)
 DROP_ROUND_TIMEOUT = "round-timeout"  # a round outlived round_timeout_s and was cancelled
 DROP_SUPERSEDED = "superseded"  # the PR moved past this round's head mid-panel; cancelled (#245)
+DROP_EXHAUSTION_BACKOFF = "exhaustion-backoff"  # this head exhausted recently; backfill waits (#297)
 # The PR merged / was closed while the round ran (#261): nothing is posted, and there is no head
 # to hand the slot to. `drop:superseded-merged` / `drop:superseded-closed`.
 DROP_SUPERSEDED_MERGED = "superseded-merged"
@@ -1344,6 +1345,8 @@ class Dispatcher:
         self._post_failures: dict[str, int] = {}  # repo#pr@head -> NON-transient verdict-post refusals
         self._viewer_checked = False  # viewer_login vs our reviews' real author, warned once
         self._round_cap: dict[str, float] = {}  # repo#pr -> monotonic timestamp when capped
+        # repo#pr -> (head, exhaustions of that head, monotonic ts of the last one) (#297)
+        self._exhausted: dict[str, tuple[str, int, float]] = {}
         # Backfill panels the sweep started and did not wait for (`_detach_backfill`). Held
         # here so the tasks are not garbage-collected mid-run, and counted against
         # `backfill_per_pass` so successive passes cannot pile an unbounded queue onto the
@@ -1881,6 +1884,52 @@ class Dispatcher:
             if "max_rounds_cooldown" in cfg
             else _env_int("PR_REVIEWER_MAX_ROUNDS_COOLDOWN", 7200)
         )
+
+    @property
+    def exhaustion_backoff_s(self) -> int:
+        """Seconds the sweep waits before backfilling a head that just exhausted (#297).
+        Doubles with each further exhaustion of the same head, up to
+        `exhaustion_backoff_max_s`. Zero disables the backoff."""
+        cfg = self.cfg
+        return (
+            int(cfg["exhaustion_backoff"])
+            if "exhaustion_backoff" in cfg
+            else _env_int("PR_REVIEWER_EXHAUSTION_BACKOFF", 900)
+        )
+
+    @property
+    def exhaustion_backoff_max_s(self) -> int:
+        """Ceiling on the doubling backfill backoff for a repeatedly exhausted head (#297)."""
+        cfg = self.cfg
+        return (
+            int(cfg["exhaustion_backoff_max"])
+            if "exhaustion_backoff_max" in cfg
+            else _env_int("PR_REVIEWER_EXHAUSTION_BACKOFF_MAX", 14400)
+        )
+
+    def _note_exhaustion(self, repo: str, pr: int, head: str) -> None:
+        """Count an exhaustion of `head`; a new head starts the count over (#297)."""
+        key = f"{repo}#{pr}"
+        prev = self._exhausted.get(key)
+        count = prev[1] + 1 if prev and prev[0] == head else 1
+        self._exhausted[key] = (head, count, time.monotonic())
+
+    def _exhaustion_backoff_left(self, repo: str, pr: int, head: str) -> float:
+        """Seconds before the sweep may backfill `head` again — 0 when it may now (#297).
+
+        A deterministic exhaustion (protoAgent#4505: 14 panels in 3 h, every one refused
+        at synthesize) or an hours-long gateway outage (rabbit-hole.io#387: 59) otherwise
+        re-panels the same head on every sweep tick. The retry itself is right — outages
+        end, and most such heads did get a verdict — so this slows it, never stops it.
+        Only the sweep consults it: a push or a summon still runs at once.
+        """
+        entry = self._exhausted.get(f"{repo}#{pr}")
+        base = self.exhaustion_backoff_s
+        if not entry or entry[0] != head or base <= 0:
+            return 0.0
+        _head, count, at = entry
+        wait = min(base * 2 ** (count - 1), max(base, self.exhaustion_backoff_max_s))
+        return max(0.0, wait - (time.monotonic() - at))
 
     @property
     def gateway_degraded_retries_5m(self) -> int:
@@ -3781,6 +3830,7 @@ class Dispatcher:
                 causes=per_attempt,
                 **size,
             )
+            self._note_exhaustion(repo, pr, head)
             return "error:panel-exhausted"
         if undelivered:
             # Absent ≠ empty (#113): the panel ran, but a stage boundary delivered NO findings
@@ -3819,6 +3869,7 @@ class Dispatcher:
                 causes=per_attempt,
                 **size,
             )
+            self._note_exhaustion(repo, pr, head)
             return "error:panel-incomplete"
 
         result = await self._rerun_contradicted_verify(runner, recipe, inputs, result, repo=repo, pr=pr, head=head)
@@ -6102,6 +6153,17 @@ class Dispatcher:
         """
         if backfill_budget > 0:
             head = await self.needs_backfill(repo, pr)
+            if head and (wait := self._exhaustion_backoff_left(repo, pr, head)) > 0:
+                self.telemetry.emit(
+                    "drop",
+                    repo=repo,
+                    pr=pr,
+                    sha=head,
+                    reason=DROP_EXHAUSTION_BACKOFF,
+                    action=BACKFILL_ACTION,
+                    wait_s=round(wait),
+                )
+                head = None
             if head:
                 if detach_backfill:  # the sweep: see `_detach_backfill`
                     return self._detach_backfill(repo, pr, head), backfill_budget - 1
