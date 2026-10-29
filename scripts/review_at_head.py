@@ -145,11 +145,11 @@ def parse_marker(body: str | None) -> dict[str, str] | None:
 
 # ── BEGIN VENDORED SUPERSEDE RULE ─────────────────────────────────────────────────────
 # Vendored from protoLabsAI/pr-reviewer-plugin `rounds.py` (+ the findings-record reader in
-# `verdicts.py`) @ f0f0bf5 — the option-(a) rule of pr-reviewer-plugin#234. Copied, not
+# `verdicts.py`) @ d5d08a2 — the option-(a) rule of pr-reviewer-plugin#234. Copied, not
 # imported: the repos this script gates have no plugin checkout, and a network fetch would
 # make a required check depend on it. Do NOT edit here; edit the plugin and re-sync.
-#   rounds-ast-sha256: 04e26b5f1fe0f7a29a0f88d11c400c97f26111435dd55ed1ea70790fba8262c4
-#   block-ast-sha256:  0e0cb7cc11df1b3a1605209a0f8daf27cbc524817223a9f758eb0a0deca730e9
+#   rounds-ast-sha256: 519816b4fd3ef1a4b06d6826b9f2b92965ee61ecfea862ce41fb10ab6e69ba2c
+#   block-ast-sha256:  6c9180c0ebe8675417cc4c1d166bf521c61e0acfc99db8c9a5836d1e39202153
 # Both hashes are over the AST minus comments and docstrings (formatter-proof; see
 # pr-reviewer-plugin `scripts/vendor_supersede_rule.py`). The plugin's drift
 # test fails when `rounds.py`'s rule no longer matches the first, or this block the second;
@@ -254,6 +254,7 @@ def _v_blocking_priors(round_: dict | None) -> list[dict]:
         and str(f.get("severity") or "").lower() in _V_BLOCKING
         and str(f.get("verdict") or "").lower() != "refuted"
         and not f.get("nearby")
+        and str(f.get("scope") or "").strip().lower() != "pre-existing"
         and not f.get("ungrounded")
     ]
 

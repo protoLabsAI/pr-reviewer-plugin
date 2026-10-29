@@ -139,10 +139,32 @@ def report_hard_stopped(output: str) -> bool:
     return bool(_HARDSTOP_RE.match(output or ""))
 
 
+# Scope classification (#300) — the ADR 0077 field every blocking finding carries. `in-diff`
+# means the defect falls in (or is owned by) this PR's change and gates as before; `pre-existing`
+# means it is positively shown to reproduce at the merge-base, so the PR did not cause it. An
+# ABSENT scope reads as `in-diff` (the fail-closed default): relief is only ever the explicit
+# `pre-existing` mark. `projectBoard-plugin#653` reads this field off the posted findings record.
+IN_DIFF_SCOPE = "in-diff"
+PRE_EXISTING_SCOPE = "pre-existing"
+
+
+def is_pre_existing(finding: object) -> bool:
+    """A finding positively classified `pre-existing` (#300): it reproduces at the merge-base,
+    so it is excluded from the verdict, rendered apart, and never carried. Anything else —
+    including a finding with no scope — reads as in-diff and gates as before."""
+    return isinstance(finding, dict) and str(finding.get("scope") or "").strip().lower() == PRE_EXISTING_SCOPE
+
+
 def verdict_for(findings: list[dict]) -> str:
-    """The pure mapping. `findings` are ADR 0077 dicts (post-report: refuted already dropped)."""
+    """The pure mapping. `findings` are ADR 0077 dicts (post-report: refuted already dropped).
+
+    A `pre-existing` finding (#300) is excluded here, the same way a refuted one is: it was
+    proven to exist at the merge-base, so this PR does not own it and it cannot gate the merge.
+    The exclusion is pure — it reads the finding's own `scope` field and nothing else."""
     worst = PASS
     for f in findings:
+        if is_pre_existing(f):
+            continue
         sev = str(f.get("severity") or "").lower()
         verdict = str(f.get("verdict") or "").lower()
         if sev in ("blocker", "major"):
@@ -211,6 +233,29 @@ def _function_spans(source: str) -> list[tuple[int, int]] | None:
     return spans
 
 
+def _in_changed_scope(file: str, line: object, spans: list[tuple[int, int]] | None, text: str | None) -> bool | None:
+    """Is `line` inside the code this PR changed? `True` = inside a changed hunk, or (Python)
+    inside a function the PR changed; `False` = provably outside; `None` = cannot be
+    established (no hunks for the file, a non-positive-int line, a line past the end of the
+    head text, or a Python file that could not be read or parsed). Callers fail CLOSED on
+    `None` — the core of `nearby_structural` (#232). (#300's pre-existing classification maps the
+    line to the merge-base through the raw hunks instead; see `base_reproduction_precondition`.)"""
+    if not spans or isinstance(line, bool) or not isinstance(line, int) or line <= 0:
+        return None
+    if any(start <= line <= end for start, end in spans):
+        return True
+    if isinstance(text, str) and line > len(text.splitlines()):
+        return None  # cites a line the head does not have — unmappable
+    if file.endswith(_PYTHON_SUFFIXES):
+        functions = _function_spans(text) if isinstance(text, str) else None
+        if functions is None:
+            return None
+        changed = [f for f in functions if any(f[0] <= end and start <= f[1] for start, end in spans)]
+        if any(start <= line <= end for start, end in changed):
+            return True
+    return False
+
+
 def nearby_structural(
     findings: list[dict],
     ranges: dict[str, list[tuple[int, int]]] | None,
@@ -237,24 +282,152 @@ def nearby_structural(
         if not isinstance(finding, dict) or str(finding.get("source") or "").strip().lower() != STRUCTURAL_SOURCE:
             continue
         file = _norm_path(str(finding.get("file") or ""))
-        spans = ranges.get(file)
-        line = finding.get("line")
-        if not spans or isinstance(line, bool) or not isinstance(line, int) or line <= 0:
-            continue
-        if any(start <= line <= end for start, end in spans):
-            continue
         text = (sources or {}).get(file)
-        if isinstance(text, str) and line > len(text.splitlines()):
-            continue  # cites a line the head does not have — unmappable
-        if file.endswith(_PYTHON_SUFFIXES):
-            functions = _function_spans(text) if isinstance(text, str) else None
-            if functions is None:
-                continue
-            changed = [f for f in functions if any(f[0] <= end and start <= f[1] for start, end in spans)]
-            if any(start <= line <= end for start, end in changed):
-                continue
-        out.append(i)
+        if _in_changed_scope(file, finding.get("line"), ranges.get(file), text) is False:
+            out.append(i)
     return out
+
+
+def line_in_diff(
+    finding: dict,
+    ranges: dict[str, list[tuple[int, int]]] | None,
+    sources: dict[str, str | None] | None,
+) -> bool | None:
+    """Does the finding's cited line fall inside the PR's changed hunks (or, in Python, a
+    function the PR changed)? `True`/`False`/`None` as `_in_changed_scope` — `None` ranges
+    (unreadable diff) is `None` (cannot say), which every caller fails closed on. #300."""
+    if not ranges:
+        return None
+    file = _norm_path(str(finding.get("file") or ""))
+    return _in_changed_scope(file, finding.get("line"), ranges.get(file), (sources or {}).get(file))
+
+
+def claim_references_changed(finding: dict, changed_paths: object) -> bool:
+    """Does the finding's claim/evidence/note name a file this PR changed? If so the defect
+    plausibly DEPENDS on code the PR touched (a cross-file break, a removed behaviour), so it
+    is not safe to call pre-existing — fail CLOSED. Matches a changed path or its basename as
+    a substring: over-matching only ever DENIES relief, the safe direction (#300)."""
+    hay = " ".join(str(finding.get(k) or "") for k in ("claim", "evidence", "note"))
+    for p in changed_paths or []:
+        norm = _norm_path(str(p or ""))
+        if not norm:
+            continue
+        base = norm.rsplit("/", 1)[-1]
+        if norm in hay or (base and base in hay):
+            return True
+    return False
+
+
+# The hunk header carries BOTH sides — `@@ -oldstart,oldcount +newstart,newcount @@` — because
+# #300 maps a head line to its merge-base counterpart line-for-line, which needs the old side
+# too (`delta_ranges`'s `_HUNK_RE` keeps only the new side it cares about).
+_HUNK_HEADER_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", re.MULTILINE)
+
+
+def parse_hunks(patches: object) -> dict[str, list[tuple[int, int, int, int]]]:
+    """`{normalized file: [(old_start, old_count, new_start, new_count), …]}` from a PR/compare
+    `/files` payload's unified-diff `patch` hunks (#300). A file present with no readable patch
+    (binary, truncated) maps to `[]` — changed, structure unknown. This is the raw hunk geometry
+    `map_head_line_to_base` walks; `delta_ranges` derives its padded head-side ranges separately."""
+    out: dict[str, list[tuple[int, int, int, int]]] = {}
+    for entry in patches or []:
+        if not isinstance(entry, dict):
+            continue
+        path = _norm_path(str(entry.get("filename") or ""))
+        if not path:
+            continue
+        hunks = out.setdefault(path, [])
+        for m in _HUNK_HEADER_RE.finditer(str(entry.get("patch") or "")):
+            old_start = int(m.group(1))
+            old_count = int(m.group(2)) if m.group(2) is not None else 1
+            new_start = int(m.group(3))
+            new_count = int(m.group(4)) if m.group(4) is not None else 1
+            hunks.append((old_start, old_count, new_start, new_count))
+    return out
+
+
+def _valid_line(line: object) -> bool:
+    return isinstance(line, int) and not isinstance(line, bool) and line > 0
+
+
+def map_head_line_to_base(line: object, hunks: list[tuple[int, int, int, int]] | None) -> int | None:
+    """The merge-base (OLD-side) line a HEAD (new-side) line maps to through the PR's hunks,
+    or None when the line falls INSIDE a changed hunk (unmappable — it IS the change). A file
+    the PR never touched (`hunks` None/empty) maps identically. A line outside every hunk shifts
+    by the cumulative net line delta of the hunks ABOVE it (#300)."""
+    if not _valid_line(line):
+        return None
+    delta = 0
+    for old_start, old_count, new_start, new_count in sorted(hunks or [], key=lambda h: h[2]):
+        if new_count > 0:
+            new_end = new_start + new_count - 1
+            if new_start <= line <= new_end:
+                return None  # inside a changed hunk — this line IS the change, not pre-existing
+            before = new_end < line
+        else:  # a pure deletion occupies no head line; GNU convention puts it after `new_start`
+            before = new_start < line
+        if before:
+            delta += new_count - old_count
+    return line - delta
+
+
+def map_base_line_to_head(line: object, hunks: list[tuple[int, int, int, int]] | None) -> int | None:
+    """The inverse of `map_head_line_to_base`: the HEAD (new-side) line an OLD-side line maps to,
+    or None when that old line falls inside a changed hunk (it was touched). Used to re-anchor a
+    prior finding's line from the head it was raised at to the current head (#300)."""
+    if not _valid_line(line):
+        return None
+    delta = 0
+    for old_start, old_count, new_start, new_count in sorted(hunks or [], key=lambda h: h[0]):
+        if old_count > 0:
+            old_end = old_start + old_count - 1
+            if old_start <= line <= old_end:
+                return None  # the push touched this line — it must not be classified (#300 step 2)
+            before = old_end < line
+        else:  # a pure insertion occupies no old line
+            before = old_start < line
+        if before:
+            delta += new_count - old_count
+    return line + delta
+
+
+def base_reproduction_precondition(
+    finding: dict,
+    hunks: list[tuple[int, int, int, int]] | None,
+    head_sources: dict[str, str | None] | None,
+    base_sources: dict[str, str | None] | None,
+    changed_paths: object,
+) -> bool:
+    """The DETERMINISTIC gate (#300): is this finding even ELIGIBLE for the base verifier?
+
+    True only when the cited HEAD line maps to the merge-base through the PR's hunks line-for-line
+    AND the mapped base line is BYTE-IDENTICAL to the head line AND the claim names no file the PR
+    changed. This is never a text search (`x in base_text.splitlines()` matched a line that merely
+    happens to recur): the mapping pins the exact base line. A line it cannot map (inside a changed
+    hunk), a mismatch, a blank line, an unreadable head/base, or a claim leaning on changed code all
+    return False ⇒ IN-DIFF. The verifier then makes the actual reproduces-at-base call — this only
+    decides whom it is even worth asking, and fails CLOSED like #232's `nearby_structural`."""
+    file = _norm_path(str(finding.get("file") or ""))
+    head_text = (head_sources or {}).get(file)
+    base_text = (base_sources or {}).get(file)
+    if not isinstance(head_text, str) or not isinstance(base_text, str):
+        return False  # head or merge-base unreadable ⇒ ambiguous ⇒ keep gating
+    line = finding.get("line")
+    base_line = map_head_line_to_base(line, hunks)
+    if base_line is None:
+        return False  # in a changed hunk, or no valid line ⇒ in-diff
+    head_lines = head_text.splitlines()
+    base_lines = base_text.splitlines()
+    if not (1 <= line <= len(head_lines)) or not (1 <= base_line <= len(base_lines)):
+        return False  # a line past the end of either side cannot be proven pre-existing
+    cited = head_lines[line - 1]
+    if not cited.strip():
+        return False  # a blank line proves nothing
+    if cited != base_lines[base_line - 1]:
+        return False  # not byte-identical at the mapped base line ⇒ the PR owns it
+    if claim_references_changed(finding, changed_paths):
+        return False  # plausibly depends on code the PR changed ⇒ keep gating
+    return True
 
 
 def mark_nearby(finding: dict) -> dict:
@@ -280,6 +453,55 @@ def render_nearby_footnote(nearby: list[dict]) -> str:
         f"\n\n---\n_{len(nearby)} structural finding(s) are **nearby notes**, not part of the verdict: "
         f"they sit in code this PR did not change (outside its changed lines and the functions "
         f"those lines are in). Worth a look; not a request for this PR._\n{lines}"
+    )
+
+
+PRE_EXISTING_SECTION_TITLE = "Pre-existing, not blocking"
+
+
+def pre_existing_dedup_key(finding: dict) -> str:
+    """The key an operator (or `projectBoard-plugin#653`) dedups a pre-existing finding on:
+    its normalized file plus its normalized claim (#300). Two reviews that surface the same
+    merge-base defect produce the same key, so it is filed once."""
+    file = _norm_path(str(finding.get("file") or "")) or "(no file)"
+    claim = " ".join(str(finding.get("claim") or "").lower().split())
+    return f"{file}::{claim}"
+
+
+def suggested_issue_title(finding: dict) -> str:
+    """A ready-to-file title for a pre-existing finding (#300) — tracked, not dropped."""
+    file = _norm_path(str(finding.get("file") or "")) or "(no file)"
+    claim = " ".join(str(finding.get("claim") or "").split())
+    claim = (claim[:79] + "…") if len(claim) > 80 else (claim or "pre-existing defect")
+    return f"Pre-existing: {claim} ({file})"
+
+
+def render_pre_existing_section(pre_existing: list[dict]) -> str:
+    """The "Pre-existing, not blocking" body section (#300) — "" when there are none.
+
+    Each row carries a dedup key and a suggested issue title so the defect is TRACKED
+    (filed against the default branch), not silently dropped. Auto-filing is out of scope
+    (projectBoard-plugin#653); this is what an operator, or the board, files from."""
+    rows = [f for f in pre_existing or [] if isinstance(f, dict)]
+    if not rows:
+        return ""
+    lines = []
+    for f in rows:
+        loc = str(f.get("file") or "(no file)")
+        line = f.get("line")
+        if isinstance(line, int) and not isinstance(line, bool) and line > 0:
+            loc = f"{loc}:{line}"
+        sev = str(f.get("severity") or "?").lower()
+        claim = str(f.get("claim") or "")[:160]
+        lines.append(
+            f"- `{loc}` ({sev}) — {claim}\n"
+            f"  - dedup key: `{pre_existing_dedup_key(f)}`\n"
+            f"  - suggested issue: {suggested_issue_title(f)}"
+        )
+    return (
+        f"\n\n---\n### {PRE_EXISTING_SECTION_TITLE}\n"
+        f"_{len(rows)} finding(s) reproduce at the merge-base — the defect predates this PR, so it does "
+        f"not gate the merge and is not carried. Worth filing against the default branch (#300)._\n" + "\n".join(lines)
     )
 
 
