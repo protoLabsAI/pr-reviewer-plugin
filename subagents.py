@@ -50,6 +50,22 @@ def _completion_contract(config_cls) -> dict:
     }
 
 
+def _narrow_tools(config_cls) -> dict:
+    """Opt the relay out of the lead's read tools, when the host has the field (protoAgent#4471).
+
+    Since that change a subagent inherits the lead's read tools by default, so the relay was
+    offered `read_file`, `search_files` and four more next to `protopatch_review`. With six tools
+    the smart lane ended a third of relay turns with an empty reply and no tool call — the call
+    reasoned about but never delivered — and the lane went `no-output` (#302: 8/24 on the exact
+    live prompt, 0/24 with the one tool). The relay never reads code itself. An older host's
+    `SubagentConfig` rejects unknown kwargs, so there the field is left out.
+    """
+    fields = getattr(config_cls, "__dataclass_fields__", None)
+    if fields is not None and "inherit_read_tools" not in fields:
+        return {}
+    return {"inherit_read_tools": False}
+
+
 def get_subagents() -> list:
     from graph.subagents.config import SubagentConfig
 
@@ -97,5 +113,6 @@ that edits its payload corrupts the panel. A clean (empty) result is a good resu
         max_turns=10,
         allow_skill_emission=False,
         **_completion_contract(SubagentConfig),
+        **_narrow_tools(SubagentConfig),
     )
     return [structural_finder]
