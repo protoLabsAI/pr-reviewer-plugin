@@ -38,7 +38,7 @@ import json
 import re
 
 from .grounding import quoted_snippets
-from .verdicts import PASS, WARN, fenced_blocks, read_findings_record
+from .verdicts import PASS, WARN, fenced_blocks, is_pre_existing, read_findings_record
 
 # From this round on, the convergence rule is eligible to fire. Rounds 1–2 are the
 # review doing its job; #88's loop only became self-referential at round 3+.
@@ -284,8 +284,8 @@ def render_prior_requests(rounds: list[dict]) -> str:
     for number, round_ in numbered:
         out.append(f'  <round number="{number}" verdict="{_attr(round_.get("verdict"))}">')
         for finding in round_["findings"][:MAX_REQUESTS_PER_ROUND]:
-            if isinstance(finding, dict) and finding.get("nearby"):
-                continue  # a nearby note (#232) was never a request of this PR
+            if isinstance(finding, dict) and (finding.get("nearby") or is_pre_existing(finding)):
+                continue  # a nearby note (#232) / pre-existing finding (#300) was never a request of this PR
             if str(finding.get("verdict") or "").lower() == "refuted":
                 status = REQUEST_REFUTED
             elif any(same_prior(finding, f) for f in latest):  # a drifted anchor is the same request (#260)
@@ -437,8 +437,8 @@ def unexplained_clearance(
             clean_runs += 1
             continue
         for finding in prior:
-            if finding.get("nearby"):
-                continue  # a nearby note never gated (#232); its absence clears nothing
+            if finding.get("nearby") or is_pre_existing(finding):
+                continue  # a nearby note (#232) / pre-existing finding (#300) never gated; its absence clears nothing
             severity = str(finding.get("severity") or "").lower()
             if severity in ("blocker", "major") and str(finding.get("verdict") or "").lower() != "refuted":
                 if clean_runs >= corroborate:
@@ -716,6 +716,14 @@ OUTCOME_FIXED = "fixed"  # `fixed`, proven by the delta or targeted re-verificat
 OUTCOME_REFUTED = "refuted"  # `refuted`, honoured
 OUTCOME_OPEN = "open"
 OUTCOME_FIXED_UNPROVEN = "fixed-unproven"  # `fixed`, but the cited line did not move
+# #38: a refutation of a verifier-confirmed prior on code that has NOT changed is one model
+# draw against another, so the block holds. ONE documented exception (#300): if this round
+# re-classifies the prior `pre-existing` — positively shown to reproduce at the merge-base, so
+# the PR never owned it — it CLEARS, and #38 does not carry it. The classification runs every
+# round (the dispatcher stamps `scope` on the prior before the ledger reads it), so a prior
+# the merge-base could not be read for stays blocking until a round can read it. #38 is
+# unchanged for in-diff and PR-caused priors, where a defect on unchanged code is a real
+# regression this PR must still own.
 OUTCOME_NOT_HONOURED = "refutation-not-honoured"  # #38: verifier-confirmed on unchanged code
 OUTCOME_CONFLICT = "conflict"  # rows disagree
 OUTCOME_NONE = "undispositioned"
@@ -746,8 +754,8 @@ def prior_ledger(
     changed = {_norm(p) for p in paths or [] if p and p.strip()}
     debt = []
     for f in round_.get("findings") or []:
-        if not isinstance(f, dict) or f.get("ungrounded") or f.get("nearby"):
-            continue
+        if not isinstance(f, dict) or f.get("ungrounded") or f.get("nearby") or is_pre_existing(f):
+            continue  # a pre-existing prior (#300) reproduces at the merge-base — not this PR's debt
         if str(f.get("severity") or "").lower() not in _BLOCKING:
             continue
         if str(f.get("verdict") or "").lower() == "refuted":
@@ -927,7 +935,10 @@ def gating_debt(carried: list[dict]) -> list[dict]:
     return [
         f
         for f in carried or []
-        if isinstance(f, dict) and str(f.get("severity") or "").lower() in _BLOCKING and _verifier_confirmed(f)
+        if isinstance(f, dict)
+        and not is_pre_existing(f)  # a pre-existing carry (#300) does not gate — it cleared
+        and str(f.get("severity") or "").lower() in _BLOCKING
+        and _verifier_confirmed(f)
     ]
 
 
@@ -1139,6 +1150,7 @@ def carried_debt(round_: dict | None) -> list[dict]:
         if isinstance(f, dict)
         and f.get("carried")
         and f.get("carried_by") != "synthesizer"
+        and not is_pre_existing(f)  # a pre-existing carry (#300) is not standing debt — it cleared
         and str(f.get("severity") or "").lower() in _BLOCKING
         and str(f.get("verdict") or "").lower() not in ("refuted", "uncertain")
     ]
@@ -1174,6 +1186,8 @@ def relisted_blocking_priors(findings: list[dict], history: list[dict]) -> tuple
         and str(p.get("severity") or "").lower() in _BLOCKING
         # a #232 `nearby` note never gated, so a re-listing of it has no ruling to inherit
         and not p.get("nearby")
+        # a #300 pre-existing prior never gated either — a re-listing of it inherits no block
+        and not is_pre_existing(p)
         and not p.get("ungrounded")
     ]
     pairs: list[tuple[int, dict]] = []

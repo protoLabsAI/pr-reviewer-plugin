@@ -139,10 +139,32 @@ def report_hard_stopped(output: str) -> bool:
     return bool(_HARDSTOP_RE.match(output or ""))
 
 
+# Scope classification (#300) — the ADR 0077 field every blocking finding carries. `in-diff`
+# means the defect falls in (or is owned by) this PR's change and gates as before; `pre-existing`
+# means it is positively shown to reproduce at the merge-base, so the PR did not cause it. An
+# ABSENT scope reads as `in-diff` (the fail-closed default): relief is only ever the explicit
+# `pre-existing` mark. `projectBoard-plugin#653` reads this field off the posted findings record.
+IN_DIFF_SCOPE = "in-diff"
+PRE_EXISTING_SCOPE = "pre-existing"
+
+
+def is_pre_existing(finding: object) -> bool:
+    """A finding positively classified `pre-existing` (#300): it reproduces at the merge-base,
+    so it is excluded from the verdict, rendered apart, and never carried. Anything else —
+    including a finding with no scope — reads as in-diff and gates as before."""
+    return isinstance(finding, dict) and str(finding.get("scope") or "").strip().lower() == PRE_EXISTING_SCOPE
+
+
 def verdict_for(findings: list[dict]) -> str:
-    """The pure mapping. `findings` are ADR 0077 dicts (post-report: refuted already dropped)."""
+    """The pure mapping. `findings` are ADR 0077 dicts (post-report: refuted already dropped).
+
+    A `pre-existing` finding (#300) is excluded here, the same way a refuted one is: it was
+    proven to exist at the merge-base, so this PR does not own it and it cannot gate the merge.
+    The exclusion is pure — it reads the finding's own `scope` field and nothing else."""
     worst = PASS
     for f in findings:
+        if is_pre_existing(f):
+            continue
         sev = str(f.get("severity") or "").lower()
         verdict = str(f.get("verdict") or "").lower()
         if sev in ("blocker", "major"):
@@ -211,6 +233,28 @@ def _function_spans(source: str) -> list[tuple[int, int]] | None:
     return spans
 
 
+def _in_changed_scope(file: str, line: object, spans: list[tuple[int, int]] | None, text: str | None) -> bool | None:
+    """Is `line` inside the code this PR changed? `True` = inside a changed hunk, or (Python)
+    inside a function the PR changed; `False` = provably outside; `None` = cannot be
+    established (no hunks for the file, a non-positive-int line, a line past the end of the
+    head text, or a Python file that could not be read or parsed). Callers fail CLOSED on
+    `None` — the shared core of `nearby_structural` (#232) and `scope_for` (#300)."""
+    if not spans or isinstance(line, bool) or not isinstance(line, int) or line <= 0:
+        return None
+    if any(start <= line <= end for start, end in spans):
+        return True
+    if isinstance(text, str) and line > len(text.splitlines()):
+        return None  # cites a line the head does not have — unmappable
+    if file.endswith(_PYTHON_SUFFIXES):
+        functions = _function_spans(text) if isinstance(text, str) else None
+        if functions is None:
+            return None
+        changed = [f for f in functions if any(f[0] <= end and start <= f[1] for start, end in spans)]
+        if any(start <= line <= end for start, end in changed):
+            return True
+    return False
+
+
 def nearby_structural(
     findings: list[dict],
     ranges: dict[str, list[tuple[int, int]]] | None,
@@ -237,24 +281,80 @@ def nearby_structural(
         if not isinstance(finding, dict) or str(finding.get("source") or "").strip().lower() != STRUCTURAL_SOURCE:
             continue
         file = _norm_path(str(finding.get("file") or ""))
-        spans = ranges.get(file)
-        line = finding.get("line")
-        if not spans or isinstance(line, bool) or not isinstance(line, int) or line <= 0:
-            continue
-        if any(start <= line <= end for start, end in spans):
-            continue
         text = (sources or {}).get(file)
-        if isinstance(text, str) and line > len(text.splitlines()):
-            continue  # cites a line the head does not have — unmappable
-        if file.endswith(_PYTHON_SUFFIXES):
-            functions = _function_spans(text) if isinstance(text, str) else None
-            if functions is None:
-                continue
-            changed = [f for f in functions if any(f[0] <= end and start <= f[1] for start, end in spans)]
-            if any(start <= line <= end for start, end in changed):
-                continue
-        out.append(i)
+        if _in_changed_scope(file, finding.get("line"), ranges.get(file), text) is False:
+            out.append(i)
     return out
+
+
+def line_in_diff(
+    finding: dict,
+    ranges: dict[str, list[tuple[int, int]]] | None,
+    sources: dict[str, str | None] | None,
+) -> bool | None:
+    """Does the finding's cited line fall inside the PR's changed hunks (or, in Python, a
+    function the PR changed)? `True`/`False`/`None` as `_in_changed_scope` — `None` ranges
+    (unreadable diff) is `None` (cannot say), which every caller fails closed on. #300."""
+    if not ranges:
+        return None
+    file = _norm_path(str(finding.get("file") or ""))
+    return _in_changed_scope(file, finding.get("line"), ranges.get(file), (sources or {}).get(file))
+
+
+def claim_references_changed(finding: dict, changed_paths: object) -> bool:
+    """Does the finding's claim/evidence/note name a file this PR changed? If so the defect
+    plausibly DEPENDS on code the PR touched (a cross-file break, a removed behaviour), so it
+    is not safe to call pre-existing — fail CLOSED. Matches a changed path or its basename as
+    a substring: over-matching only ever DENIES relief, the safe direction (#300)."""
+    hay = " ".join(str(finding.get(k) or "") for k in ("claim", "evidence", "note"))
+    for p in changed_paths or []:
+        norm = _norm_path(str(p or ""))
+        if not norm:
+            continue
+        base = norm.rsplit("/", 1)[-1]
+        if norm in hay or (base and base in hay):
+            return True
+    return False
+
+
+def scope_for(
+    finding: dict,
+    ranges: dict[str, list[tuple[int, int]]] | None,
+    head_sources: dict[str, str | None] | None,
+    base_sources: dict[str, str | None] | None,
+    changed_paths: object,
+) -> str:
+    """Classify ONE blocking finding `in-diff` | `pre-existing` (#300), fail CLOSED.
+
+    `pre-existing` is returned ONLY when the defect is positively shown to predate the PR:
+    the cited line is OUTSIDE the PR's changed hunks, the SAME line of code is byte-identical
+    at the merge-base, and the claim names no file the PR changed. Every unknown — an
+    in-diff or unmappable line, an unreadable merge-base or head, a blank cited line, a line
+    whose text is not at the merge-base, or a claim that leans on changed code — returns
+    `in-diff`, so the finding keeps gating. This is the same discipline as #232's
+    `nearby_structural`: relief only on proof, never on an absence of it."""
+    in_diff = line_in_diff(finding, ranges, head_sources)
+    if in_diff is not False:  # True (in the change) or None (unmappable) ⇒ keep gating
+        return IN_DIFF_SCOPE
+    file = _norm_path(str(finding.get("file") or ""))
+    head_text = (head_sources or {}).get(file)
+    base_text = (base_sources or {}).get(file)
+    if not isinstance(head_text, str) or not isinstance(base_text, str):
+        return IN_DIFF_SCOPE  # head or merge-base unreadable ⇒ ambiguous ⇒ keep gating
+    line = finding.get("line")
+    if isinstance(line, bool) or not isinstance(line, int) or line <= 0:
+        return IN_DIFF_SCOPE
+    head_lines = head_text.splitlines()
+    if line > len(head_lines):
+        return IN_DIFF_SCOPE
+    cited = head_lines[line - 1]
+    if not cited.strip():
+        return IN_DIFF_SCOPE  # a blank line proves nothing
+    if cited not in base_text.splitlines():
+        return IN_DIFF_SCOPE  # the cited code is not byte-identical at base ⇒ the PR owns it
+    if claim_references_changed(finding, changed_paths):
+        return IN_DIFF_SCOPE  # plausibly depends on code the PR changed ⇒ keep gating
+    return PRE_EXISTING_SCOPE
 
 
 def mark_nearby(finding: dict) -> dict:
@@ -280,6 +380,55 @@ def render_nearby_footnote(nearby: list[dict]) -> str:
         f"\n\n---\n_{len(nearby)} structural finding(s) are **nearby notes**, not part of the verdict: "
         f"they sit in code this PR did not change (outside its changed lines and the functions "
         f"those lines are in). Worth a look; not a request for this PR._\n{lines}"
+    )
+
+
+PRE_EXISTING_SECTION_TITLE = "Pre-existing, not blocking"
+
+
+def pre_existing_dedup_key(finding: dict) -> str:
+    """The key an operator (or `projectBoard-plugin#653`) dedups a pre-existing finding on:
+    its normalized file plus its normalized claim (#300). Two reviews that surface the same
+    merge-base defect produce the same key, so it is filed once."""
+    file = _norm_path(str(finding.get("file") or "")) or "(no file)"
+    claim = " ".join(str(finding.get("claim") or "").lower().split())
+    return f"{file}::{claim}"
+
+
+def suggested_issue_title(finding: dict) -> str:
+    """A ready-to-file title for a pre-existing finding (#300) — tracked, not dropped."""
+    file = _norm_path(str(finding.get("file") or "")) or "(no file)"
+    claim = " ".join(str(finding.get("claim") or "").split())
+    claim = (claim[:79] + "…") if len(claim) > 80 else (claim or "pre-existing defect")
+    return f"Pre-existing: {claim} ({file})"
+
+
+def render_pre_existing_section(pre_existing: list[dict]) -> str:
+    """The "Pre-existing, not blocking" body section (#300) — "" when there are none.
+
+    Each row carries a dedup key and a suggested issue title so the defect is TRACKED
+    (filed against the default branch), not silently dropped. Auto-filing is out of scope
+    (projectBoard-plugin#653); this is what an operator, or the board, files from."""
+    rows = [f for f in pre_existing or [] if isinstance(f, dict)]
+    if not rows:
+        return ""
+    lines = []
+    for f in rows:
+        loc = str(f.get("file") or "(no file)")
+        line = f.get("line")
+        if isinstance(line, int) and not isinstance(line, bool) and line > 0:
+            loc = f"{loc}:{line}"
+        sev = str(f.get("severity") or "?").lower()
+        claim = str(f.get("claim") or "")[:160]
+        lines.append(
+            f"- `{loc}` ({sev}) — {claim}\n"
+            f"  - dedup key: `{pre_existing_dedup_key(f)}`\n"
+            f"  - suggested issue: {suggested_issue_title(f)}"
+        )
+    return (
+        f"\n\n---\n### {PRE_EXISTING_SECTION_TITLE}\n"
+        f"_{len(rows)} finding(s) reproduce at the merge-base — the defect predates this PR, so it does "
+        f"not gate the merge and is not carried. Worth filing against the default branch (#300)._\n" + "\n".join(lines)
     )
 
 

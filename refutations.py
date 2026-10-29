@@ -166,11 +166,36 @@ class RefutationStore:
             and f.get("file")
             and f.get("claim")
         ]
-        if not refuted:
+        return self._remember(repo, refuted, pr=pr, head=head, origin="verifier")
+
+    def record_dismissal(self, repo: str, findings: list[dict], *, pr: int, head: str) -> int:
+        """An operator dismissed a review of ours: remember its `source: protopatch` findings
+        so the structural pass pre-marks them refuted on the next round (#300). The dismissal
+        harvest used to record LLM-lane findings only (#207), so a dismissed STRUCTURAL finding
+        came back regardless — protoAgent#4581 sat blocked on `config.py:418` through an
+        operator's out-of-scope call. A finding the verifier already refuted is skipped (it is
+        `record`'s job); anything else the operator dismissed is remembered here. Never raises."""
+        dismissed = [
+            f
+            for f in findings or []
+            if isinstance(f, dict)
+            and str(f.get("source") or "").lower() == "protopatch"
+            and str(f.get("verdict") or "").lower() != "refuted"
+            and f.get("file")
+            and f.get("claim")
+        ]
+        return self._remember(repo, dismissed, pr=pr, head=head, origin="dismissal")
+
+    def _remember(self, repo: str, rows: list[dict], *, pr: int, head: str, origin: str) -> int:
+        """Load, dedup by (file, claim), append `rows`, and write — the one write path both
+        `record` (verifier refutations, #190) and `record_dismissal` (operator dismissals,
+        #300) share, so a structural dismissal ages out on the same clock and reads back the
+        same way. Returns how many were written; never raises on a write failure."""
+        if not rows:
             return 0
         entries = self._load(repo)
         now = time.time()
-        for f in refuted:
+        for f in rows:
             entries = [
                 e
                 for e in entries
@@ -185,6 +210,7 @@ class RefutationStore:
                     "line": f.get("line"),
                     "claim": str(f["claim"]),
                     "note": str(f.get("note") or "")[:300],
+                    "origin": origin,
                     "pr": int(pr),
                     "head": str(head or "")[:12],
                     "at": now,
@@ -195,7 +221,7 @@ class RefutationStore:
         except OSError:
             log.exception("[pr-reviewer] refutation store write failed for %s", repo)
             return 0
-        return len(refuted)
+        return len(rows)
 
     def match(self, repo: str, file: str, claim: str, line: int | None = None) -> dict | None:
         """The remembered refutation of this claim on this file, or None. With `line`, only
