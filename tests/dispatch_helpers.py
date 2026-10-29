@@ -80,7 +80,7 @@ def facts(**over):
     return base
 
 
-def make(tmp_path, *, cfg=None, gh=None, runner=None, inbox=None):
+def make(tmp_path, *, cfg=None, gh=None, runner=None, inbox=None, base_verifier=None):
     async def default_runner(name, inputs):
         return {"output": REPORT, "steps": {}, "failed": []}
 
@@ -90,6 +90,7 @@ def make(tmp_path, *, cfg=None, gh=None, runner=None, inbox=None):
         run_gh_fn=gh or FakeGH(),
         workflow_run=runner or default_runner,
         inbox_add=inbox,
+        base_verifier=base_verifier,
     )
     return d
 

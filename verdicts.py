@@ -238,7 +238,8 @@ def _in_changed_scope(file: str, line: object, spans: list[tuple[int, int]] | No
     inside a function the PR changed; `False` = provably outside; `None` = cannot be
     established (no hunks for the file, a non-positive-int line, a line past the end of the
     head text, or a Python file that could not be read or parsed). Callers fail CLOSED on
-    `None` — the shared core of `nearby_structural` (#232) and `scope_for` (#300)."""
+    `None` — the core of `nearby_structural` (#232). (#300's pre-existing classification maps the
+    line to the merge-base through the raw hunks instead; see `base_reproduction_precondition`.)"""
     if not spans or isinstance(line, bool) or not isinstance(line, int) or line <= 0:
         return None
     if any(start <= line <= end for start, end in spans):
@@ -317,44 +318,116 @@ def claim_references_changed(finding: dict, changed_paths: object) -> bool:
     return False
 
 
-def scope_for(
+# The hunk header carries BOTH sides — `@@ -oldstart,oldcount +newstart,newcount @@` — because
+# #300 maps a head line to its merge-base counterpart line-for-line, which needs the old side
+# too (`delta_ranges`'s `_HUNK_RE` keeps only the new side it cares about).
+_HUNK_HEADER_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", re.MULTILINE)
+
+
+def parse_hunks(patches: object) -> dict[str, list[tuple[int, int, int, int]]]:
+    """`{normalized file: [(old_start, old_count, new_start, new_count), …]}` from a PR/compare
+    `/files` payload's unified-diff `patch` hunks (#300). A file present with no readable patch
+    (binary, truncated) maps to `[]` — changed, structure unknown. This is the raw hunk geometry
+    `map_head_line_to_base` walks; `delta_ranges` derives its padded head-side ranges separately."""
+    out: dict[str, list[tuple[int, int, int, int]]] = {}
+    for entry in patches or []:
+        if not isinstance(entry, dict):
+            continue
+        path = _norm_path(str(entry.get("filename") or ""))
+        if not path:
+            continue
+        hunks = out.setdefault(path, [])
+        for m in _HUNK_HEADER_RE.finditer(str(entry.get("patch") or "")):
+            old_start = int(m.group(1))
+            old_count = int(m.group(2)) if m.group(2) is not None else 1
+            new_start = int(m.group(3))
+            new_count = int(m.group(4)) if m.group(4) is not None else 1
+            hunks.append((old_start, old_count, new_start, new_count))
+    return out
+
+
+def _valid_line(line: object) -> bool:
+    return isinstance(line, int) and not isinstance(line, bool) and line > 0
+
+
+def map_head_line_to_base(line: object, hunks: list[tuple[int, int, int, int]] | None) -> int | None:
+    """The merge-base (OLD-side) line a HEAD (new-side) line maps to through the PR's hunks,
+    or None when the line falls INSIDE a changed hunk (unmappable — it IS the change). A file
+    the PR never touched (`hunks` None/empty) maps identically. A line outside every hunk shifts
+    by the cumulative net line delta of the hunks ABOVE it (#300)."""
+    if not _valid_line(line):
+        return None
+    delta = 0
+    for old_start, old_count, new_start, new_count in sorted(hunks or [], key=lambda h: h[2]):
+        if new_count > 0:
+            new_end = new_start + new_count - 1
+            if new_start <= line <= new_end:
+                return None  # inside a changed hunk — this line IS the change, not pre-existing
+            before = new_end < line
+        else:  # a pure deletion occupies no head line; GNU convention puts it after `new_start`
+            before = new_start < line
+        if before:
+            delta += new_count - old_count
+    return line - delta
+
+
+def map_base_line_to_head(line: object, hunks: list[tuple[int, int, int, int]] | None) -> int | None:
+    """The inverse of `map_head_line_to_base`: the HEAD (new-side) line an OLD-side line maps to,
+    or None when that old line falls inside a changed hunk (it was touched). Used to re-anchor a
+    prior finding's line from the head it was raised at to the current head (#300)."""
+    if not _valid_line(line):
+        return None
+    delta = 0
+    for old_start, old_count, new_start, new_count in sorted(hunks or [], key=lambda h: h[0]):
+        if old_count > 0:
+            old_end = old_start + old_count - 1
+            if old_start <= line <= old_end:
+                return None  # the push touched this line — it must not be classified (#300 step 2)
+            before = old_end < line
+        else:  # a pure insertion occupies no old line
+            before = old_start < line
+        if before:
+            delta += new_count - old_count
+    return line + delta
+
+
+def base_reproduction_precondition(
     finding: dict,
-    ranges: dict[str, list[tuple[int, int]]] | None,
+    hunks: list[tuple[int, int, int, int]] | None,
     head_sources: dict[str, str | None] | None,
     base_sources: dict[str, str | None] | None,
     changed_paths: object,
-) -> str:
-    """Classify ONE blocking finding `in-diff` | `pre-existing` (#300), fail CLOSED.
+) -> bool:
+    """The DETERMINISTIC gate (#300): is this finding even ELIGIBLE for the base verifier?
 
-    `pre-existing` is returned ONLY when the defect is positively shown to predate the PR:
-    the cited line is OUTSIDE the PR's changed hunks, the SAME line of code is byte-identical
-    at the merge-base, and the claim names no file the PR changed. Every unknown — an
-    in-diff or unmappable line, an unreadable merge-base or head, a blank cited line, a line
-    whose text is not at the merge-base, or a claim that leans on changed code — returns
-    `in-diff`, so the finding keeps gating. This is the same discipline as #232's
-    `nearby_structural`: relief only on proof, never on an absence of it."""
-    in_diff = line_in_diff(finding, ranges, head_sources)
-    if in_diff is not False:  # True (in the change) or None (unmappable) ⇒ keep gating
-        return IN_DIFF_SCOPE
+    True only when the cited HEAD line maps to the merge-base through the PR's hunks line-for-line
+    AND the mapped base line is BYTE-IDENTICAL to the head line AND the claim names no file the PR
+    changed. This is never a text search (`x in base_text.splitlines()` matched a line that merely
+    happens to recur): the mapping pins the exact base line. A line it cannot map (inside a changed
+    hunk), a mismatch, a blank line, an unreadable head/base, or a claim leaning on changed code all
+    return False ⇒ IN-DIFF. The verifier then makes the actual reproduces-at-base call — this only
+    decides whom it is even worth asking, and fails CLOSED like #232's `nearby_structural`."""
     file = _norm_path(str(finding.get("file") or ""))
     head_text = (head_sources or {}).get(file)
     base_text = (base_sources or {}).get(file)
     if not isinstance(head_text, str) or not isinstance(base_text, str):
-        return IN_DIFF_SCOPE  # head or merge-base unreadable ⇒ ambiguous ⇒ keep gating
+        return False  # head or merge-base unreadable ⇒ ambiguous ⇒ keep gating
     line = finding.get("line")
-    if isinstance(line, bool) or not isinstance(line, int) or line <= 0:
-        return IN_DIFF_SCOPE
+    base_line = map_head_line_to_base(line, hunks)
+    if base_line is None:
+        return False  # in a changed hunk, or no valid line ⇒ in-diff
     head_lines = head_text.splitlines()
-    if line > len(head_lines):
-        return IN_DIFF_SCOPE
+    base_lines = base_text.splitlines()
+    if not (1 <= line <= len(head_lines)) or not (1 <= base_line <= len(base_lines)):
+        return False  # a line past the end of either side cannot be proven pre-existing
     cited = head_lines[line - 1]
     if not cited.strip():
-        return IN_DIFF_SCOPE  # a blank line proves nothing
-    if cited not in base_text.splitlines():
-        return IN_DIFF_SCOPE  # the cited code is not byte-identical at base ⇒ the PR owns it
+        return False  # a blank line proves nothing
+    if cited != base_lines[base_line - 1]:
+        return False  # not byte-identical at the mapped base line ⇒ the PR owns it
     if claim_references_changed(finding, changed_paths):
-        return IN_DIFF_SCOPE  # plausibly depends on code the PR changed ⇒ keep gating
-    return PRE_EXISTING_SCOPE
+        return False  # plausibly depends on code the PR changed ⇒ keep gating
+    return True
 
 
 def mark_nearby(finding: dict) -> dict:

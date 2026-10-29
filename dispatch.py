@@ -160,11 +160,13 @@ from .trigger import structural_trigger
 from .verdicts import (
     FAIL,
     FINDER_STEP_PREFIX,
+    IN_DIFF_SCOPE,
     PASS,
     PRE_EXISTING_SCOPE,
     STRUCTURAL_SOURCE,
     WARN,
     _norm_path,
+    base_reproduction_precondition,
     confine_findings,
     coverage_gaps,
     coverage_verdict,
@@ -174,12 +176,13 @@ from .verdicts import (
     format_stage_causes,
     is_pre_existing,
     lane_repo_violation,
-    line_in_diff,
+    map_base_line_to_head,
     mark_nearby,
     mentions_any,
     merge_carried_findings,
     nearby_structural,
     overrun_lanes,
+    parse_hunks,
     parse_verdict_marker,
     pre_existing_dedup_key,
     render_nearby_footnote,
@@ -187,7 +190,6 @@ from .verdicts import (
     render_verdict_body,
     report_hard_stopped,
     restate_findings,
-    scope_for,
     stage_causes,
     structural_relay_ok,
     undelivered_stages,
@@ -1315,6 +1317,7 @@ class Dispatcher:
         inbox_add=None,
         cfg_provider=None,
         resolve_checkout=None,
+        base_verifier=None,
     ):
         # Config is resolved LIVE, never snapshotted (issue #11). Every knob below used
         # to be read once in __init__, so an operator editing `repos` or flipping
@@ -1354,6 +1357,11 @@ class Dispatcher:
         )
         self._run_gh = run_gh_fn or run_gh
         self._workflow_run = workflow_run  # None → resolve STATE.workflow_run lazily
+        # The #300 pre-existing verifier: an async `(finding, base_sources) -> "yes"|"no"|"unsure"`
+        # handed the merge-base text of the cited file(s) and asked whether the defect ALREADY
+        # exists there. None (unwired, a test without one, the host before it provides one) fails
+        # CLOSED — every eligible finding reads `unsure`, so nothing is relieved to pre-existing.
+        self._base_verifier = base_verifier
         self._inbox_add = inbox_add  # None → resolve STATE.inbox_store lazily
         self._viewer: str | None = None
         self._promote_failures: dict[str, int] = {}  # repo#pr@head -> consecutive APPROVE failures
@@ -4047,12 +4055,14 @@ class Dispatcher:
         truncated = report_hard_stopped(output)
         # Re-classify the PRIOR round's blocking findings against THIS head/merge-base (#300),
         # before the ledger reads them: a carried prior now shown pre-existing CLEARS — the one
-        # documented exception to #38. Runs every round; fail-closed, so a prior whose merge-base
+        # documented exception to #38. The prior's line is first re-anchored to THIS head (its
+        # line was from its own head); a prior that cannot be re-anchored, or whose line the push
+        # since touched, stays blocking. Runs every round; fail-closed, so a prior whose merge-base
         # cannot be read stays blocking exactly as before. #38 is unchanged for in-diff/PR-caused.
         prior_round = last_substantive_round(history)
         if prior_round is not None and prior_round.get("findings"):
             try:
-                await self._classify_scopes(repo, pr, head, facts, prior_round["findings"])
+                await self._classify_prior_scopes(repo, pr, head, facts, history, prior_round["findings"])
             except Exception:  # noqa: BLE001 — a classification failure keeps every prior gating
                 log.exception("[pr-reviewer] prior-scope classification failed on %s#%s", repo, pr)
         # What became of the PRIOR round's blocker/majors (#26) — and, since #218/#220/#232,
@@ -4727,12 +4737,77 @@ class Dispatcher:
             for file, (blob, combined) in (raw or {}).items()
         }
 
+    async def _pr_hunks(self, repo: str, pr: int) -> dict[str, list[tuple[int, int, int, int]]] | None:
+        """The PR's own base→head hunk geometry per file (BOTH sides), or None (unreadable).
+
+        Same `/files` patches `_pr_hunk_ranges` reads, through `parse_hunks` — `map_head_line_to_base`
+        needs the OLD-side line numbers the padded ranges drop. None on any unreadable page ⇒ #300
+        scoping stands down and every finding keeps gating."""
+        rc, out, _err = await self._run_gh(
+            [
+                "api",
+                f"repos/{repo}/pulls/{pr}/files",
+                "--paginate",
+                "--jq",
+                ".[] | {filename: .filename, patch: .patch}",
+            ]
+        )
+        if rc != 0:
+            return None
+        rows = gh_json_rows(out)
+        if not rows:
+            return None
+        return parse_hunks([r for r in rows if isinstance(r, dict)])
+
+    async def _delta_hunks(self, repo: str, base: str, head: str) -> dict[str, list[tuple[int, int, int, int]]] | None:
+        """`base→head` hunk geometry per file, or None (unreadable). The re-anchoring counterpart of
+        `_delta_ranges`: `map_base_line_to_head` maps a prior finding's line from the head it was
+        raised at to the current head through these (#300 step 2). None is load-bearing — an
+        unreadable delta means the prior cannot be re-anchored, so it keeps gating."""
+        if not base or not head or base == head:
+            return None
+        rc, out, _err = await self._run_gh(
+            [
+                "api",
+                f"repos/{repo}/compare/{base}...{head}",
+                "--jq",
+                "[.files[]? | {filename: .filename, patch: .patch}]",
+            ],
+        )
+        if rc != 0:
+            return None
+        try:
+            files = json.loads(out)
+        except json.JSONDecodeError:
+            return None
+        return parse_hunks(files) if isinstance(files, list) else None
+
+    async def _exists_at_base(self, finding: dict, base_sources: dict[str, str | None]) -> str:
+        """Ask the #300 verifier whether `finding`'s defect ALREADY exists at the merge-base —
+        `"yes"` | `"no"` | `"unsure"`. Only `"yes"` earns pre-existing; no verifier wired, a parse
+        failure, an unrecognised answer, or an error all read `"unsure"` and keep the finding gating
+        (fail closed). The verifier sees ONLY the base text (never the head), so the very change
+        under review cannot talk it into `"yes"`."""
+        verifier = self._base_verifier
+        if verifier is None:
+            return "unsure"
+        try:
+            answer = await verifier(finding, {k: v for k, v in (base_sources or {}).items() if isinstance(v, str)})
+        except Exception:  # noqa: BLE001 — a verifier error must never fail the round
+            log.exception("[pr-reviewer] #300 base verifier failed")
+            return "unsure"
+        norm = str(answer or "").strip().lower()
+        return norm if norm in ("yes", "no") else "unsure"
+
     async def _classify_scopes(self, repo, pr, head, facts, findings, *, raw=None) -> set[int]:
-        """Stamp `scope` (`in-diff` | `pre-existing`) IN PLACE on every blocking, non-nearby
-        finding that sits OUTSIDE the PR's changed hunks (#300), reading the cited file at head
-        and at the merge-base. A finding on a changed line is left unscoped — an absent scope
-        reads as in-diff (the fail-closed default), so a clean review's record is unchanged.
-        Fails CLOSED to `in-diff` at every unknown. Returns the ids stamped `pre-existing`."""
+        """Stamp `scope` (`in-diff` | `pre-existing`) IN PLACE on every blocking, non-nearby finding
+        (#300). Recomputed EVERY round and fails CLOSED: a target carrying a `pre-existing` label is
+        reset to in-diff first, so a stale relief never survives a round that does not re-derive it,
+        and every early return (no targets, unreadable diff/merge-base, nothing eligible) leaves all
+        targets in-diff (an absent/`in-diff` scope IS the gating default). A finding is relieved ONLY
+        when the DETERMINISTIC precondition holds — `base_reproduction_precondition`: its cited line
+        maps to the merge-base byte-identically and its claim names no changed file — AND the verifier
+        then answers `yes`. Returns the ids stamped `pre-existing`."""
         targets = [
             f
             for f in findings or []
@@ -4740,32 +4815,84 @@ class Dispatcher:
             and str(f.get("severity") or "").lower() in ("blocker", "major")
             and not f.get("nearby")
         ]
+        for f in targets:
+            if is_pre_existing(f):
+                f["scope"] = IN_DIFF_SCOPE  # re-derive from scratch — never inherit last round's relief
         if not targets:
             return set()
-        ranges = await self._pr_hunk_ranges(repo, pr)
-        if not ranges:
-            return set()  # unreadable diff ⇒ nothing is provably out-of-diff ⇒ all keep gating
+        hunks = await self._pr_hunks(repo, pr)
+        if not hunks:
+            return set()  # unreadable diff ⇒ nothing is provably pre-existing ⇒ all keep gating
         head_src = self._head_blobs_from_raw(raw)
-        missing = {_norm_path(str(f.get("file") or "")) for f in targets if f.get("file")} - set(head_src)
+        cited = {_norm_path(str(f.get("file") or "")) for f in targets if f.get("file")}
+        missing = cited - set(head_src)
         if missing:
             head_src.update(await self._read_blobs(repo, head, missing))
-        out_of_diff = [f for f in targets if line_in_diff(f, ranges, head_src) is False]
-        if not out_of_diff:
-            return set()
         base_sha = await self._merge_base_sha(repo, str(facts.get("base_ref") or ""), head)
-        base_src: dict[str, str | None] = {}
-        if base_sha:
-            base_src = await self._read_blobs(
-                repo, base_sha, {_norm_path(str(f.get("file") or "")) for f in out_of_diff if f.get("file")}
+        if not base_sha:
+            return set()  # merge-base unreadable ⇒ ambiguous ⇒ all keep gating
+        base_src = await self._read_blobs(repo, base_sha, cited)
+        changed = set(hunks)
+        eligible = [
+            f
+            for f in targets
+            if base_reproduction_precondition(
+                f, hunks.get(_norm_path(str(f.get("file") or ""))), head_src, base_src, changed
             )
-        changed = set(ranges)
+        ]
+        if not eligible:
+            return set()
         pre: set[int] = set()
-        for f in out_of_diff:
-            sc = scope_for(f, ranges, head_src, base_src, changed)
-            f["scope"] = sc
-            if sc == PRE_EXISTING_SCOPE:
+        for f in eligible:
+            if await self._exists_at_base(f, base_src) == "yes":
+                f["scope"] = PRE_EXISTING_SCOPE
                 pre.add(id(f))
         return pre
+
+    async def _classify_prior_scopes(self, repo, pr, head, facts, history, priors) -> None:
+        """Re-classify a PRIOR round's blocking findings against THIS head/merge-base (#300 steps 2+3).
+
+        Each prior's `line` is from the head it was raised at; it is RE-ANCHORED to the current head
+        through the raised-at→head diff (`map_base_line_to_head`, reusing the `since` provenance
+        `since_ranges`/`prior_touched` key off). A prior whose delta is unreadable, or whose line the
+        push since touched (maps to None), cannot be re-anchored and stays IN-DIFF — never classified.
+        Re-anchoring never mutates the recorded `line` (the ledger matches priors on file+line): the
+        re-anchored line rides a throwaway copy that `_classify_scopes` reads the current head with."""
+        prior_head = str((last_substantive_round(history) or {}).get("head") or "")
+        targets = [
+            f
+            for f in priors or []
+            if isinstance(f, dict)
+            and str(f.get("severity") or "").lower() in ("blocker", "major")
+            and not f.get("nearby")
+        ]
+        for f in targets:
+            if is_pre_existing(f):
+                f["scope"] = IN_DIFF_SCOPE  # a stale pre-existing never survives a round (#300 step 3)
+        if not targets:
+            return
+        since_heads = {str(f.get("since") or prior_head or "") for f in targets}
+        since_hunks = {h: await self._delta_hunks(repo, h, head) for h in since_heads if h and h != head}
+        pairs: list[tuple[dict, dict]] = []  # (original prior, re-anchored copy to classify)
+        for f in targets:
+            since = str(f.get("since") or prior_head or "")
+            if not since or since == head:
+                anchored = f.get("line")  # raised at THIS head already — no shift
+            else:
+                hunks_by_file = since_hunks.get(since)
+                if hunks_by_file is None:
+                    continue  # delta unreadable ⇒ cannot re-anchor ⇒ keep gating
+                # A file the push did not touch keeps its line (None hunks ⇒ identity map).
+                anchored = map_base_line_to_head(f.get("line"), hunks_by_file.get(_norm_path(str(f.get("file") or ""))))
+                if anchored is None:
+                    continue  # the push since touched the line ⇒ keep gating, do not classify
+            pairs.append((f, {**f, "line": anchored}))
+        if not pairs:
+            return
+        pre_ids = await self._classify_scopes(repo, pr, head, facts, [c for _o, c in pairs], raw=None)
+        for orig, copy in pairs:
+            if id(copy) in pre_ids:
+                orig["scope"] = PRE_EXISTING_SCOPE
 
     async def _scope_pre_existing(self, repo, pr, head, facts, findings, reported, raw):
         """Classify this round's blocking findings — the record and the verdict list together

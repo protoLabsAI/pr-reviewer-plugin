@@ -1276,8 +1276,9 @@ _B64URL_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 def blocking_priors(round_: dict | None) -> list[dict]:
     """The blocker/major findings a round's record holds as gating debt — the same set
-    `unaccounted_priors` holds a later round to: not refuted, not a #232 nearby note, not a
-    finding grounding already called fabricated."""
+    `unaccounted_priors` holds a later round to: not refuted, not a #232 nearby note, not a #300
+    pre-existing finding (it reproduces at the merge-base — the PR never owned it, so it is not
+    debt and never blocks a supersede), not a finding grounding already called fabricated."""
     return [
         f
         for f in (round_ or {}).get("findings") or []
@@ -1285,6 +1286,7 @@ def blocking_priors(round_: dict | None) -> list[dict]:
         and str(f.get("severity") or "").lower() in _BLOCKING
         and str(f.get("verdict") or "").lower() != "refuted"
         and not f.get("nearby")
+        and not is_pre_existing(f)
         and not f.get("ungrounded")
     ]
 
