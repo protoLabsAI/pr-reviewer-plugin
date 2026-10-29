@@ -131,6 +131,26 @@ def test_the_relay_gets_the_contract_only_on_a_host_that_has_the_fields():
     OldHost(name="structural-finder", **_completion_contract(OldHost))
 
 
+def test_the_relay_opts_out_of_inherited_read_tools_only_on_a_host_that_has_the_field():
+    # #302: inherited read tools made the relay drop its one protopatch_review call.
+    from dataclasses import dataclass
+
+    from pr_reviewer.subagents import _narrow_tools
+
+    @dataclass
+    class NewHost:
+        name: str = ""
+        inherit_read_tools: bool = True
+
+    @dataclass
+    class OldHost:  # rejects unknown kwargs — the plugin must not pass them
+        name: str = ""
+
+    assert NewHost(name="structural-finder", **_narrow_tools(NewHost)).inherit_read_tools is False
+    assert _narrow_tools(OldHost) == {}
+    OldHost(name="structural-finder", **_narrow_tools(OldHost))
+
+
 # ── one dispatcher and one sweep loop per process across config reloads (issue #198) ──
 
 
