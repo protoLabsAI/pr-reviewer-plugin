@@ -4816,9 +4816,12 @@ class Dispatcher:
             and not f.get("nearby")
         ]
         for f in targets:
-            if is_pre_existing(f):
-                f["scope"] = IN_DIFF_SCOPE  # re-derive from scratch — never inherit last round's relief
-        if not targets:
+            f["scope"] = IN_DIFF_SCOPE  # reset EVERY target every round — a stale/model relief never survives
+        if not targets or self._base_verifier is None:
+            # No verifier wired ⇒ nothing can ever be relieved to pre-existing, so skip the
+            # /files + compare + merge-base + contents reads entirely — they only feed the
+            # verifier. The reset above already ran, so this stays fail-closed: every target
+            # keeps the in-diff default and goes on gating (#300).
             return set()
         hunks = await self._pr_hunks(repo, pr)
         if not hunks:
@@ -4900,30 +4903,39 @@ class Dispatcher:
 
         A finding positively shown `pre-existing` is stamped so in the RECORD (`reported`, what
         the board reads and the next round recalls), dropped from the VERDICT list, and returned
-        for the "Pre-existing, not blocking" section. The verdict list inherits the record's
-        ruling by content, so a grounding copy that is not the same object as its recorded row
-        is still excluded. Any failure leaves both lists exactly as they were."""
-        pre_ids = await self._classify_scopes(repo, pr, head, facts, reported, raw=raw)
-        pre_existing = [f for f in reported if id(f) in pre_ids]
-        if not pre_existing:
-            return findings, reported, []
-        scope_by_key = {
-            _scope_key(f): str(f.get("scope") or "").strip().lower()
-            for f in reported
-            if str(f.get("scope") or "").strip()
-        }
-        kept: list[dict] = []
-        for f in findings:
-            if (
+        for the "Pre-existing, not blocking" section.
+
+        The verdict list holds grounding/line-correction COPIES that are not the same objects as
+        their recorded rows, so each blocking copy is reset to in-diff FIRST — in place, before
+        the first read that can raise — and then takes the scope its recorded row was re-derived
+        to THIS round, matched by content; no matching row leaves it in-diff. A `scope:
+        pre-existing` the model's report JSON (or a prior round) left on a verdict copy is thus
+        wiped unless this round re-derives it against the merge-base. Without this a label the
+        finding never earned would sail past `verdict_for` (which drops `is_pre_existing`) and
+        silently clear a blocker the record still shows in-diff — and it survives even when
+        `_classify_scopes` returns early (no verifier, nothing eligible) or raises, because the
+        reset is a plain in-place mutation done before the await."""
+
+        def _blocking(f: object) -> bool:
+            return (
                 isinstance(f, dict)
                 and str(f.get("severity") or "").lower() in ("blocker", "major")
                 and not f.get("nearby")
-            ):
-                sc = scope_by_key.get(_scope_key(f))
-                if sc:
-                    f["scope"] = sc
+            )
+
+        for f in findings:
+            if _blocking(f):
+                f["scope"] = IN_DIFF_SCOPE  # fail-closed reset; persists even if the classify below raises
+        pre_ids = await self._classify_scopes(repo, pr, head, facts, reported, raw=raw)
+        pre_existing = [f for f in reported if id(f) in pre_ids]
+        scope_by_key = {_scope_key(f): str(f.get("scope") or "").strip().lower() for f in reported if _blocking(f)}
+        kept: list[dict] = []
+        for f in findings:
+            if _blocking(f):
+                # The record row's re-derived ruling wins; no matching row ⇒ in-diff (fail closed).
+                f["scope"] = scope_by_key.get(_scope_key(f)) or IN_DIFF_SCOPE
                 if is_pre_existing(f):
-                    continue  # proven pre-existing ⇒ out of the verdict
+                    continue  # proven pre-existing THIS round ⇒ out of the verdict
             kept.append(f)
         return kept, reported, pre_existing
 

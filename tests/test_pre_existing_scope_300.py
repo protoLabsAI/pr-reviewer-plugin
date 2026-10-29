@@ -24,6 +24,7 @@ import base64
 import difflib
 import json
 
+import pytest
 from pr_reviewer.refutations import LlmRefutationStore, RefutationStore, premark_refuted
 from pr_reviewer.rounds import (
     OUTCOME_NOT_HONOURED,
@@ -526,3 +527,158 @@ async def test_an_unreadable_prior_delta_cannot_reanchor_and_keeps_gating(tmp_pa
 def test_delta_ranges_still_reads_the_same_patches():
     # The padded head-side ranges `line_in_diff`/#232 use are still derivable from the same patch.
     assert delta_ranges([{"filename": FILE, "patch": PR_PATCH}]).get(FILE)
+
+
+# ── a model-supplied `scope` is re-derived, never trusted (round-2 major, dispatch.py:4910) ──
+# The report JSON may carry `scope: pre-existing` itself. The verdict list holds grounding/line-
+# correction COPIES that are NOT the recorded rows, so a label the model put on a copy would ride
+# past `verdict_for` (which drops `is_pre_existing`) and clear a blocker with no merge-base check —
+# even on the common path where nothing is relieved (no verifier) or `_classify_scopes` raises.
+# `_scope_pre_existing` must reset every blocking verdict copy up front and keep only the scope
+# THIS round re-derives on the record.
+
+
+def _model_scoped_pair():
+    """A blocking major on the unchanged defect line as TWO distinct dicts — the verdict copy and
+    the recorded row — both carrying the model's own `scope: pre-existing`. This is the shape a
+    real round hands `_scope_pre_existing` once grounding/line-correction have copied the verdict
+    row away from its recorded original."""
+    reported = [dict(LLM_MAJOR, scope=PRE_EXISTING_SCOPE)]
+    findings = [dict(LLM_MAJOR, scope=PRE_EXISTING_SCOPE)]
+    assert findings[0] is not reported[0]
+    return findings, reported
+
+
+async def test_a_model_supplied_pre_existing_scope_is_re_derived_not_trusted(tmp_path):
+    # Verifier says `no`: nothing is relieved, so the verdict copy's model-supplied `pre-existing`
+    # is reset to in-diff and the blocker stays in the verdict.
+    gh = PreExistingGH(pr_facts=facts(), reviews=[])
+    d = make(tmp_path, gh=gh, base_verifier=_verifier("no"))
+    findings, reported = _model_scoped_pair()
+    kept, _rep, pre = await d._scope_pre_existing("o/r", 1, HEAD, facts(), findings, reported, {})
+    assert pre == []  # nothing re-derived pre-existing this round
+    assert findings[0]["scope"] == IN_DIFF_SCOPE  # the model's label was wiped, not trusted
+    assert kept == findings and verdict_for(kept) == FAIL  # the blocker still gates
+
+
+async def test_no_verifier_resets_a_model_supplied_pre_existing_scope(tmp_path):
+    # With no verifier wired nothing can be relieved, so a model-supplied `pre-existing` on EITHER
+    # list must be reset — the "every round while no verifier is wired" leak flagged in round 2.
+    gh = PreExistingGH(pr_facts=facts(), reviews=[])
+    d = make(tmp_path, gh=gh)  # base_verifier defaults to None
+    findings, reported = _model_scoped_pair()
+    kept, _rep, pre = await d._scope_pre_existing("o/r", 1, HEAD, facts(), findings, reported, {})
+    assert pre == []
+    assert findings[0]["scope"] == IN_DIFF_SCOPE and reported[0]["scope"] == IN_DIFF_SCOPE
+    assert verdict_for(kept) == FAIL
+
+
+async def test_a_model_scope_leaks_nothing_even_when_classification_raises(tmp_path):
+    # The reset is an in-place mutation done BEFORE the read that can raise, so a crash inside
+    # `_classify_scopes` (which the dispatcher catches) still leaves the verdict copy in-diff.
+    gh = PreExistingGH(pr_facts=facts(), reviews=[])
+    d = make(tmp_path, gh=gh, base_verifier=_verifier("yes"))
+
+    async def boom(*a, **k):
+        raise RuntimeError("merge-base read exploded")
+
+    d._classify_scopes = boom
+    findings, reported = _model_scoped_pair()
+    with pytest.raises(RuntimeError):
+        await d._scope_pre_existing("o/r", 1, HEAD, facts(), findings, reported, {})
+    assert findings[0]["scope"] == IN_DIFF_SCOPE  # reset survived the raise ⇒ no silent clearance
+
+
+# A model-scoped major whose evidence quote anchors uniquely at head, so grounding/line-correction
+# hand the verdict a COPY distinct from the recorded row — the exact object split behind the leak.
+LLM_MAJOR_MODEL_SCOPED = {
+    "file": FILE,
+    "line": DEFECT_LINE,
+    "severity": "major",
+    "category": "correctness",
+    "claim": "explain() dereferences a None config.",
+    "evidence": "the unchanged body reads `name = cfg.name` with no guard.",
+    "verdict": "confirmed",
+    "scope": PRE_EXISTING_SCOPE,
+}
+
+
+async def test_a_model_scoped_blocker_is_not_dropped_without_a_merge_base_check(tmp_path):
+    # End to end: the model itself tags the blocker `pre-existing`, but the verifier (seeing only
+    # the base) says `no`. The verdict must be FAIL, nothing lands in the Pre-existing section, and
+    # the record shows `in-diff` — the model's say-so never clears a blocker on its own.
+    gh = PreExistingGH(pr_facts=facts(), reviews=[])
+    runner, _ = capturing_runner(_report(LLM_MAJOR_MODEL_SCOPED))
+    d = make(tmp_path, cfg={"shadow_mode": False}, gh=gh, runner=runner, base_verifier=_verifier("no"))
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "reviewed:FAIL"
+    body = gh.reviews_posted[0]["body"]
+    assert "Pre-existing, not blocking" not in body
+    recorded = json.loads(extract_findings_json(body))
+    assert recorded and recorded[0]["scope"] == IN_DIFF_SCOPE
+
+
+# ── the base verifier is WIRED in production (round-2 major, __init__.py:94) ─────────────────
+from pr_reviewer.base_verify import build_user_prompt, make_base_verifier, parse_answer  # noqa: E402
+
+
+def test_parse_answer_normalises_to_yes_no_or_unsure():
+    assert parse_answer("yes\nreproduces at base") == "yes"
+    assert parse_answer("No, the guard is added by the PR") == "no"
+    assert parse_answer("unsure — cannot tell") == "unsure"
+    assert parse_answer("`yes`") == "yes"  # a fenced/punctuated token still reads
+    assert parse_answer("maybe") == "unsure"  # anything that is not yes/no fails closed
+    assert parse_answer("") == "unsure"
+    assert parse_answer(None) == "unsure"
+
+
+def test_the_base_prompt_carries_the_finding_and_only_the_base_text():
+    prompt = build_user_prompt(_finding(), {FILE: BASE})
+    assert "explain() dereferences a None config." in prompt
+    assert "name = cfg.name" in prompt  # the base source is shown
+    assert "DEFAULT_TIMEOUT = 60" not in prompt  # never the head's version
+
+
+async def test_the_production_verifier_fails_closed_without_a_gateway(monkeypatch):
+    for var in ("GATEWAY_API_KEY", "OPENAI_API_KEY", "OPENAI_BASE_URL", "PR_REVIEWER_BASE_VERIFIER_MODEL"):
+        monkeypatch.delenv(var, raising=False)
+    verify = make_base_verifier(lambda: {})  # no creds, no host ⇒ no endpoint
+    assert await verify(_finding(), {FILE: BASE}) == "unsure"
+
+
+async def test_the_production_verifier_maps_the_gateway_answer():
+    calls: dict = {}
+
+    async def poster(url, headers, payload, timeout_s):
+        calls["url"], calls["model"] = url, payload["model"]
+        # The model never sees the head: assert the base reached it, the head did not.
+        user = payload["messages"][-1]["content"]
+        calls["saw_head"] = "DEFAULT_TIMEOUT = 60" in user
+        return "yes\nthe None deref is already present at the base"
+
+    def endpoint(cfg):
+        return "k", "https://gw/v1/chat/completions", cfg.get("model") or "fallback"
+
+    verify = make_base_verifier(lambda: {"model": "mini"}, poster=poster, endpoint=endpoint)
+    assert await verify(_finding(), {FILE: BASE}) == "yes"
+    assert calls["url"].endswith("/chat/completions") and calls["model"] == "mini"
+    assert calls["saw_head"] is False
+
+
+async def test_the_production_verifier_never_raises_on_a_transport_error():
+    async def poster(url, headers, payload, timeout_s):
+        raise RuntimeError("gateway 503")
+
+    verify = make_base_verifier(lambda: {}, poster=poster, endpoint=lambda cfg: ("k", "u", "m"))
+    assert await verify(_finding(), {FILE: BASE}) == "unsure"
+
+
+def test_register_wires_a_live_base_verifier(tmp_path, monkeypatch):
+    import pr_reviewer
+
+    from tests.conftest import FakeRegistry
+
+    monkeypatch.setenv("PR_REVIEWER_HOME", str(tmp_path))
+    reg = FakeRegistry({"default_repo": "o/r"})
+    pr_reviewer.register(reg)
+    dispatcher = pr_reviewer._MACHINERY[str(pr_reviewer._state_home(reg.config))]["dispatcher"]
+    assert dispatcher._base_verifier is not None  # not inert in production anymore

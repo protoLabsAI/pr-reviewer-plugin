@@ -92,6 +92,16 @@ def register(registry) -> None:
             # Snapshotting them meant an operator flipping the gate through Settings got a
             # silent no-op until the container restarted.
             dispatcher = Dispatcher(cfg, telemetry, cfg_provider=live)
+            # The #300 pre-existing verifier: the one model call that decides whether a finding
+            # on an unchanged line reproduces at the merge-base. Wired here so classification is
+            # LIVE in production — the seam defaults to None, which makes relief INERT (every
+            # eligible finding reads "unsure" and keeps gating). It resolves the host's own gateway
+            # lazily and host-free and never raises; the dispatcher reads any failure as "unsure".
+            # Its config is read through `dispatcher.cfg` (not the boot closure) so a live reload's
+            # gateway knobs reach it the same way `rebind_config` refreshes every other knob.
+            from .base_verify import make_base_verifier
+
+            dispatcher._base_verifier = make_base_verifier(lambda: dispatcher.cfg)
             shared = _MACHINERY[home] = {"telemetry": telemetry, "dispatcher": dispatcher}
 
         def _secret() -> str:
