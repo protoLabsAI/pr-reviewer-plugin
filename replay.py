@@ -43,9 +43,13 @@ import re
 from urllib.parse import quote
 
 from .gh_cli import gh_json_rows
-from .grounding import UNREADABLE, apply_grounding
+from .grounding import UNREADABLE, apply_grounding, mentioned_paths, resolve_cited_paths
 from .rounds import converge, delta_ranges, parse_dispositions, unaccounted_priors
 from .verdicts import confine_findings, extract_findings_json, verdict_for
+
+# Files read per round because a finding names them in its evidence (#261) — in lockstep with
+# `dispatch.MAX_RELATED_READS`, kept local so replay stays host-free (it constructs no Dispatcher).
+MAX_RELATED_READS = 10
 
 # The report step is contracted to end with a fenced findings array — `[]` on a clean
 # pass. Its ABSENCE (not emptiness) is the truncation signal: the model never produced a
@@ -183,8 +187,17 @@ async def replay_review(
     ungrounded: list[dict] = []
     unreadable: list[dict] = []
     if findings:
-        sources = await _finding_sources(run_gh, repo, pr, head, findings)
-        findings, ungrounded, unreadable = apply_grounding(findings, sources)
+        pr_patches: dict[str, str] = {}
+        sources = await _finding_sources(run_gh, repo, pr, head, findings, patches_out=pr_patches)
+        # Ground a quote against every file the finding's evidence cites, not only its anchor and
+        # the PR patch (protoAgent#4723) — in lockstep with the live path. Cited bare names are
+        # resolved against the head tree so `checks.yml` reads from `.github/workflows/checks.yml`;
+        # the tree is fetched only when a finding names another file.
+        tree = await _head_tree(run_gh, repo, head) if any(mentioned_paths(f) for f in findings) else None
+        related = await _related_sources(run_gh, repo, head, findings, sources, tree)
+        findings, ungrounded, unreadable = apply_grounding(
+            findings, {**related, **sources}, patches="\n".join(pr_patches.values())
+        )
         grounding_checked = len(findings)
 
     verdict = verdict_for(findings)
@@ -254,11 +267,16 @@ async def _pr_is_merged(run_gh, repo: str, pr: int) -> bool:
     return rc == 0 and out.strip() == "true"
 
 
-async def _finding_sources(run_gh, repo: str, pr: int, head: str, findings: list[dict]) -> dict:
+async def _finding_sources(
+    run_gh, repo: str, pr: int, head: str, findings: list[dict], *, patches_out: dict | None = None
+) -> dict:
     """Kept in lockstep with `Dispatcher._finding_sources` (issue #109): the head read is
     PINNED to the immutable head SHA (path/ref URL-encoded), and a FAILED read yields the
     `UNREADABLE` sentinel — never a patch-only haystack, which would ground a head-context
-    quote against the patch alone and downgrade a real finding for code never actually read."""
+    quote against the patch alone and downgrade a real finding for code never actually read.
+
+    `patches_out`, when given, receives the whole PR patch ({file: patch}) so the caller can
+    ground a quote against the rest of the diff without a second read (#261)."""
     import base64
 
     patches: dict[str, str] = {}
@@ -270,6 +288,8 @@ async def _finding_sources(run_gh, repo: str, pr: int, head: str, findings: list
     for r in (gh_json_rows(out) if rc == 0 else None) or []:
         if isinstance(r, dict) and r.get("f"):
             patches[str(r["f"])] = str(r.get("p") or "")
+    if patches_out is not None:
+        patches_out.update(patches)
     sources: dict[str, str | object | None] = {}
     for file in {str(f.get("file") or "") for f in findings if f.get("file")}:
         ref = quote(head, safe="")
@@ -309,6 +329,70 @@ async def _finding_sources(run_gh, repo: str, pr: int, head: str, findings: list
                 blob = ""
         sources[file] = f"{blob}\n{patches.get(file, '')}" if read_ok else UNREADABLE
     return sources
+
+
+async def _head_tree(run_gh, repo: str, head: str) -> set[str] | None:
+    """The blob paths in the head commit's tree, or None (unreadable) — in lockstep with
+    `Dispatcher._head_tree`. PINNED to the head SHA via its tree SHA (never a model ref,
+    ADR 0078), in ONE recursive read. Lets a bare cited file name resolve to where it lives
+    (protoAgent#4723). Fails OPEN to None: a tree we could not read resolves no cited path."""
+    rc, out, _e = await run_gh(["api", f"repos/{repo}/commits/{quote(head, safe='')}", "--jq", ".commit.tree.sha"])
+    tree_sha = out.strip() if rc == 0 else ""
+    if not tree_sha:
+        return None
+    rc, out, _e = await run_gh(
+        [
+            "api",
+            f"repos/{repo}/git/trees/{quote(tree_sha, safe='')}?recursive=1",
+            "--jq",
+            '.tree[]? | select(.type == "blob") | .path',
+        ]
+    )
+    if rc != 0:
+        return None
+    paths = {line.strip() for line in out.splitlines() if line.strip()}
+    return paths or None
+
+
+async def _related_sources(
+    run_gh, repo: str, head: str, findings: list[dict], known: dict, tree: set[str] | None = None
+) -> dict[str, str]:
+    """{cited path: text at head} for the files the findings NAME in their own evidence (#261),
+    each resolved against the head `tree` so a bare name reads from where it actually lives
+    (protoAgent#4723). In lockstep with `Dispatcher._related_sources`: the text is keyed by the
+    cited name so `related_text` finds it, a cited name with no file in the tree is dropped
+    (reads stay inside the repo at head), and at most `MAX_RELATED_READS` distinct files are read.
+    Pinned to the head like every read here."""
+    import base64
+
+    wanted: dict[str, str] = {}  # cited name → the tree path to READ for it
+    for f in findings:
+        for cited, path in resolve_cited_paths(f, tree).items():
+            if cited not in known:
+                wanted.setdefault(cited, path)
+    out: dict[str, str] = {}
+    reads: dict[str, str] = {}  # tree path → text, so two names on one file cost one read
+    for cited, path in wanted.items():
+        if path not in reads:
+            if len(reads) >= MAX_RELATED_READS:
+                continue
+            rc, raw, _e = await run_gh(
+                [
+                    "api",
+                    f"repos/{repo}/contents/{quote(path, safe='/')}?ref={quote(head, safe='')}",
+                    "--jq",
+                    '(.encoding // "") + "\\u0000" + (.content // "")',
+                ]
+            )
+            encoding, _, payload = raw.partition("\x00")
+            if rc != 0 or encoding.strip() != "base64":
+                continue
+            try:
+                reads[path] = base64.b64decode(payload.strip()).decode("utf-8", errors="replace")
+            except Exception:  # noqa: BLE001 — an undecodable file grounds nothing
+                continue
+        out[cited] = reads[path]
+    return out
 
 
 async def _delta_ranges(run_gh, repo: str, base: str, head: str) -> dict | None:

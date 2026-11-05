@@ -492,3 +492,116 @@ async def test_finding_sources_reads_a_second_page_of_patches():
     sources = await _finding_sources(gh, "o/r", 1, HEAD40, [{"file": "b.py"}])
     assert not gh.jq.startswith("[")  # one object per line, pagination-safe
     assert sources["b.py"].endswith("patchB")  # the second page's patch arrived
+
+
+# ── protoAgent#4723: ground against every file the evidence cites, resolved to the head tree ──
+
+
+class CitedPathsGH:
+    """Read-only fake serving the #4723 shape: the changed paths, the PR patches, the head tree,
+    and per-path file contents (keyed by the file's REAL path in the tree). Records every call so
+    a test can assert replay never writes."""
+
+    def __init__(self, *, changed, patches, tree, tree_sha="tree0", contents):
+        self.changed = changed  # changed-file names (confine_findings)
+        self.patches = patches  # [{f, p}] rows
+        self.tree = set(tree)
+        self.tree_sha = tree_sha
+        self.contents = dict(contents)  # {real tree path: file text}
+        self.calls: list[list[str]] = []
+
+    async def __call__(self, args, timeout=30):
+        import base64
+
+        self.calls.append(args)
+        assert "-X" not in args, "replay must never write to GitHub"
+        j = " ".join(args)
+        if ".commit.tree.sha" in j and "/commits/" in j:  # _head_tree → _commit_tree
+            return 0, self.tree_sha, ""
+        if "/git/trees/" in j:  # _head_tree recursive read
+            return 0, "\n".join(sorted(self.tree)), ""
+        if "/contents/" in j:
+            from urllib.parse import unquote
+
+            path = unquote(j.split("/contents/", 1)[1].split("?", 1)[0])
+            text = self.contents.get(path)
+            if text is None:
+                return 1, "", "404"
+            return 0, "base64\x00" + base64.b64encode(text.encode()).decode(), ""
+        if "/files" in j and ".patch" in j:  # _finding_sources patches
+            return 0, "\n".join(json.dumps(r) for r in self.patches), ""
+        if "/files" in j:  # _changed_paths
+            return 0, "".join(f"{p}\n" for p in self.changed), ""
+        if ".merged" in j:
+            return 0, "false", ""
+        return 0, "", ""
+
+
+_UV_LOCK = 'version = 1\nrequires-python = ">=3.11"\n# protolabs 0.11.28\n'
+_CHECKS_YML = 'jobs:\n  build:\n    steps:\n      - with:\n          version: "0.11.29"\n'
+
+
+def _finding_4723():
+    return json.dumps(
+        [
+            {
+                "file": "uv.lock",
+                "line": 3,
+                "severity": "major",
+                "claim": "uv.lock pins 0.11.28 but the workflows pin 0.11.29",
+                "evidence": 'Both `checks.yml` and `prepare-release.yml` declare `version: "0.11.29"`, but uv.lock:3 has 0.11.28.',
+            }
+        ]
+    )
+
+
+async def test_replay_grounds_a_finding_against_a_cited_file_in_a_subdirectory():
+    # #4723: the quoted `version: "0.11.29"` is absent from the anchor (uv.lock) and the patch,
+    # but present in `.github/workflows/checks.yml` — a file the evidence cites by bare name.
+    # Resolved against the head tree, the real file is read and the TRUE major keeps its grounding
+    # rather than being downgraded to a non-gating uncertain.
+    gh = CitedPathsGH(
+        changed=["uv.lock"],
+        patches=[{"f": "uv.lock", "p": "@@ -3 +3 @@\n-# protolabs 0.11.27\n+# protolabs 0.11.28\n"}],
+        tree={"uv.lock", ".github/workflows/checks.yml", ".github/workflows/prepare-release.yml"},
+        contents={
+            "uv.lock": _UV_LOCK,
+            ".github/workflows/checks.yml": _CHECKS_YML,
+            ".github/workflows/prepare-release.yml": "name: prepare-release\n",
+        },
+    )
+    out = await replay_review(
+        {"repo": "o/r", "pr": 1, "head": "a" * 40},
+        run_gh=gh,
+        runner=_runner(f"brief\n```json\n{_finding_4723()}\n```"),
+        parse_findings=_parse,
+    )
+    assert out["telemetry"]["grounding_downgraded"] == 0  # found in the cited workflow file
+    assert out["findings"][0].get("ungrounded") is not True
+    assert out["verdict"] == "FAIL"  # a grounded, confirmed major gates
+    # the real workflow file was read at its actual path, pinned to the head SHA
+    reads = [" ".join(c) for c in gh.calls if "/contents/" in " ".join(c)]
+    assert any(".github/workflows/checks.yml" in r and "ref=" + "a" * 40 in r for r in reads)
+
+
+async def test_replay_still_downgrades_when_the_quote_is_in_no_cited_file():
+    # The guard still bites: the cited files exist and are read, but none carries the quote, so the
+    # fabricated-looking major is downgraded exactly as before (a WARN, not a FAIL).
+    gh = CitedPathsGH(
+        changed=["uv.lock"],
+        patches=[{"f": "uv.lock", "p": ""}],
+        tree={"uv.lock", ".github/workflows/checks.yml", ".github/workflows/prepare-release.yml"},
+        contents={
+            "uv.lock": _UV_LOCK,
+            ".github/workflows/checks.yml": "jobs:\n  build:\n    steps:\n      - run: echo hi\n",
+            ".github/workflows/prepare-release.yml": "name: prepare-release\n",
+        },
+    )
+    out = await replay_review(
+        {"repo": "o/r", "pr": 1, "head": "a" * 40},
+        run_gh=gh,
+        runner=_runner(f"brief\n```json\n{_finding_4723()}\n```"),
+        parse_findings=_parse,
+    )
+    assert out["telemetry"]["grounding_downgraded"] == 1
+    assert out["verdict"] == "WARN"  # a downgraded major cannot FAIL
