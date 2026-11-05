@@ -289,6 +289,58 @@ def related_candidates(finding: dict) -> list[str]:
     return [p for p in out if p != own]
 
 
+def _dirname(path: str) -> str:
+    return path.rsplit("/", 1)[0] if "/" in path else ""
+
+
+def _nearest_tree_path(matches: list[str], base: str) -> str | None:
+    """From the tree paths that could answer a cited name, the one to READ: in the cited file's
+    OWN directory first, then the shallowest path, then lexicographically — a stable choice so a
+    finding always resolves to the same file and never to an arbitrary one of several namesakes."""
+    if not matches:
+        return None
+    return min(matches, key=lambda p: (_dirname(p) != base, p.count("/"), p))
+
+
+def resolve_cited_paths(finding: dict, tree: set[str] | None) -> dict[str, str]:
+    """``{candidate the finding cites: the file in the head ``tree`` to READ for it}`` — the
+    bridge that makes a quote ground against every file the evidence names, not only the ones the
+    evidence spelled out with a full path (protoAgent#4723).
+
+    Each key is a ``related_candidates`` entry, so a reader can store the file's text under that
+    key and `related_text` finds it unchanged. The value is the repo path that actually carries
+    the cited name at the reviewed head:
+
+    * a candidate the tree has verbatim maps to itself;
+    * a candidate WRITTEN WITH A DIRECTORY that the tree lacks maps to its nearest suffix match
+      (the evidence may omit a leading package dir);
+    * a BARE file name (``checks.yml``) maps to the tree file that carries it, nearest the cited
+      file's own directory — so a ``uv.lock`` finding that cites ``checks.yml`` reads the real
+      ``.github/workflows/checks.yml`` instead of a non-existent root ``checks.yml`` and keeps
+      its grounding.
+
+    A candidate with NO file in the tree is dropped: the reads it would drive are restricted to
+    files that exist in the repo at the reviewed head (acceptance r4), so a cited path can never
+    send a read outside the checkout. ``tree`` None (unreadable) maps every candidate to itself —
+    the pre-tree behaviour, fail-open like every other step here, so a tree we could not read
+    never COSTS a related read that would otherwise have landed."""
+    candidates = related_candidates(finding)
+    if not tree:
+        return {c: c for c in candidates}
+    base = _dirname(str(finding.get("file") or "").lstrip("./"))
+    out: dict[str, str] = {}
+    for candidate in candidates:
+        if candidate in tree:
+            hit: str | None = candidate
+        elif "/" in candidate:
+            hit = _nearest_tree_path([p for p in tree if p.endswith("/" + candidate)], base)
+        else:
+            hit = _nearest_tree_path([p for p in tree if p.rsplit("/", 1)[-1] == candidate], base)
+        if hit:
+            out[candidate] = hit
+    return out
+
+
 def ground_finding(finding: dict, source: str | None, related: str = "") -> tuple[bool, list[str]]:
     """(grounded?, quotes that were absent). `source` should be the file at the reviewed
     head PLUS the PR's patch for it — a removed-behaviour finding legitimately quotes

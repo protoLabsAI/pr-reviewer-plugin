@@ -79,10 +79,11 @@ from .grounding import (
     ground_absence_claims,
     ground_finding,
     is_absence_claim,
-    related_candidates,
+    mentioned_paths,
     render_absence_footnote,
     render_grounding_footnote,
     render_unreadable_footnote,
+    resolve_cited_paths,
 )
 from .pr_description import render as render_pr_description
 from .protopatch import (
@@ -2644,35 +2645,48 @@ class Dispatcher:
             sources[file] = (blob, combined)
         return sources
 
-    async def _related_sources(self, repo: str, head: str, findings: list[dict], known: dict) -> dict[str, str]:
-        """{path: text at head} for the files the findings NAME in their own evidence (#261) —
-        `tests/conftest.py defines …` — so a quote attributed there is looked for there before
-        it is called missing. Pinned to the head like every read here; a path that does not
-        exist or cannot be read is simply absent. At most `MAX_RELATED_READS` reads a round."""
+    async def _related_sources(
+        self, repo: str, head: str, findings: list[dict], known: dict, tree: set[str] | None = None
+    ) -> dict[str, str]:
+        """{cited path: text at head} for the files the findings NAME in their own evidence
+        (#261) — `tests/conftest.py defines …` — so a quote attributed there is looked for there
+        before it is called missing. Each cited name is RESOLVED against the head `tree` first, so
+        a bare name (`checks.yml`) is read from where it actually lives
+        (`.github/workflows/checks.yml`) and a real quote is not called missing just because the
+        evidence omitted the directory (protoAgent#4723). The text is keyed by the cited name so
+        `related_text` finds it; a cited name with no file in the tree is dropped, keeping the
+        reads inside the repo at the reviewed head (acceptance r4). Pinned to the head like every
+        read here; `tree` None falls back to the cited name verbatim. At most `MAX_RELATED_READS`
+        distinct files are read a round."""
         import base64
 
-        wanted: dict[str, None] = {}
+        wanted: dict[str, str] = {}  # cited name → the tree path to READ for it
         for f in findings:
-            for path in related_candidates(f):
-                if path not in known:
-                    wanted.setdefault(path, None)
+            for cited, path in resolve_cited_paths(f, tree).items():
+                if cited not in known:
+                    wanted.setdefault(cited, path)
         out: dict[str, str] = {}
-        for path in list(wanted)[:MAX_RELATED_READS]:
-            rc, raw, _err = await self._run_gh(
-                [
-                    "api",
-                    f"repos/{repo}/contents/{quote(path, safe='/')}?ref={quote(head, safe='')}",
-                    "--jq",
-                    '(.encoding // "") + "\\u0000" + (.content // "")',
-                ]
-            )
-            encoding, _, payload = raw.partition("\x00")
-            if rc != 0 or encoding.strip() != "base64":
-                continue
-            try:
-                out[path] = base64.b64decode(payload.strip()).decode("utf-8", errors="replace")
-            except Exception:  # noqa: BLE001 — an undecodable file grounds nothing
-                continue
+        reads: dict[str, str] = {}  # tree path → text, so two names on one file cost one read
+        for cited, path in wanted.items():
+            if path not in reads:
+                if len(reads) >= MAX_RELATED_READS:
+                    continue
+                rc, raw, _err = await self._run_gh(
+                    [
+                        "api",
+                        f"repos/{repo}/contents/{quote(path, safe='/')}?ref={quote(head, safe='')}",
+                        "--jq",
+                        '(.encoding // "") + "\\u0000" + (.content // "")',
+                    ]
+                )
+                encoding, _, payload = raw.partition("\x00")
+                if rc != 0 or encoding.strip() != "base64":
+                    continue
+                try:
+                    reads[path] = base64.b64decode(payload.strip()).decode("utf-8", errors="replace")
+                except Exception:  # noqa: BLE001 — an undecodable file grounds nothing
+                    continue
+            out[cited] = reads[path]
         return out
 
     async def _head_tree(self, repo: str, head: str) -> set[str] | None:
@@ -4188,15 +4202,26 @@ class Dispatcher:
         # nearby finding (#232) must be flagged in the RECORD too, which later rounds read.
         recorded_kept = list(findings)
         raw: dict = {}
+        # The head tree, fetched at most once and shared with the absence pass below. Only read
+        # when a finding CITES another file (so the related reads can be resolved against it) —
+        # an ordinary review names no other file and pays nothing.
+        head_tree: set[str] | None = None
+        head_tree_fetched = False
         if self.grounding_enabled and findings:
             pr_patches: dict[str, str] = {}
             raw = await self._finding_sources(repo, pr, head, findings, patches_out=pr_patches)
             blobs = {f: v[0] for f, v in raw.items()}
             grounding_sources = {f: v[1] for f, v in raw.items()}
-            # Before a quote is called missing it is looked for in the files the finding names
-            # and in the rest of the PR's patch (#261) — a real quote attributed to the wrong
-            # file is not a fabrication. Related reads never replace a finding's own source.
-            related = await self._related_sources(repo, head, findings, grounding_sources)
+            # Before a quote is called missing it is looked for in every file the finding names
+            # and in the rest of the PR's patch (#261) — a real quote attributed to another file
+            # is not a fabrication. The cited files are resolved against the head tree, so a bare
+            # name (`checks.yml`) reads from `.github/workflows/checks.yml` and a finding anchored
+            # elsewhere stays grounded (protoAgent#4723). Related reads never replace a finding's
+            # own source.
+            if any(mentioned_paths(f) for f in findings):
+                head_tree = await self._head_tree(repo, head)
+                head_tree_fetched = True
+            related = await self._related_sources(repo, head, findings, grounding_sources, head_tree)
             grounded_findings, ungrounded, unreadable = apply_grounding(
                 findings, {**related, **grounding_sources}, patches="\n".join(pr_patches.values())
             )
@@ -4259,7 +4284,7 @@ class Dispatcher:
         if self.grounding_enabled and any(
             is_absence_claim(f) and str(f.get("severity") or "").lower() in ("blocker", "major") for f in findings
         ):
-            tree = await self._head_tree(repo, head)
+            tree = head_tree if head_tree_fetched else await self._head_tree(repo, head)
             diff_truncated, dropped_paths = await self._diff_truncation(repo, pr)
             findings, absence_demoted = ground_absence_claims(
                 findings, tree, truncated=diff_truncated, dropped_paths=dropped_paths
