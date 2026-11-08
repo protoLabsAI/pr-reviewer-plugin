@@ -24,7 +24,11 @@ import json
 import logging
 import time
 
-from .chokepoint import DISPATCH_ACTIONS, verify_signature
+from .chokepoint import DISPATCH_ACTIONS, DROP_IN_FLIGHT, verify_signature
+
+#: A dispatch delivery for a head whose earlier delivery is still waiting for a panel slot
+#: (#309). The waiter ahead of it reviews that head.
+DROP_ALREADY_QUEUED = "already-queued"
 
 log = logging.getLogger("protoagent.plugins.pr_reviewer")
 
@@ -128,9 +132,11 @@ def build_routers(dispatcher, telemetry, get_secret, run_gh_fn=None):
         (#209). The publish runs outside the queue lock and is best-effort — a failure is
         logged in the dispatcher and never blocks the round.
 
-        It fires ONLY for a `DISPATCH_ACTIONS` event, though: `_safe_handle` takes this slot for
-        EVERY pull_request action, BEFORE `handle_pr_event` applies the DISPATCH_ACTIONS /
-        in-flight / cooldown / allowlist filters. Left ungated, a non-dispatch action (labeled,
+        It fires ONLY for a `DISPATCH_ACTIONS` event, though. Since #309 `_safe_handle` takes no
+        slot for a non-dispatch action at all, and this gate stays as the second rail for any
+        caller that does. Before #309 the slot was taken for EVERY pull_request action, BEFORE
+        `handle_pr_event` applied the DISPATCH_ACTIONS / in-flight / cooldown / allowlist
+        filters. Left ungated, a non-dispatch action (labeled,
         review_requested, edited, closed) or a redelivery that has to wait would rewrite the
         head's required check to "Queued behind N" and then be dropped with no round to move it
         forward — even over a panel already `in_progress` for that head. Gating here keeps the
@@ -377,12 +383,53 @@ def build_routers(dispatcher, telemetry, get_secret, run_gh_fn=None):
         except Exception:  # noqa: BLE001
             log.exception("[pr-reviewer] summon crashed for %s#%s", repo, pr)
 
+    def _resolved_before_queue(repo: str, pr: int, head: str, action: str) -> str | None:
+        """A dispatch delivery that needs no panel slot, decided without waiting for one (#309).
+
+        The chokepoint drops a second request for a head already under review ("dropped, not
+        queued"), but only once the delivery holds a panel slot. Under load that meant a
+        redelivery parked behind every real panel, inflated the queue depth and the
+        "Queued behind N" check, and was then dropped anyway. Here:
+
+          - a head with a LIVE chokepoint slot drops `in-flight` now;
+          - a head whose earlier delivery is still WAITING drops `already-queued` now: that
+            waiter reviews it;
+          - a different head while a round is in flight sets the newer-head hint NOW, so the
+            running round's in-step poll (#258) can stop it, and then queues as before.
+
+        Pure and synchronous, with no await between the read and the drop. `ready_for_review`
+        always takes the normal path, because `handle_pr_event` resets the round cap for it."""
+        if not head or action not in DISPATCH_ACTIONS or action == "ready_for_review":
+            return None
+        choke = getattr(dispatcher, "chokepoint", None)
+        live_shas = getattr(choke, "live_shas", None)
+        live = live_shas(repo, pr) if callable(live_shas) else set()
+        if head in live:
+            reason = DROP_IN_FLIGHT
+        elif isinstance(_panel_queue, PanelQueue) and _panel_queue.has_waiter(repo, pr, head):
+            reason = DROP_ALREADY_QUEUED
+        else:
+            hint = getattr(dispatcher, "_hint_newer_head", None)
+            if live and callable(hint):
+                hint(repo, pr, head)
+            return None
+        telemetry.emit("drop", repo=repo, pr=pr, sha=head, reason=reason, action=action, pre_queue=True)
+        return f"drop:{reason}"
+
     async def _safe_handle(repo: str, pr: int, head: str, action: str) -> None:
         # Hold a panel slot across the dispatch; a burst beyond the cap queues here
-        # rather than launching every panel at once (#96).
+        # rather than launching every panel at once (#96). Only a delivery that can START a
+        # panel waits for one (#309): a non-dispatch action (labeled, edited, closed, ...)
+        # never runs a panel in `handle_pr_event`, and parking it behind real panels only
+        # inflated the queue and delayed the `closed` hint and check publish.
         try:
-            async with _panel_slot("webhook", repo, pr, head, action):
+            if action not in DISPATCH_ACTIONS:
                 outcome = await dispatcher.handle_pr_event(repo, pr, head, action)
+            elif (early := _resolved_before_queue(repo, pr, head, action)) is not None:
+                outcome = early
+            else:
+                async with _panel_slot("webhook", repo, pr, head, action):
+                    outcome = await dispatcher.handle_pr_event(repo, pr, head, action)
             log.info("[pr-reviewer] %s#%s @%s (%s) -> %s", repo, pr, head[:7], action, outcome)
         except Exception:  # noqa: BLE001
             log.exception("[pr-reviewer] webhook dispatch crashed for %s#%s", repo, pr)
