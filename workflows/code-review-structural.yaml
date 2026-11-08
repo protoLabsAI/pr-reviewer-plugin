@@ -155,7 +155,8 @@ inputs:
     default: "(none)"
 steps:
   - id: find_correctness
-    subagent: review-finder
+    # review-finder-deep: the same finder, on pr_reviewer.deep_finder_model when set (#318).
+    subagent: review-finder-deep
     timeout: "{{inputs.finder_timeout}}"
     prompt: |
       Review PR #{{inputs.pr}} in repo "{{inputs.repo}}" at head SHA
@@ -235,7 +236,8 @@ steps:
       means "the repo is inaccessible" — the diff you were given came from it.
 
   - id: find_removed_behavior
-    subagent: review-finder
+    # review-finder-deep: the same finder, on pr_reviewer.deep_finder_model when set (#318).
+    subagent: review-finder-deep
     timeout: "{{inputs.finder_timeout}}"
     prompt: |
       Review PR #{{inputs.pr}} in repo "{{inputs.repo}}" at head SHA

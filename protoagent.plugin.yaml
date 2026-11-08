@@ -15,7 +15,9 @@ description: >-
   a partial structural pass must not void the panel review (ADR 0078 D3).
 enabled: false                 # SHIP DISABLED — enabling is the operator's trust decision
 repository: https://github.com/protoLabsAI/pr-reviewer-plugin
-min_protoagent_version: "0.170.0"  # a step `timeout` that references an input (protoAgent#3555):
+min_protoagent_version: "0.186.0"  # 0.186.0: a subagent's pinned model is read from its registry entry at
+# dispatch (protoAgent#3944) — what lets `review-finder-deep` (#318) run on its own model.
+# Before that, 0.170.0: a step `timeout` that references an input (protoAgent#3555):
 # the bundled recipe takes its finder budget from `inputs.finder_timeout` (issue #93), and an
 # older engine REJECTS that at validation — the recipe would not load and every structural
 # review would fail. Refusing to load on an old core is the loud version of that. 0.170.0 also
