@@ -14,6 +14,8 @@ spending a panel and carries the board's verdict into the gates that read hers:
 - `failure`/`error`: hold. The record's own fix round owns the PR. Vera posts NOTHING:
   a FAIL from her would be read back by the board as the external panel failing its head
   (projectBoard#354/#512), and the merge stays blocked anyway because no verdict exists.
+- `pending` for longer than `pending_grace_s` (3600): the record died mid-review; Vera
+  reviews the head.
 - no status at all after `grace_s`: the record is not reviewing this head (the board
   dropped the card, an operator pushed past it, the gate is off). Vera reviews it herself,
   so no head is ever left with nobody reviewing it.
@@ -30,6 +32,9 @@ import json
 from dataclasses import dataclass
 
 DEFAULT_GRACE_S = 1200
+# A record status stuck at `pending` this long is a gate that died mid-run (the board's own
+# per-call cap is 1800s): stop waiting and review the head.
+DEFAULT_PENDING_GRACE_S = 3600
 
 PASS_ = "pass"
 HOLD_PENDING = "hold-pending"
@@ -45,6 +50,7 @@ class Rule:
     status: str
     grace_s: int = DEFAULT_GRACE_S
     name: str = ""
+    pending_grace_s: int = DEFAULT_PENDING_GRACE_S
 
     @property
     def who(self) -> str:
@@ -72,12 +78,19 @@ def parse_rules(raw) -> list[Rule]:
         status = str(item.get("status") or "").strip()
         if not label or not status:
             continue
-        try:
-            grace = int(item.get("grace_s", DEFAULT_GRACE_S))
-        except (TypeError, ValueError):
-            grace = DEFAULT_GRACE_S
-        rules.append(Rule(label, status, max(0, grace), str(item.get("name") or "").strip()))
+        grace = _int(item.get("grace_s"), DEFAULT_GRACE_S)
+        pending = _int(item.get("pending_grace_s"), DEFAULT_PENDING_GRACE_S)
+        rules.append(Rule(label, status, grace, str(item.get("name") or "").strip(), pending))
     return rules
+
+
+def _int(value, default: int) -> int:
+    if value is None:
+        return default
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return default
 
 
 def match(rules: list[Rule], labels) -> Rule | None:
@@ -85,15 +98,25 @@ def match(rules: list[Rule], labels) -> Rule | None:
     return next((r for r in rules if r.label.lower() in have), None)
 
 
-def decide(state: str | None, head_age_s: float | None, grace_s: int) -> str:
+def decide(
+    state: str | None,
+    head_age_s: float | None,
+    grace_s: int,
+    *,
+    status_age_s: float | None = None,
+    pending_grace_s: int = DEFAULT_PENDING_GRACE_S,
+) -> str:
     """The record's status state at the head (None: it posted none) → what Vera does.
 
-    An unreadable head age is treated as fresh: holding costs one sweep pass, while reviewing
-    a head the record is about to review spends a whole panel for nothing."""
+    An unreadable age is treated as fresh: holding costs one sweep pass, while reviewing a
+    head the record is about to review spends a whole panel for nothing. A `pending` older
+    than `pending_grace_s` is a record that died mid-review; Vera reviews it."""
     s = (state or "").strip().lower()
     if s == "success":
         return PASS_
     if s == "pending":
+        if status_age_s is not None and status_age_s >= pending_grace_s:
+            return REVIEW_FALLBACK
         return HOLD_PENDING
     if s in ("failure", "error"):
         return HOLD_FAILED

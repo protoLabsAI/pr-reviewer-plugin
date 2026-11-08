@@ -62,6 +62,13 @@ def test_decide(state, age, want):
     assert decide(state, age, 1200) == want
 
 
+def test_a_pending_record_that_died_mid_review_falls_back():
+    assert decide("pending", None, 1200, status_age_s=3599, pending_grace_s=3600) == HOLD_PENDING
+    assert decide("pending", None, 1200, status_age_s=3600, pending_grace_s=3600) == REVIEW_FALLBACK
+    assert decide("pending", None, 1200, status_age_s=None) == HOLD_PENDING  # unreadable: hold
+    assert parse_rules([{**RULE, "pending_grace_s": 99}])[0].pending_grace_s == 99
+
+
 # ── through the dispatcher ──────────────────────────────────────────────────────────────
 
 
@@ -140,6 +147,15 @@ async def test_no_record_status_past_the_grace_reviews_herself(tmp_path):
     assert out.startswith("reviewed:"), out
     assert calls  # the panel ran
     assert _events(tmp_path, "reviewer_of_record")[-1]["decision"] == REVIEW_FALLBACK
+
+
+async def test_a_stale_pending_record_status_reviews_herself(tmp_path):
+    calls: list = []
+    old = datetime.fromtimestamp(time.time() - 7200, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+    gh = _labelled(status={"state": "pending", "description": "Review gate running…", "updated_at": old})
+    d = make(tmp_path, cfg=CFG, gh=gh, runner=_runner(calls))
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")).startswith("reviewed:")
+    assert calls
 
 
 async def test_an_unreadable_record_status_holds(tmp_path):

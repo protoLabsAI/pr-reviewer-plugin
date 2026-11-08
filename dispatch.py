@@ -725,6 +725,19 @@ def _env_repos() -> list[str]:
     return [r for r in re.split(r"[,\s]+", os.environ.get("PR_REVIEWER_REPOS", "").strip()) if r]
 
 
+def _age_s(stamp) -> float | None:
+    """Seconds since an ISO-8601 GitHub timestamp, or None when it is absent or unreadable."""
+    text = str(stamp or "").strip()
+    if not text:
+        return None
+    try:
+        from datetime import datetime
+
+        return time.time() - datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
 def _env_bool(name: str, default: bool) -> bool:
     """A tri-state env flag: unset → default; else truthy iff 1/true/yes/on."""
     raw = os.environ.get(name)
@@ -2411,7 +2424,7 @@ class Dispatcher:
                 "api",
                 f"repos/{repo}/commits/{head}/statuses",
                 "--jq",
-                f"[.[] | select(.context == {json.dumps(rule.status)})][0] // {{}} | {{state, description}}",
+                f"[.[] | select(.context == {json.dumps(rule.status)})][0] // {{}} | {{state, description, updated_at}}",
             ]
         )
         try:
@@ -2425,15 +2438,15 @@ class Dispatcher:
         age = None
         if not state:
             rc2, out2, _ = await self._run_gh(["api", f"repos/{repo}/commits/{head}", "--jq", ".commit.committer.date"])
-            if rc2 == 0 and out2.strip():
-                try:
-                    from datetime import datetime
-
-                    stamp = datetime.fromisoformat(out2.strip().replace("Z", "+00:00"))
-                    age = time.time() - stamp.timestamp()
-                except ValueError:
-                    age = None
-        return decide(state, age, rule.grace_s), rule, str((row or {}).get("description") or "")
+            age = _age_s(out2) if rc2 == 0 else None
+        decision = decide(
+            state,
+            age,
+            rule.grace_s,
+            status_age_s=_age_s((row or {}).get("updated_at")),
+            pending_grace_s=rule.pending_grace_s,
+        )
+        return decision, rule, str((row or {}).get("description") or "")
 
     async def _post_attested(
         self, repo: str, pr: int, head: str, scope: _epic.EpicScope, history: list[dict], diff_id: str | None
