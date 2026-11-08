@@ -84,6 +84,8 @@ never the main YAML.
 | `absence_search` | `true` | `PR_REVIEWER_ABSENCE_SEARCH` | `git grep` the head for what an absence claim says is missing. Needs grounding on |
 | `absence_search_budget_s` | `120` | | Wall-clock bound on that search |
 | `absence_search_clone` | `true` | | `false` uses only a checkout the structural pass already made, never a fresh clone |
+| `repo_search` | `true` | `PR_REVIEWER_REPO_SEARCH` | Back the lanes' `search_pr_repo` / `list_pr_repo_files` with a checkout of the PR head (issue #311). `false` makes both return a `SEARCH ERROR` |
+| `repo_search_checkout_wait_s` | `90` | | How long one search waits for the head checkout to finish building before answering `SEARCH ERROR` (the clone carries on in the background) |
 | `evidence_guard` | `true` | `PR_REVIEWER_EVIDENCE_GUARD` | Demote a `confirmed` that quotes no code. Needs grounding on |
 | `hold_unexplained_clearance` | `true` | `PR_REVIEWER_HOLD_UNEXPLAINED_CLEARANCE` | A zero-finding PASS does not dismiss our standing block when a prior confirmed blocker/major vanished unexplained. `false` restores always-dismiss |
 | `convergence_rounds` | `3` | `PR_REVIEWER_CONVERGENCE_ROUNDS` | The round from which an all-minor, all-in-delta WARN retires to PASS-with-notes. `0` disables |
