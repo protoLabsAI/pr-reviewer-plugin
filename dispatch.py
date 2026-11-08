@@ -38,6 +38,7 @@ from urllib.parse import quote
 
 from . import absence_search as _absence
 from . import epic as _epic
+from . import repo_search as _repo_search
 from .absence_search import AbsenceSearcher, render_absence_search_footnote
 from .approve import (
     HOLD_NO_CLEAR_VERDICT,
@@ -3655,6 +3656,8 @@ class Dispatcher:
         # Bind this PR to the round's repo (#279) so the structural tool, if the model omits
         # `repo`, resolves to it and never to a stray default_repo pointing at another repo.
         set_bound_repo(repo, pr)
+        # The lanes' repo search (#311) reads THIS head, and its checkout starts building now.
+        _repo_search.bind_review(repo, pr, head, self.cfg)
         if self.finder_timeout_s:
             inputs["finder_timeout"] = self.finder_timeout_s  # else the recipe's default (#93)
         if self.synthesize_timeout_s:

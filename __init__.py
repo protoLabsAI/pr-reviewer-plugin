@@ -56,6 +56,18 @@ def register(registry) -> None:
     except Exception:  # noqa: BLE001 — never let one group sink the rest
         log.exception("[pr-reviewer] registering tools failed")
 
+    try:
+        # Read-only search of the PR head for the panel's lanes (issue #311). Marked
+        # `access: read`, so the host's read-tool inheritance hands it to the finders and
+        # the verifier without a host change.
+        from .repo_search import get_tools as get_search_tools
+
+        for t in get_search_tools(cfg):
+            registry.register_tool(t)
+            n_tools += 1
+    except Exception:  # noqa: BLE001
+        log.exception("[pr-reviewer] registering the repo-search tools failed")
+
     n_subagents = 0
     if hasattr(registry, "register_subagent"):
         try:

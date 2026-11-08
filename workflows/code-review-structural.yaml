@@ -171,6 +171,19 @@ steps:
       Server-resolved refs (empty when not provided): head SHA
       "{{inputs.head_sha}}", base ref "{{inputs.base_ref}}".
 
+      ## Searching the repo (issue #311)
+      `search_pr_repo` and `list_pr_repo_files` read a checkout of THIS PR's
+      head commit — pass `pr={{inputs.pr}}` and `repo="{{inputs.repo}}"`. They
+      are the only search that sees this PR: `search_files`, `find_files`,
+      `list_dir` and `read_file` point at an unrelated, empty local workspace,
+      and their "no matches" means nothing. A claim that something is absent or
+      universal — "no test covers X", "`f` is never called / dead", "no `x.py`
+      exists", "every entry under `d/` is named Y" — is about the whole repo:
+      back it with one of these calls and put the call (pattern, path) and its
+      result in the finding's evidence. `NO MATCHES` and `PATH MATCHES NO FILES`
+      are evidence; `SEARCH ERROR` is not. A claim you could not back with a
+      clean search is not a finding.
+
       ## Review scope
       {{inputs.review_scope}}
 
@@ -239,6 +252,19 @@ steps:
       Server-resolved refs (empty when not provided): head SHA
       "{{inputs.head_sha}}", base ref "{{inputs.base_ref}}".
 
+      ## Searching the repo (issue #311)
+      `search_pr_repo` and `list_pr_repo_files` read a checkout of THIS PR's
+      head commit — pass `pr={{inputs.pr}}` and `repo="{{inputs.repo}}"`. They
+      are the only search that sees this PR: `search_files`, `find_files`,
+      `list_dir` and `read_file` point at an unrelated, empty local workspace,
+      and their "no matches" means nothing. A claim that something is absent or
+      universal — "no test covers X", "`f` is never called / dead", "no `x.py`
+      exists", "every entry under `d/` is named Y" — is about the whole repo:
+      back it with one of these calls and put the call (pattern, path) and its
+      result in the finding's evidence. `NO MATCHES` and `PATH MATCHES NO FILES`
+      are evidence; `SEARCH ERROR` is not. A claim you could not back with a
+      clean search is not a finding.
+
       ## Review scope
       {{inputs.review_scope}}
 
@@ -301,7 +327,9 @@ steps:
       clean pass. Your assigned angle: **cross-file consistency**. Signatures
       changed but callers not updated, contracts/schemas drifting from their
       consumers, config keys renamed on one side only, docs/tests contradicting
-      the new behavior. Use github_read_file on the files the diff touches
+      the new behavior. Find the callers, importers and readers of what changed
+      with `search_pr_repo` (one search, not a directory walk), then use
+      github_read_file on the files the diff touches
       indirectly — this angle is exactly the one a hunk-by-hunk read misses.
       Pass `ref="{{inputs.head_sha}}"` on EVERY such call, including files
       outside the immediate diff: omitting it silently reads the default
@@ -313,6 +341,19 @@ steps:
 
       Server-resolved refs (empty when not provided): head SHA
       "{{inputs.head_sha}}", base ref "{{inputs.base_ref}}".
+
+      ## Searching the repo (issue #311)
+      `search_pr_repo` and `list_pr_repo_files` read a checkout of THIS PR's
+      head commit — pass `pr={{inputs.pr}}` and `repo="{{inputs.repo}}"`. They
+      are the only search that sees this PR: `search_files`, `find_files`,
+      `list_dir` and `read_file` point at an unrelated, empty local workspace,
+      and their "no matches" means nothing. A claim that something is absent or
+      universal — "no test covers X", "`f` is never called / dead", "no `x.py`
+      exists", "every entry under `d/` is named Y" — is about the whole repo:
+      back it with one of these calls and put the call (pattern, path) and its
+      result in the finding's evidence. `NO MATCHES` and `PATH MATCHES NO FILES`
+      are evidence; `SEARCH ERROR` is not. A claim you could not back with a
+      clean search is not a finding.
 
       ## Review scope
       {{inputs.review_scope}}
@@ -390,6 +431,19 @@ steps:
 
       Server-resolved refs (empty when not provided): head SHA
       "{{inputs.head_sha}}", base ref "{{inputs.base_ref}}".
+
+      ## Searching the repo (issue #311)
+      `search_pr_repo` and `list_pr_repo_files` read a checkout of THIS PR's
+      head commit — pass `pr={{inputs.pr}}` and `repo="{{inputs.repo}}"`. They
+      are the only search that sees this PR: `search_files`, `find_files`,
+      `list_dir` and `read_file` point at an unrelated, empty local workspace,
+      and their "no matches" means nothing. A claim that something is absent or
+      universal — "no test covers X", "`f` is never called / dead", "no `x.py`
+      exists", "every entry under `d/` is named Y" — is about the whole repo:
+      back it with one of these calls and put the call (pattern, path) and its
+      result in the finding's evidence. `NO MATCHES` and `PATH MATCHES NO FILES`
+      are evidence; `SEARCH ERROR` is not. A claim you could not back with a
+      clean search is not a finding.
 
       ## Review scope
       {{inputs.review_scope}}
@@ -617,10 +671,17 @@ steps:
          "no Python tests" from a 30-file list that had dropped every `tests/`
          path, and the PR added two test files. Before confirming, search the
          repo at head SHA "{{inputs.head_sha}}" for the named symbol, test or path
-         (the test directory, the callers, the import sites), and write in your
+         (the test directory, the callers, the import sites) with
+         `search_pr_repo(pattern, pr={{inputs.pr}}, repo="{{inputs.repo}}", path=...)`
+         or `list_pr_repo_files` — the only search that sees this PR's head
+         (`search_files` / `find_files` read an unrelated, empty workspace) —
+         and write in your
          note WHAT you searched and WHERE, e.g. "searched tests/ for `call(`: no
          use outside conftest.py". A reference found refutes the claim. If you
-         could not search, the finding is `uncertain`, never `confirmed`. The
+         could not search (a `SEARCH ERROR`, or no search tool), the finding is
+         `uncertain`, never `confirmed`. A claim that something holds EVERYWHERE
+         ("every entry is named by issue number") is checked the same way: list
+         the files and count the exceptions. The
          plugin also greps the head checkout after you; a reference it finds
          demotes a confirmed absence anyway.
 
