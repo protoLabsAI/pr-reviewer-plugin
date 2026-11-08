@@ -1015,6 +1015,14 @@ class PanelQueue(asyncio.Semaphore):
             e.repo == repo and e.pr == pr and e.kind not in exclude_kinds for e in (*self._active, *self._pending)
         )
 
+    def has_waiter(self, repo: str, pr: int, head: str, *, kinds: tuple[str, ...] = ("webhook",)) -> bool:
+        """Is a slot of one of `kinds` already WAITING for exactly this head? A pure in-memory
+        read for the webhook's pre-queue dedupe (#309): a second delivery for a head whose
+        first is still parked adds a phantom position and nothing else."""
+        return bool(head) and any(
+            w.repo == repo and w.pr == pr and w.head == head and w.kind in kinds for w in self._pending
+        )
+
     def lookup(self, repo: str, pr: int, *, now: float | None = None, degraded: bool = False) -> dict:
         """Per-PR state for `GET /queue?repo=…&pr=…`: running / queued / idle, with the
         position and the ETAs (`eta_verdict_s = eta_start_s + p50`, null without data)."""

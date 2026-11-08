@@ -1197,11 +1197,11 @@ async def test_a_waiting_head_gets_a_queued_check_and_an_immediate_one_does_not(
 
 
 async def test_a_non_dispatch_action_that_waits_publishes_no_queued_check(tmp_path):
-    """The rejected-review fix: `_safe_handle` takes the panel slot for EVERY pull_request
-    action, BEFORE `handle_pr_event` drops the non-dispatch ones. A `labeled`/`edited`/
-    `review_requested`/`closed` event that has to WAIT must NOT rewrite the head's required
-    check to "Queued behind N" — that action moves no round forward, so the check would
-    dangle. Only a `DISPATCH_ACTIONS` event engages the queued publish."""
+    """The rejected-review fix: a `labeled`/`edited`/`review_requested`/`closed` event must
+    NOT rewrite the head's required check to "Queued behind N". That action moves no round
+    forward, so the check would dangle. Only a `DISPATCH_ACTIONS` event engages the queued
+    publish. Since #309 a non-dispatch action does not even wait for a slot: it is handled
+    at once, while the queue is full."""
     dispatcher = QueuedCheckDispatcher(max_concurrent_panels=1)
     app, _telemetry = _gated_app(tmp_path, dispatcher)
 
@@ -1213,17 +1213,17 @@ async def test_a_non_dispatch_action_that_waits_publishes_no_queued_check(tmp_pa
         ] is True
         await _yield_until(lambda: dispatcher.running >= 1)
 
-        # PR2 arrives as a NON-dispatch `labeled` event — it still parks on the full queue…
+        # PR2 arrives as a NON-dispatch `labeled` event while the only slot is held…
         body = pr_payload(2, action="labeled")
         assert (await client.post("/plugins/pr-reviewer/webhook", content=body, headers=signed(body))).json()[
             "dispatched"
         ] is True
-        for _ in range(10):  # give the labeled waiter time to reach and park on the queue
+        for _ in range(10):
             await asyncio.sleep(0)
-        assert dispatcher.running == 1  # PR2 is genuinely parked behind PR1
+        assert dispatcher.panel_sem.status()["depth"] == 0  # it never parked on the queue (#309)
 
-        # …but nothing published a `queued` check for it: a non-dispatch action never engages
-        # `on_wait`, so no live check is rewritten by an event that moves no round.
+        # …and nothing published a `queued` check for it, so no live check is rewritten by an
+        # event that moves no round.
         assert dispatcher.queued_checks == []
 
         dispatcher.release.set()

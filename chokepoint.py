@@ -150,6 +150,18 @@ class Chokepoint:
         now = self._now()
         return any(now - taken < self.in_flight_ttl_s for taken in slots.values())
 
+    def live_shas(self, repo: str, pr: int) -> set[str]:
+        """`held_shas` minus the abandoned slots `admit` would reclaim — a pure read, it
+        never reclaims or takes anything. The webhook's pre-queue check (#309) reads it to
+        drop a redelivery of a head already under review without waiting for a panel slot;
+        an expired hold must not count, or a hung round would keep eating its own head's
+        pushes before they ever reach `admit`'s reclaim."""
+        slots = self._in_flight.get(f"{repo}#{pr}")
+        if not slots:
+            return set()
+        now = self._now()
+        return {sha for sha, taken in slots.items() if now - taken < self.in_flight_ttl_s}
+
     def held_shas(self, repo: str, pr: int) -> set[str]:
         """The shas this PR's live slots are keyed by. Each is the sha its CALLER admitted
         with, which for a webhook is the event's sha, not necessarily the head its round is
