@@ -65,6 +65,18 @@ def _pr_number(body: dict):
     return pr
 
 
+def _apply_deep_lanes(dispatcher) -> str:
+    """Set the deep lanes' model for a replay exactly as a live attempt does (#318); "" when
+    the dispatcher predates it or the lanes run on the default model."""
+    lanes = getattr(dispatcher, "_deep_lanes", None)
+    if lanes is None:
+        return ""
+    try:
+        return lanes.apply(dispatcher.deep_finder_model)
+    except Exception:  # noqa: BLE001 — a replay never fails on the model pin
+        return ""
+
+
 def _replay_trials(body: dict) -> int:
     from fastapi import HTTPException
 
@@ -538,18 +550,23 @@ def build_routers(dispatcher, telemetry, get_secret, run_gh_fn=None):
             if model:
                 row = {**row, "model": model}
             for trial in range(trials):
-                runs.append(
-                    await replay_review(
-                        row,
-                        run_gh=run_gh_fn,
-                        runner=runner,
-                        parse_findings=dispatcher._parse_findings,
-                        trial=trial,
-                        stamp=stamp,
-                        include_raw=include_raw,
-                        finder_timeout=dispatcher.finder_timeout_s,
-                    )
+                # Replay runs the panel as deployed, and that includes the deep lanes' model
+                # (#318): the live round sets it per attempt, and replay calls the runner
+                # directly, so it sets it the same way, from the same config and breaker.
+                deep_model = _apply_deep_lanes(dispatcher)
+                run = await replay_review(
+                    row,
+                    run_gh=run_gh_fn,
+                    runner=runner,
+                    parse_findings=dispatcher._parse_findings,
+                    trial=trial,
+                    stamp=stamp,
+                    include_raw=include_raw,
+                    finder_timeout=dispatcher.finder_timeout_s,
                 )
+                if isinstance(run, dict) and isinstance(run.get("run"), dict):
+                    run["run"]["deep_model"] = deep_model or None
+                runs.append(run)
         return {"runs": runs}
 
     @api.get("/queue")
