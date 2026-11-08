@@ -115,4 +115,40 @@ that edits its payload corrupts the panel. A clean (empty) result is a good resu
         **_completion_contract(SubagentConfig),
         **_narrow_tools(SubagentConfig),
     )
-    return [structural_finder]
+    deep = deep_finder()
+    return [structural_finder, *([deep] if deep is not None else [])]
+
+
+DEEP_FINDER_NAME = "review-finder-deep"
+
+
+def deep_finder():
+    """The review-finder the correctness and removed-behavior lanes run as (issue #318).
+
+    A copy of the host's own `review-finder` (same prompt, tools, completion guard, turn
+    budget) under a second name, so those two lanes can run on a different model from the
+    other two finders. The host reads a subagent's model from its registry entry at
+    dispatch, so `deep_lanes.apply` sets this object's `model` per round. With no model set
+    it resolves like `review-finder` does, so registering it changes nothing on its own.
+
+    `None` on a host without `REVIEW_FINDER_CONFIG`. The recipe then names a subagent the
+    host does not have, which is why the manifest's `min_protoagent_version` covers it.
+    """
+    from dataclasses import fields, replace
+
+    try:
+        from graph.subagents.config import REVIEW_FINDER_CONFIG
+    except Exception:  # noqa: BLE001 — an older host: no deep lane, nothing else changes
+        return None
+    kwargs = {
+        "name": DEEP_FINDER_NAME,
+        "description": (
+            "The code-review panel's correctness and removed-behavior lanes: the same "
+            "review-finder, registered separately so those lanes can run on their own model "
+            "(pr_reviewer.deep_finder_model)."
+        ),
+        "model": "",
+    }
+    if "lead_visible" in {f.name for f in fields(REVIEW_FINDER_CONFIG)}:
+        kwargs["lead_visible"] = False
+    return replace(REVIEW_FINDER_CONFIG, **kwargs)

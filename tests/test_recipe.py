@@ -94,9 +94,13 @@ def test_structural_seat_uses_the_plugin_subagent():
     step = STEPS["find_structural"]
     assert step["subagent"] == "structural-finder"
     assert "protopatch_review" in step["prompt"]
-    # The four LLM lanes stay on the core role.
-    for sid in ("find_correctness", "find_removed_behavior", "find_crossfile", "find_conventions"):
+    # Cross-file and conventions stay on the core role; correctness and removed-behavior
+    # run as the plugin's copy of it, so they can take their own model (#318).
+    for sid in ("find_crossfile", "find_conventions"):
         assert STEPS[sid]["subagent"] == "review-finder"
+    for sid in ("find_correctness", "find_removed_behavior"):
+        assert STEPS[sid]["subagent"] == "review-finder-deep"
+    for sid in ("find_correctness", "find_removed_behavior", "find_crossfile", "find_conventions"):
         assert "{{inputs.prior_findings}}" in STEPS[sid]["prompt"]
 
 

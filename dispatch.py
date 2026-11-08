@@ -1344,6 +1344,10 @@ class Dispatcher:
         # dispatcher (or a re-registration) shares the one handler and never double-counts.
         self._gateway_state = GatewayDegradeState(telemetry)
         _ensure_gateway_retry_handler(_GATEWAY)
+        # The correctness/removed-behavior lanes' model and its fallback breaker (#318).
+        from .deep_lanes import DeepLanes
+
+        self._deep_lanes = DeepLanes(telemetry)
         # Refuted structural claims, remembered per repo (#190) — written here when a round
         # posts, read by the structural pass; one constructor so root and TTL cannot drift.
         from .refutations import LlmRefutationStore, RefutationStore
@@ -1898,6 +1902,27 @@ class Dispatcher:
         if "incremental_review" in cfg:
             return str(cfg["incremental_review"]).strip().lower() in ("true", "1", "yes", "on")
         return _env_bool("PR_REVIEWER_INCREMENTAL_REVIEW", False)
+
+    @property
+    def deep_finder_model(self) -> str:
+        """The model the correctness and removed-behavior lanes run on (#318), e.g.
+        `anthropic-oauth:claude-sonnet-5-5`. Empty (the default): the same model as the other
+        finders, so the panel is unchanged."""
+        cfg = self.cfg
+        if "deep_finder_model" in cfg:
+            return str(cfg.get("deep_finder_model") or "").strip()
+        return os.environ.get("PR_REVIEWER_DEEP_FINDER_MODEL", "").strip()
+
+    @property
+    def deep_finder_cooldown_s(self) -> int:
+        """How long the deep lanes stay on the default model after failing on theirs (#318)."""
+        cfg = self.cfg
+        if "deep_finder_cooldown_s" in cfg:
+            try:
+                return max(0, int(cfg["deep_finder_cooldown_s"]))
+            except (TypeError, ValueError):
+                return 1800
+        return max(0, _env_int("PR_REVIEWER_DEEP_FINDER_COOLDOWN_S", 1800))
 
     @property
     def diff_char_budget(self) -> int:
@@ -3766,6 +3791,9 @@ class Dispatcher:
         for attempt in range(1, self.panel_retries + 2):
             last = attempt == self.panel_retries + 1
             per_attempt.append([])  # Preserve attempt numbers when a runner crashes before returning.
+            # Per attempt, so a breaker the last attempt tripped moves this one to the default
+            # model, and a config change takes effect on the next round with no restart (#318).
+            deep_model = self._deep_lanes.apply(self.deep_finder_model)
             # Bounded: a hung attempt must end as a failed attempt (retried, then reported
             # on the PR), not hold the round — and with it the PR's slot — forever.
             attempt_bound = asyncio.timeout(self.panel_attempt_timeout_s)
@@ -3835,6 +3863,10 @@ class Dispatcher:
                 return await self._abandon_superseded(repo, pr, head, watch, review_check_id)
             failed = list(result.get("failed") or [])
             steps_now = result.get("steps") if isinstance(result.get("steps"), dict) else {}
+            result = {**result, "deep_model": deep_model}
+            # A deep lane that failed on its own model sends the retry to the default one (#318),
+            # rather than failing the same way twice and exhausting the round.
+            self._deep_lanes.trip(steps_now, failed, self.deep_finder_cooldown_s)
             # A finder that overran the model's context window (#176) is a coverage gap
             # the round carries — like a lane the engine timed out — not a failed round.
             # The other lanes delivered; retrying all five re-rolls the same dice (7 of 8
@@ -4682,6 +4714,9 @@ class Dispatcher:
             brief_borrowed=(brief_source == "synthesize") or None,
             report_truncated=truncated or None,
             overran=overran or None,
+            # The model the correctness/removed-behavior lanes ran on this round (#318); None
+            # when they ran on the default model, so an A/B reads straight off this field.
+            deep_model=str(result.get("deep_model") or "") or None,
             grounding_checked=grounding_checked,
             grounding_downgraded=len(ungrounded),
             grounding_unreadable=len(unreadable),

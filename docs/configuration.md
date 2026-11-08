@@ -37,6 +37,8 @@ never the main YAML.
 | `summon_handle` | `vera` | | The `@handle` commands answer to, in addition to the reviewer's own login |
 | `epic_attestation` | `true` | `PR_REVIEWER_EPIC_ATTESTATION` | [Review an `epic/*` PR by its residual only](epic-attestation.md) |
 | `incremental_review` | `false` | `PR_REVIEWER_INCREMENTAL_REVIEW` | [Re-review only the files that changed since the last round](incremental-review.md), carrying that round's findings on the rest. Off: every round is byte-for-byte a full review |
+| `deep_finder_model` | `""` | `PR_REVIEWER_DEEP_FINDER_MODEL` | The model the correctness and removed-behavior lanes run on (the `review-finder-deep` subagent; #318), e.g. `anthropic-oauth:claude-sonnet-5-5`. Empty: the same model as the other finders. Read each round, so a change needs no restart. An `anthropic-oauth:` model with no readable Claude token stays on the default |
+| `deep_finder_cooldown_s` | `1800` | `PR_REVIEWER_DEEP_FINDER_COOLDOWN_S` | After a deep lane fails on `deep_finder_model`, how long both deep lanes run on the default model. The failed attempt's retry already runs there, so a rate limit or lost token costs one attempt, not the round |
 | `allow_self_review` | `false` | | **Testing only.** Lifts the never-review-your-own-PR rail |
 | `viewer_login` | `""` | `PR_REVIEWER_VIEWER_LOGIN` | Our own login, for the self-review rail. **Required on App auth** (e.g. `my-reviewer[bot]`); auto-detected with a PAT |
 
