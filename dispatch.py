@@ -1937,7 +1937,6 @@ class Dispatcher:
                 return 1800
         return max(0, _env_int("PR_REVIEWER_DEEP_FINDER_COOLDOWN_S", 1800))
 
-
     @property
     def reviewers_of_record(self) -> list:
         """PRs another reviewer owns (#318): `[{label, status, grace_s, name}]`. Empty (default):
