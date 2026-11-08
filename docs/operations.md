@@ -16,6 +16,7 @@ meet most:
 | `queued` / `superseded` | Queue wait; a round stood down for a newer head |
 | `incremental_scope` | With `incremental_review` on: the round's `mode` (`scoped` or `full:<reason>`), the prior head, and the in-scope files. The `reviewed` row then carries `incremental`, `files_reviewed`, `files_carried`, `carried_kept`, `carried_dropped`, `out_of_scope_dropped`, `lane_s_saved_est` |
 | `deep_lane` | The deep lanes' model (#318). `decision: model` when it changes (`model`, `why`: `configured` / `unset` / `no-oauth-token` / `breaker-open:<reason>`). `decision: fallback` when a deep lane failed on it (`lanes`, `reason`: `provider` or `lane-error`, `cooldown_s`, `error`). The `reviewed` row's `deep_model` is the model the posted round's deep lanes ran on, `null` for the default |
+| `reviewer_of_record` | A labelled PR's record decision (#318): `decision` is `pass` (attested PASS posted), `hold-pending`, `hold-failed`, `hold-absent` (no status yet, inside the grace) or `review-fallback` (no status past the grace; the panel runs), with `record` and `status` |
 | `structural_plan` | Per-pass feature plan and outcomes |
 | `counter_evidence` | `count`, `chars` of dispute comments passed to a re-review |
 | `fail_superseded` | A refutation replaced a FAIL |
