@@ -191,3 +191,49 @@ def test_has_waiter_matches_repo_pr_head_and_kind():
     assert not q.has_waiter("o/r", 1, "other")
     assert not q.has_waiter("o/r", 2, "k")  # a backfill waiter is not a webhook one
     assert not q.has_waiter("o/r", 1, "")
+
+
+def draft_payload(pr: int, head: str, action: str, draft: bool) -> bytes:
+    return json.dumps(
+        {
+            "action": action,
+            "repository": {"full_name": "o/r"},
+            "pull_request": {"number": pr, "head": {"sha": head}, "draft": draft},
+        }
+    ).encode()
+
+
+async def test_a_draft_delivery_drops_without_queueing_but_ready_for_review_queues(tmp_path):
+    """#318 follow-up: a draft is never reviewed, so its push must not wait for a slot to be told
+    so (23 eval drafts queued 27 deep on Vera). `ready_for_review` still queues."""
+    d = ChokedDispatcher(limit=1)
+    app, telemetry = _app(tmp_path, d)
+    async with httpx.AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
+        await _post(c, payload(1, "a" * 40, "opened"))  # takes the only slot
+        await _settle(lambda: d.running == 1)
+        for action in ("opened", "synchronize", "reopened"):
+            await _post(c, draft_payload(2, "b" * 40, action, True))
+        await _settle()
+        assert d.panel_sem.status()["depth"] == 0
+        drops = [e for e in telemetry.read_all() if e["event"] == "drop" and e.get("pre_queue")]
+        assert [(e["reason"], e["why"]) for e in drops] == [("pr-not-eligible", "draft")] * 3
+        # Marked ready: the event says draft false, and it queues for the slot.
+        await _post(c, draft_payload(2, "b" * 40, "ready_for_review", False))
+        await _settle(lambda: d.panel_sem.status()["depth"] == 1)
+        assert d.panel_sem.status()["depth"] == 1
+        d.release.set()
+        await _settle(lambda: (2, "b" * 40) in d.panels)
+    assert (2, "b" * 40) in d.panels
+
+
+async def test_a_non_draft_or_draftless_payload_queues_as_before(tmp_path):
+    d = ChokedDispatcher(limit=1)
+    app, _t = _app(tmp_path, d)
+    async with httpx.AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
+        await _post(c, payload(1, "a" * 40, "opened"))
+        await _settle(lambda: d.running == 1)
+        await _post(c, draft_payload(2, "b" * 40, "synchronize", False))
+        await _post(c, payload(3, "c" * 40, "synchronize"))  # no `draft` key at all
+        await _settle(lambda: d.panel_sem.status()["depth"] == 2)
+        assert d.panel_sem.status()["depth"] == 2
+        d.release.set()
