@@ -12,6 +12,7 @@ Start with the [README](../README.md) for the two-minute version. This directory
 | [verdicts.md](verdicts.md) | How findings become a verdict: precision guards, convergence, coverage gaps |
 | [structural.md](structural.md) | The protoPatch structural engine: planning, budgets, partial results |
 | [epic-attestation.md](epic-attestation.md) | Not reviewing an `epic/*` branch twice |
+| [incremental-review.md](incremental-review.md) | Re-reviewing only what changed since the last round (behind a flag) |
 | [configuration.md](configuration.md) | Every config key, its default, env fallback, and when a change applies |
 | [tools.md](tools.md) | Every agent tool |
 | [api.md](api.md) | Every HTTP route: the public (HMAC) and operator (bearer) surfaces |

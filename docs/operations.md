@@ -14,6 +14,7 @@ meet most:
 | `promotion` / `regate` | A promote or re-gate decision, with its `hold:*` |
 | `exhaustion` | Panel ended with no verdict. `undelivered: [...]` names lanes. `causes` lists per-attempt arrays of `{stage, cause, seconds}`: cause is `timeout`, `empty`, `no-array`, or `failed`; seconds is null when the host supplies no timing (an attempt that crashed before returning has an empty array) |
 | `queued` / `superseded` | Queue wait; a round stood down for a newer head |
+| `incremental_scope` | With `incremental_review` on: the round's `mode` (`scoped` or `full:<reason>`), the prior head, and the in-scope files. The `reviewed` row then carries `incremental`, `files_reviewed`, `files_carried`, `carried_kept`, `carried_dropped`, `out_of_scope_dropped`, `lane_s_saved_est` |
 | `structural_plan` | Per-pass feature plan and outcomes |
 | `counter_evidence` | `count`, `chars` of dispute comments passed to a re-review |
 | `fail_superseded` | A refutation replaced a FAIL |
