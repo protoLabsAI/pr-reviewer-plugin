@@ -29,6 +29,9 @@ from .chokepoint import DISPATCH_ACTIONS, DROP_IN_FLIGHT, verify_signature
 #: A dispatch delivery for a head whose earlier delivery is still waiting for a panel slot
 #: (#309). The waiter ahead of it reviews that head.
 DROP_ALREADY_QUEUED = "already-queued"
+#: The dispatcher's reason for a PR it will not review (closed, draft, locked); the same
+#: string, so a draft dropped before the queue reads exactly like one dropped after it.
+DROP_PR_NOT_ELIGIBLE = "pr-not-eligible"
 
 log = logging.getLogger("protoagent.plugins.pr_reviewer")
 
@@ -192,10 +195,11 @@ def build_routers(dispatcher, telemetry, get_secret, run_gh_fn=None):
             repo = str(payload["repository"]["full_name"])
             pr = int(payload["pull_request"]["number"])
             head = str(payload["pull_request"]["head"]["sha"])
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            draft = payload["pull_request"].get("draft") is True
+        except (KeyError, TypeError, ValueError, AttributeError, json.JSONDecodeError):
             telemetry.emit("drop", reason="malformed-payload")
             return {"ok": True, "dispatched": False, "reason": "malformed-payload"}
-        asyncio.get_running_loop().create_task(_safe_handle(repo, pr, head, action))
+        asyncio.get_running_loop().create_task(_safe_handle(repo, pr, head, action, draft=draft))
         return {"ok": True, "dispatched": True}
 
     async def _handle_comment(body: bytes) -> dict:
@@ -395,7 +399,7 @@ def build_routers(dispatcher, telemetry, get_secret, run_gh_fn=None):
         except Exception:  # noqa: BLE001
             log.exception("[pr-reviewer] summon crashed for %s#%s", repo, pr)
 
-    def _resolved_before_queue(repo: str, pr: int, head: str, action: str) -> str | None:
+    def _resolved_before_queue(repo: str, pr: int, head: str, action: str, draft: bool = False) -> str | None:
         """A dispatch delivery that needs no panel slot, decided without waiting for one (#309).
 
         The chokepoint drops a second request for a head already under review ("dropped, not
@@ -413,6 +417,22 @@ def build_routers(dispatcher, telemetry, get_secret, run_gh_fn=None):
         always takes the normal path, because `handle_pr_event` resets the round cap for it."""
         if not head or action not in DISPATCH_ACTIONS or action == "ready_for_review":
             return None
+        if draft:
+            # The delivery says the PR is a draft, and a draft is never reviewed: `_review`
+            # drops it as `pr-not-eligible` once it holds a slot. Waiting for that slot first
+            # parked every draft push behind real panels (23 eval drafts queued 27 deep on
+            # 2026-11-08, #318). It becoming ready sends `ready_for_review`, which queues.
+            telemetry.emit(
+                "drop",
+                repo=repo,
+                pr=pr,
+                sha=head,
+                reason=DROP_PR_NOT_ELIGIBLE,
+                why="draft",
+                action=action,
+                pre_queue=True,
+            )
+            return f"drop:{DROP_PR_NOT_ELIGIBLE}"
         choke = getattr(dispatcher, "chokepoint", None)
         live_shas = getattr(choke, "live_shas", None)
         live = live_shas(repo, pr) if callable(live_shas) else set()
@@ -428,7 +448,7 @@ def build_routers(dispatcher, telemetry, get_secret, run_gh_fn=None):
         telemetry.emit("drop", repo=repo, pr=pr, sha=head, reason=reason, action=action, pre_queue=True)
         return f"drop:{reason}"
 
-    async def _safe_handle(repo: str, pr: int, head: str, action: str) -> None:
+    async def _safe_handle(repo: str, pr: int, head: str, action: str, draft: bool = False) -> None:
         # Hold a panel slot across the dispatch; a burst beyond the cap queues here
         # rather than launching every panel at once (#96). Only a delivery that can START a
         # panel waits for one (#309): a non-dispatch action (labeled, edited, closed, ...)
@@ -437,7 +457,7 @@ def build_routers(dispatcher, telemetry, get_secret, run_gh_fn=None):
         try:
             if action not in DISPATCH_ACTIONS:
                 outcome = await dispatcher.handle_pr_event(repo, pr, head, action)
-            elif (early := _resolved_before_queue(repo, pr, head, action)) is not None:
+            elif (early := _resolved_before_queue(repo, pr, head, action, draft)) is not None:
                 outcome = early
             else:
                 async with _panel_slot("webhook", repo, pr, head, action):
