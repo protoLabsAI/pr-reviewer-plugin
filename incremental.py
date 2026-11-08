@@ -280,10 +280,6 @@ def carry_row(finding: dict, origin: str) -> dict:
     }
 
 
-def is_incremental_carry(finding: object) -> bool:
-    return isinstance(finding, dict) and finding.get("carried_by") == CARRIED_BY
-
-
 def select_scope(
     prior_round: dict | None,
     head_rows: dict[str, FileRow] | None,
