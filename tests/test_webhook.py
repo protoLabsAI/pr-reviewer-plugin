@@ -1315,3 +1315,47 @@ async def test_slot_cancelled_during_on_wait_leaves_no_phantom_waiter(tmp_path):
 
     release.set()
     await runner
+
+
+async def test_replay_sets_the_deep_lanes_model_like_a_live_attempt(tmp_path):
+    """#318: replay calls the runner directly, so it pins the deep lanes' model itself, from
+    the same config and breaker, and says which model the run used."""
+    applied = []
+
+    class _Lanes:
+        def apply(self, configured):
+            applied.append(configured)
+            return configured
+
+    class ReplayDispatcher(SpyDispatcher):
+        finder_timeout_s = 900
+        deep_finder_model = "anthropic-oauth:claude-sonnet-5-5"
+        _deep_lanes = _Lanes()
+
+        def _runner(self):
+            async def run(recipe, inputs):
+                return {"output": "brief\n```json\n[]\n```", "failed": [], "timings": {}, "usage": {}}
+
+            return run
+
+        @staticmethod
+        def _parse_findings(output):
+            return []
+
+    async def fake_gh(args, timeout=30):
+        if "/files" in " ".join(args):
+            return 0, "x.py\n", ""
+        return 0, "[]", ""
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    _pub, api = build_routers(ReplayDispatcher(), Telemetry(tmp_path), lambda: "s", run_gh_fn=fake_gh)
+    app = FastAPI()
+    app.include_router(api, prefix="/api/plugins/pr-reviewer")
+    r = TestClient(app).post(
+        "/api/plugins/pr-reviewer/replay", json={"row": {"repo": "o/r", "pr": 1, "head": "a" * 40}, "trials": 2}
+    )
+    runs = r.json()["runs"]
+    assert applied == ["anthropic-oauth:claude-sonnet-5-5"] * 2
+    assert [x["run"]["deep_model"] for x in runs] == ["anthropic-oauth:claude-sonnet-5-5"] * 2
