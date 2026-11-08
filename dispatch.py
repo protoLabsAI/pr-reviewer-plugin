@@ -1924,6 +1924,18 @@ class Dispatcher:
                 return 1800
         return max(0, _env_int("PR_REVIEWER_DEEP_FINDER_COOLDOWN_S", 1800))
 
+
+    @property
+    def reviewers_of_record(self) -> list:
+        """PRs another reviewer owns (#318): `[{label, status, grace_s, name}]`. Empty (default):
+        Vera reviews every PR herself, as before."""
+        from .record import parse_rules
+
+        cfg = self.cfg
+        if "reviewers_of_record" in cfg:
+            return parse_rules(cfg.get("reviewers_of_record"))
+        return parse_rules(os.environ.get("PR_REVIEWER_REVIEWERS_OF_RECORD", ""))
+
     @property
     def diff_char_budget(self) -> int:
         """The review panel's per-review diff char budget — the size past which the workflow
@@ -2249,7 +2261,7 @@ class Dispatcher:
                 "{head: .head.sha, base_ref: .base.ref, state: .state, merged: .merged, draft: .draft, locked: .locked, "
                 "changed_files: .changed_files, additions: .additions, deletions: .deletions, title: .title, body: .body, "
                 "author: .user.login, head_ref: .head.ref, head_repo: .head.repo.full_name, "
-                "base_sha: .base.sha, default_branch: .base.repo.default_branch}",
+                "base_sha: .base.sha, default_branch: .base.repo.default_branch, labels: [.labels[].name]}",
             ],
         )
         if rc != 0:
@@ -2384,6 +2396,44 @@ class Dispatcher:
             diff_truncated=scope.diff_truncated or None,
         )
         return scope
+
+    async def _record_outcome(self, repo: str, pr: int, facts: dict, head: str):
+        """(decision, rule, status description) for a PR a reviewer of record owns (#318), or
+        None when no configured rule's label is on the PR. Reads only for a labelled PR."""
+        from .record import decide, match
+
+        rules = self.reviewers_of_record
+        rule = match(rules, facts.get("labels")) if rules else None
+        if rule is None:
+            return None
+        rc, out, _err = await self._run_gh(
+            [
+                "api",
+                f"repos/{repo}/commits/{head}/statuses",
+                "--jq",
+                f"[.[] | select(.context == {json.dumps(rule.status)})][0] // {{}} | {{state, description}}",
+            ]
+        )
+        try:
+            row = json.loads(out) if rc == 0 and out.strip() else {}
+        except json.JSONDecodeError:
+            row = {}
+        if rc != 0:
+            # Unreadable: hold. A wrong "absent" here would spend a panel the record owns.
+            return "hold-pending", rule, "status unreadable"
+        state = (row or {}).get("state")
+        age = None
+        if not state:
+            rc2, out2, _ = await self._run_gh(["api", f"repos/{repo}/commits/{head}", "--jq", ".commit.committer.date"])
+            if rc2 == 0 and out2.strip():
+                try:
+                    from datetime import datetime
+
+                    stamp = datetime.fromisoformat(out2.strip().replace("Z", "+00:00"))
+                    age = time.time() - stamp.timestamp()
+                except ValueError:
+                    age = None
+        return decide(state, age, rule.grace_s), rule, str((row or {}).get("description") or "")
 
     async def _post_attested(
         self, repo: str, pr: int, head: str, scope: _epic.EpicScope, history: list[dict], diff_id: str | None
@@ -3600,6 +3650,38 @@ class Dispatcher:
         # LATER rebase can reaffirm against THIS round. A summon still computes it for the
         # stamp but never reuses a verdict from it — `force` means the operator is disputing.
         diff_id = await self._pr_diff_id(repo, str(facts.get("base_ref") or ""), head)
+        if not force:
+            # A PR another reviewer owns (#318): mirror its verdict, hold for it, or review
+            # it ourselves once it has plainly not reviewed this head. A summon always runs.
+            record = await self._record_outcome(repo, pr, facts, head)
+            if record is not None:
+                decision, rule, desc = record
+                self.telemetry.emit(
+                    "reviewer_of_record",
+                    repo=repo,
+                    pr=pr,
+                    sha=head,
+                    decision=decision,
+                    record=rule.who,
+                    status=rule.status,
+                )
+                if decision == "pass":
+                    from .record import attested_brief
+
+                    posted = await self._post_verdict(
+                        repo,
+                        pr,
+                        head,
+                        PASS,
+                        [],
+                        "reviewer-of-record",
+                        brief=attested_brief(rule, head, desc),
+                        hold_blocks=any(r.get("verdict") == FAIL for r in history),
+                        diff_id=diff_id,
+                    )
+                    return f"attested:{PASS}" if posted else f"error:post-failed:{PASS}"
+                if decision != "review-fallback":
+                    return f"hold:reviewer-of-record-{decision.removeprefix('hold-')}"
         if history and not force:
             # A new head SHA whose base↔head diff is byte-identical to the most recent round
             # reaffirms that verdict without re-spending the panel — a rebase, a reworded
@@ -6579,6 +6661,10 @@ class Dispatcher:
             return None
         if any(r["head"] == head for r in ours):
             return None  # a verdict for the CURRENT head exists — nothing to backfill
+        # A reviewer of record still owns this head (#318): don't take a panel slot to hold.
+        record = await self._record_outcome(repo, pr, facts, head)
+        if record is not None and record[0].startswith("hold-"):
+            return None
         return head
 
     async def backfill_review(self, repo: str, pr: int, head: str) -> str:
