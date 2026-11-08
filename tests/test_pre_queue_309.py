@@ -237,3 +237,11 @@ async def test_a_non_draft_or_draftless_payload_queues_as_before(tmp_path):
         await _settle(lambda: d.panel_sem.status()["depth"] == 2)
         assert d.panel_sem.status()["depth"] == 2
         d.release.set()
+
+
+def test_the_pre_queue_drop_reason_matches_the_dispatchers():
+    """The webhook drops a draft with the dispatcher's own `pr-not-eligible` reason (#323), so
+    the two must not drift: a draft dropped before the queue reads exactly like one after."""
+    from pr_reviewer import dispatch, webhook
+
+    assert webhook.DROP_PR_NOT_ELIGIBLE == dispatch.DROP_PR_NOT_ELIGIBLE
