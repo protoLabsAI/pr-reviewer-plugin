@@ -24,7 +24,12 @@ def no_app_env(monkeypatch):
 def test_registers_tools_subagent_routers_and_surface(no_app_env):
     reg = FakeRegistry({"default_repo": "octo/repo"})
     pr_reviewer.register(reg)
-    assert [t.name for t in reg.tools] == ["protopatch_review", "pr_review_eval"]
+    assert [t.name for t in reg.tools] == [
+        "protopatch_review",
+        "search_pr_repo",
+        "list_pr_repo_files",
+        "pr_review_eval",
+    ]
     assert [s.name for s in reg.subagents] == ["structural-finder"]
     assert [p for _r, p in reg.routers] == ["/plugins/pr-reviewer", "/api/plugins/pr-reviewer"]
     assert [s["name"] for s in reg.surfaces] == ["pr-reviewer-sweep"]
@@ -60,7 +65,7 @@ def test_registers_on_a_minimal_host_without_subagent_seam():
 
     reg = MinimalRegistry()
     pr_reviewer.register(reg)  # must not raise
-    assert len(reg.tools) == 1
+    assert [t.name for t in reg.tools] == ["protopatch_review", "search_pr_repo", "list_pr_repo_files"]
 
 
 def test_machinery_registers_the_eval_tool():

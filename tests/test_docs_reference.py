@@ -46,7 +46,7 @@ def _routes() -> set[tuple[str, str]]:
 def _tool_names() -> set[str]:
     """Names of every `@tool`-decorated function (sync or async) in the tool modules."""
     names: set[str] = set()
-    for module in ("protopatch.py", "eval.py"):
+    for module in ("protopatch.py", "eval.py", "repo_search.py"):
         for node in ast.walk(ast.parse((ROOT / module).read_text())):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 if any(getattr(d, "id", "") == "tool" for d in node.decorator_list):
@@ -59,7 +59,7 @@ def _config_keys() -> set[str]:
     dispatcher or a helper reads out of the config that the manifest does not default."""
     manifest = yaml.safe_load((ROOT / "protoagent.plugin.yaml").read_text())
     keys = set(manifest["config"]) | set(manifest.get("secrets") or [])
-    for module in ("dispatch.py", "lintcheck.py", "absence_search.py", "summon.py", "webhook.py"):
+    for module in ("dispatch.py", "lintcheck.py", "absence_search.py", "repo_search.py", "summon.py", "webhook.py"):
         text = (ROOT / module).read_text()
         keys |= set(re.findall(r'"([a-z][a-z_0-9]+)" in cfg\b', text))
         keys |= set(re.findall(r'\bcfg\.get\(\s*"([a-z][a-z_0-9]+)"', text))

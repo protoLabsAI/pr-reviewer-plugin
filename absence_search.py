@@ -46,6 +46,11 @@ small-diff recipe has no structural seat) a blobless clone at head is made, shie
 search's budget so a slow clone never leaves a half-written cache entry behind. The GitHub code
 search API is no substitute: it indexes only the default branch, so it cannot see a PR head, and
 the contents API reads one file per call, which cannot search a repo.
+
+Since #311 the lanes search the same checkout themselves (`repo_search.search_pr_repo`) and are
+told to back an absence claim with a search where they make it. This pass stays as the backstop:
+it is deterministic, it runs whatever the model did, and it also covers the host's small-diff
+`code-review` recipe, whose prompts this plugin does not own.
 """
 
 from __future__ import annotations
