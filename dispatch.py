@@ -38,6 +38,7 @@ from urllib.parse import quote
 
 from . import absence_search as _absence
 from . import epic as _epic
+from . import incremental as _inc
 from . import repo_search as _repo_search
 from .absence_search import AbsenceSearcher, render_absence_search_footnote
 from .approve import (
@@ -1890,6 +1891,15 @@ class Dispatcher:
         return _env_bool("PR_REVIEWER_EPIC_ATTESTATION", True)
 
     @property
+    def incremental_review(self) -> bool:
+        """Re-review only what changed since the last round and carry the rest (#313). Off by
+        default: off, a round is byte-for-byte today's."""
+        cfg = self.cfg
+        if "incremental_review" in cfg:
+            return str(cfg["incremental_review"]).strip().lower() in ("true", "1", "yes", "on")
+        return _env_bool("PR_REVIEWER_INCREMENTAL_REVIEW", False)
+
+    @property
     def diff_char_budget(self) -> int:
         """The review panel's per-review diff char budget — the size past which the workflow
         engine truncates the base↔head diff (issue #209). Read here only to detect that the
@@ -3611,6 +3621,33 @@ class Dispatcher:
             return "drop:max-rounds-capped"
         prior_findings = json.dumps(prior["findings"]) if prior and prior["findings"] else ""
         prior_requests = render_prior_requests(history)
+        # Incremental re-review (#313). None when the flag is off, and every line below then
+        # runs exactly as before. A SCOPED plan narrows the panel to the files that changed
+        # since the last round (plus their dependents) and carries that round's findings on
+        # the rest. A full plan only adds telemetry.
+        inc = await self._incremental_plan(
+            repo, pr, facts, head, history, ours, recipe, epic=epic_scope is not None, force=force
+        )
+        inc_scoped = inc is not None and inc.scoped
+        if inc is not None:
+            self.telemetry.emit(
+                "incremental_scope",
+                repo=repo,
+                pr=pr,
+                sha=head,
+                round=round_number,
+                mode=inc.label(),
+                prior_head=inc.prior_head or None,
+                in_scope=dict(list(inc.in_scope.items())[:50]) or None,
+                files_carried=len(inc.carried_files) if inc_scoped else None,
+                carried=len(inc.carried) if inc_scoped else None,
+                carried_dropped=len(inc.carried_dropped) if inc_scoped else None,
+            )
+        if inc_scoped:
+            # The panel dispositions only the priors on files it reviews. Priors on carried files
+            # are carried by the dispatcher below, verbatim. An empty list is still passed ("[]"),
+            # so a re-round never reads the recipe's "first review of this PR" default.
+            prior_findings = json.dumps(inc.scoped_priors)
 
         runner = self._runner()
         if runner is None:
@@ -3658,6 +3695,12 @@ class Dispatcher:
         set_bound_repo(repo, pr)
         # The lanes' repo search (#311) reads THIS head, and its checkout starts building now.
         _repo_search.bind_review(repo, pr, head, self.cfg)
+        if inc_scoped:
+            # The scope rides the recipe's existing `review_scope` input, which every finder and
+            # the synthesizer read. The structural pass plans only the in-scope files.
+            residual = await self._residual_patches(repo, inc.prior_head, head)
+            inputs["review_scope"] = _inc.render_scope_block(inc, round_number, residual, self.diff_char_budget)
+            set_structural_scope(repo, pr, head, sorted(inc.in_scope))
         if self.finder_timeout_s:
             inputs["finder_timeout"] = self.finder_timeout_s  # else the recipe's default (#93)
         if self.synthesize_timeout_s:
@@ -4115,7 +4158,14 @@ class Dispatcher:
         # `unaccounted_priors` returns — and the ledger is what the table, the Findings carry
         # and the footer all render from, so a prior has exactly one state in the body.
         ledger = (
-            prior_ledger(history, dispositions, ranges=ranges, since_ranges=since_ranges, paths=paths)
+            prior_ledger(
+                history,
+                dispositions,
+                ranges=ranges,
+                since_ranges=since_ranges,
+                # A scoped round's ledger covers the priors the panel saw; the rest are carried.
+                paths=sorted(inc.in_scope) if inc_scoped else paths,
+            )
             if dispositions
             else []
         )
@@ -4189,6 +4239,13 @@ class Dispatcher:
         # the record `rounds.supersedes` reads on both checks. Written from the CODE's outcome
         # (still carried or cleared), never from the model's say-so alone.
         disposed = disposition_record(dispositioned, dispositions, still_open=list(unaccounted) + list(deferred))
+        # A scoped round (#313): the panel's fresh minor/nit (or duplicate) findings on carried
+        # files are set aside, and the carried rows join the record BEFORE confinement, grounding
+        # and every demotion below, so each of those re-checks them at this head.
+        out_of_scope: list[dict] = []
+        if inc_scoped:
+            reported, out_of_scope = _inc.split_panel_findings(reported, inc)
+            reported = _inc.merge_carries(reported, inc)
         findings, confined = confine_findings(reported, confine_paths)
         if confined:
             # Server-side in-diff enforcement — prompt discipline made a promise,
@@ -4462,6 +4519,8 @@ class Dispatcher:
         )
         if epic_scope is not None:
             trailer += _epic.render_attestation_notes(epic_scope)
+        if inc_scoped:
+            trailer += _inc.render_incremental_note(inc, out_of_scope)
         if degraded:
             trailer += render_degraded_note(degraded)
         if incomplete_finders:
@@ -4672,6 +4731,9 @@ class Dispatcher:
             coverage_capped=(verdict != finding_verdict) or None,
             posted=posted,
             shadow=self.shadow,
+            # #313: files reviewed vs carried, carried findings kept/dropped, and the estimated
+            # lane seconds saved. Absent when the flag is off, so that row is unchanged.
+            **_inc.telemetry_fields(inc, out_of_scope=len(out_of_scope), timings=timings),
         )
         return f"reviewed:{verdict}" if posted else f"error:post-failed:{verdict}"
 
@@ -4817,6 +4879,145 @@ class Dispatcher:
         except json.JSONDecodeError:
             return None
         return parse_hunks(files) if isinstance(files, list) else None
+
+    # ── incremental re-review (#313) ─────────────────────────────────────────
+
+    async def _pr_file_rows(self, repo: str, pr: int) -> dict[str, _inc.FileRow] | None:
+        """The PR's files at head with their blob SHAs and patches, or None (unreadable). The
+        head side of the incremental cache key."""
+        rc, out, _err = await self._run_gh(
+            [
+                "api",
+                f"repos/{repo}/pulls/{pr}/files",
+                "--paginate",
+                "--jq",
+                ".[] | {filename: .filename, sha: .sha, status: .status, "
+                "previous_filename: .previous_filename, patch: .patch}",
+            ]
+        )
+        if rc != 0:
+            return None
+        rows = gh_json_rows(out)
+        return _inc.file_rows(rows) if rows else None
+
+    async def _prior_file_rows(self, repo: str, merge_base: str, prior_head: str) -> dict[str, _inc.FileRow] | str:
+        """The PR's files as they stood at `prior_head`, diffed from THIS head's merge-base, or
+        the full-round reason when they cannot be trusted: the compare is unreadable, its own
+        merge-base is not `merge_base` (the base moved since that round), or its list may be
+        truncated."""
+        rc, out, _err = await self._run_gh(
+            [
+                "api",
+                f"repos/{repo}/compare/{quote(merge_base, safe='')}...{quote(prior_head, safe='')}",
+                "--jq",
+                "{mb: .merge_base_commit.sha, files: [.files[]? | {filename: .filename, sha: .sha, "
+                "status: .status, previous_filename: .previous_filename}]}",
+            ]
+        )
+        if rc != 0:
+            return _inc.FULL_UNREADABLE
+        try:
+            data = json.loads(out)
+        except json.JSONDecodeError:
+            return _inc.FULL_UNREADABLE
+        if not isinstance(data, dict) or not isinstance(data.get("files"), list):
+            return _inc.FULL_UNREADABLE
+        if str(data.get("mb") or "") != merge_base:
+            return _inc.FULL_BASE_MOVED
+        if len(data["files"]) >= _inc.COMPARE_FILE_CAP:
+            return _inc.FULL_TRUNCATED
+        rows = _inc.file_rows(data["files"])
+        return rows if rows is not None else _inc.FULL_UNREADABLE
+
+    async def _residual_patches(self, repo: str, prior_head: str, head: str) -> dict[str, str] | None:
+        """{path: prior→head patch}, or None when the push was not a fast-forward from
+        `prior_head` (no clean delta to show), or the compare is unreadable or truncated."""
+        rc, out, _err = await self._run_gh(
+            [
+                "api",
+                f"repos/{repo}/compare/{quote(prior_head, safe='')}...{quote(head, safe='')}",
+                "--jq",
+                "{status: .status, files: [.files[]? | {filename: .filename, patch: .patch}]}",
+            ]
+        )
+        if rc != 0:
+            return None
+        try:
+            data = json.loads(out)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(data, dict) or data.get("status") != "ahead":
+            return None
+        files = data.get("files")
+        if not isinstance(files, list) or len(files) >= _inc.COMPARE_FILE_CAP:
+            return None
+        return {
+            _norm_path(str(f.get("filename") or "")): str(f.get("patch") or "")
+            for f in files
+            if isinstance(f, dict) and f.get("filename")
+        }
+
+    async def _incremental_plan(
+        self,
+        repo: str,
+        pr: int,
+        facts: dict,
+        head: str,
+        history: list[dict],
+        ours: list[dict],
+        recipe: str,
+        *,
+        epic: bool,
+        force: bool,
+    ) -> _inc.Plan | None:
+        """The #313 plan for this round: None when the flag is off (today's path, untouched),
+        otherwise a scoped or a full plan. Every read that fails returns a FULL plan. Never
+        raises: a planning bug reviews the whole PR."""
+        if not self.incremental_review:
+            return None
+        try:
+            if force:
+                return _inc.Plan.full(_inc.FULL_SUMMON)  # an operator's re-sweep reviews everything
+            if epic:
+                return _inc.Plan.full(_inc.FULL_EPIC)
+            if recipe != _inc.INCREMENTAL_RECIPE:
+                return _inc.Plan.full(_inc.FULL_RECIPE)
+            if not history:
+                return _inc.Plan.full(_inc.FULL_FIRST)
+            prior = history[-1]
+            prior_head = str(prior.get("head") or "")
+            body = next(
+                (
+                    str(r.get("body") or "")
+                    for r in reversed(ours or [])
+                    if str(r.get("head") or "") == prior_head and not r.get("promoted")
+                ),
+                "",
+            )
+            merge_base = await self._merge_base_sha(repo, str(facts.get("base_ref") or ""), head)
+            if not merge_base or not prior_head:
+                return _inc.Plan.full(_inc.FULL_UNREADABLE)
+            prior_rows = await self._prior_file_rows(repo, merge_base, prior_head)
+            if isinstance(prior_rows, str):
+                return _inc.Plan.full(prior_rows)
+            head_rows = await self._pr_file_rows(repo, pr)
+            expected = int(facts.get("changed_files") or 0)
+            if head_rows is not None and expected and len(head_rows) != expected:
+                return _inc.Plan.full(_inc.FULL_TRUNCATED)  # the /files list stops at 3,000
+            plan = _inc.select_scope(prior, head_rows, prior_rows, prior_recipe=_inc.recipe_of(body), recipe=recipe)
+            if plan.scoped and plan.carried and self.grounding_enabled:
+                # Re-ground the carries at THIS head: a row whose quoted evidence is gone is
+                # dropped, not carried. An unreadable source keeps the row (fail closed: it gated).
+                patches: dict[str, str] = {}
+                raw = await self._finding_sources(repo, pr, head, plan.carried, patches_out=patches)
+                grounded, _down, _unreadable = apply_grounding(
+                    plan.carried, {f: v[1] for f, v in raw.items()}, patches="\n".join(patches.values())
+                )
+                _inc.drop_ungrounded_carries(plan, grounded)
+            return plan
+        except Exception:  # noqa: BLE001 — planning only ever narrows a round; failing it reviews in full
+            log.exception("[pr-reviewer] incremental planning failed on %s#%s; reviewing in full", repo, pr)
+            return _inc.Plan.full(_inc.FULL_UNREADABLE)
 
     async def _exists_at_base(self, finding: dict, base_sources: dict[str, str | None]) -> str:
         """Ask the #300 verifier whether `finding`'s defect ALREADY exists at the merge-base —

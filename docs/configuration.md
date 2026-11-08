@@ -36,6 +36,7 @@ never the main YAML.
 | `summon` | `true` | `PR_REVIEWER_SUMMON` | The [comment-command surface](usage.md#comment-commands) and the pause check on the automated path |
 | `summon_handle` | `vera` | | The `@handle` commands answer to, in addition to the reviewer's own login |
 | `epic_attestation` | `true` | `PR_REVIEWER_EPIC_ATTESTATION` | [Review an `epic/*` PR by its residual only](epic-attestation.md) |
+| `incremental_review` | `false` | `PR_REVIEWER_INCREMENTAL_REVIEW` | [Re-review only the files that changed since the last round](incremental-review.md), carrying that round's findings on the rest. Off: every round is byte-for-byte a full review |
 | `allow_self_review` | `false` | | **Testing only.** Lifts the never-review-your-own-PR rail |
 | `viewer_login` | `""` | `PR_REVIEWER_VIEWER_LOGIN` | Our own login, for the self-review rail. **Required on App auth** (e.g. `my-reviewer[bot]`); auto-detected with a PAT |
 
