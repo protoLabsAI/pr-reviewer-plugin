@@ -95,6 +95,7 @@ def dispositions(output):
 def reconcile(accounting, steps, output, *, history=()):
     """Validate identities, not counts, at every boundary and retain transformation evidence."""
     from .rounds import normalize_relisted_priors, relisted_blocking_priors
+    from .verdicts import verification_ran
 
     result = copy.deepcopy(accounting)
     expected = set(result["raw"])
@@ -107,6 +108,7 @@ def reconcile(accounting, steps, output, *, history=()):
             result["gaps"].append(f"{stage}: missing or malformed findings/accounting array")
         covered = []
         targets = set()
+        current_survivors = []
         # Only code-matched prior relistings belong to the separate prior ledger.
         # Current IDs and arbitrary foreign IDs must still pass native accounting.
         # These helpers select verdict-less rows for re-verification/normalization.
@@ -136,6 +138,9 @@ def reconcile(accounting, steps, output, *, history=()):
                 )
             ):
                 continue
+            # Native identities belong to this attempt even if a model labels them
+            # carried. Only the matched prior rows above are exempt from verification.
+            current_survivors.append(dict(row, carried=False))
             if (not isinstance(row.get("claim"), str) or not row["claim"].strip()) or str(
                 row.get("severity") or ""
             ) not in {"blocker", "major", "minor", "nit"}:
@@ -165,6 +170,10 @@ def reconcile(accounting, steps, output, *, history=()):
                         {"stage": stage, "raw_id": rid, "target": target, "before": before, "after": row}
                     )
                     previous[rid] = row
+        # Check the verifier's entire surviving array before reporting can dispose of
+        # a row. Final-report verification alone cannot detect that lost annotation.
+        if stage == "verify" and not verification_ran(str(text or ""), current_survivors):
+            result["gaps"].append("verify: incomplete survivor verification")
         for item in rejected or []:
             if not isinstance(item, dict):
                 result["gaps"].append(f"{stage}: malformed disposition")

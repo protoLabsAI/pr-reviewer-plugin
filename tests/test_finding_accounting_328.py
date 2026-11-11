@@ -33,7 +33,7 @@ def raw(rows):
 
 def prepared(rows=None):
     inv = a.inventory(raw([F] if rows is None else rows), {"head": HEAD, "attempt": "a"})
-    tagged = [dict(v["finding"], raw_ids=[rid], finding_id=rid) for rid, v in inv["raw"].items()]
+    tagged = [dict(v["finding"], raw_ids=[rid], finding_id=rid, verdict="confirmed") for rid, v in inv["raw"].items()]
     return inv, tagged
 
 
@@ -137,7 +137,7 @@ class NativeRunner:
             ]
             for stage in a.STAGES:
                 steps.setdefault(stage, output([] if stage == self.loss else rows))
-            steps["verify"] += "\nVERIFY_STATUS: annotated n=1"
+            steps["verify"] += f"\nVERIFY_STATUS: annotated n={len(rows)}"
         return {"steps": steps, "output": steps["report"], "failed": [], "degraded": []}
 
 
@@ -282,6 +282,46 @@ async def test_partial_verification_holds_even_with_a_nonempty_verified_array(tm
     marker = parse_verdict_marker(gh.reviews_posted[-1]["body"])
     assert not marker["complete"] and not marker["verified"]
     assert "verify: missing identities" in gh.reviews_posted[-1]["body"]
+
+
+@pytest.mark.parametrize("fault", ["unannotated", "carried", "short-count", None])
+@pytest.mark.parametrize("retain_first", [True, False])
+async def test_report_disposition_cannot_hide_partial_verification(tmp_path, fault, retain_first):
+    native = NativeRunner(rows=[F, dict(F, claim="Second defect", line=8)])
+
+    async def runner(recipe, inputs, *, seed_outputs=None):
+        result = await native(recipe, inputs, seed_outputs=seed_outputs)
+        if "finding_accounting" in inputs:
+            rows = a.array(result["steps"]["verify"])
+            if fault in ("unannotated", "carried"):
+                rows[1].pop("verdict")
+            if fault == "carried":
+                rows[1]["carried"] = True
+            count = 1 if fault in ("unannotated", "short-count") else 2
+            result["steps"]["verify"] = output(rows) + f"\nVERIFY_STATUS: annotated n={count}"
+            rejected = [
+                {
+                    "raw_ids": row["raw_ids"],
+                    "disposition": "unsupported",
+                    "reason": "Caller guard prevents the reported impact",
+                    "evidence": "x.py:3 guard",
+                }
+                for row in (rows[1:] if retain_first else rows)
+            ]
+            result["output"] = output(rows[:1] if retain_first else [], rejected)
+            result["steps"]["report"] = result["output"]
+        return result
+
+    gh = RoutedGH(pr_facts=facts(changed_files=6))
+    d = make(tmp_path, gh=gh, runner=runner, cfg={"grounding": False})
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")).startswith("reviewed:")
+    body = gh.reviews_posted[-1]["body"]
+    marker = parse_verdict_marker(body)
+    assert marker["complete"] is (fault is None)
+    assert marker["verified"] is (fault is None)
+    if fault:
+        assert "verify: incomplete survivor verification" in body
+        assert "Raw finding accounting: incomplete" in body
 
 
 async def test_native_empty_lanes_post_complete_coverage(tmp_path):
