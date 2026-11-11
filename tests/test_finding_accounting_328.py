@@ -435,3 +435,77 @@ async def test_structural_prior_recheck_refutation_keeps_native_coverage_complet
     marker = parse_verdict_marker(body)
     assert marker["complete"] and marker["verified"]
     assert "cleared by re-verification" in body
+
+
+@pytest.mark.parametrize("fault", [None, "finder-context", "reused-execution"])
+async def test_accounting_barrier_validates_each_physical_execution(tmp_path, fault):
+    from tests.runner_fixtures import native_runner
+
+    native = native_runner(NativeRunner())
+    physical_results = []
+
+    async def runner(recipe, inputs, *, seed_outputs=None, seed_run_id=None):
+        result = await native(recipe, inputs, seed_outputs=seed_outputs)
+        if not physical_results:
+            if fault == "finder-context":
+                result["review_context"]["steps"][a.LANES[0]]["parent_history"] = "supplied"
+        else:
+            first = physical_results[0]
+            assert seed_run_id == first["run_id"]
+            # The host links the seeded lanes to the actual first invocation,
+            # without inventing observations for them in the second execution.
+            result["review_context"].pop("previous_executions", None)
+            result["tool_receipts"].pop("previous_executions", None)
+            for lane in a.LANES:
+                original = first["review_context"]["steps"][lane]
+                result["review_context"]["steps"][lane]["origin"] = {
+                    k: original[k] for k in ("run_id", "step_id", "execution_id")
+                }
+            if fault == "reused-execution":
+                eid = first["tool_receipts"]["execution_id"]
+                for key in ("review_context", "tool_receipts"):
+                    result[key]["execution_id"] = eid
+                    for step in result[key]["steps"].values():
+                        step["execution_id"] = eid
+        physical_results.append(copy.deepcopy(result))
+        return result
+
+    d = make(tmp_path)
+    wrapped = _accounting_runner(runner, invoke=d._invoke_runner)
+    result = await d._invoke_runner(wrapped, "code-review-structural", {"head_sha": HEAD})
+    assert len(physical_results) == 2
+    assert a.coverage(result, "code-review-structural")["complete"]
+    assert bool(result["isolation_gaps"]) is bool(fault)
+    if fault == "reused-execution":
+        assert "stale execution" in result["isolation_gaps"]["execution"]
+    assert result["context_adoptions"][a.LANES[0]]["run_id"] == physical_results[0]["run_id"]
+
+
+def test_combined_accounting_and_context_coverage_notes():
+    from pr_reviewer.verdicts import render_coverage_note
+
+    note = render_coverage_note({"finding_accounting": "missing ID", "context:verify": "unknown"})
+    assert "Raw finding accounting has gaps" in note
+    assert "Runner independence unverified" in note
+
+
+@pytest.mark.parametrize("fault", [None, "changed-output", "foreign-origin", "missing-receipt"])
+def test_seeded_retry_uses_retained_finder_adoption(fault):
+    from pr_reviewer.runner_contract import validate_result
+
+    from tests.test_runner_contract_327 import result, seed_result
+
+    original = result()
+    composite = result()
+    composite["context_adoptions"] = {
+        "find_bugs": {k: copy.deepcopy(original[k]) for k in ("run_id", "review_context", "tool_receipts")}
+    }
+    retry = seed_result(original)
+    if fault == "changed-output":
+        composite["steps"]["find_bugs"] = "changed"
+    elif fault == "foreign-origin":
+        retry["review_context"]["steps"]["find_bugs"]["origin"]["execution_id"] = "foreign"
+    elif fault == "missing-receipt":
+        composite["context_adoptions"]["find_bugs"]["tool_receipts"] = {}
+    gaps = validate_result(retry, seed_source=composite)
+    assert bool(gaps) is bool(fault)

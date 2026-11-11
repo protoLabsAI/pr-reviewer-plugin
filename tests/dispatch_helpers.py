@@ -11,6 +11,7 @@ from pr_reviewer.telemetry import Telemetry
 from pr_reviewer.verdicts import render_verdict_body
 
 from tests.conftest import note_write
+from tests.runner_fixtures import native_runner
 
 HEAD = "a" * 40
 OLD_HEAD = "b" * 40
@@ -80,7 +81,7 @@ def facts(**over):
     return base
 
 
-def make(tmp_path, *, cfg=None, gh=None, runner=None, inbox=None, base_verifier=None):
+def make(tmp_path, *, cfg=None, gh=None, runner=None, inbox=None, base_verifier=None, native_context=True):
     async def default_runner(name, inputs):
         return {"output": REPORT, "steps": {}, "failed": []}
 
@@ -88,7 +89,7 @@ def make(tmp_path, *, cfg=None, gh=None, runner=None, inbox=None, base_verifier=
         {"repos": ["o/r"], "cooldown_s": 30, **(cfg or {})},
         Telemetry(tmp_path),
         run_gh_fn=gh or FakeGH(),
-        workflow_run=runner or default_runner,
+        workflow_run=native_runner(runner or default_runner) if native_context else runner or default_runner,
         inbox_add=inbox,
         base_verifier=base_verifier,
     )

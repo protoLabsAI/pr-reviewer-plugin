@@ -24,6 +24,7 @@ from pr_reviewer.verdicts import parse_verdict_marker, render_verdict_body
 
 from tests.dispatch_helpers import _CLEAN_STEPS, RoutedGH, accounted_empty_panel, facts
 from tests.git_helpers import _ENV, resolver_for
+from tests.runner_fixtures import native_runner
 
 # ── a real repository ────────────────────────────────────────────────────────────
 
@@ -357,7 +358,7 @@ def epic_dispatcher(tmp_path, repo: Repo, sha: dict, gh, runner, cfg=None) -> Di
         {"repos": ["o/r"], "cooldown_s": 30, **(cfg or {})},
         Telemetry(tmp_path),
         run_gh_fn=gh,
-        workflow_run=runner,
+        workflow_run=native_runner(runner),
         resolve_checkout=resolver_for(work),
     )
     return d
