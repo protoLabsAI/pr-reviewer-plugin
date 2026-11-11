@@ -4317,7 +4317,7 @@ class Dispatcher:
             structural_partial=structural_partial,
             lane_reasons=lane_repo_gaps,
         )
-        accounting = _accounting.coverage(result, recipe)
+        accounting = _accounting.coverage(result, recipe, history=history)
         for row in refuted_before:
             _accounting.dispose(
                 accounting, row, "refuted", "validated prior refutation on unchanged code", row.get("refuted_before")
@@ -5653,7 +5653,6 @@ class Dispatcher:
                 coverage_gaps = {**(coverage_gaps or {}), "finding_accounting": "; ".join(accounting["gaps"])}
                 complete = verified = False
                 verdict = coverage_verdict(verdict, coverage_gaps)
-            notes += _accounting.render(accounting)
         body = render_verdict_body(
             repo=repo,
             pr=pr,
@@ -5677,6 +5676,11 @@ class Dispatcher:
             reaffirmed_from=reaffirmed_from,
             disposition_token=disposition_token,
         )
+        if accounting is not None:
+            # Budget against the complete body, including its machine-readable ledger.
+            # Keep the full provenance in telemetry even when the appendix cannot fit.
+            self.telemetry.emit("finding_accounting", repo=repo, pr=pr, sha=head, accounting=accounting)
+            body += _accounting.render(accounting, max_chars=max(0, 65536 - len(body)))
         event = "COMMENT"
         if not self.shadow and verdict == FAIL and not superseded:
             # A blocking verdict only against terminal CI (#863) — else comment now;

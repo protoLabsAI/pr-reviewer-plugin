@@ -311,3 +311,87 @@ async def test_seeded_barrier_placeholders_cannot_mask_missing_synthesis():
     result = await _accounting_runner(runner)("code-review-structural", {"head_sha": HEAD})
     assert result["steps"]["synthesize"] == ""
     assert not a.coverage(result, "code-review-structural")["complete"]
+
+
+@pytest.mark.parametrize("budget", [0, 30, 300, 65000])
+def test_large_accounting_render_respects_available_body_budget(budget):
+    inv, rows = prepared([dict(F, evidence="x" * 20000)])
+    accounting = check(inv, rows)
+    assert accounting["complete"]
+    assert len(a.render(accounting, max_chars=budget)) <= budget
+    assert accounting["transitions"][0]["before"]["evidence"] == "x" * 20000
+
+
+@pytest.mark.parametrize("notes_size", [0, 64000, 65000])
+async def test_posting_large_accounting_preserves_postable_verdict(tmp_path, notes_size):
+    inv, _rows = prepared([dict(F, evidence="x" * 20000)])
+    accounting = check(
+        inv,
+        [],
+        [{"raw_ids": list(inv["raw"]), "disposition": "refuted", "reason": "guard blocks this", "evidence": "x.py:3"}],
+    )
+    accounting["report_findings"] = []
+    gh = RoutedGH(pr_facts=facts())
+    d = make(tmp_path, gh=gh)
+    assert await d._post_verdict(
+        "o/r", 1, HEAD, "PASS", [], "code-review-structural", notes="n" * notes_size, accounting=accounting
+    )
+    body = gh.reviews_posted[-1]["body"]
+    assert len(body) <= 65536
+    assert "n" * notes_size in body
+    assert parse_verdict_marker(body)["complete"]
+    trace = next(e for e in d.telemetry.read_all() if e["event"] == "finding_accounting")
+    assert trace["accounting"]["raw"] == inv["raw"]
+
+
+@pytest.mark.parametrize("severity", ["major", "minor"])
+@pytest.mark.parametrize("old_ids", [None, ["old-attempt:1"]])
+def test_known_prior_relisting_is_separate_but_cannot_hide_native_loss(old_ids, severity):
+    prior = dict(F, severity=severity)
+    if old_ids is not None:
+        prior["raw_ids"] = old_ids
+    history = [{"head": "old", "findings": [prior]}]
+    inv, rows = prepared()
+    text = output([*rows, prior])
+    assert a.reconcile(inv, {s: text for s in a.STAGES}, text, history=history)["complete"]
+    assert not a.reconcile(inv, {s: text for s in a.STAGES}, text)["complete"]
+    missing = output([prior])
+    assert not a.reconcile(inv, {s: missing for s in a.STAGES}, missing, history=history)["complete"]
+    foreign = output([*rows, dict(prior, raw_ids=["invented"])])
+    assert not a.reconcile(inv, {s: foreign for s in a.STAGES}, foreign, history=history)["complete"]
+
+
+async def test_structural_prior_recheck_refutation_keeps_native_coverage_complete(tmp_path):
+    from tests.test_dispatch import _F841_REPORT, F841_RELISTED, _f841_gh, verify_reply
+
+    native = NativeRunner(rows=[])
+    rechecked = False
+
+    async def runner(recipe, inputs, *, seed_outputs=None):
+        nonlocal rechecked
+        if seed_outputs and seed_outputs.get("report") == report:
+            rechecked = True
+            return {
+                "output": report,
+                "steps": {
+                    **seed_outputs,
+                    "verify": verify_reply(dict(F841_RELISTED, verdict="refuted", note="now `_`")),
+                },
+                "failed": [],
+            }
+        result = await native(recipe, inputs, seed_outputs=seed_outputs)
+        if "finding_accounting" in inputs:
+            result["output"] = result["steps"]["report"] = report
+            result["steps"]["verify"] = output([]) + "\nVERIFY_STATUS: nothing-to-verify"
+        return result
+
+    report = _F841_REPORT + '\n```accounting\n{"dispositions": []}\n```'
+    gh = _f841_gh()
+    gh.pr_facts.update(facts(changed_files=6))
+    d = make(tmp_path, gh=gh, runner=runner, cfg={"evidence_grounding": False, "shadow_mode": False})
+    assert await d.handle_pr_event("o/r", 1, HEAD, "synchronize") == "reviewed:PASS"
+    assert rechecked
+    body = gh.reviews_posted[-1]["body"]
+    marker = parse_verdict_marker(body)
+    assert marker["complete"] and marker["verified"]
+    assert "cleared by re-verification" in body

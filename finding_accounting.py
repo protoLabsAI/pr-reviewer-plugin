@@ -92,8 +92,10 @@ def dispositions(output):
         return None
 
 
-def reconcile(accounting, steps, output):
+def reconcile(accounting, steps, output, *, history=()):
     """Validate identities, not counts, at every boundary and retain transformation evidence."""
+    from .rounds import normalize_relisted_priors, relisted_blocking_priors
+
     result = copy.deepcopy(accounting)
     expected = set(result["raw"])
     previous = {rid: value["finding"] for rid, value in result["raw"].items()}
@@ -105,7 +107,30 @@ def reconcile(accounting, steps, output):
             result["gaps"].append(f"{stage}: missing or malformed findings/accounting array")
         covered = []
         targets = set()
-        for row in rows or []:
+        # Only code-matched prior relistings belong to the separate prior ledger.
+        # Current IDs and arbitrary foreign IDs must still pass native accounting.
+        _, relistings = relisted_blocking_priors(rows or [], history)
+        priors = dict(relistings)
+        prior_round = next((r for r in reversed(history) if r.get("findings")), {})
+        for index, row in enumerate(rows or []):
+            if row.get("severity") in ("minor", "nit"):
+                for prior in prior_round.get("findings", []):
+                    _, normalized = normalize_relisted_priors([row], [{"findings": [prior]}])
+                    if normalized:
+                        priors[index] = prior
+                        break
+        for index, row in enumerate(rows or []):
+            prior = priors.get(index)
+            ids = row.get("raw_ids")
+            if prior is not None and (
+                ids is None
+                or (
+                    ids == prior.get("raw_ids")
+                    and isinstance(ids, list)
+                    and all(isinstance(i, str) and i not in expected for i in ids)
+                )
+            ):
+                continue
             if (not isinstance(row.get("claim"), str) or not row["claim"].strip()) or str(
                 row.get("severity") or ""
             ) not in {"blocker", "major", "minor", "nit"}:
@@ -165,7 +190,7 @@ def reconcile(accounting, steps, output):
     return result
 
 
-def coverage(result, recipe):
+def coverage(result, recipe, *, history=()):
     if recipe != "code-review-structural":
         return {"supported": False, "complete": None, "gaps": [], "status": "unsupported"}
     account = result.get("finding_accounting")
@@ -182,20 +207,31 @@ def coverage(result, recipe):
         )
     ):
         return {"supported": True, "complete": False, "gaps": ["native inventory unavailable or malformed"]}
-    reconciled = reconcile(account, result.get("steps") or {}, result.get("output"))
+    reconciled = reconcile(account, result.get("steps") or {}, result.get("output"), history=history)
     reconciled["report_findings"] = array(result.get("output"))
     return reconciled
 
 
-def render(accounting):
+def render(accounting, *, max_chars=65536):
     # Object fence cannot be mistaken for the prior-round findings array.
-    return (
+    rendered = (
         "\n\n<details><summary>Raw finding accounting: "
         + ("unsupported" if not accounting["supported"] else "complete" if accounting["complete"] else "incomplete")
         + "</summary>\n\n```json\n"
         + json.dumps(accounting, ensure_ascii=True).replace("<", "\\u003c").replace("`", "\\u0060")
         + "\n```\n</details>\n"
     )
+
+    if len(rendered) <= max_chars:
+        return rendered
+    status = "unsupported" if not accounting["supported"] else "complete" if accounting["complete"] else "incomplete"
+    summary = (
+        f"\n\nRaw finding accounting: {status}. "
+        f"Raw findings: {len(accounting.get('raw', {}))}; "
+        f"gaps: {len(accounting.get('gaps', []))}. "
+        "Full trace omitted from this review to fit GitHub's body limit."
+    )
+    return summary if len(summary) <= max_chars else ""
 
 
 def restate_dispositions(output):
