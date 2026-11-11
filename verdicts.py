@@ -853,6 +853,9 @@ def fenced_blocks(text: str, *, json_only: bool = False) -> list[str]:
     `json_only` takes ```json fences alone; otherwise an untagged ``` fence counts too.
     """
     text = text or ""
+    # The separate current-run accounting payload is not a findings block.
+    # Skip its closing fence too, which otherwise looks like an untagged opener.
+    text = re.sub(r"(?m)^```accounting[^\n]*\n.*?^```[ \t]*(?:\n|$)", "", text, flags=re.DOTALL)
     opener_re = re.compile(r"```json\s*\n" if json_only else r"```(?:json)?\s*\n")
     out: list[str] = []
     pos = 0
@@ -1305,6 +1308,17 @@ def render_coverage_note(gaps: dict[str, str] | None, lanes: int = 0) -> str:
     gaps while four lanes were blind — so this line, not the brief, is the record."""
     if not gaps:
         return ""
+    if "finding_accounting" in gaps:
+        lanes_only = {k: v for k, v in gaps.items() if k != "finding_accounting"}
+        prefix = (
+            render_coverage_note(lanes_only, lanes)
+            if lanes_only
+            else "**Coverage incomplete — this is not a clean pass.**"
+        )
+        return (
+            prefix
+            + " Raw finding accounting has gaps; PASS is capped at WARN and promotion is held. See the accounting record below."
+        )
     context = {sid: why for sid, why in gaps.items() if sid.startswith("context:")}
     if context:
         lanes_note = render_coverage_note({sid: why for sid, why in gaps.items() if sid not in context}, lanes)

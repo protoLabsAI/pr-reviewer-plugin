@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import contextvars
+import copy as _copy
 import functools
 import json
 import logging
@@ -32,12 +33,14 @@ import math
 import os
 import re
 import time
+import uuid
 from collections import deque
 from pathlib import Path
 from urllib.parse import quote
 
 from . import absence_search as _absence
 from . import epic as _epic
+from . import finding_accounting as _accounting
 from . import incremental as _inc
 from . import repo_search as _repo_search
 from .absence_search import AbsenceSearcher, render_absence_search_footnote
@@ -452,6 +455,107 @@ def _in_review_session(runner, repo: str, pr: int, head: str):
             return await runner(*args, **kwargs)
 
     return scoped
+
+
+def _accounting_runner(runner, *, invoke=None):
+    """Use the host's existing seed API to place a deterministic barrier before synthesis.
+
+    Seeded retries reuse the original inventory; only a fresh finder pass mints IDs.
+    The caller checks seed_outputs support before installing this adapter.
+    """
+    current = None
+    lane_seeds = {}
+    finder_context = {}
+    finder_gaps = {}
+
+    async def physical(recipe, inputs, *, seed_source=None, **kwargs):
+        if invoke is not None:
+            return await invoke(runner, recipe, inputs, seed_source=seed_source, **kwargs)
+        return await runner(recipe, inputs, **kwargs)
+
+    @functools.wraps(runner)
+    async def run(recipe, inputs, **kwargs):
+        nonlocal current, lane_seeds, finder_context, finder_gaps
+        if recipe != "code-review-structural":
+            return await runner(recipe, inputs, **kwargs)
+        seed_source = kwargs.pop("seed_source", None)
+        seeds = dict(kwargs.pop("seed_outputs", {}) or {})
+        first = None
+        if not all(lane in seeds for lane in _accounting.LANES):
+            binding = {
+                "attempt": uuid.uuid4().hex,
+                "repo": inputs.get("repo"),
+                "head": inputs.get("head_sha"),
+                "pr": inputs.get("pr"),
+            }
+            first = await physical(
+                recipe, inputs, seed_outputs={s: "```json\n[]\n```" for s in _accounting.STAGES}, **kwargs
+            )
+            finder_context = {
+                lane: {k: first.get(k) for k in ("run_id", "review_context", "tool_receipts")}
+                for lane in _accounting.LANES
+            }
+            finder_gaps = {
+                k: v for k, v in (first.get("isolation_gaps") or {}).items() if k in (*_accounting.LANES, "execution")
+            }
+            steps = first.get("steps") if isinstance(first.get("steps"), dict) else {}
+            current = _accounting.inventory(steps, binding)
+            for lane in list(first.get("degraded") or []) + list(first.get("failed") or []):
+                if lane in _accounting.LANES:
+                    current["gaps"].append(f"{lane}: execution failed or degraded")
+            seeds = {lane: str(steps.get(lane) or "") for lane in _accounting.LANES}
+            for lane in _accounting.LANES:
+                rows = [
+                    dict(v["finding"], raw_ids=[rid], finding_id=rid)
+                    for rid, v in current["raw"].items()
+                    if v["lane"] == lane
+                ]
+                if _accounting.array(seeds[lane]) is not None:
+                    seeds[lane] += "\n```json\n" + json.dumps(rows) + "\n```"
+            lane_seeds = dict(seeds)
+            # Only deterministic ID annotations differ from the observed originals.
+            seed_source = {**first, "steps": {**steps, **seeds}}
+        elif current is not None and (
+            any(seeds[lane] != lane_seeds.get(lane) for lane in _accounting.LANES)
+            or any(
+                current["binding"].get(k) != inputs.get(i)
+                for k, i in (("head", "head_sha"), ("repo", "repo"), ("pr", "pr"))
+            )
+        ):
+            current = _copy.deepcopy(current)
+            current["gaps"].append("seeded rerun: stale or foreign finder inputs")
+        if current is None:
+            current = _accounting.inventory({}, {"head": inputs.get("head_sha"), "attempt": "unobserved"})
+        payload = dict(inputs, finding_accounting=json.dumps(current, sort_keys=True))
+        result = await physical(recipe, payload, seed_outputs=seeds, seed_source=seed_source, **kwargs)
+        returned_steps = result.get("steps") or {}
+        if any(lane in returned_steps and returned_steps[lane] != seeds[lane] for lane in _accounting.LANES):
+            current["gaps"].append("runner changed seeded finder outputs")
+        result = {**result, "steps": {**seeds, **returned_steps}}
+        if first:
+            result = {
+                **result,
+                "steps": {**{s: "" for s in _accounting.STAGES}, **result["steps"]},
+                "failed": list(first.get("failed") or []) + list(result.get("failed") or []),
+                "degraded": list(first.get("degraded") or []) + list(result.get("degraded") or []),
+                "timings": {
+                    **(result.get("timings") or {}),
+                    **{k: v for k, v in (first.get("timings") or {}).items() if k in _accounting.LANES},
+                },
+                "tool_calls": {
+                    **(result.get("tool_calls") or {}),
+                    **{k: v for k, v in (first.get("tool_calls") or {}).items() if k in _accounting.LANES},
+                },
+            }
+        return {
+            **result,
+            "isolation_gaps": {**(result.get("isolation_gaps") or {}), **finder_gaps},
+            "context_adoptions": {**(result.get("context_adoptions") or {}), **finder_context},
+            "finding_accounting": _copy.deepcopy(current),
+        }
+
+    run._accounting_physical_validation = invoke is not None
+    return run
 
 
 def _accepts_keyword(fn, name: str) -> bool:
@@ -2089,6 +2193,8 @@ class Dispatcher:
 
     async def _invoke_runner(self, runner, recipe, inputs, *, seed_source=None, **kwargs):
         """Keep legacy signatures, and bind evidence at every physical runner return."""
+        if getattr(runner, "_accounting_physical_validation", False):
+            return await runner(recipe, inputs, seed_source=seed_source, **kwargs)
         if seed_source and _accepts_keyword(runner, "seed_run_id") and seed_source.get("run_id"):
             kwargs["seed_run_id"] = seed_source["run_id"]
         result = await runner(recipe, inputs, **kwargs)
@@ -3792,6 +3898,8 @@ class Dispatcher:
             self.telemetry.emit("drop", repo=repo, pr=pr, reason=DROP_NO_RUNNER, model_retries=self._round_retries())
             return f"drop:{DROP_NO_RUNNER}"
         runner = _in_review_session(runner, repo, pr, head)
+        if recipe == "code-review-structural" and _accepts_keyword(runner, "seed_outputs"):
+            runner = _accounting_runner(runner, invoke=self._invoke_runner)
         self.telemetry.emit(
             "dispatch",
             repo=repo,
@@ -4253,6 +4361,14 @@ class Dispatcher:
             structural_partial=structural_partial,
             lane_reasons=lane_repo_gaps,
         )
+        accounting = _accounting.coverage(result, recipe, history=history)
+        for row in refuted_before:
+            _accounting.dispose(
+                accounting, row, "refuted", "validated prior refutation on unchanged code", row.get("refuted_before")
+            )
+        if accounting["gaps"]:
+            gaps["finding_accounting"] = "; ".join(accounting["gaps"])
+            complete = False
         isolation_gaps = dict(result.get("isolation_gaps") or {})
         gaps.update({f"context:{sid}": why for sid, why in isolation_gaps.items()})
         complete = complete and not isolation_gaps
@@ -4371,6 +4487,7 @@ class Dispatcher:
             head=head,
             round_number=round_number,
             disputed=disputed,
+            accounting=accounting,
             isolation_gaps=isolation_gaps,
             seed_source=result,
         )
@@ -4397,6 +4514,14 @@ class Dispatcher:
         out_of_scope: list[dict] = []
         if inc_scoped:
             reported, out_of_scope = _inc.split_panel_findings(reported, inc)
+            for row in out_of_scope:
+                _accounting.dispose(
+                    accounting,
+                    row,
+                    "out-of-scope",
+                    "outside current incremental scope",
+                    {"file": row.get("file"), "line": row.get("line"), "evidence": row.get("evidence")},
+                )
             reported = _inc.merge_carries(reported, inc)
         findings, confined = confine_findings(reported, confine_paths)
         if confined:
@@ -4626,6 +4751,10 @@ class Dispatcher:
         # and the clearance guard above judges the finding-based verdict, so a capped
         # zero-finding round holds a standing block exactly as a clean one would. A gap
         # never softens a FAIL and never withholds the verdict — it caps PASS at WARN.
+        _accounting.finalize(accounting, output, reported)
+        if accounting["gaps"]:
+            gaps["finding_accounting"] = "; ".join(accounting["gaps"])
+            complete = False
         finding_verdict = verdict
         verdict = coverage_verdict(verdict, gaps)
         # The owed priors face the same #259 evidence guard as this round's own findings: a
@@ -4734,7 +4863,11 @@ class Dispatcher:
         # an unreadable PR posts as before (a lost verdict is worse than a late one).
         if ended := pr_ended(await self._pr_facts(repo, pr)):
             return await self._abandon_ended(repo, pr, head, ended, "posting", review_check_id)
-        round_verified = not isolation_gaps and verification_ran(str(steps_out.get("verify") or ""), reported)
+        round_verified = (
+            not isolation_gaps
+            and not accounting["gaps"]
+            and verification_ran(str(steps_out.get("verify") or ""), reported)
+        )
         posted = await self._post_verdict(
             repo,
             pr,
@@ -4762,6 +4895,7 @@ class Dispatcher:
             # normal; empty over real findings means the verdict is ungrounded, and the
             # promotion gate must not auto-approve it (mirrors `complete` one step up).
             verified=round_verified,
+            accounting=accounting,
             # Stamp the reviewed base↔head diff identity into the marker (issue #91) so a
             # later rebased/reworded head with a byte-identical diff reaffirms this verdict.
             diff_id=diff_id,
@@ -5364,6 +5498,8 @@ class Dispatcher:
             host = [f.to_dict() for f in parse_findings(output)]
         except Exception:  # noqa: BLE001 — host-free: the plugin's own read is all there is
             return own
+        if len(own) == len(host) and any("raw_ids" in f for f in own):
+            return own  # host schemas may discard the plugin-owned accounting metadata
         if len(own) > len(host):
             log.warning(
                 "[pr-reviewer] the host parser read %d finding(s) where the report carries %d; using the report's",
@@ -5551,6 +5687,7 @@ class Dispatcher:
         lanes: int = 0,
         reaffirmed_from: str = "",
         disposition_token: str = "",
+        accounting: dict | None = None,
     ) -> bool:
         # Immediately before posting — the last moment a mid-round push can be caught.
         # The marker keeps the PINNED head on purpose: the round ran against it, and
@@ -5566,6 +5703,12 @@ class Dispatcher:
                 "the current head is queued for its own review."
             )
             self.telemetry.emit("superseded", repo=repo, pr=pr, sha=head, verdict=verdict)
+        if accounting is not None:
+            _accounting.finalize(accounting, accounting.get("report_findings") or [], findings, stage="posted")
+            if accounting["gaps"]:
+                coverage_gaps = {**(coverage_gaps or {}), "finding_accounting": "; ".join(accounting["gaps"])}
+                complete = verified = False
+                verdict = coverage_verdict(verdict, coverage_gaps)
         body = render_verdict_body(
             repo=repo,
             pr=pr,
@@ -5589,6 +5732,11 @@ class Dispatcher:
             reaffirmed_from=reaffirmed_from,
             disposition_token=disposition_token,
         )
+        if accounting is not None:
+            # Budget against the complete body, including its machine-readable ledger.
+            # Keep the full provenance in telemetry even when the appendix cannot fit.
+            self.telemetry.emit("finding_accounting", repo=repo, pr=pr, sha=head, accounting=accounting)
+            body += _accounting.render(accounting, max_chars=max(0, 65536 - len(body)))
         event = "COMMENT"
         if not self.shadow and verdict == FAIL and not superseded:
             # A blocking verdict only against terminal CI (#863) — else comment now;
@@ -5946,10 +6094,16 @@ class Dispatcher:
         if decision != REGATE:
             self.telemetry.emit("regate", repo=repo, pr=pr, sha=head, decision=decision)
             return decision
-        body = (
+        note = (
             f"_Checks are terminal ({checks}) — arming the FAIL verdict below as a blocking review "
-            f"(it posted as a comment while CI was still pending)._\n\n" + latest["body"]
+            f"(it posted as a comment while CI was still pending)._\n\n"
         )
+        # The stored verdict (including its ledger/accounting) can already fill the
+        # GitHub body limit. Omit only the optional note when it cannot fit; never
+        # truncate the judgement or prevent its promotion to a blocking review.
+        body = latest["body"]
+        if len(note) + len(body) <= 65536:
+            body = note + body
         rc, _out, err = await self._run_gh(
             [
                 "api",
@@ -6014,7 +6168,7 @@ class Dispatcher:
         # contradiction (2 of 2, and #384's separate panels agree), while the same payload
         # in any other shape reads fine. The re-run hands the verifier the SAME array,
         # restated — an explicit count first, no delegation banner, no prose brief.
-        seeded["synthesize"] = restate_findings(synthesized)
+        seeded["synthesize"] = restate_findings(synthesized) + _accounting.restate_dispositions(steps.get("synthesize"))
         self.report_phase("verify")  # the seeded re-run runs only verify + report
         for attempt in range(1, self.verify_reruns + 1):
             try:
@@ -6147,6 +6301,7 @@ class Dispatcher:
         head: str,
         round_number: int,
         disputed: set[str] | None = None,
+        accounting: dict | None = None,
         isolation_gaps: dict[str, str] | None = None,
         seed_source: dict | None = None,
     ) -> tuple[list[dict], list[dict], list[dict], list[dict]]:
@@ -6233,10 +6388,14 @@ class Dispatcher:
             ruling = ruling_for.get(("relisted", k))
             outcome, value = resolve_relisting(out[i], prior, ruling, ranges, since_ranges)
             if outcome == "cleared":
+                _accounting.dispose(accounting, out[i], "refuted", "prior relisting cleared by recheck", ruling)
                 drop.add(i)
                 cleared.append({**prior, "recheck_note": (ruling or {}).get("note", "")})
                 settled.append(prior)
             elif outcome == "deferred":
+                _accounting.dispose(
+                    accounting, out[i], "unsupported", "unverified relisting deferred to prior debt ledger", value
+                )
                 drop.add(i)
                 deferred.append(value)
                 settled.append(prior)  # carried by `deferred`, named once

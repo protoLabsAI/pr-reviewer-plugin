@@ -498,7 +498,8 @@ async def test_a_carry_whose_evidence_is_gone_at_head_is_dropped(tmp_path):
     assert not [f for f in _posted_findings(gh) if f.get("carried_by") == inc.CARRIED_BY]
     [row] = _events(d, "reviewed")
     assert row["carried_kept"] == 0 and row["carried_dropped"] == 1
-    assert outcome == "reviewed:PASS"
+    assert outcome == "reviewed:WARN"  # this legacy runner supplies no native raw inventory
+    assert "complete=false" in gh.reviews_posted[-1]["body"]
 
 
 @pytest.mark.parametrize(

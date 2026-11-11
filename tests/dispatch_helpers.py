@@ -245,3 +245,22 @@ def recheck_runner(report, reply=None, steps=None):
         return {"output": seed_outputs["report"], "steps": {**seed_outputs, "verify": reply or ""}, "failed": []}
 
     return runner, calls
+
+
+def accounted_empty_panel(result):
+    """Native empty-inventory fixture for tests of other structural coverage rules.
+
+    Nonempty cases must supply their own identity mappings, never infer them by count.
+    """
+    from pr_reviewer.finding_accounting import array, inventory
+
+    steps = dict(result.get("steps") or {})
+    for text in [result.get("output"), *steps.values()]:
+        assert array(text) in (None, [])
+    block = '\n```accounting\n{"dispositions": []}\n```\n'
+    return {
+        **result,
+        "finding_accounting": inventory(steps, {"head": HEAD, "attempt": "test-native"}),
+        "steps": {k: block + v if k in ("synthesize", "verify", "report") else v for k, v in steps.items()},
+        "output": block + result["output"],
+    }

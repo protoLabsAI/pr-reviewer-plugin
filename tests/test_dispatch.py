@@ -27,6 +27,7 @@ from tests.dispatch_helpers import (  # noqa: F401 — the shared fakes, re-expo
     REPORT,
     FakeGH,
     RoutedGH,
+    accounted_empty_panel,
     facts,
     make,
     recheck_runner,
@@ -1298,7 +1299,7 @@ async def test_a_verifier_that_contradicts_the_synthesizer_is_re_run_alone(tmp_p
             "timings": {"verify": 9.0},
         }
 
-    d = make(tmp_path, gh=_structural_gh(), runner=runner)
+    d = make(tmp_path, gh=RoutedGH(pr_facts=facts()), runner=runner)
     out = await d.handle_pr_event("o/r", 1, HEAD, "opened")
     assert out == "reviewed:WARN"
     # The re-run was seeded with every step BUT verify and report — the finders did not run twice.
@@ -1339,7 +1340,7 @@ async def test_a_restated_miss_falls_back_to_one_fresh_panel(tmp_path):
             "failed": [],
         }
 
-    gh = _structural_gh()
+    gh = RoutedGH(pr_facts=facts())
     d = make(tmp_path, gh=gh, runner=runner)
     assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "reviewed:WARN"
     assert calls == ["fresh", "seeded", "fresh"]  # original, restated re-run, ONE fallback panel
@@ -1364,7 +1365,7 @@ async def test_a_fallback_panel_that_also_contradicts_posts_held_and_stops(tmp_p
         )
         return {"output": _REPORT_UNVERIFIED, "steps": steps, "failed": []}
 
-    gh = _structural_gh()
+    gh = RoutedGH(pr_facts=facts())
     d = make(tmp_path, gh=gh, runner=runner)
     await d.handle_pr_event("o/r", 1, HEAD, "opened")
     assert calls == 3 and "verified=false" in gh.reviews_posted[0]["body"]  # bounded: no second fallback
@@ -1407,7 +1408,7 @@ async def test_a_re_run_that_does_not_clear_leaves_the_original_rounds_findings(
             }
         return {"output": report_one, "steps": {"verify": _VERIFY_FLAKED, "report": report_one}, "failed": []}
 
-    gh = _structural_gh()
+    gh = RoutedGH(pr_facts=facts())
     d = make(tmp_path, cfg={"verify_fallback_panel": False}, gh=gh, runner=runner)
     await d.handle_pr_event("o/r", 1, HEAD, "opened")
     body = gh.reviews_posted[0]["body"]
@@ -1429,7 +1430,7 @@ async def test_a_verifier_that_stays_contradicted_posts_unverified_as_before(tmp
             "failed": [],
         }
 
-    gh = _structural_gh()
+    gh = RoutedGH(pr_facts=facts())
     d = make(tmp_path, cfg={"verify_fallback_panel": False}, gh=gh, runner=runner)
     await d.handle_pr_event("o/r", 1, HEAD, "opened")
     assert "verified=false" in gh.reviews_posted[0]["body"]  # fail-closed, exactly as today
@@ -1468,7 +1469,7 @@ async def test_verify_reruns_zero_disables_the_re_run_on_a_host_that_could_seed(
             "failed": [],
         }
 
-    gh = _structural_gh()
+    gh = RoutedGH(pr_facts=facts())
     d = make(tmp_path, cfg={"verify_reruns": 0}, gh=gh, runner=runner)
     await d.handle_pr_event("o/r", 1, HEAD, "opened")
     assert calls == 1 and "verified=false" in gh.reviews_posted[0]["body"]
@@ -1487,7 +1488,7 @@ async def test_a_verifier_that_read_its_input_is_not_re_run(tmp_path):
             "failed": [],
         }
 
-    d = make(tmp_path, gh=_structural_gh(), runner=runner)
+    d = make(tmp_path, gh=RoutedGH(pr_facts=facts()), runner=runner)
     await d.handle_pr_event("o/r", 1, HEAD, "opened")
     assert calls == 1 and _events(tmp_path, "verify-contradicted") == []
 
@@ -1606,7 +1607,7 @@ async def test_a_refuted_structural_finding_is_remembered_from_the_verify_step_w
         return {"output": report, "failed": [], "steps": steps}
 
     d = make(tmp_path, cfg={"state_root": str(tmp_path / "st")}, gh=_patched_gh(10), runner=runner)
-    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "reviewed:PASS"
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "reviewed:WARN"
     hit = RefutationStore(tmp_path / "st").match("o/r", "packs/necromunda/src/lib.rs", claim)
     assert hit and hit["pr"] == 1 and "returns Result" in hit["note"]
 
@@ -1897,7 +1898,7 @@ async def test_a_complete_structural_lane_is_not_marked_partial(tmp_path):
     gh = _structural_gh()
 
     async def runner(name, inputs):
-        return {"output": CLEAN_REPORT, "failed": [], "steps": _panel_steps()}
+        return accounted_empty_panel({"output": CLEAN_REPORT, "failed": [], "steps": _panel_steps()})
 
     d = make(tmp_path, cfg={"shadow_mode": False}, gh=gh, runner=runner)
     await d.handle_pr_event("o/r", 1, HEAD, "opened")
@@ -2067,7 +2068,7 @@ async def test_a_verifier_that_returns_only_a_preamble_is_not_a_clean_pass(tmp_p
     assert "`verify` (returned no findings array and no status line" in body
     reviewed = _events(tmp_path, "reviewed")[-1]
     assert reviewed["verify_undelivered"] is True and reviewed["coverage_capped"] is True
-    assert reviewed["complete"] is True  # every finder covered the diff; the hold is not for this
+    assert reviewed["complete"] is False  # native raw accounting is unavailable on this legacy runner
 
 
 async def test_an_explicit_empty_array_at_every_boundary_is_still_a_clean_pass(tmp_path):
@@ -2078,7 +2079,7 @@ async def test_an_explicit_empty_array_at_every_boundary_is_still_a_clean_pass(t
 
     async def runner(name, inputs):
         calls.append(name)
-        return {"output": CLEAN_REPORT, "failed": [], "steps": _panel_steps()}
+        return accounted_empty_panel({"output": CLEAN_REPORT, "failed": [], "steps": _panel_steps()})
 
     d = make(tmp_path, cfg={"shadow_mode": False}, gh=gh, runner=runner)
     assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "reviewed:PASS"
@@ -2274,8 +2275,8 @@ async def test_an_absent_payload_recovered_on_retry_posts_the_real_verdict(tmp_p
     async def runner(name, inputs):
         calls.append(name)
         if len(calls) == 1:
-            return {"output": "The report was cut off before its findings.", "failed": []}
-        return {"output": CLEAN_REPORT, "failed": [], "steps": _panel_steps()}
+            return accounted_empty_panel({"output": "The report was cut off before its findings.", "failed": []})
+        return accounted_empty_panel({"output": CLEAN_REPORT, "failed": [], "steps": _panel_steps()})
 
     d = make(tmp_path, gh=gh, runner=runner)
     assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "reviewed:PASS"
@@ -2326,17 +2327,21 @@ async def test_all_finders_declaring_reviewed_stays_complete(tmp_path):
 
     async def runner(name, inputs):
         clean = "no issues\n```json\n[]\n```\nFINDER_STATUS: reviewed n=0"
-        return {
-            "output": CLEAN_REPORT,
-            "failed": [],
-            "steps": {
-                "find_correctness": clean,
-                "find_removed_behavior": clean,
-                "find_crossfile": clean,
-                "find_conventions": clean,
-                "find_structural": "```json\n[]\n```",
-            },
-        }
+        return accounted_empty_panel(
+            {
+                "output": CLEAN_REPORT,
+                "failed": [],
+                "steps": {
+                    "find_correctness": clean,
+                    "find_removed_behavior": clean,
+                    "find_crossfile": clean,
+                    "find_conventions": clean,
+                    "find_structural": "```json\n[]\n```",
+                    "synthesize": CLEAN_REPORT,
+                    "verify": "VERIFY_STATUS: nothing-to-verify\n" + CLEAN_REPORT,
+                },
+            }
+        )
 
     d = make(tmp_path, cfg={"shadow_mode": False}, gh=gh, runner=runner)
     out = await d.handle_pr_event("o/r", 1, HEAD, "opened")

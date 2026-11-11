@@ -17,11 +17,12 @@ from pathlib import Path
 import pytest
 from pr_reviewer import epic
 from pr_reviewer.dispatch import Dispatcher
+from pr_reviewer.finding_accounting import LANES
 from pr_reviewer.protopatch import structural_scope
 from pr_reviewer.telemetry import Telemetry
 from pr_reviewer.verdicts import parse_verdict_marker, render_verdict_body
 
-from tests.dispatch_helpers import _CLEAN_STEPS, RoutedGH, facts
+from tests.dispatch_helpers import _CLEAN_STEPS, RoutedGH, accounted_empty_panel, facts
 from tests.git_helpers import _ENV, resolver_for
 from tests.runner_fixtures import native_runner
 
@@ -373,7 +374,17 @@ def recording_runner():
     async def runner(name, inputs):
         calls.append((name, inputs))
         report = "<!-- brief -->\nResidual reviewed.\n<!-- /brief -->\n\n```json\n[]\n```"
-        return {"output": report, "steps": {**_CLEAN_STEPS, "report": report}, "failed": []}
+        return accounted_empty_panel(
+            {
+                "output": report,
+                "steps": {
+                    **_CLEAN_STEPS,
+                    **{lane: report + "\nFINDER_STATUS: reviewed n=0" for lane in LANES},
+                    "report": report,
+                },
+                "failed": [],
+            }
+        )
 
     return runner, calls
 

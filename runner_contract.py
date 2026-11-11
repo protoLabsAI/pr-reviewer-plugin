@@ -126,12 +126,11 @@ def validate_result(result, *, seed_outputs=None, seed_source=None):
                 if (
                     isinstance(seed_source, dict)
                     and sid in _map(seed_source.get("steps"))
-                    and sid not in _map(seed_source.get("context_adoptions"))
                     and _map(seed_source.get("steps")).get(sid) == _map(seed_outputs).get(sid, steps.get(sid))
                 ):
-                    candidates.append(
-                        (seed_source.get("review_context"), seed_source.get("tool_receipts"), seed_source.get("run_id"))
-                    )
+                    source = _map(seed_source.get("context_adoptions")).get(sid, seed_source)
+                    source = _map(source)
+                    candidates.append((source.get("review_context"), source.get("tool_receipts"), source.get("run_id")))
                 histories = context.get("previous_executions", [])
                 receipt_histories = receipts.get("previous_executions", [])
                 if isinstance(histories, list) and isinstance(receipt_histories, list):
