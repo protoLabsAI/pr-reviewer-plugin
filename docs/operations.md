@@ -73,3 +73,38 @@ curl -X POST .../api/plugins/pr-reviewer/replay -d '{"manifest": [...], "model":
 | A panel hangs | Bounded by `panel_attempt_timeout` and `round_timeout`; the slot is reclaimed past the round bound + 10 min |
 | A `FAIL` you believe is wrong, head unchanged | [Dispute it](usage.md#disputing-a-fail-on-an-unchanged-head) |
 | A `FAIL` is a false positive pattern | Flip `regate: false` while you investigate; this stops arming blocks without losing the seat |
+
+## Native runner context evidence
+
+The reviewer consumes the merged protoAgent #5091 `review_context` schema version 1
+([host contract](https://github.com/protoLabsAI/protoAgent/blob/f815eaf501f203aa707fb63db86e8c141406d700/docs/reference/workflow-tool-receipts.md)).
+There is no `source=native_runtime` discriminator. Each observed construction must
+match the returned run ID, step ID, and tool-receipt execution segment. Shared
+tracing/session IDs do not prove independence. Reused execution segments are rejected
+within the dispatcher's bounded recent-execution cache.
+
+`conversation=fresh`, `parent_history=not_supplied`, and `inputs.history=not_supplied`
+exclude parent messages, not intended prior findings interpolated into the prompt.
+Workflow state is independently fresh or resumed. Instruction observations describe
+the registered subagent and assembled system prompt; mandatory repository guidance
+remains available. External instruction sources, later runtime additions, and external
+tool policy remain **unknown**. Bound tools, inherited fences, and enforcement are
+validated separately from parent-history exclusion. Prompt/system-prompt text is not
+copied into the public review.
+
+Unknown, missing, malformed, contradictory, or foreign construction evidence produces
+code-authored `Gap: isolation` coverage, `complete=false`, and `verified=false`. Legacy
+runners still execute with their original signatures. Existing coverage and unverified
+promotion holds apply; isolation gaps do not fabricate defect findings or override
+structural degradation, critical-stage exhaustion, or carried-prior convergence.
+Seeded verify/report adoption is checked too: `not_executed` is not a fresh observation.
+An explicit seed origin must resolve to retained original construction and receipts;
+unknown or evicted origins remain gaps. Where supported, the dispatcher supplies
+`seed_run_id`; a restated synthesis differs from its stored output and therefore may
+correctly retain an unknown origin. A fresh verifier can still check intended prior
+findings, but unknown seeded context keeps the round held.
+
+`tests/test_runner_contract_327.py` and `tests/runner_fixtures.py` exercise consumer
+behavior without a host checkout. These fixtures are **not native probe evidence**.
+The native producer probe is bd-pe6vb / protoAgent #5092 and remains subject to its
+own merge checks. Passing consumer tests does not clear that host-probe safety hold.
