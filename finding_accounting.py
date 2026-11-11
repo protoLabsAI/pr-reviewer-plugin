@@ -109,10 +109,15 @@ def reconcile(accounting, steps, output, *, history=()):
         targets = set()
         # Only code-matched prior relistings belong to the separate prior ledger.
         # Current IDs and arbitrary foreign IDs must still pass native accounting.
-        _, relistings = relisted_blocking_priors(rows or [], history)
+        # These helpers select verdict-less rows for re-verification/normalization.
+        # Accounting only needs their prior matching rules: a retained verifier verdict
+        # does not turn a prior into a current-run observation. Use copies so the real
+        # verdicts and the dispatcher's convergence decisions remain untouched.
+        prior_candidates = [dict(row, verdict="") for row in rows or []]
+        _, relistings = relisted_blocking_priors(prior_candidates, history)
         priors = dict(relistings)
         prior_round = next((r for r in reversed(history) if r.get("findings")), {})
-        for index, row in enumerate(rows or []):
+        for index, row in enumerate(prior_candidates):
             if row.get("severity") in ("minor", "nit"):
                 for prior in prior_round.get("findings", []):
                     _, normalized = normalize_relisted_priors([row], [{"findings": [prior]}])

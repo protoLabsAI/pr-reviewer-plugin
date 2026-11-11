@@ -6038,10 +6038,16 @@ class Dispatcher:
         if decision != REGATE:
             self.telemetry.emit("regate", repo=repo, pr=pr, sha=head, decision=decision)
             return decision
-        body = (
+        note = (
             f"_Checks are terminal ({checks}) — arming the FAIL verdict below as a blocking review "
-            f"(it posted as a comment while CI was still pending)._\n\n" + latest["body"]
+            f"(it posted as a comment while CI was still pending)._\n\n"
         )
+        # The stored verdict (including its ledger/accounting) can already fill the
+        # GitHub body limit. Omit only the optional note when it cannot fit; never
+        # truncate the judgement or prevent its promotion to a blocking review.
+        body = latest["body"]
+        if len(note) + len(body) <= 65536:
+            body = note + body
         rc, _out, err = await self._run_gh(
             [
                 "api",

@@ -344,21 +344,61 @@ async def test_posting_large_accounting_preserves_postable_verdict(tmp_path, not
     assert trace["accounting"]["raw"] == inv["raw"]
 
 
-@pytest.mark.parametrize("severity", ["major", "minor"])
+@pytest.mark.parametrize(
+    "checks",
+    [[], [{"status": "completed", "conclusion": "success"}], [{"status": "completed", "conclusion": "failure"}]],
+)
+@pytest.mark.parametrize("remaining", [0, 100, 300])
+async def test_accounting_fail_regates_within_body_limit(tmp_path, checks, remaining):
+    inv, rows = prepared([dict(F, severity="major", verdict="confirmed")])
+    accounting = check(inv, rows)
+    accounting["report_findings"] = rows
+    gh = RoutedGH(pr_facts=facts(), checks=[{"status": "in_progress", "conclusion": None}])
+    d = make(tmp_path, gh=gh, cfg={"shadow_mode": False, "promotion_owner": True})
+    # Size the provenance appendix to leave less than a re-gating note at the boundary.
+    assert await d._post_verdict(
+        "o/r", 1, HEAD, "FAIL", rows, "code-review-structural", accounting=copy.deepcopy(accounting)
+    )
+    initial_size = len(gh.reviews_posted[-1]["body"])
+    accounting["padding"] = "x" * (65536 - remaining - initial_size - len(', "padding": ""'))
+    assert await d._post_verdict("o/r", 1, HEAD, "FAIL", rows, "code-review-structural", accounting=accounting)
+    initial = gh.reviews_posted[-1]
+    assert initial["event"] == "COMMENT"
+    assert len(initial["body"]) == 65536 - remaining
+    gh.reviews = [{"state": "COMMENTED", "body": initial["body"], "id": 1}]
+    assert await d.evaluate_regate("o/r", 1) == "hold:regate-checks-pending"
+    gh.checks = checks
+    assert await d.evaluate_regate("o/r", 1) == "regate"
+    blocking = gh.reviews_posted[-1]
+    assert blocking["event"] == "REQUEST_CHANGES"
+    assert len(blocking["body"]) <= 65536
+    assert blocking["body"].endswith(initial["body"])
+    assert parse_verdict_marker(blocking["body"]) == parse_verdict_marker(initial["body"])
+    assert blocking["body"].startswith("_Checks are terminal") == (remaining == 300)
+
+
+@pytest.mark.parametrize("severity", ["blocker", "major", "minor", "nit"])
+@pytest.mark.parametrize("verdict", [None, "confirmed", "uncertain"])
 @pytest.mark.parametrize("old_ids", [None, ["old-attempt:1"]])
-def test_known_prior_relisting_is_separate_but_cannot_hide_native_loss(old_ids, severity):
+def test_known_prior_relisting_is_separate_but_cannot_hide_native_loss(old_ids, severity, verdict):
     prior = dict(F, severity=severity)
+    if verdict is not None:
+        prior["verdict"] = verdict
     if old_ids is not None:
         prior["raw_ids"] = old_ids
     history = [{"head": "old", "findings": [prior]}]
     inv, rows = prepared()
     text = output([*rows, prior])
     assert a.reconcile(inv, {s: text for s in a.STAGES}, text, history=history)["complete"]
+    assert a.array(text)[-1] == prior  # matching must not strip the real verifier verdict
     assert not a.reconcile(inv, {s: text for s in a.STAGES}, text)["complete"]
     missing = output([prior])
     assert not a.reconcile(inv, {s: missing for s in a.STAGES}, missing, history=history)["complete"]
     foreign = output([*rows, dict(prior, raw_ids=["invented"])])
     assert not a.reconcile(inv, {s: foreign for s in a.STAGES}, foreign, history=history)["complete"]
+    # Even a matched prior must account for any current-run IDs it claims.
+    duplicate = output([*rows, dict(prior, raw_ids=rows[0]["raw_ids"], finding_id=rows[0]["finding_id"])])
+    assert not a.reconcile(inv, {s: duplicate for s in a.STAGES}, duplicate, history=history)["complete"]
 
 
 async def test_structural_prior_recheck_refutation_keeps_native_coverage_complete(tmp_path):
