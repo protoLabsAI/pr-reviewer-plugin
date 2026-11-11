@@ -61,6 +61,37 @@ def test_empty_is_valid_but_missing_malformed_and_truncated_are_gaps():
     assert a.array(output([dict(F, evidence="literal ``` in a quote")]))[0]["evidence"] == "literal ``` in a quote"
 
 
+@pytest.mark.parametrize("language", ["json", ""])
+@pytest.mark.parametrize("payload", ["", "{", "{}", "null", "[", "[]"])
+@pytest.mark.parametrize("closed", [False, True])
+def test_final_findings_fence_cannot_fall_back_to_valid_draft(language, payload, closed):
+    suffix = f"\n```{language}\n{payload}" + ("\n```" if closed else "")
+    text = output([F]) + suffix
+    if payload == "[]" and closed:
+        assert a.array(text) == []
+        return
+    assert a.array(text) is None
+    steps = raw([])
+    steps[a.LANES[0]] = text
+    inv = a.inventory(steps, "attempt")
+    assert inv["lanes"][a.LANES[0]]["state"] == "missing-or-malformed"
+    assert not check(inv, [])["complete"]
+    inv, rows = prepared()
+    for stage in a.STAGES:
+        steps = {s: output(rows) for s in a.STAGES}
+        steps[stage] += suffix
+        result = a.reconcile(inv, steps, steps["report"])
+        assert not result["complete"]
+        assert f"{stage}: missing or malformed findings/accounting array" in result["gaps"]
+
+
+def test_findings_fences_ignore_other_blocks_and_accept_bare_arrays():
+    assert a.array(json.dumps([F])) == [F]
+    assert a.array(output([F]) + '\n```accounting\n{"dispositions": []}\n```\n') == [F]
+    assert a.array(output([F]) + '\n```python\nprint("example")\n```\n') == [F]
+    assert a.array(output([F]) + "\n```json") is None
+
+
 @pytest.mark.parametrize("kind", ["missing", "duplicate", "foreign", "stale", "malformed"])
 def test_identity_errors_cannot_pass_by_equal_counts(kind):
     inv, rows = prepared([F, F])
@@ -161,6 +192,30 @@ async def test_barrier_and_seeded_rerun_keep_original_provenance():
 async def test_dispatcher_loss_holds_coverage_and_verification(tmp_path, loss):
     gh = RoutedGH(pr_facts=facts(changed_files=6, additions=150))
     d = make(tmp_path, gh=gh, runner=NativeRunner(loss), cfg={"grounding": False})
+    outcome = await d.handle_pr_event("o/r", 1, HEAD, "opened")
+    assert outcome.startswith("reviewed:"), outcome
+    body = gh.reviews_posted[-1]["body"]
+    marker = parse_verdict_marker(body)
+    assert marker["complete"] is False
+    assert marker["verified"] is False
+    assert "Raw finding accounting: incomplete" in body
+
+
+@pytest.mark.parametrize("stage", [a.LANES[0], *a.STAGES])
+@pytest.mark.parametrize("suffix", ["\n```json\n{", "\n```json\n", "\n```json\n{}\n```"])
+async def test_dispatcher_malformed_final_fence_holds_coverage_and_verification(tmp_path, stage, suffix):
+    native = NativeRunner()
+
+    async def runner(recipe, inputs, *, seed_outputs=None):
+        result = await native(recipe, inputs, seed_outputs=seed_outputs)
+        if stage not in (seed_outputs or {}):
+            result["steps"][stage] += suffix
+            if stage == "report":
+                result["output"] = result["steps"][stage]
+        return result
+
+    gh = RoutedGH(pr_facts=facts(changed_files=6, additions=150))
+    d = make(tmp_path, gh=gh, runner=runner, cfg={"grounding": False})
     outcome = await d.handle_pr_event("o/r", 1, HEAD, "opened")
     assert outcome.startswith("reviewed:"), outcome
     body = gh.reviews_posted[-1]["body"]

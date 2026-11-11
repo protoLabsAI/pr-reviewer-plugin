@@ -22,10 +22,23 @@ def _json(value):
 def array(output, *, allow_malformed=False):
     """Strict final array: malformed/truncated candidates never fall back to an earlier draft."""
     text = str(output or "")
-    candidates = list(re.finditer(r"(?m)^```(?:json)?[ \t]*\n(?=\s*\[)", text))
+    # Select the final findings fence before inspecting its payload. A broken
+    # final draft (including an empty fence or an object) must invalidate coverage.
+    # Track other fenced blocks too, so their closing fences are not candidates.
+    candidate = None
+    in_fence = False
+    for fence in re.finditer(r"(?m)^```([^`\r\n]*)\r?(?:\n|$)", text):
+        language = fence[1].strip()
+        if in_fence:
+            if not language:
+                in_fence = False
+        else:
+            in_fence = True
+            if language in ("", "json"):
+                candidate = fence
     try:
-        if candidates:
-            payload = text[candidates[-1].end() :].lstrip()
+        if candidate is not None:
+            payload = text[candidate.end() :].lstrip()
             rows, end = json.JSONDecoder().raw_decode(payload)
             if not payload[end:].lstrip().startswith("```"):
                 return None
