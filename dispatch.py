@@ -158,6 +158,7 @@ from .rounds import (
     verdict_with_debt,
     verify_retry_state,
 )
+from .runner_contract import context_note, validate_result
 from .telemetry import REAFFIRM_DIFF, REAFFIRM_HEAD, REAFFIRM_MISS, REAFFIRM_RECORDED, VERIFY_CONTRADICTED, Telemetry
 from .trigger import structural_trigger
 from .verdicts import (
@@ -2086,6 +2087,24 @@ class Dispatcher:
 
     # ── plumbing ──────────────────────────────────────────────────────────────
 
+    async def _invoke_runner(self, runner, recipe, inputs, *, seed_source=None, **kwargs):
+        """Keep legacy signatures, and bind evidence at every physical runner return."""
+        if seed_source and _accepts_keyword(runner, "seed_run_id") and seed_source.get("run_id"):
+            kwargs["seed_run_id"] = seed_source["run_id"]
+        result = await runner(recipe, inputs, **kwargs)
+        gaps = validate_result(result, seed_outputs=kwargs.get("seed_outputs"), seed_source=seed_source)
+        receipts = result.get("tool_receipts")
+        execution = receipts.get("execution_id") if isinstance(receipts, dict) else None
+        # A tracing session is intentionally shared; a physical execution may not be.
+        seen = getattr(self, "_context_executions", None)
+        if seen is None:
+            self._context_executions = seen = {}
+        if isinstance(execution, str) and execution:
+            if execution in seen:
+                gaps["execution"] = "Gap: isolation — stale execution reused by another invocation"
+            _remember(seen, execution)
+        return {**result, "isolation_gaps": gaps}
+
     def _runner(self):
         if self._workflow_run is not None:
             return self._workflow_run
@@ -3895,7 +3914,7 @@ class Dispatcher:
                 async with attempt_bound:
                     # A task, so a supersede check can cancel THIS attempt without
                     # cancelling the round around it (#245).
-                    watch.task = asyncio.ensure_future(runner(recipe, inputs, **step_kwargs))
+                    watch.task = asyncio.ensure_future(self._invoke_runner(runner, recipe, inputs, **step_kwargs))
                     self._arm_supersede_poll(watch, self.supersede_poll_s)
                     try:
                         result = await watch.task
@@ -4234,6 +4253,9 @@ class Dispatcher:
             structural_partial=structural_partial,
             lane_reasons=lane_repo_gaps,
         )
+        isolation_gaps = dict(result.get("isolation_gaps") or {})
+        gaps.update({f"context:{sid}": why for sid, why in isolation_gaps.items()})
+        complete = complete and not isolation_gaps
         brief, brief_found = extract_brief(output)
         # A report that dropped its brief (#168: 5 of 150 posted reviews, every one a clean
         # round) leaves the author a PASS with no word on what was looked at. The
@@ -4349,7 +4371,11 @@ class Dispatcher:
             head=head,
             round_number=round_number,
             disputed=disputed,
+            isolation_gaps=isolation_gaps,
+            seed_source=result,
         )
+        gaps.update({f"context:{sid}": why for sid, why in isolation_gaps.items()})
+        complete = complete and not isolation_gaps
         ledger = settle_fixed_priors(ledger, rechecked_cleared, list(unaccounted) + list(deferred))
         # Prior minors the panel stopped raising on code the PR changed since — credited, not
         # silently dropped (#260). Needs the delta; read it only when such a minor exists.
@@ -4643,6 +4669,7 @@ class Dispatcher:
             + render_pre_existing_section(pre_existing)
             + render_refuted_before_note(refuted_before)
         )
+        trailer += "\n\n" + context_note(isolation_gaps)
         if epic_scope is not None:
             trailer += _epic.render_attestation_notes(epic_scope)
         if inc_scoped:
@@ -4707,7 +4734,7 @@ class Dispatcher:
         # an unreadable PR posts as before (a lost verdict is worse than a late one).
         if ended := pr_ended(await self._pr_facts(repo, pr)):
             return await self._abandon_ended(repo, pr, head, ended, "posting", review_check_id)
-        round_verified = verification_ran(str(steps_out.get("verify") or ""), reported)
+        round_verified = not isolation_gaps and verification_ran(str(steps_out.get("verify") or ""), reported)
         posted = await self._post_verdict(
             repo,
             pr,
@@ -5992,7 +6019,7 @@ class Dispatcher:
         for attempt in range(1, self.verify_reruns + 1):
             try:
                 async with asyncio.timeout(self.panel_attempt_timeout_s):
-                    again = await runner(recipe, inputs, seed_outputs=seeded)
+                    again = await self._invoke_runner(runner, recipe, inputs, seed_outputs=seeded, seed_source=result)
             except Exception as exc:  # noqa: BLE001 — a failed re-run leaves the original round
                 log.warning("[pr-reviewer] %s#%s verify re-run %d failed: %s", repo, pr, attempt, exc)
                 break
@@ -6009,6 +6036,23 @@ class Dispatcher:
                 result = {
                     **result,
                     "output": again["output"],
+                    "isolation_gaps": {
+                        **{k: v for k, v in result.get("isolation_gaps", {}).items() if k not in ("verify", "report")},
+                        **again["isolation_gaps"],
+                    },
+                    # Composite outputs retain their original segment identities. They
+                    # must not be attributed to the first invocation's construction.
+                    "context_adoptions": {
+                        **result.get("context_adoptions", {}),
+                        **{
+                            k: {
+                                "run_id": again.get("run_id"),
+                                "review_context": again.get("review_context"),
+                                "tool_receipts": again.get("tool_receipts"),
+                            }
+                            for k in ("verify", "report")
+                        },
+                    },
                     "steps": {**steps, **{k: v for k, v in again_steps.items() if k in ("verify", "report")}},
                     "timings": {**(result.get("timings") or {}), **(again.get("timings") or {})},
                     "degraded": [*(result.get("degraded") or []), *(again.get("degraded") or [])],
@@ -6034,7 +6078,7 @@ class Dispatcher:
             return result
         try:
             async with asyncio.timeout(self.panel_attempt_timeout_s):
-                fresh = await runner(recipe, inputs)
+                fresh = await self._invoke_runner(runner, recipe, inputs)
         except Exception as exc:  # noqa: BLE001 — a failed fallback leaves the restated round
             log.warning("[pr-reviewer] %s#%s verify fallback panel failed: %s", repo, pr, exc)
             return result
@@ -6103,6 +6147,8 @@ class Dispatcher:
         head: str,
         round_number: int,
         disputed: set[str] | None = None,
+        isolation_gaps: dict[str, str] | None = None,
+        seed_source: dict | None = None,
     ) -> tuple[list[dict], list[dict], list[dict], list[dict]]:
         """(reported, unaccounted, cleared, deferred) — prior blocker/majors re-verified at
         THIS head before they are re-asserted (#218, #220, #232 ask 5).
@@ -6158,7 +6204,9 @@ class Dispatcher:
             self.report_phase("verify")
             try:
                 async with asyncio.timeout(self.panel_attempt_timeout_s):
-                    again = await runner(recipe, inputs, seed_outputs=seeded)
+                    again = await self._invoke_runner(
+                        runner, recipe, inputs, seed_outputs=seeded, seed_source=seed_source
+                    )
             except Exception as exc:  # noqa: BLE001 — a failed re-check leaves the priors as they were
                 log.warning("[pr-reviewer] %s#%s prior re-check failed: %s", repo, pr, exc)
                 again = {}
@@ -6167,6 +6215,11 @@ class Dispatcher:
             verify_out = str(again_steps.get("verify") or "")
             if not reason and (again.get("failed") or not verify_out.strip()):
                 reason = "no-verify-output"
+            context_gaps = again.get("isolation_gaps", {})
+            if isolation_gaps is not None:
+                isolation_gaps.update({f"prior-recheck:{sid}": why for sid, why in context_gaps.items()})
+            if context_gaps.get("verify") or context_gaps.get("execution"):
+                reason = reason or "isolation-unverified"
             if not reason:
                 rulings = align_recheck(candidates, self._parse_findings(verify_out))
         ruling_for = dict(zip(targets, rulings))
@@ -6493,6 +6546,10 @@ class Dispatcher:
             if gaps
             else ""
         )
+        if gaps and any(sid.startswith("context:") for sid in gaps):
+            coverage = (
+                " Coverage was incomplete — runner independence is unverified; see the isolation Gaps in the review."
+            )
         if verdict == FAIL:
             return (
                 f"The QA panel returned **{verdict}** — blocking defects stand against this "

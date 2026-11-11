@@ -1305,6 +1305,15 @@ def render_coverage_note(gaps: dict[str, str] | None, lanes: int = 0) -> str:
     gaps while four lanes were blind — so this line, not the brief, is the record."""
     if not gaps:
         return ""
+    context = {sid: why for sid, why in gaps.items() if sid.startswith("context:")}
+    if context:
+        lanes_note = render_coverage_note({sid: why for sid, why in gaps.items() if sid not in context}, lanes)
+        listed = "; ".join(f"`{sid.removeprefix('context:')}`: {why}" for sid, why in context.items())
+        return (lanes_note + " " if lanes_note else "") + (
+            "**Runner independence unverified — coverage incomplete.** " + listed + ". "
+            "Findings stand; a PASS is capped at WARN and promotion remains held. "
+            "This code-authored context record supersedes independence claims in the brief."
+        )
     listed = ", ".join(f"`{sid}` ({why})" for sid, why in gaps.items())
     of = f" of {lanes}" if lanes >= len(gaps) else ""
     return (
