@@ -18,7 +18,7 @@ from pr_reviewer.telemetry import Telemetry
 from pr_reviewer.verdicts import lane_repo_violation
 
 from tests.conftest import note_write
-from tests.dispatch_helpers import HEAD, FakeGH, facts, make
+from tests.dispatch_helpers import HEAD, FakeGH, accounted_empty_panel, facts, make
 
 BOUND = "protoLabsAI/protoContent"
 OTHER = "protoLabsAI/protoAgent"
@@ -109,7 +109,7 @@ def _clean_runner_with(tool_calls=None):
     records each lane called) through to the dispatcher's grounding check."""
 
     async def runner(name, inputs):
-        result = {"output": CLEAN_REPORT, "failed": [], "steps": _panel_steps()}
+        result = accounted_empty_panel({"output": CLEAN_REPORT, "failed": [], "steps": _panel_steps()})
         if tool_calls is not None:
             result["tool_calls"] = tool_calls
         return result
@@ -163,7 +163,7 @@ async def test_lane_inputs_name_the_bound_repo_and_head_sha(tmp_path):
 
     async def runner(name, inputs):
         captured.update(inputs)
-        return {"output": CLEAN_REPORT, "failed": [], "steps": _panel_steps()}
+        return accounted_empty_panel({"output": CLEAN_REPORT, "failed": [], "steps": _panel_steps()})
 
     d = make(tmp_path, cfg={"repos": [BOUND]}, gh=_gh(), runner=runner)
     assert (await d.handle_pr_event(BOUND, PR, HEAD, "opened")) == "reviewed:PASS"
