@@ -489,6 +489,28 @@ def test_combined_accounting_and_context_coverage_notes():
     assert "Runner independence unverified" in note
 
 
+async def test_dispatcher_preserves_both_accounting_and_context_holds(tmp_path):
+    from tests.runner_fixtures import native_runner
+
+    native = native_runner(NativeRunner("report"))
+
+    async def runner(recipe, inputs, *, seed_outputs=None):
+        result = await native(recipe, inputs, seed_outputs=seed_outputs)
+        if "finding_accounting" in inputs:
+            result["review_context"]["steps"]["verify"]["execution_id"] = "foreign"
+        return result
+
+    gh = RoutedGH(pr_facts=facts(changed_files=6, additions=150))
+    dispatcher = make(tmp_path, gh=gh, runner=runner, native_context=False)
+    assert await dispatcher.handle_pr_event("o/r", 1, HEAD, "opened") == "reviewed:WARN"
+    body = gh.reviews_posted[-1]["body"]
+    marker = parse_verdict_marker(body)
+    assert marker["complete"] is False
+    assert marker["verified"] is False
+    assert "Raw finding accounting has gaps" in body
+    assert "Runner independence unverified" in body
+
+
 @pytest.mark.parametrize("fault", [None, "changed-output", "foreign-origin", "missing-receipt"])
 def test_seeded_retry_uses_retained_finder_adoption(fault):
     from pr_reviewer.runner_contract import validate_result
