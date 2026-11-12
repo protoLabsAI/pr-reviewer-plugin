@@ -41,6 +41,7 @@ from .checkout_cache import CheckoutCache, CheckoutError, checkout_root_for, red
 from .gh_cli import bad_repo, resolve_token, run_gh
 from .lintcheck import LintChecker, render_refuted
 from .refutations import RefutationStore, _norm_path, premark_refuted
+from .result_cache import StructuralResultCache, plugin_version, result_key, result_root_for
 
 log = logging.getLogger("protoagent.plugins.pr_reviewer")
 
@@ -392,6 +393,7 @@ DEFAULT_MAX_FEATURES = 16
 FEATURE_CAP_REASON = "feature cap reached"
 PLAN_FILENAME = "feature-plan.txt"
 PLAN_STEP_BUDGET_S = 120  # `init` + `map` are local and heuristic (~2-3 s on protoAgent)
+ENGINE_VERSION_BUDGET_S = 30  # `--version` is local; a hang here must not eat the pass budget
 
 
 def is_low_signal(path: str) -> bool:
@@ -726,7 +728,10 @@ def map_finding(record: dict, ranges: dict[str, list[tuple[int, int]]] | None = 
 
 
 def read_findings(
-    state_dir: Path, changed_files: set[str] | None, ranges: dict[str, list[tuple[int, int]]] | None = None
+    state_dir: Path,
+    changed_files: set[str] | None,
+    ranges: dict[str, list[tuple[int, int]]] | None = None,
+    cached: list[dict] | None = None,
 ) -> list[dict]:
     """Open findings from `<state>/findings/*.json`, confined to this PR.
 
@@ -734,20 +739,29 @@ def read_findings(
     findings on a shared file can never leak in. `changed_files`, when known, still confines the
     report to the diff. Deduped by protoPatch `signature`. `ranges` (changed lines per file)
     picks each finding's anchor — see `map_finding`.
+
+    `cached` is extra RAW FindingRecords a result-cache hit replayed (#312). They take the same
+    road as the fresh ones, after them: the same confinement to THIS pass's diff, the same
+    signature dedup (a replayed record and a fresh twin count once), the same anchor choice
+    against this pass's changed lines — a cached row is re-validated, never trusted as rendered.
     """
     findings_dir = state_dir / "findings"
-    if not findings_dir.is_dir():
-        return []
+    records: list[tuple[str, dict]] = []  # (fallback signature, raw record)
+    if findings_dir.is_dir():
+        for path in sorted(findings_dir.glob("*.json")):
+            try:
+                record = json.loads(path.read_text())
+            except (OSError, json.JSONDecodeError):
+                continue
+            if isinstance(record, dict):
+                records.append((path.name, record))
+    for i, record in enumerate(cached or []):
+        if isinstance(record, dict):
+            records.append((f"cached:{i}", record))
     out: list[dict] = []
     seen: set[str] = set()
-    for path in sorted(findings_dir.glob("*.json")):
-        try:
-            record = json.loads(path.read_text())
-        except (OSError, json.JSONDecodeError):
-            continue
-        if not isinstance(record, dict):
-            continue
-        sig = str(record.get("signature") or record.get("findingId") or path.name)
+    for fallback_sig, record in records:
+        sig = str(record.get("signature") or record.get("findingId") or fallback_sig)
         if sig in seen:
             continue
         paths = {str(e.get("path")) for e in record.get("evidence") or [] if isinstance(e, dict) and e.get("path")}
@@ -758,6 +772,38 @@ def read_findings(
             seen.add(sig)
             out.append(mapped)
     return out
+
+
+def attribute_findings(records: list[dict], scopes: dict[str, set[str]]) -> tuple[dict[str, list[dict]], int]:
+    """Which reviewed feature produced each raw FindingRecord (#312) — (attributed, orphans).
+
+    The engine's own attribution (a `featureId` on the record) wins when it names a reviewed
+    feature. Otherwise a record belongs to every reviewed feature whose owned+context files cover
+    ALL its evidence paths: the only features whose review saw everything the finding cites — and,
+    because the cache key hashes those same files, exactly the features whose cache entries go
+    stale the moment any cited file changes. `orphans` counts records that fit no reviewed feature
+    (an evidence-less record counts too): one orphan means this run's results cannot be separated
+    per feature, so the caller must cache NOTHING from it — an entry that silently dropped a
+    finding would replay as a clean pass."""
+    attributed: dict[str, list[dict]] = {fid: [] for fid in scopes}
+    orphans = 0
+    for record in records:
+        fid = str(record.get("featureId") or "")
+        if fid in attributed:
+            attributed[fid].append(record)
+            continue
+        paths = {
+            _norm_path(str(e.get("path")))
+            for e in record.get("evidence") or []
+            if isinstance(e, dict) and e.get("path")
+        }
+        homes = [f for f, scope in scopes.items() if paths and paths <= scope]
+        if not homes:
+            orphans += 1
+            continue
+        for f in homes:
+            attributed[f].append(record)
+    return attributed, orphans
 
 
 # One structural pass gets its OWN clawpatch state dir, under the repo's persistent one (#223).
@@ -843,6 +889,14 @@ class ProtoPatchRunner:
         self.max_features = structural_max_features(self.cfg.get("structural_max_features"))  # None = no cap
         # False = the pre-#232 path: `clawpatch ci --since <base>` picks the features (the rollback switch).
         self.plan_features = str(self.cfg.get("structural_plan", "")).strip().lower() not in ("false", "0", "no", "off")
+        # Per-feature structural results reused across passes when nothing a feature's prompt
+        # depends on changed (#312). None = `structural_result_cache: false`, the off switch:
+        # every planned feature runs, exactly as before.
+        self.result_cache = (
+            StructuralResultCache(result_root_for(self.cfg))
+            if str(self.cfg.get("structural_result_cache", "")).strip().lower() not in ("false", "0", "no", "off")
+            else None
+        )
         self.bin = str(self.cfg.get("clawpatch_bin") or "clawpatch")
         self.model = str(self.cfg.get("model") or "")
         self.gateway_base_url = str(self.cfg.get("gateway_base_url") or "")
@@ -915,8 +969,14 @@ class ProtoPatchRunner:
         return {line.strip() for line in out.splitlines() if line.strip()}
 
     def _prune(self) -> int:
-        """Best-effort checkout-cache maintenance (TTL sweep + LRU entry/byte caps).
-        Degrades, never raises — a failed prune must not void the review (ADR 0078 D3)."""
+        """Best-effort cache maintenance: the checkout cache (TTL sweep + LRU entry/byte caps)
+        and the structural result cache (#312) alike. Degrades, never raises — a failed prune
+        must not void the review (ADR 0078 D3)."""
+        try:
+            if self.result_cache is not None and (results := self.result_cache.prune()):
+                log.info("[pr-reviewer] pruned %d stale structural result(s) from the cache", results)
+        except Exception:  # noqa: BLE001 — maintenance is best-effort, never fatal
+            log.exception("[pr-reviewer] structural result cache prune failed")
         try:
             removed = self.cache.prune()
         except Exception:  # noqa: BLE001 — maintenance is best-effort, never fatal
@@ -998,6 +1058,135 @@ class ProtoPatchRunner:
         except Exception:  # noqa: BLE001 — a failed plan falls back to the pre-#232 path, never raises
             log.exception("[pr-reviewer] structural plan failed; using --since")
             return None
+
+    async def _head_blobs(self, checkout: Path) -> dict[str, str] | None:
+        """{path: blob SHA} for every file at the checked-out head — the content identity the
+        result cache keys on (#312). None when the tree cannot be read; an EMPTY listing reads
+        as None too, so a failed read can never key every feature to the same all-absent hash."""
+        from .checkout_cache import _default_run_git
+
+        run = self._run_git or _default_run_git
+        rc, out, _err = await run(["-C", str(checkout), "ls-tree", "-r", "-z", "HEAD"])
+        if rc != 0:
+            return None
+        blobs: dict[str, str] = {}
+        for row in out.split("\0"):
+            meta, _tab, path = row.partition("\t")
+            parts = meta.split()
+            if len(parts) >= 3 and path:
+                blobs[_norm_path(path)] = parts[2]
+        return blobs or None
+
+    async def _engine_version(self, checkout: Path, env: dict) -> str | None:
+        """`clawpatch --version`, first line — part of the result-cache key, so an engine
+        upgrade invalidates every cached result. None (the cache sits this pass out) when it
+        cannot be read. Never raises."""
+        try:
+            rc, out, _err, timed_out = await self._run_clawpatch(
+                [self.bin, "--version"], checkout, env, ENGINE_VERSION_BUDGET_S
+            )
+            if rc != 0 or timed_out:
+                return None
+            lines = (out or "").strip().splitlines()
+            return lines[0].strip() or None if lines else None
+        except Exception:  # noqa: BLE001 — an unreadable version disables the cache, never the pass
+            return None
+
+    async def _split_cached(self, plan: FeaturePlan, checkout: Path, state_dir: Path, env: dict):
+        """(cache hits, features to run, feature id → key) for one planned pass (#312).
+
+        A hit is a selected feature whose key — its owned+context files' head blob SHAs, its id,
+        the engine version, the model and this plugin's version — already maps to a COMPLETED
+        result; its stored raw records ride back as `{"id", "records"}`. Anything that stops a
+        key from being computed (unreadable tree, unknown engine version, a cache fault)
+        degrades to running every selected feature. Never raises."""
+        selected = list(plan.selected)
+        try:
+            if self.result_cache is None:
+                return [], selected, {}
+            blobs = await self._head_blobs(checkout)
+            if not blobs:
+                return [], selected, {}
+            engine = await self._engine_version(checkout, env)
+            if not engine:
+                return [], selected, {}
+            records = {str(r.get("featureId")): r for r in read_feature_records(state_dir)}
+            hits: list[dict] = []
+            to_run: list[dict] = []
+            keys: dict[str, str] = {}
+            for f in selected:
+                rec = records.get(f["id"])
+                if rec is None:
+                    to_run.append(f)
+                    continue
+                keys[f["id"]] = result_key(
+                    f["id"],
+                    _paths(rec.get("ownedFiles")),
+                    _paths(rec.get("contextFiles")),
+                    blobs,
+                    engine,
+                    self.model,
+                    plugin_version(),
+                )
+                entry = self.result_cache.get(keys[f["id"]])
+                if (
+                    isinstance(entry, dict)
+                    and entry.get("outcome") == "finished"
+                    and isinstance(entry.get("records"), list)
+                ):
+                    hits.append({"id": f["id"], "records": [r for r in entry["records"] if isinstance(r, dict)]})
+                else:
+                    to_run.append(f)
+            return hits, to_run, keys
+        except Exception:  # noqa: BLE001 — a cache fault costs a re-run, never the pass
+            log.exception("[pr-reviewer] structural result cache read failed; running every feature")
+            return [], selected, {}
+
+    def _store_results(self, state_dir: Path, ran_ids: list[str], keys: dict[str, str]) -> None:
+        """Cache the findings of every feature THIS run completed (#312).
+
+        Only a feature whose own record says its review finished (`COMPLETED_FEATURE_STATUSES`)
+        is stored — a killed, errored or never-started feature is not, however the pass ended.
+        Findings are attributed per feature (`attribute_findings`); one finding that fits no ran
+        feature means the run's results cannot be separated, and nothing is cached from it.
+        Degrades, never raises."""
+        if self.result_cache is None or not keys or not ran_ids:
+            return
+        try:
+            ran = set(ran_ids)
+            features: dict[str, dict] = {}
+            for rec in read_feature_records(state_dir):
+                fid = str(rec.get("featureId"))
+                if fid in ran:
+                    features[fid] = rec
+            scopes = {
+                fid: _paths(rec.get("ownedFiles")) | _paths(rec.get("contextFiles")) for fid, rec in features.items()
+            }
+            raw: list[dict] = []
+            findings_dir = state_dir / "findings"
+            if findings_dir.is_dir():
+                for path in sorted(findings_dir.glob("*.json")):
+                    try:
+                        record = json.loads(path.read_text())
+                    except (OSError, json.JSONDecodeError):
+                        continue
+                    if isinstance(record, dict):
+                        raw.append(record)
+            attributed, orphans = attribute_findings(raw, scopes)
+            if orphans:
+                log.warning(
+                    "[pr-reviewer] structural result cache: %d finding(s) fit no reviewed feature; caching nothing",
+                    orphans,
+                )
+                return
+            for fid in ran_ids:
+                key = keys.get(fid)
+                rec = features.get(fid)
+                if not key or rec is None or rec.get("status") not in COMPLETED_FEATURE_STATUSES:
+                    continue
+                self.result_cache.put(key, {"feature": fid, "outcome": "finished", "records": attributed.get(fid, [])})
+        except Exception:  # noqa: BLE001 — a cache fault costs a re-run, never the pass
+            log.exception("[pr-reviewer] structural result cache store failed")
 
     def _emit_plan(self, repo: str, pr: int, record: dict, result: str) -> None:
         """One `structural_plan` event per pass (#232 ask 1): what was planned, what finished, and how
@@ -1114,6 +1303,9 @@ class ProtoPatchRunner:
             if self.plan_features
             else None
         )
+        cached: list[dict] = []  # result-cache hits (#312): [{"id", "records"}], merged at render
+        to_run = list(plan.selected) if plan is not None else []
+        feature_keys: dict[str, str] = {}
         render = dict(
             pr=pr,
             repo=repo,
@@ -1123,6 +1315,7 @@ class ProtoPatchRunner:
             changed=changed,
             state_dir=state_dir,
             plan=plan,
+            cached=None,
         )
         if plan is None:
             record["planner"] = "since"
@@ -1141,10 +1334,18 @@ class ProtoPatchRunner:
             if not plan.selected:
                 # Nothing owns or depends on a changed source file: there is nothing to review, the same
                 # answer `ci --since` gives an untouched map (see `FeaturePlan` for the lockfile case).
+                if self.result_cache is not None:
+                    record.update(features_cached=0, features_run=0)
                 record["elapsed_s"] = round(time.monotonic() - started, 1)
                 return await self._render_findings(**render, elapsed=time.monotonic() - started)
+            if self.result_cache is not None:
+                # Serve what an earlier pass already reviewed (#312): a feature whose prompt inputs
+                # and engine/model/plugin versions are unchanged is a hit; only the misses run.
+                cached, to_run, feature_keys = await self._split_cached(plan, checkout, state_dir, env)
+                record.update(features_cached=len(cached), features_run=len(to_run))
+                render["cached"] = cached or None
             plan_path = state_dir / PLAN_FILENAME
-            plan_path.write_text("".join(f"{f['id']}\n" for f in plan.selected))
+            plan_path.write_text("".join(f"{f['id']}\n" for f in to_run))
             args = [self.bin, "review", "--provider", "gateway", "--json", "--state-dir", str(state_dir)]
             args += ["--feature-list", str(plan_path)]
         args_tail: list[str] = []
@@ -1160,7 +1361,9 @@ class ProtoPatchRunner:
         attempt = 0
         stderr_seen: list[str] = []
         try:
-            while True:
+            # Every selected feature served from the result cache (#312) ⇒ nothing to run: the
+            # engine is skipped entirely and the pass renders from the replayed records below.
+            while plan is None or to_run:
                 attempt += 1
                 remaining_s = deadline - time.monotonic()
                 attempt_budget_s = max(round(remaining_s), 1)
@@ -1195,6 +1398,12 @@ class ProtoPatchRunner:
                     # pre-#232 way instead of losing it. Not a gateway attempt, so it is not counted.
                     log.warning("[pr-reviewer] clawpatch has no --feature-list; using ci --since (needs >= 0.7.0)")
                     plan = render["plan"] = None
+                    # `ci --since` re-reviews everything itself: drop the cache hits (nothing to
+                    # merge, nothing attributable to store) along with the plan's telemetry fields.
+                    cached, to_run, feature_keys = [], [], {}
+                    render["cached"] = None
+                    record.pop("features_cached", None)
+                    record.pop("features_run", None)
                     record.update(planner="since", feature_list_unsupported=True)
                     args = [self.bin, "ci", "--provider", "gateway", "--json", "--state-dir", str(state_dir)]
                     args += ["--since", base_sha] + args_tail
@@ -1222,12 +1431,13 @@ class ProtoPatchRunner:
             if plan is not None and plan.dropped:
                 # Every planned feature finished, but the plan itself left some out: a coverage gap,
                 # never a complete pass (the fail-open this guards: a capped pass reading as clean).
+                # A cache hit counts as reviewed — its findings are in the pass — just not re-run.
                 done = pass_coverage(state_dir)
                 return await self._render_findings(
                     **render,
                     elapsed=time.monotonic() - started,
                     partial=(
-                        f"{done[0] if done else len(plan.selected)} of {len(plan.eligible)} features reviewed",
+                        f"{(done[0] if done else len(to_run)) + len(cached)} of {len(plan.eligible)} features reviewed",
                         f"{FEATURE_CAP_REASON}: the {len(plan.selected)} features with the most changed lines "
                         f"were reviewed, {plan.dropped} were not (structural_max_features={plan.cap})",
                     ),
@@ -1239,9 +1449,16 @@ class ProtoPatchRunner:
             if plan is not None and plan.selected:
                 ids = [f["id"] for f in plan.selected]
                 outcomes = feature_outcomes(stderr_seen[-1] if stderr_seen else "", state_dir, ids)
+                cached_ids = {h["id"] for h in cached}
+                for row in outcomes:
+                    if row["id"] in cached_ids:
+                        row["status"] = "cached"  # served from the result cache, not run (#312)
                 ranked = {f["id"]: f for f in plan.selected}
                 record["features"] = [{**ranked[o["id"]], **o} for o in outcomes]
                 record["finished"] = sum(o["status"] == "finished" for o in outcomes)
+                # Cache what THIS run completed — on every exit, success or cut short alike; the
+                # per-feature status gate inside keeps partial/killed/errored features out.
+                self._store_results(state_dir, [f["id"] for f in to_run], feature_keys)
 
     async def _cut_short(self, reason: str, partial_reason: str, attempt: int, **render) -> str:
         """The answer for a pass that did not finish: its findings so far, or an outage (#205).
@@ -1253,16 +1470,21 @@ class ProtoPatchRunner:
         findings are not lost. With nothing finished it is the outage it always was. Never raises.
 
         With a plan (#232) the denominator is every ELIGIBLE feature, not just the planned ones, so a
-        pass that was both capped and cut short says how much of the diff's features it really covered."""
+        pass that was both capped and cut short says how much of the diff's features it really covered.
+        A result-cache hit (#312) counts as reviewed on both sides of the fraction: its findings are
+        already in hand, so a pass cut short after serving hits still returns them as a partial."""
+        cached = render.get("cached") or []
         try:
             coverage = pass_coverage(render["state_dir"])
-            if coverage is not None and coverage[0] > 0:
+            finished = (coverage[0] if coverage else 0) + len(cached)
+            if finished > 0:
                 plan = render.get("plan")
-                total = max(coverage[1], len(plan.eligible)) if plan is not None else coverage[1]
+                claimed = (coverage[1] if coverage else 0) + len(cached)
+                total = max(claimed, len(plan.eligible)) if plan is not None else claimed
                 return await self._render_findings(
                     **render,
                     partial=(
-                        f"{coverage[0]} of {total} features reviewed",
+                        f"{finished} of {total} features reviewed",
                         _with_attempts(partial_reason, attempt),
                     ),
                 )
@@ -1283,11 +1505,15 @@ class ProtoPatchRunner:
         elapsed: float,
         partial: tuple[str, str] | None = None,
         plan: FeaturePlan | None = None,
+        cached: list[dict] | None = None,
     ) -> str:
         """The header + fenced findings array for a pass, complete — or partial when `partial` is
-        (coverage, reason). The one place findings are read, confined and pre-marked."""
+        (coverage, reason). The one place findings are read, confined and pre-marked. `cached`
+        (result-cache hits, #312) rides its raw records through the SAME read as the fresh ones:
+        the same diff confinement, dedup, anchor choice, lint check and refutation pre-marks."""
         ranges = await self._changed_ranges(checkout, base_sha)
-        findings = read_findings(state_dir, changed, ranges)
+        replayed = [r for hit in cached or [] for r in hit.get("records") or [] if isinstance(r, dict)]
+        findings = read_findings(state_dir, changed, ranges, cached=replayed)
         # A finding that cites a lint rule is settled by the linter CI runs, not by a model
         # (#232 ask 6, protoAgent#4017 r1: F841 on a tuple-unpack target, which F841 never
         # flags). Refuted ⇒ dropped here, before the relay can carry it; anything uncertain
@@ -1304,7 +1530,8 @@ class ProtoPatchRunner:
             f"head {head_sha[:12]}, base {base_sha[:12]}, {elapsed:.0f}s, {len(findings)} reportable finding(s)"
             f"{' from the features that finished' if partial else ''}{repeats}"
             f"{render_refuted(lint_refuted, lint_version)}, scope: {confinement}"
-            f"{f'; {plan.summary()}' if plan is not None else ''}."
+            f"{f'; {plan.summary()}' if plan is not None else ''}"
+            f"{f'; {len(cached)} feature(s) served from the result cache' if cached else ''}."
         )
         if partial:
             return partial_result(partial[0], partial[1], header, findings)

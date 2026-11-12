@@ -115,6 +115,13 @@ config:
                                # silent drop. Lockfiles / generated files / dependency manifests never pull a
                                # feature in as context. 0 = no cap.
   structural_plan: true        # false = let `clawpatch ci --since` pick the features (pre-#232; the rollback)
+  structural_result_cache: true # memoize per-feature structural results (#312): a selected feature whose
+                               # owned+context head blobs, engine version, model and plugin version are
+                               # unchanged since a COMPLETED review is served from a JSON store next to the
+                               # checkout cache instead of re-run (25% of feature tokens were byte-identical
+                               # re-runs); all hits = the engine is skipped. Partial / timed-out / failed
+                               # features are never cached; any cache fault just re-runs the feature.
+                               # false = always run every planned feature (the rollback).
   model: ""                    # clawpatch --model override; "" = its default (protolabs/smart)
   gateway_base_url: ""         # exported as OPENAI_BASE_URL to clawpatch; "" = its default
   checkout_root: ""            # "" = ~/.protoagent/pr-reviewer/checkouts
