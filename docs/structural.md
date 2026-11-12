@@ -57,6 +57,21 @@ prompt size, `elapsed_s` and how it ended (`finished`, `error`, `killed` = in fl
 [epic attestation](epic-attestation.md) the plan, selection and confinement use the residual files
 only (`scoped_paths`).
 
+## Result cache
+
+A quarter of planned features were byte-identical to the previous pass of the same PR and were
+re-run anyway (#312). Each selected feature is keyed by sha256 over its owned and context files'
+head blob SHAs, the feature id, the engine version (`clawpatch --version`), the configured
+`model` and the plugin version; a key that already maps to a **completed** review is served from
+a small JSON store next to the checkout cache (TTL 7 days, LRU entry cap, atomic writes) instead
+of re-run — the engine gets a shrunken `--feature-list`, and if every feature hits it is skipped
+entirely. Replayed records re-enter through the same read as fresh ones (diff confinement,
+signature dedup, anchor choice, lint check, refutation pre-marks), so a changed base or scope is
+re-applied on every pass. Partial, timed-out or failed features are never cached; a finding that
+cannot be attributed to a reviewed feature blocks caching for that run; any cache fault just
+re-runs the feature. `structural_result_cache: false` turns it off. The `structural_plan` event
+records `features_cached` / `features_run`, and a served feature's row says `cached`.
+
 ## Concurrency
 
 `structural_jobs` (default 4) is clawpatch's `--jobs`. Left alone clawpatch reviews about half the

@@ -106,6 +106,7 @@ See [structural](structural.md) for what each does.
 | `structural_jobs` | `4` | Concurrent feature reviews (`--jobs`). `0` = clawpatch's default. Clamped to 10. If you lower it, raise `time_budget_s` |
 | `structural_max_features` | `16` | Features reviewed per pass, ranked by changed lines. `0` = no cap. The excess is a coverage gap |
 | `structural_plan` | `true` | `false` lets `clawpatch ci --since` pick the features (the rollback) |
+| `structural_result_cache` | `true` | Serve a planned feature from its cached result when its owned+context file blobs at head, the engine version, the model and the plugin version are unchanged since a COMPLETED review ([details](structural.md#result-cache)). Partial, timed-out or failed features are never cached; any cache fault re-runs the feature. `false` always runs every planned feature |
 | `model` | `""` | `clawpatch --model` override; empty = its default (`protolabs/smart`) |
 | `gateway_base_url` | `""` | Exported as `OPENAI_BASE_URL` to clawpatch; empty = its default |
 | `lint_check` | `true` | Re-run a cited ruff rule with the repo's pinned ruff |
