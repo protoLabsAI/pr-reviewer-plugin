@@ -786,16 +786,31 @@ def merge_lost_findings(findings: list[dict], lost: list[dict]) -> list[dict]:
     already capped by the `report_lost_findings` coverage gap, and injecting them into
     `findings` would re-decide it (a verdict-less major would FAIL a round whose loss is a
     coverage problem, not a confirmed defect). Deduped against rows the record already
-    carries (`rounds.same_prior`), so a lost row that is also a carried prior does not sit
-    beside its own carry."""
-    from .rounds import same_prior
+    carries, so a lost row that is also a carried prior does not sit beside its own carry —
+    but NOT by `rounds.same_prior` alone: its same-file:line shortcut exists for disposition
+    rows that carry only an anchor, and here it collapsed two DISTINCT dropped findings on
+    one line into one recorded debt row while the `report_lost_findings` gap counted both.
+    Synthesized rows carry their own claims, so two rows are one finding only when the
+    claims also agree (equal once normalized, `_same_defect`, or the `rounds` similar-claims
+    test); a row missing its claim on either side keeps the plain anchor matching — nothing
+    left to tell them apart, and one debt row beats a duplicate."""
+    from .rounds import _similar_claims, same_prior
+
+    def same_lost(a: dict, b: dict) -> bool:
+        if not same_prior(a, b):
+            return False
+        ra, rb = str(a.get("claim") or ""), str(b.get("claim") or "")
+        ca, cb = " ".join(ra.lower().split()), " ".join(rb.lower().split())
+        if not ca or not cb:
+            return True
+        return ca == cb or _same_defect(a, b) or _similar_claims(ra, rb)
 
     existing = [f for f in (findings or []) if isinstance(f, dict)]
     additions: list[dict] = []
     for finding in lost or []:
         if not isinstance(finding, dict):
             continue
-        if any(same_prior(finding, f) for f in (*existing, *additions)):
+        if any(same_lost(finding, f) for f in (*existing, *additions)):
             continue
         item = {
             k: finding.get(k)
@@ -1357,6 +1372,21 @@ def render_coverage_note(gaps: dict[str, str] | None, lanes: int = 0) -> str:
         return (
             prefix
             + " Raw finding accounting has gaps; PASS is capped at WARN and promotion is held. See the accounting record below."
+        )
+    if "report_lost_findings" in gaps:
+        # Not a lane (#306 review r1): every lane RAN; the loss sits at the report
+        # boundary. Rendering it through the lane sentence below told the author a lane
+        # did not complete and lane-only defects may be missed — neither is true here.
+        others = {k: v for k, v in gaps.items() if k != "report_lost_findings"}
+        prefix = (
+            render_coverage_note(others, lanes) if others else "**Coverage incomplete — this is not a clean pass.**"
+        )
+        return prefix + (
+            f" `report_lost_findings` ({gaps['report_lost_findings']}): every lane ran, but the "
+            "report step dropped the round's synthesized findings without the verifier refuting "
+            "them, so the loss is at the report boundary, not in coverage of the code. The dropped "
+            "findings are recorded below as unverified carried debt; a PASS is capped at WARN and "
+            "promotion is held."
         )
     context = {sid: why for sid, why in gaps.items() if sid.startswith("context:")}
     if context:

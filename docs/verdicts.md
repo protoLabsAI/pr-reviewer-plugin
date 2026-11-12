@@ -146,10 +146,24 @@ Both used to parse as `[]`, so a lost payload posted PASS.
   and "stopped at its preamble" looked the same. A zero-finding round whose `verify` output has no
   fenced array and no `VERIFY_STATUS` line names `verify` in the coverage line and posts WARN
   (`verify_undelivered`). `complete` stays true and the round is not retried.
-- **A verifier that contradicts the synthesizer** (`nothing-to-verify` over a synthesis that has
-  findings) is re-run alone, seeded with the earlier outputs, up to `verify_reruns` times. If it
-  stays contradicted, one fresh panel runs (`verify_fallback_panel`) before a held PASS posts.
-  A round that still cannot verify posts `verified=false` and holds.
+- **A verifier that contradicts — or ignores — the synthesizer.** `nothing-to-verify`, or a prose
+  reply that annotates none of the synthesized findings (#306: "the findings were not included in
+  the input"), over a synthesis that has findings triggers a seeded re-run of verify+report alone,
+  up to `verify_reruns` times; if that stays unverified, one fresh panel runs
+  (`verify_fallback_panel`). What posts then depends on what the report kept:
+  - the report **kept** the findings: the round posts held, `verified=false`, exactly as before;
+  - the report **dropped them all** and the verifier annotated nothing: the round is **incomplete,
+    no verdict** — the absent-payload ending above (red check, operator escalated, `exhaustion`
+    with `undelivered: ["verify"]`), never a PASS and never "came back clean" (#306);
+  - the report dropped them all and the verifier **did** annotate but did not refute every one: a
+    `report_lost_findings` coverage gap — PASS capped at WARN, `complete=false` (promotion and any
+    standing block hold), and the un-refuted rows join the recorded findings as `raised_unverified`
+    carried debt;
+  - the verifier explicitly **refuted every** synthesized finding: dropping refuted rows is the
+    report's contract, and the round may post a clean PASS.
+
+  "No findings — the review came back clean" therefore renders only when the lanes raised nothing
+  or every synthesized finding was explicitly refuted.
 
 ## Latency note
 

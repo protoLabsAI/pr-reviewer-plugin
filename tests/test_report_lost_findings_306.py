@@ -13,9 +13,9 @@ from __future__ import annotations
 import json
 
 from pr_reviewer.telemetry import Telemetry
-from pr_reviewer.verdicts import read_findings_record, verifier_ignored_synthesis
+from pr_reviewer.verdicts import merge_lost_findings, read_findings_record, verifier_ignored_synthesis
 
-from tests.dispatch_helpers import HEAD, RoutedGH, facts, make
+from tests.dispatch_helpers import HEAD, OLD_HEAD, RoutedGH, facts, make, review_row
 
 GREEN = [{"status": "completed", "conclusion": "success"}]
 
@@ -266,6 +266,117 @@ async def test_a_clean_round_still_posts_pass_exactly_as_before(tmp_path):
     body = gh.reviews_posted[0]["body"]
     assert "came back clean" in body
     assert "complete=false" not in body and "verified=false" not in body
+
+
+# ── merge_lost_findings dedup: one row per FINDING, not per file:line ─────────
+#
+# `rounds.same_prior` treats any two findings at one file:line as one — right for a
+# disposition row, which carries only an anchor, wrong for lost synthesized rows, which
+# each carry their own claim: two DISTINCT findings the report dropped on one line must
+# both become debt, or the second vanishes while the `report_lost_findings` gap still
+# counts it (review on this change, r1).
+
+_LOST_A = {"file": "src/io.py", "line": 42, "severity": "major", "claim": "handler_close() double-frees the buffer."}
+_LOST_B = {"file": "src/io.py", "line": 42, "severity": "major", "claim": "retry loop never decrements attempts_left."}
+
+
+def test_two_distinct_lost_findings_on_one_line_are_both_recorded():
+    merged = merge_lost_findings([], [_LOST_A, _LOST_B])
+    assert len(merged) == 2
+    assert all(f.get("raised_unverified") for f in merged)
+    assert {f["claim"] for f in merged} == {_LOST_A["claim"], _LOST_B["claim"]}
+
+
+def test_the_same_lost_finding_twice_is_still_one_debt_row():
+    assert len(merge_lost_findings([], [_LOST_A, dict(_LOST_A)])) == 1
+    # Reworded, same defect named: still one row (`rounds._similar_claims`).
+    reworded = {**_LOST_A, "claim": "handler_close() double-frees the shared buffer."}
+    assert len(merge_lost_findings([], [_LOST_A, reworded])) == 1
+
+
+def test_a_lost_row_that_relists_a_carried_prior_dedups_against_the_carry():
+    carry = {**_LOST_A, "carried": True, "note": "carried from a prior round"}
+    merged = merge_lost_findings([carry], [dict(_LOST_A), _LOST_B])
+    assert len(merged) == 2  # the carry, plus only the DISTINCT lost row
+    assert merged[0] is carry or merged[0] == carry
+    assert merged[1]["claim"] == _LOST_B["claim"]
+
+
+def test_a_lost_row_with_no_claim_keeps_the_plain_anchor_matching():
+    # Nothing left to tell them apart — fail toward one row, as before.
+    bare = {"file": "src/io.py", "line": 42, "severity": "major"}
+    assert len(merge_lost_findings([_LOST_A], [bare])) == 1
+
+
+async def test_report_loss_holds_a_standing_block(tmp_path):
+    """`hold_blocks` rides `report_lost` (#306): a round whose report dropped un-refuted
+    findings has not earned lifting an earlier REQUEST_CHANGES, even though its own
+    verdict (WARN) would otherwise dismiss it (`test_an_ordinary_clean_pass_still_lifts
+    _the_block` is the counterfactual)."""
+    rows = findings()
+
+    async def runner(name, inputs, *, seed_outputs=None):
+        return {
+            "output": EMPTY_REPORT,
+            "steps": core_steps(synthesize=synth(rows), verify=verify_annotated(rows, "confirmed")),
+            "failed": [],
+        }
+
+    gh = RoutedGH(pr_facts=facts(), reviews=[review_row(OLD_HEAD, "WARN", state="CHANGES_REQUESTED", id=77)])
+    d = make(tmp_path, cfg={"shadow_mode": False, "state_root": str(tmp_path / "st")}, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "synchronize")) == "reviewed:WARN"
+    assert gh.dismissed == []  # the standing REQUEST_CHANGES stays up
+    assert _events(tmp_path, "reviewed")[-1]["held"] is True
+
+
+async def test_lost_rows_merge_after_the_prior_carry_and_dedup_against_it(tmp_path):
+    """The merge order (#306): prior carries land first, so a lost row that re-lists a
+    carried prior dedups against the carry instead of sitting beside it — while a second,
+    DISTINCT lost finding on the very same line is still recorded (review r1). The report
+    dispositions the prior `open` (so the #260 ledger carries it) but drops every finding."""
+    relist = {"file": "x.py", "line": 3, "severity": "major", "claim": "real bug", "evidence": "e"}
+    distinct = {
+        "file": "x.py",
+        "line": 3,
+        "severity": "major",
+        "claim": "mutex never released in handle_retry().",
+        "evidence": "lock.acquire()",
+    }
+    dispositions = [{"file": "x.py", "line": 3, "disposition": "open", "claim": "real bug"}]
+    report = (
+        "<!-- brief -->\nStill open; nothing kept.\n<!-- /brief -->\n\n```json\n"
+        + json.dumps(dispositions)
+        + "\n```\n\n```json\n[]\n```"
+    )
+
+    async def runner(name, inputs):  # cannot seed: no prior re-check, no verify re-run
+        return {
+            "output": report,
+            "steps": core_steps(
+                synthesize=synth([relist, distinct]),
+                verify=verify_annotated([relist, distinct], "confirmed"),
+            ),
+            "failed": [],
+        }
+
+    prior = json.dumps([relist])
+    gh = RoutedGH(
+        pr_facts=facts(),
+        reviews=[review_row(OLD_HEAD, "FAIL", state="CHANGES_REQUESTED", findings_json=prior, id=77)],
+        compare=[{"filename": "x.py", "patch": ""}],
+    )
+    d = make(tmp_path, cfg={"shadow_mode": False, "state_root": str(tmp_path / "st")}, gh=gh, runner=runner)
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "synchronize")) == "reviewed:WARN"
+    assert gh.dismissed == []
+    body = gh.reviews_posted[0]["body"]
+    assert "`report_lost_findings` (2 synthesized, 0 reported, 2 not refuted)" in body
+    recorded, _trusted = read_findings_record(body)
+    at_line = [f for f in recorded if f.get("file") == "x.py" and f.get("line") == 3]
+    assert sorted(str(f.get("claim")) for f in at_line) == [distinct["claim"], "real bug"]
+    carried = next(f for f in at_line if f.get("claim") == "real bug")
+    assert carried.get("carried") is True  # ONE row for the prior — the carry, not a duplicate
+    lost = next(f for f in at_line if f.get("claim") == distinct["claim"])
+    assert lost.get("raised_unverified") is True
 
 
 async def test_306_replay_structural_recipe_posts_no_verdict(tmp_path):

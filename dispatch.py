@@ -2114,6 +2114,55 @@ class Dispatcher:
         count = prev[1] + 1 if prev and prev[0] == head else 1
         self._exhausted[key] = (head, count, time.monotonic())
 
+    async def _conclude_panel_incomplete(
+        self,
+        repo: str,
+        pr: int,
+        head: str,
+        review_check_id: int | None,
+        *,
+        body: str,
+        escalation: str,
+        undelivered: list[str],
+        attempts: int,
+        per_attempt: list[list[dict]],
+        size: dict,
+        **telemetry_extra: object,
+    ) -> str:
+        """The #113 incomplete-round ending, shared by every boundary that delivered no
+        usable findings payload — an absent stage array, or a verify step that annotated
+        none of a non-empty synthesis while the report dropped it (#306). Red check,
+        operator escalation, exhaustion telemetry, backoff note: one sequence, so the
+        copies cannot drift apart (the #306 copy had already lost the stage-causes tail)."""
+        await self._conclude_review_check(
+            repo,
+            review_check_id,
+            FAILURE,
+            "QA panel incomplete — no verdict",
+            f"{body}\n\n{format_stage_causes(per_attempt)}",
+        )
+        await self._escalate(
+            escalation,
+            dedup_key=f"pr-reviewer-incomplete:{repo}#{pr}@{head[:7]}",
+            repo=repo,
+            pr=pr,
+            head_sha=head,
+        )
+        self.telemetry.emit(
+            "exhaustion",
+            repo=repo,
+            pr=pr,
+            sha=head,
+            failed=[],
+            undelivered=undelivered,
+            attempts=attempts,
+            causes=per_attempt,
+            **telemetry_extra,
+            **size,
+        )
+        self._note_exhaustion(repo, pr, head)
+        return "error:panel-incomplete"
+
     def _exhaustion_backoff_left(self, repo: str, pr: int, head: str) -> float:
         """Seconds before the sweep may backfill `head` again — 0 when it may now (#297).
 
@@ -4192,38 +4241,25 @@ class Dispatcher:
             # backfill retries the head later (it has no verdict). Telemetered as an
             # exhaustion so the eval's unreviewed-PR count sees it; `undelivered` says why.
             stages = ", ".join(undelivered)
-            attempts = self.panel_retries + 1
-            await self._conclude_review_check(
+            return await self._conclude_panel_incomplete(
                 repo,
+                pr,
+                head,
                 review_check_id,
-                FAILURE,
-                "QA panel incomplete — no verdict",
-                f"The review panel ran on head `{head[:12]}` but delivered no findings payload at "
-                f"stage(s) {stages} after {attempts} attempt(s). An absent payload is not a clean "
-                f"result, so no verdict was posted; push a fix or comment `@vera review` to re-trigger the review.\n\n"
-                f"{format_stage_causes(per_attempt)}",
-            )
-            await self._escalate(
-                f"pr-reviewer: panel delivered no findings payload ({stages}) on {repo}#{pr} "
-                f"after {attempts} attempt(s) — no verdict posted; PR is UNREVIEWED.",
-                dedup_key=f"pr-reviewer-incomplete:{repo}#{pr}@{head[:7]}",
-                repo=repo,
-                pr=pr,
-                head_sha=head,
-            )
-            self.telemetry.emit(
-                "exhaustion",
-                repo=repo,
-                pr=pr,
-                sha=head,
-                failed=[],
+                body=(
+                    f"The review panel ran on head `{head[:12]}` but delivered no findings payload at "
+                    f"stage(s) {stages} after {attempt} attempt(s). An absent payload is not a clean "
+                    f"result, so no verdict was posted; push a fix or comment `@vera review` to re-trigger the review."
+                ),
+                escalation=(
+                    f"pr-reviewer: panel delivered no findings payload ({stages}) on {repo}#{pr} "
+                    f"after {attempt} attempt(s) — no verdict posted; PR is UNREVIEWED."
+                ),
                 undelivered=undelivered,
-                attempts=attempts,
-                causes=per_attempt,
-                **size,
+                attempts=attempt,
+                per_attempt=per_attempt,
+                size=size,
             )
-            self._note_exhaustion(repo, pr, head)
-            return "error:panel-incomplete"
 
         result = await self._rerun_contradicted_verify(runner, recipe, inputs, result, repo=repo, pr=pr, head=head)
 
@@ -4342,41 +4378,32 @@ class Dispatcher:
             and "verify" not in degraded
             and verifier_ignored_synthesis(verify_out, synthesized_rows)
         ):
-            attempts = self.panel_retries + 1
-            await self._conclude_review_check(
+            # `attempt` survives the panel loop as the number of attempts actually RUN —
+            # this branch is reached after the loop broke on its delivering attempt, so
+            # `panel_retries + 1` over-counted whenever that break came before the last.
+            return await self._conclude_panel_incomplete(
                 repo,
+                pr,
+                head,
                 review_check_id,
-                FAILURE,
-                "QA panel incomplete — no verdict",
-                f"The review panel ran on head `{head[:12]}`: its synthesis carried "
-                f"{len(synthesized_rows)} finding(s), but the verify step annotated none of them and "
-                "the report delivered an empty findings array, so every finding was lost between "
-                "synthesis and the deliverable. An unverified empty report is not a clean result, so "
-                "no verdict was posted; push a fix or comment `@vera review` to re-trigger the review.",
-            )
-            await self._escalate(
-                f"pr-reviewer: the verify step annotated none of {len(synthesized_rows)} synthesized "
-                f"finding(s) on {repo}#{pr} and the report dropped them all — no verdict posted; "
-                f"PR is UNREVIEWED.",
-                dedup_key=f"pr-reviewer-incomplete:{repo}#{pr}@{head[:7]}",
-                repo=repo,
-                pr=pr,
-                head_sha=head,
-            )
-            self.telemetry.emit(
-                "exhaustion",
-                repo=repo,
-                pr=pr,
-                sha=head,
-                failed=[],
+                body=(
+                    f"The review panel ran on head `{head[:12]}`: its synthesis carried "
+                    f"{len(synthesized_rows)} finding(s), but the verify step annotated none of them and "
+                    "the report delivered an empty findings array, so every finding was lost between "
+                    "synthesis and the deliverable. An unverified empty report is not a clean result, so "
+                    "no verdict was posted; push a fix or comment `@vera review` to re-trigger the review."
+                ),
+                escalation=(
+                    f"pr-reviewer: the verify step annotated none of {len(synthesized_rows)} synthesized "
+                    f"finding(s) on {repo}#{pr} and the report dropped them all — no verdict posted; "
+                    f"PR is UNREVIEWED."
+                ),
                 undelivered=["verify"],
+                attempts=attempt,
+                per_attempt=per_attempt,
+                size=size,
                 synthesized=len(synthesized_rows),
-                attempts=attempts,
-                causes=per_attempt,
-                **size,
             )
-            self._note_exhaustion(repo, pr, head)
-            return "error:panel-incomplete"
         # Report-loss rule (#306), every recipe — the #328 accounting covers only the
         # structural recipe: the synthesizer carried findings, the report delivered an
         # EMPTY array, and the verifier did not explicitly refute them all. Dropping a
