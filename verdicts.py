@@ -695,11 +695,16 @@ _OWED_NOTES = {
     ),
     "conflict": "carried from a prior round — the report's dispositions of it disagree; it keeps gating",
 }
+REPORT_LOST_NOTE = (
+    "synthesized this round but dropped by the report step without a refutation (#306); recorded "
+    "unverified so it carries as debt until a round verifies, fixes or refutes it"
+)
 _CARRY_NOTES = (
     CARRIED_NOTE,
     CARRIED_UNVERIFIED_NOTE,
     CARRIED_UNCERTAIN_NOTE,
     CARRIED_DEFERRED_NOTE,
+    REPORT_LOST_NOTE,
     *_OWED_NOTES.values(),
 )
 
@@ -765,6 +770,40 @@ def merge_carried_findings(findings: list[dict], carried: list[dict], *, deferre
             note = CARRIED_DEFERRED_NOTE
         item["carried"] = True
         item["note"] = _with_carried_note(finding.get("note"), note)
+        additions.append(item)
+    return existing + additions
+
+
+def merge_lost_findings(findings: list[dict], lost: list[dict]) -> list[dict]:
+    """Add synthesized findings the report step DROPPED un-refuted (#306) to the RECORDED
+    findings list, so they become carried debt rather than vanishing. Returns the list
+    unchanged when there is nothing to add.
+
+    Each row is stamped `raised_unverified: True` — the existing carry contract
+    (`merge_carried_findings`): a later round carries such a row verdict-less as unverified
+    debt, never as a confirmed prior, until a round verifies, fixes or refutes it. The rows
+    land in the RECORD only, never in this round's verdict input — the round's verdict is
+    already capped by the `report_lost_findings` coverage gap, and injecting them into
+    `findings` would re-decide it (a verdict-less major would FAIL a round whose loss is a
+    coverage problem, not a confirmed defect). Deduped against rows the record already
+    carries (`rounds.same_prior`), so a lost row that is also a carried prior does not sit
+    beside its own carry."""
+    from .rounds import same_prior
+
+    existing = [f for f in (findings or []) if isinstance(f, dict)]
+    additions: list[dict] = []
+    for finding in lost or []:
+        if not isinstance(finding, dict):
+            continue
+        if any(same_prior(finding, f) for f in (*existing, *additions)):
+            continue
+        item = {
+            k: finding.get(k)
+            for k in ("file", "line", "severity", "category", "claim", "evidence")
+            if finding.get(k) is not None
+        }
+        item["raised_unverified"] = True
+        item["note"] = _with_carried_note(finding.get("note"), REPORT_LOST_NOTE)
         additions.append(item)
     return existing + additions
 
@@ -1384,6 +1423,41 @@ def verifier_contradicts_synthesis(verify_output: str, synthesized: list[dict] |
     re-run, not the panel.
     """
     return bool(synthesized) and NOTHING_TO_VERIFY in (verify_output or "")
+
+
+def verifier_ignored_synthesis(verify_output: str, synthesized: list[dict] | None) -> bool:
+    """The synthesizer handed the verifier findings and the verify output annotated NONE
+    of them (#306): no `VERIFY_STATUS: annotated` line and no fenced findings array with a
+    verdict-bearing row.
+
+    `verification_ran` judges the verify step against what the REPORT kept, so a report
+    that dropped every finding made a dead verifier invisible (careercoach-archetype#2:
+    the verifier answered "the annotated findings list (n=7) … were not included in the
+    input", the report emitted `[]`, and the round posted PASS). This judges it against
+    what the verifier was HANDED instead. A superset of `verifier_contradicts_synthesis`
+    (`nothing-to-verify` over real findings annotates none of them), and lenient the same
+    way `verify_delivered` is: either annotation signal — the status line, or any fenced
+    array row carrying a `verdict` — counts as the verifier having answered, so only a
+    reply with neither (a prose refusal, an empty or verdict-less array) reads as ignored.
+    """
+    if not synthesized:
+        return False
+    out = verify_output or ""
+    if re.search(r"VERIFY_STATUS:\s*annotated", out):
+        return False
+    for block in fenced_blocks(out):
+        body = block.strip()
+        if not body.startswith("["):
+            continue
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, list) and any(
+            isinstance(row, dict) and str(row.get("verdict") or "").strip() for row in data
+        ):
+            return False
+    return True
 
 
 def verification_ran(verify_output: str, findings: list[dict] | None) -> bool:
