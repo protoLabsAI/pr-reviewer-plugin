@@ -28,6 +28,21 @@ read. The structural pass plans the in-scope files only.
 The posted body ends with a note saying how many files were reviewed, how many were carried,
 and that `@vera review` buys a full re-review.
 
+## Enable on chosen repos
+
+`incremental_review_repos` (env `PR_REVIEWER_INCREMENTAL_REVIEW_REPOS`) narrows the flag to an
+`owner/name` allowlist, so the A/B can start on one or two high-churn repos:
+
+```yaml
+incremental_review: true
+incremental_review_repos: [protoLabsAI/protoAgent]
+```
+
+A YAML list or a comma/space separated string; matching is case-insensitive. Empty (the
+default): the flag governs every repo, as before. A repo not on the list takes exactly the
+flag-off path — its rounds make no incremental reads and are byte-for-byte full reviews. With
+the flag off, the list changes nothing: no repo is incremental.
+
 ## When it reviews in full
 
 Each of these reviews the whole PR. The reason is recorded as `full:<reason>`.
