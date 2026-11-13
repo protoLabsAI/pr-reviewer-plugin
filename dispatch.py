@@ -505,18 +505,15 @@ def _accounting_runner(runner, *, invoke=None):
             for lane in list(first.get("degraded") or []) + list(first.get("failed") or []):
                 if lane in _accounting.LANES:
                     current["gaps"].append(f"{lane}: execution failed or degraded")
+            # Seed the finder outputs EXACTLY as the first run returned them (#343). The host links
+            # a seeded step to its source run only when the seeded text equals what that run
+            # persisted; an id-annotated copy never does, so every lane came back with an unknown
+            # origin and every structural round read "Runner independence unverified". The raw ids
+            # reach the synthesizer through `inputs.finding_accounting`, which carries each id with
+            # its lane and its finding; nothing downstream reads them out of the lane text.
             seeds = {lane: str(steps.get(lane) or "") for lane in _accounting.LANES}
-            for lane in _accounting.LANES:
-                rows = [
-                    dict(v["finding"], raw_ids=[rid], finding_id=rid)
-                    for rid, v in current["raw"].items()
-                    if v["lane"] == lane
-                ]
-                if _accounting.array(seeds[lane]) is not None:
-                    seeds[lane] += "\n```json\n" + json.dumps(rows) + "\n```"
             lane_seeds = dict(seeds)
-            # Only deterministic ID annotations differ from the observed originals.
-            seed_source = {**first, "steps": {**steps, **seeds}}
+            seed_source = first
         elif current is not None and (
             any(seeds[lane] != lane_seeds.get(lane) for lane in _accounting.LANES)
             or any(
