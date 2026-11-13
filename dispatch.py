@@ -187,6 +187,7 @@ from .verdicts import (
     mark_nearby,
     mentions_any,
     merge_carried_findings,
+    merge_lost_findings,
     nearby_structural,
     overrun_lanes,
     parse_hunks,
@@ -203,6 +204,7 @@ from .verdicts import (
     verdict_for,
     verification_ran,
     verifier_contradicts_synthesis,
+    verifier_ignored_synthesis,
     verify_delivered,
 )
 
@@ -2111,6 +2113,55 @@ class Dispatcher:
         prev = self._exhausted.get(key)
         count = prev[1] + 1 if prev and prev[0] == head else 1
         self._exhausted[key] = (head, count, time.monotonic())
+
+    async def _conclude_panel_incomplete(
+        self,
+        repo: str,
+        pr: int,
+        head: str,
+        review_check_id: int | None,
+        *,
+        body: str,
+        escalation: str,
+        undelivered: list[str],
+        attempts: int,
+        per_attempt: list[list[dict]],
+        size: dict,
+        **telemetry_extra: object,
+    ) -> str:
+        """The #113 incomplete-round ending, shared by every boundary that delivered no
+        usable findings payload — an absent stage array, or a verify step that annotated
+        none of a non-empty synthesis while the report dropped it (#306). Red check,
+        operator escalation, exhaustion telemetry, backoff note: one sequence, so the
+        copies cannot drift apart (the #306 copy had already lost the stage-causes tail)."""
+        await self._conclude_review_check(
+            repo,
+            review_check_id,
+            FAILURE,
+            "QA panel incomplete — no verdict",
+            f"{body}\n\n{format_stage_causes(per_attempt)}",
+        )
+        await self._escalate(
+            escalation,
+            dedup_key=f"pr-reviewer-incomplete:{repo}#{pr}@{head[:7]}",
+            repo=repo,
+            pr=pr,
+            head_sha=head,
+        )
+        self.telemetry.emit(
+            "exhaustion",
+            repo=repo,
+            pr=pr,
+            sha=head,
+            failed=[],
+            undelivered=undelivered,
+            attempts=attempts,
+            causes=per_attempt,
+            **telemetry_extra,
+            **size,
+        )
+        self._note_exhaustion(repo, pr, head)
+        return "error:panel-incomplete"
 
     def _exhaustion_backoff_left(self, repo: str, pr: int, head: str) -> float:
         """Seconds before the sweep may backfill `head` again — 0 when it may now (#297).
@@ -4190,38 +4241,25 @@ class Dispatcher:
             # backfill retries the head later (it has no verdict). Telemetered as an
             # exhaustion so the eval's unreviewed-PR count sees it; `undelivered` says why.
             stages = ", ".join(undelivered)
-            attempts = self.panel_retries + 1
-            await self._conclude_review_check(
+            return await self._conclude_panel_incomplete(
                 repo,
+                pr,
+                head,
                 review_check_id,
-                FAILURE,
-                "QA panel incomplete — no verdict",
-                f"The review panel ran on head `{head[:12]}` but delivered no findings payload at "
-                f"stage(s) {stages} after {attempts} attempt(s). An absent payload is not a clean "
-                f"result, so no verdict was posted; push a fix or comment `@vera review` to re-trigger the review.\n\n"
-                f"{format_stage_causes(per_attempt)}",
-            )
-            await self._escalate(
-                f"pr-reviewer: panel delivered no findings payload ({stages}) on {repo}#{pr} "
-                f"after {attempts} attempt(s) — no verdict posted; PR is UNREVIEWED.",
-                dedup_key=f"pr-reviewer-incomplete:{repo}#{pr}@{head[:7]}",
-                repo=repo,
-                pr=pr,
-                head_sha=head,
-            )
-            self.telemetry.emit(
-                "exhaustion",
-                repo=repo,
-                pr=pr,
-                sha=head,
-                failed=[],
+                body=(
+                    f"The review panel ran on head `{head[:12]}` but delivered no findings payload at "
+                    f"stage(s) {stages} after {attempt} attempt(s). An absent payload is not a clean "
+                    f"result, so no verdict was posted; push a fix or comment `@vera review` to re-trigger the review."
+                ),
+                escalation=(
+                    f"pr-reviewer: panel delivered no findings payload ({stages}) on {repo}#{pr} "
+                    f"after {attempt} attempt(s) — no verdict posted; PR is UNREVIEWED."
+                ),
                 undelivered=undelivered,
-                attempts=attempts,
-                causes=per_attempt,
-                **size,
+                attempts=attempt,
+                per_attempt=per_attempt,
+                size=size,
             )
-            self._note_exhaustion(repo, pr, head)
-            return "error:panel-incomplete"
 
         result = await self._rerun_contradicted_verify(runner, recipe, inputs, result, repo=repo, pr=pr, head=head)
 
@@ -4317,6 +4355,69 @@ class Dispatcher:
         # — see verdicts.py). `reported` is what the panel said this round and what the
         # body records; `findings` is the confined subset the verdict is computed from.
         reported = self._parse_findings(output)
+        # The round's findings as the SYNTHESIZER handed them to the verifier (#306) — the
+        # yardstick verification is judged against, not only what the report kept. Parsed
+        # once; the verify-boundary check and the report-loss rule below both read it.
+        synthesized_rows = self._parse_findings(str(steps_out.get("synthesize") or ""))
+        verify_out = str(steps_out.get("verify") or "")
+        # The verify boundary over a non-empty synthesis (#306): the verifier annotated
+        # NOTHING — no `VERIFY_STATUS: annotated`, no verdict-bearing row — and the report
+        # dropped every finding, so nothing downstream could tell this round from a clean
+        # one (`verification_ran` returns True for an empty findings list before it reads
+        # the verify output). careercoach-archetype#2@2470a74: 7 findings synthesized, the
+        # verifier said its input never arrived, the report emitted `[]`, and the round
+        # posted PASS and was promoted. The seeded verify re-run (#167/#182, broadened to
+        # this shape) has already had its chance by now; a round still in this state is
+        # incomplete — the #113 outcome, no verdict — never one that reads as clean. A
+        # report that KEPT the findings posts held (`verified=false`) exactly as before:
+        # the record still carries them, so nothing is lost.
+        if (
+            synthesized_rows
+            and not reported
+            and "verify" in steps_out
+            and "verify" not in degraded
+            and verifier_ignored_synthesis(verify_out, synthesized_rows)
+        ):
+            # `attempt` survives the panel loop as the number of attempts actually RUN —
+            # this branch is reached after the loop broke on its delivering attempt, so
+            # `panel_retries + 1` over-counted whenever that break came before the last.
+            return await self._conclude_panel_incomplete(
+                repo,
+                pr,
+                head,
+                review_check_id,
+                body=(
+                    f"The review panel ran on head `{head[:12]}`: its synthesis carried "
+                    f"{len(synthesized_rows)} finding(s), but the verify step annotated none of them and "
+                    "the report delivered an empty findings array, so every finding was lost between "
+                    "synthesis and the deliverable. An unverified empty report is not a clean result, so "
+                    "no verdict was posted; push a fix or comment `@vera review` to re-trigger the review."
+                ),
+                escalation=(
+                    f"pr-reviewer: the verify step annotated none of {len(synthesized_rows)} synthesized "
+                    f"finding(s) on {repo}#{pr} and the report dropped them all — no verdict posted; "
+                    f"PR is UNREVIEWED."
+                ),
+                undelivered=["verify"],
+                attempts=attempt,
+                per_attempt=per_attempt,
+                size=size,
+                synthesized=len(synthesized_rows),
+            )
+        # Report-loss rule (#306), every recipe — the #328 accounting covers only the
+        # structural recipe: the synthesizer carried findings, the report delivered an
+        # EMPTY array, and the verifier did not explicitly refute them all. Dropping a
+        # refuted row is the report's contract; dropping a confirmed or never-annotated
+        # one loses the round's findings. The un-refuted rows become a coverage gap below
+        # (capping PASS at WARN, complete=false) and join the record after the verdict as
+        # `raised_unverified` debt. Fail-closed matching: a verify row that cannot be
+        # aligned to its synthesized finding (`align_recheck`) is "not refuted".
+        report_lost: list[dict] = []
+        if synthesized_rows and not reported:
+            rulings = align_recheck(synthesized_rows, self._parse_findings(verify_out))
+            report_lost = [
+                f for f, ruling in zip(synthesized_rows, rulings) if not (ruling and ruling["verdict"] == "refuted")
+            ]
         reported, refuted_before = self._settle_refuted_before(
             repo, pr, head, round_number, steps_out, reported, pr_ranges
         )
@@ -4362,6 +4463,30 @@ class Dispatcher:
             lane_reasons=lane_repo_gaps,
         )
         accounting = _accounting.coverage(result, recipe, history=history)
+        if report_lost and accounting["supported"] and accounting["complete"]:
+            # The #328 identity accounting reconciled COMPLETE: every raw finding the
+            # report dropped is covered by a reasoned, code-validated disposition — the
+            # stronger contract, and this drop is accounted, not lost. The heuristic
+            # stands everywhere the accounting cannot speak: the core recipe
+            # (unsupported) and any structural round whose reconciliation has gaps.
+            report_lost = []
+        if report_lost:
+            # The report-loss gap (#306): registered before the coverage cap and the
+            # completeness stamp, so a PASS is capped at WARN (`coverage_verdict`) and the
+            # marker records complete=false — approve-on-green never promotes this round.
+            gaps["report_lost_findings"] = (
+                f"{len(synthesized_rows)} synthesized, 0 reported, {len(report_lost)} not refuted"
+            )
+            complete = False
+            self.telemetry.emit(
+                "report_lost_findings",
+                repo=repo,
+                pr=pr,
+                sha=head,
+                round=round_number,
+                synthesized=len(synthesized_rows),
+                not_refuted=len(report_lost),
+            )
         for row in refuted_before:
             _accounting.dispose(
                 accounting, row, "refuted", "validated prior refutation on unchanged code", row.get("refuted_before")
@@ -4845,6 +4970,12 @@ class Dispatcher:
                     {"file": str(m.get("file") or ""), "severity": str(m.get("severity") or "")} for m in unaccounted
                 ],
             )
+        if report_lost:
+            # The lost findings join the RECORD as `raised_unverified` debt (#306) — after
+            # the verdict (already capped via the gap above, like the unaccounted carry)
+            # and after the prior carries, so a lost row that re-lists a carried prior
+            # dedups against it instead of sitting beside it.
+            reported = merge_lost_findings(reported, report_lost)
         if dropped_finding:
             trailer += render_held_note(dropped_finding)
             self.telemetry.emit(
@@ -4886,7 +5017,10 @@ class Dispatcher:
             truncated=truncated,
             confined=confined,
             notes=trailer,
-            hold_blocks=bool(dropped_finding) or bool(unaccounted) or bool(deferred),
+            # `report_lost` holds too (#306): a round whose report dropped un-refuted
+            # findings has not earned lifting an earlier block any more than one that
+            # silently dropped a prior.
+            hold_blocks=bool(dropped_finding) or bool(unaccounted) or bool(deferred) or bool(report_lost),
             complete=complete,
             coverage_gaps=gaps,
             lanes=lanes,
@@ -4952,7 +5086,7 @@ class Dispatcher:
             **size,
             findings=len(findings),
             notes=len(notes),
-            held=bool(dropped_finding) or bool(unaccounted) or bool(deferred),
+            held=bool(dropped_finding) or bool(unaccounted) or bool(deferred) or bool(report_lost),
             confined=len(confined),
             nearby=len(nearby),
             # Every guard reports what it DECIDED, not only when it acted. A rule that
@@ -4995,6 +5129,8 @@ class Dispatcher:
             debt_failed=(verdict != debt_verdict) or None,
             credited_minors=len(credited) or None,
             relisted_deferred=len(deferred) or None,
+            # Synthesized findings the report dropped un-refuted, carried as debt (#306).
+            report_lost=len(report_lost) or None,
             latency_s=round(elapsed, 1),
             # Model/SDK gateway retries this round (issue #209): a slow gate looked identical to
             # a dead one until this was counted. A finder subagent's retries land here through the
@@ -6152,13 +6288,23 @@ class Dispatcher:
         `verify` and `report` run again — seconds, where the panel is minutes. Bounded by
         `verify_reruns`. A host whose runner cannot seed (protoAgent < #3571) still counts
         the contradiction; either way, a round that stays contradicted posts exactly as
-        today (`verified=false`, held), never as clean.
+        today (`verified=false`, held), never as clean — unless its report ALSO lost every
+        finding, in which case the dispatcher voids the round (#306, below).
+
+        Also triggered (#306) when the verifier annotated NOTHING over a non-empty
+        synthesis without saying `nothing-to-verify` — a prose "the findings were not
+        included in the input" reply (`verifier_ignored_synthesis`). The re-run is the
+        same restated handover, and a re-run that still annotates nothing has not cleared.
         """
         steps = result.get("steps") if isinstance(result.get("steps"), dict) else {}
         if "verify" not in steps or "synthesize" not in steps:
             return result
+
+        def _unverified(verify_out: str, synth: list[dict]) -> bool:
+            return verifier_contradicts_synthesis(verify_out, synth) or verifier_ignored_synthesis(verify_out, synth)
+
         synthesized = self._parse_findings(str(steps.get("synthesize") or ""))
-        if not verifier_contradicts_synthesis(str(steps.get("verify") or ""), synthesized):
+        if not _unverified(str(steps.get("verify") or ""), synthesized):
             return result
         if not _accepts_keyword(runner, "seed_outputs") or self.verify_reruns <= 0:
             self.telemetry.emit(VERIFY_CONTRADICTED, repo=repo, pr=pr, sha=head, attempt=0, rerun=False, cleared=False)
@@ -6180,7 +6326,7 @@ class Dispatcher:
             again_steps = again.get("steps") if isinstance(again.get("steps"), dict) else {}
             if again.get("failed") or "verify" not in again_steps or not again.get("output"):
                 break
-            cleared = not verifier_contradicts_synthesis(str(again_steps["verify"] or ""), synthesized)
+            cleared = not _unverified(str(again_steps["verify"] or ""), synthesized)
             if cleared:
                 # Only a re-run that VERIFIED replaces the round's verify and report. A re-run
                 # that contradicted again wrote its report over a "nothing-to-verify" reply
@@ -6245,7 +6391,7 @@ class Dispatcher:
         ):
             return result
         fresh_synth = self._parse_findings(str(fresh_steps.get("synthesize") or ""))
-        cleared = not verifier_contradicts_synthesis(str(fresh_steps.get("verify") or ""), fresh_synth)
+        cleared = not _unverified(str(fresh_steps.get("verify") or ""), fresh_synth)
         self.telemetry.emit(
             VERIFY_CONTRADICTED,
             repo=repo,
