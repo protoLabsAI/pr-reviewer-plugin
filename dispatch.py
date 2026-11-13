@@ -5017,6 +5017,10 @@ class Dispatcher:
             truncated=truncated,
             confined=confined,
             notes=trailer,
+            # The carried-findings lead (#325): the brief sees only this round's in-scope
+            # findings, so a scoped round with surviving carries says so ABOVE it, next to
+            # the coverage line. "" when the flag is off or nothing survived the carry.
+            carried_lead=_inc.render_carried_lead(inc) if inc_scoped else "",
             # `report_lost` holds too (#306): a round whose report dropped un-refuted
             # findings has not earned lifting an earlier block any more than one that
             # silently dropped a prior.
@@ -5814,6 +5818,7 @@ class Dispatcher:
         truncated: bool = False,
         confined: list[dict] | None = None,
         notes: str = "",
+        carried_lead: str = "",
         hold_blocks: bool = False,
         complete: bool = True,
         review_check_id: int | None = None,
@@ -5859,6 +5864,7 @@ class Dispatcher:
             recipe=recipe,
             confined=confined,
             notes=notes,
+            carried_lead=carried_lead,
             complete=complete,
             verified=verified,
             stale_note=stale_note,

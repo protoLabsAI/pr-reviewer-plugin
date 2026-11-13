@@ -476,6 +476,22 @@ def render_scope_block(plan: Plan, round_number: int, residual: dict[str, str] |
     )
 
 
+def render_carried_lead(plan: Plan | None) -> str:
+    """The code-authored carried-findings lead, rendered ABOVE the brief (#325). The brief is
+    model-written and sees only this round's in-scope findings — on protoAgent#4908 r2 it said
+    "Clean" beside a WARN whose one finding was a carry — so this line, not the brief, is the
+    record. Counts only the carries that survived into the round (`plan.carried` after
+    `drop_ungrounded_carries`), never the dropped ones. Empty for a full round, a scope that
+    carried nothing, or one whose every carry was dropped at this head."""
+    if plan is None or not plan.scoped or not plan.carried:
+        return ""
+    return (
+        f"**{len(plan.carried)} finding(s) carried forward from `{plan.prior_head[:12]}` still stand** "
+        "(unchanged files, not re-read this round). Where the brief below says the review is "
+        "clean, this line supersedes it."
+    )
+
+
 def render_incremental_note(plan: Plan, out_of_scope: list[dict]) -> str:
     """The body trailer for a scoped round, so a reader knows what this round re-read and what
     it carried."""

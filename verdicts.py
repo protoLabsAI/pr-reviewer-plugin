@@ -1555,6 +1555,7 @@ def render_verdict_body(
     truncated: bool = False,
     confined: list[dict] | None = None,
     notes: str = "",
+    carried_lead: str = "",
     complete: bool = True,
     verified: bool = True,
     stale_note: str = "",
@@ -1585,7 +1586,13 @@ def render_verdict_body(
 
     `coverage_gaps` names the lanes that did not deliver a full pass (#117). Its note sits
     ABOVE the brief for the same reason: the brief cannot see the lanes and has claimed
-    full coverage over blind ones, so the reader meets the code-authored record first."""
+    full coverage over blind ones, so the reader meets the code-authored record first.
+
+    `carried_lead` is the pre-rendered carried-findings lead of a scoped round (#325,
+    `incremental.render_carried_lead`); it arrives as text, like `notes`, so this module
+    stays free of the incremental machinery. It sits above the brief with the coverage
+    note: the brief cannot see the carries and has called a round with standing carried
+    findings clean."""
     mode = "shadow — comment-only" if shadow else "formal"
     footnote = ""
     if confined:
@@ -1642,6 +1649,8 @@ def render_verdict_body(
         sections.append("> ⚠️ The report pass was cut off at its turn limit — this round's findings may be incomplete.")
     if coverage_gaps:
         sections.append(f"> ⚠️ {render_coverage_note(coverage_gaps, lanes)}")
+    if carried_lead:
+        sections.append(f"> ⚠️ {carried_lead}")
     if brief:
         sections.append(brief)
     elif not brief_found:
