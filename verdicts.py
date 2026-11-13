@@ -1314,6 +1314,7 @@ def coverage_gaps(
     overran: list[str] | None = None,
     structural_partial: bool = False,
     lane_reasons: dict[str, str] | None = None,
+    failed_lanes: list[str] | None = None,
 ) -> dict[str, str]:
     """{lane: why} for every lane that did not deliver a full pass — the signals the
     dispatcher already records (`degraded`, `incomplete_finders`, the structural lane
@@ -1322,11 +1323,16 @@ def coverage_gaps(
 
     `lane_reasons` overrides the generic "did not complete a real pass" wording for a named
     lane (#279): a lane marked incomplete because it read the WRONG repo gets a Gap naming
-    that repo, not the blanket reason, so the coverage note says which codebase it read."""
+    that repo, not the blanket reason, so the coverage note says which codebase it read.
+
+    `failed_lanes` (#357) are finder lanes that still errored after the retry while the
+    other lanes delivered — carried as a coverage Gap, not an exhausted round."""
     lane_reasons = lane_reasons or {}
     gaps = {str(s): "hit its time budget" for s in (degraded or [])}
     for s in overran or []:
         gaps[str(s)] = "overran the model's context window — read more than it could hold"
+    for s in failed_lanes or []:
+        gaps[str(s)] = "failed after the retry"
     for s in incomplete_finders or []:
         gaps.setdefault(str(s), lane_reasons.get(str(s), "did not complete a real pass"))
     if structural_gap:

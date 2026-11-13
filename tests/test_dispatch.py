@@ -1526,7 +1526,10 @@ async def test_a_lane_that_overran_its_context_is_a_gap_not_a_failed_round(tmp_p
     assert row["overran"] == ["find_crossfile"] and row["complete"] is False
 
 
-async def test_a_lane_that_crashed_for_another_reason_still_retries_and_exhausts(tmp_path):
+async def test_a_lane_that_crashed_for_another_reason_is_a_gap_after_the_retry(tmp_path):
+    """#357: a finder lane that errors for a non-overrun reason while the others deliver is
+    carried as a coverage Gap once the retry is spent — not an exhausted round. It retries
+    ONCE (unlike an overrun, which is a Gap on the first attempt), then posts a capped WARN."""
     calls = 0
 
     async def runner(name, inputs):
@@ -1537,9 +1540,15 @@ async def test_a_lane_that_crashed_for_another_reason_still_retries_and_exhausts
 
     gh = _structural_gh()
     d = make(tmp_path, cfg={"shadow_mode": False, "panel_retries": 1}, gh=gh, runner=runner)
-    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "error:panel-exhausted"
-    assert calls == 2 and gh.reviews_posted == []
-    assert _events(tmp_path, "finder_overran") == []
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")) == "reviewed:WARN"
+    assert calls == 2  # the retry is spent first; only the LAST failed attempt degrades
+    body = gh.reviews_posted[0]["body"]
+    assert "verdict=WARN" in body and "complete=false" in body
+    assert "`find_crossfile` (failed after the retry" in body
+    assert _events(tmp_path, "exhaustion") == [] and _events(tmp_path, "finder_overran") == []
+    assert [e["lanes"] for e in _events(tmp_path, "finder_failed")] == [["find_crossfile"]]
+    row = _events(tmp_path, "reviewed")[-1]
+    assert row["finder_failed"] == ["find_crossfile"] and row["complete"] is False
 
 
 async def test_a_refuted_structural_finding_is_remembered_for_the_repo_when_the_round_posts(tmp_path):
