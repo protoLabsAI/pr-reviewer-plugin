@@ -27,6 +27,7 @@ from pr_reviewer.protopatch import (
     PARTIAL_PREFIX,
     STRUCTURAL_GAP_MARKERS,
     ProtoPatchRunner,
+    parse_hunk_ranges,
     plan_features,
     read_head_source,
     sibling_features,
@@ -87,6 +88,55 @@ def touched(*needles: str, source: str = ROUTES) -> set[str]:
 
 
 # ── which definitions a diff touches ───────────────────────────────────────────────────────────
+
+
+def test_a_change_inside_a_nested_closure_touches_every_definition_enclosing_it():
+    # The handler never mentions `_inner` by name (it is registered by its decorator), so only the
+    # enclosing chain can say the handler changed.
+    source = (
+        "def register(app):\n"
+        "    async def _stream():\n"
+        "        @app.on_close\n"
+        "        def _inner():\n"
+        "            return 1\n"
+        "        return 2\n"
+        "\n"
+        "    async def _other():\n"
+        "        return 3\n"
+    )
+    names = touched("return 1", source=source)
+    assert {"_inner", "_stream", "register"} <= names and "_other" not in names
+
+
+def test_a_changed_class_header_touches_every_method():
+    source = "class Api(Base):\n    def get(self):\n        return 1\n\n    def put(self):\n        return 2\n"
+    assert {"Api", "get", "put"} <= touched("class Api(Base):", source=source)
+    # a changed method body still touches that method (and the class holding it), not its sibling
+    assert touched("return 1", source=source) == {"Api", "get"}
+
+
+def test_a_changed_factory_signature_touches_every_handler_it_defines():
+    names = touched("def register(app, cfg):")
+    assert {"_list_items", "_add_item", "_delete_item", "_health"} <= names
+
+
+def test_a_changed_condition_touches_the_definitions_it_guards():
+    source = "FLAG = True\n\nif FLAG:\n    def a():\n        return 1\n\ndef b():\n    return 2\n"
+    names = touched("if FLAG:", source=source)
+    assert "a" in names and "b" not in names
+
+
+def test_names_the_base_side_lost_count_against_what_still_refers_to_them():
+    # The diff deleted `_check` (or renamed it): on the head side nothing in the file is called
+    # `_check` any more, but `_add_item` still calls it.
+    head = ROUTES.replace('def _check(scope):\n    return scope == "admin"\n', "")
+    blank = head.splitlines().index("LIMIT = 10") + 2
+    alone = touched_symbols(head, [(blank, blank)])
+    assert alone is not None and "_add_item" not in alone[0]
+    removed = touched_symbols(ROUTES, [(line_of("def _check(scope):"), line_of('return scope == "admin"'))])
+    assert removed is not None and "_check" in removed[0]
+    seeded = touched_symbols(head, [(blank, blank)], removed[0])
+    assert seeded is not None and "_add_item" in seeded[0] and "_health" not in seeded[0]
 
 
 def test_a_change_inside_one_handler_touches_that_handler_and_its_factory_only():
@@ -164,8 +214,21 @@ FEATURES = [
 SOURCES = {"api/routes.py": ROUTES}
 
 
-def siblings(features, lines, ranges, sources=SOURCES):
-    return sibling_features(features, lines, ranges, sources.get)
+def siblings(features, lines, ranges, sources=SOURCES, base_ranges=None, base=None):
+    return sibling_features(features, lines, ranges, sources.get, base_ranges or {}, (base or {}).get)
+
+
+def test_a_helper_the_diff_removes_keeps_its_callers_out_of_the_siblings():
+    head = ROUTES.replace('def _check(scope):\n    return scope == "admin"\n', "")
+    at = head.splitlines().index("LIMIT = 10") + 3  # where the deleted lines sat, clear of `LIMIT`
+    gone = (line_of("def _check(scope):"), line_of('return scope == "admin"'))
+    args = (FEATURES, {"api/routes.py": 2}, {"api/routes.py": [(at, at)]}, {"api/routes.py": head})
+    found = siblings(*args, base_ranges={"api/routes.py": [gone]}, base=SOURCES)
+    assert found == {"feat_route_list", "feat_route_delete", "feat_route_health"}
+    # the base text is unreadable ⇒ nothing in the file is provable
+    assert siblings(*args, base_ranges={"api/routes.py": [gone]}, base={}) == set()
+    # and without the base side's ranges at all, nothing anywhere is
+    assert sibling_features(*args[:3], args[3].get) == set()
 
 
 def test_only_the_handlers_the_diff_leaves_alone_are_siblings():
@@ -227,7 +290,7 @@ def test_a_reader_that_raises_ranks_everything_as_touched():
     def boom(path):
         raise RuntimeError("disk")
 
-    assert sibling_features(FEATURES, {"api/routes.py": 1}, {"api/routes.py": [(1, 1)]}, boom) == set()
+    assert sibling_features(FEATURES, {"api/routes.py": 1}, {"api/routes.py": [(1, 1)]}, boom, {}) == set()
 
 
 def test_the_head_reader_refuses_what_is_not_a_regular_file_inside_the_checkout(tmp_path):
@@ -242,6 +305,20 @@ def test_the_head_reader_refuses_what_is_not_a_regular_file_inside_the_checkout(
     assert read_head_source(checkout, "../secret.py") is None
     assert read_head_source(checkout, "big.py") is None
     assert read_head_source(checkout, "missing.py") is None
+
+
+def test_hunk_headers_give_both_sides_of_the_diff():
+    diff = (
+        "--- a/api/routes.py\n+++ b/api/routes.py\n"
+        "@@ -7,2 +6,0 @@ LIMIT\n"  # a pure deletion: two base lines, sits after head line 6
+        "@@ -20 +18,3 @@\n"  # one base line became three
+        "@@ -30,0 +31,2 @@\n"  # a pure addition: no base lines
+        "--- /dev/null\n+++ b/api/new.py\n@@ -0,0 +1,9 @@\n"
+        "--- a/api/gone.py\n+++ /dev/null\n@@ -1,4 +0,0 @@\n"
+    )
+    head, base = parse_hunk_ranges(diff)
+    assert head == {"api/routes.py": [(6, 6), (18, 20), (31, 32)], "api/new.py": [(1, 9)]}
+    assert base == {"api/routes.py": [(7, 8), (20, 20)], "api/gone.py": [(1, 4)]}
 
 
 # ── the plan ───────────────────────────────────────────────────────────────────────────────────
@@ -293,8 +370,10 @@ def env(monkeypatch):
     monkeypatch.setattr(pp, "run_gh", fake_run_gh)
 
 
-def make_git(files: dict[str, str], hunks: dict[str, list[tuple[int, int]]]):
-    """A checkout holding `files`, whose diff changes `hunks` (head-side line ranges)."""
+def make_git(files: dict[str, str], hunks: dict[str, list[tuple[int, int]]], base_files=None, removed=None):
+    """A checkout holding `files`, whose diff changes `hunks` (head-side line ranges). `removed`
+    gives base-side ranges per file (default: a pure addition) and `base_files` the merge-base text."""
+    removed = removed or {}
 
     async def run_git(args, timeout_s=180):
         if args[0] == "clone":
@@ -307,8 +386,16 @@ def make_git(files: dict[str, str], hunks: dict[str, list[tuple[int, int]]]):
         if "--unified=0" in args:
             out = ""
             for path, ranges in hunks.items():
-                out += f"+++ b/{path}\n" + "".join(f"@@ -{a},1 +{a},{b - a + 1} @@\n" for a, b in ranges)
+                gone = removed.get(path) or [(a, a - 1) for a, _ in ranges]
+                out += f"--- a/{path}\n+++ b/{path}\n"
+                for (a, b), (c, d) in zip(ranges, gone, strict=True):
+                    out += f"@@ -{c},{d - c + 1} +{a},{b - a + 1} @@\n"
             return 0, out, ""
+        if "merge-base" in args:
+            return (0, SHA_BASE + "\n", "") if base_files is not None else (128, "", "fatal")
+        if "show" in args:
+            path = args[-1].split(":", 1)[1]
+            return (0, base_files[path], "") if path in (base_files or {}) else (128, "", "fatal")
         if "diff" in args:
             return 0, "".join(f"{p}\n" for p in hunks), ""
         return 0, "", ""
@@ -342,12 +429,12 @@ class FakeClawpatch:
         return 0, "{}", stderr, False
 
 
-def run(tmp_path, features, hunks, cfg=None, files=SOURCES):
+def run(tmp_path, features, hunks, cfg=None, files=SOURCES, **git):
     claw, tele = FakeClawpatch(features), Recorder()
     base = {"checkout_root": str(tmp_path / "co"), "state_root": str(tmp_path / "st"), "default_repo": ""}
     base["structural_result_cache"] = False
     runner = ProtoPatchRunner(
-        {**base, **(cfg or {})}, run_git=make_git(files, hunks), run_clawpatch=claw, telemetry=tele
+        {**base, **(cfg or {})}, run_git=make_git(files, hunks, **git), run_clawpatch=claw, telemetry=tele
     )
     return runner, claw, tele
 
@@ -402,3 +489,22 @@ async def test_under_the_cap_every_sibling_is_still_reviewed(tmp_path):
     out = await runner.review(1, "o/r")
     assert claw.listed[0] == "feat_route_health" and sorted(claw.listed) == sorted(f["featureId"] for f in FEATURES)
     assert "plan: 4 of 4 eligible feature(s)" in out and "not reviewed" not in out
+
+
+async def test_a_helper_removed_by_the_diff_keeps_its_caller_ahead_of_the_siblings(tmp_path):
+    head = ROUTES.replace('def _check(scope):\n    return scope == "admin"\n', "")
+    at = head.splitlines().index("LIMIT = 10") + 3  # where the deleted lines sat, clear of `LIMIT`
+    gone = [(line_of("def _check(scope):"), line_of('return scope == "admin"'))]
+    git = dict(files={"api/routes.py": head}, removed={"api/routes.py": gone})
+    cfg = {"structural_max_features": 1}
+
+    runner, claw, tele = run(tmp_path / "a", FEATURES, {"api/routes.py": [(at, at)]}, cfg, base_files=SOURCES, **git)
+    out = await runner.review(1, "o/r")
+    assert claw.listed == ["feat_route_add"]  # the one handler that still calls `_check`
+    assert not out.startswith(PARTIAL_PREFIX) and tele.events[0][1]["dropped_siblings"] == 3
+
+    # The merge base cannot be read: the file's base side is unknown, so every feature ranks as
+    # touched and the cap is a coverage gap again — never a silent "untouched".
+    runner, claw, tele = run(tmp_path / "b", FEATURES, {"api/routes.py": [(at, at)]}, cfg, **git)
+    out = await runner.review(1, "o/r")
+    assert out.startswith(PARTIAL_PREFIX) and tele.events[0][1]["siblings"] == 0

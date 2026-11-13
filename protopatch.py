@@ -448,6 +448,38 @@ def parse_numstat(out: str) -> dict[str, int]:
     return lines
 
 
+_HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+
+
+def parse_hunk_ranges(diff: str) -> tuple[dict[str, list[tuple[int, int]]], dict[str, list[tuple[int, int]]]]:
+    """(head-side, base-side) changed line ranges per file from `git diff --unified=0 --no-renames`.
+
+    The head side keeps a pure deletion as the one line it sits after (as `_changed_ranges` does);
+    the base side lists only lines the diff really removes, so a file the PR only adds to has no
+    base entry at all. A deleted file is keyed by its old path on the base side only."""
+    head: dict[str, list[tuple[int, int]]] = {}
+    base: dict[str, list[tuple[int, int]]] = {}
+    old = new = ""
+    for line in (diff or "").splitlines():
+        if line.startswith("--- "):
+            name = line[4:].strip()
+            old = "" if name == "/dev/null" else _norm_path(name[2:] if name.startswith("a/") else name)
+        elif line.startswith("+++ "):
+            name = line[4:].strip()
+            new = "" if name == "/dev/null" else _norm_path(name[2:] if name.startswith("b/") else name)
+        elif line.startswith("@@ "):
+            m = _HUNK_RE.match(line)
+            if not m:
+                continue
+            a, b = int(m.group(1)), int(m.group(2)) if m.group(2) is not None else 1
+            c, d = int(m.group(3)), int(m.group(4)) if m.group(4) is not None else 1
+            if new:
+                head.setdefault(new, []).append((c, c + max(d, 1) - 1))
+            if old and b > 0:
+                base.setdefault(old, []).append((a, a + b - 1))
+    return head, base
+
+
 def read_head_source(checkout: Path, path: str) -> str | None:
     """The text of one file of the checked-out head, for the symbol scope (#340) — None when it is
     not a regular file inside the checkout (a symlink a PR added must not point the parser
@@ -545,6 +577,8 @@ def sibling_features(
     changed_lines: dict[str, int],
     ranges: dict[str, list[tuple[int, int]]] | None,
     read_source,
+    base_ranges: dict[str, list[tuple[int, int]]] | None = None,
+    read_base=None,
 ) -> set[str]:
     """Ids of the features that own a changed file while the diff PROVABLY touches none of their
     own code (#340).
@@ -559,14 +593,18 @@ def sibling_features(
         ranges known, and holds at least one of the feature's entrypoint symbols;
       - each of those symbols is a definition in that file, and `touched_symbols` says the diff
         touches none of them — not directly, not through a changed helper, constant or import they
-        reference.
+        reference, on EITHER side of the diff: what the base side's removed lines touched (a deleted
+        or renamed helper) seeds the head side's answer.
 
-    `read_source(path)` returns the head text of a file or None. Ranges are widened by one line
-    each way, so a pure deletion at a definition's edge still counts against it. Never raises."""
+    `read_source(path)` returns the head text of a file or None; `read_base(path)` the merge-base
+    text. `ranges` / `base_ranges` are the head- and base-side changed lines; a file with base-side
+    changes whose base text cannot be read or parsed is unknown, and without `base_ranges` at all
+    nothing can be proven. Ranges are widened by one line each way, so a change at a definition's
+    edge still counts against it. Never raises."""
     try:
         from .symbol_scope import touched_symbols
 
-        if not ranges:
+        if not ranges or base_ranges is None:
             return set()
         changed = set(changed_lines)
         signal = {p for p in changed if not is_low_signal(p)}
@@ -576,10 +614,17 @@ def sibling_features(
             if path not in scopes:
                 scopes[path] = None
                 if path.endswith((".py", ".pyi")) and ranges.get(path):
+                    seeds: set[str] = set()
+                    if base_ranges.get(path):
+                        before = read_base(path) if read_base is not None else None
+                        removed = touched_symbols(before, [(a - 1, b + 1) for a, b in base_ranges[path]])
+                        if removed is None:
+                            return None  # the base side is unknown: nothing in this file is provable
+                        seeds = removed[0]
                     source = read_source(path)
                     if source is not None:
                         widened = [(a - 1, b + 1) for a, b in ranges[path]]
-                        scopes[path] = touched_symbols(source, widened)
+                        scopes[path] = touched_symbols(source, widened, seeds)
             return scopes[path]
 
         out: set[str] = set()
@@ -1183,12 +1228,49 @@ class ProtoPatchRunner:
                 lines.setdefault(_norm_path(path), 1)
             siblings: set[str] = set()
             if self.symbol_scope:
-                ranges = await self._changed_ranges(checkout, base_sha)
-                siblings = sibling_features(features, lines, ranges, lambda path: read_head_source(checkout, path))
+                siblings = await self._siblings(features, lines, checkout, base_sha)
             return plan_features(features, lines, self.max_features, siblings)
         except Exception:  # noqa: BLE001 — a failed plan falls back to the pre-#232 path, never raises
             log.exception("[pr-reviewer] structural plan failed; using --since")
             return None
+
+    async def _siblings(self, features: list[dict], lines: dict[str, int], checkout: Path, base_sha: str) -> set[str]:
+        """The features this diff provably does not touch (#340, `sibling_features`): both sides'
+        changed line ranges from one `--unified=0` diff, the head text from the checkout and the
+        base text from the merge base. Any git fault leaves that side unknown. Never raises."""
+        try:
+            from .checkout_cache import _default_run_git
+            from .symbol_scope import MAX_SOURCE_BYTES
+
+            run = self._run_git or _default_run_git
+            rc, out, _err = await run(
+                ["-C", str(checkout), "diff", "--unified=0", "--no-renames", f"{base_sha}...HEAD"]
+            )
+            if rc != 0:
+                return set()
+            head_ranges, base_ranges = parse_hunk_ranges(out)
+            owned = {p for f in features for p in _paths(f.get("ownedFiles"))}
+            wanted = sorted(p for p in base_ranges if p in head_ranges and p in owned and p.endswith((".py", ".pyi")))
+            before: dict[str, str] = {}
+            if wanted:
+                rc, merge_base, _err = await run(["-C", str(checkout), "merge-base", base_sha, "HEAD"])
+                merge_base = merge_base.strip()
+                if rc == 0 and re.fullmatch(r"[0-9a-f]{40,64}", merge_base):
+                    for path in wanted:
+                        rc, text, _err = await run(["-C", str(checkout), "show", f"{merge_base}:{path}"])
+                        if rc == 0 and len(text) <= MAX_SOURCE_BYTES:
+                            before[path] = text
+            return sibling_features(
+                features,
+                lines,
+                head_ranges,
+                lambda path: read_head_source(checkout, path),
+                base_ranges,
+                before.get,
+            )
+        except Exception:  # noqa: BLE001 — a failed analysis ranks every feature as touched
+            log.exception("[pr-reviewer] structural symbol scope failed; ranking by file only")
+            return set()
 
     async def _head_blobs(self, checkout: Path) -> dict[str, str] | None:
         """{path: blob SHA} for every file at the checked-out head — the content identity the

@@ -63,8 +63,12 @@ hold; anything short of it ranks the feature as touched:
 
 - it owns a changed file, and no changed source file reaches it as context;
 - every changed file it owns is Python that parses at head and holds one of its entrypoint symbols;
-- the diff touches none of those symbols — not a line of the definition (decorators included), and
-  not a helper, constant, closure variable or import the definition references, transitively.
+- the diff touches none of those symbols — not a line of the definition (decorators included) or of
+  anything nested in it, not the signature / bases / decorators of a class or factory that holds it,
+  not a condition that guards it, and not a helper, constant, closure variable or import the
+  definition references, transitively. Both sides of the diff count: a helper the PR deletes or
+  renames is found in the merge-base text and held against everything that still refers to it. If
+  the base text cannot be read, nothing in that file is provable.
 
 Siblings are still reviewed while the cap has room: a review of an untouched handler is what
 notices that a check added to two handlers is missing from the third. But siblings the cap leaves
