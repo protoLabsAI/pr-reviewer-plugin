@@ -667,3 +667,105 @@ async def test_the_barrier_seeds_exactly_what_the_first_run_persisted_343(tmp_pa
     assert a.coverage(result, "code-review-structural")["complete"]
     # the ids still reach the synthesizer: every raw finding is in the inventory input it is given
     assert [v["finding"] for v in result["finding_accounting"]["raw"].values()] == [F]
+
+
+# ── the shapes real stages emit (#351) ─────────────────────────────────────────────────────────
+# Every code-review-structural round on Vera after v0.71.0 read "Raw finding accounting:
+# incomplete" (protoAgent#5168 ×3, mythxengine#908), so v0.71–v0.74 capped every structural
+# verdict at WARN. Replayed through this checker, all four reconcile; none of these is a lost
+# finding.
+
+
+def json_fenced(rows, rejected=(), *, dispositions_last=False):
+    """A stage that writes its accounting object in an ordinary ```json fence, as models do."""
+    acct = "```json\n" + json.dumps({"dispositions": list(rejected)}) + "\n```"
+    found = "```json\n" + json.dumps(rows) + "\n```"
+    return "<!-- brief -->Review.<!-- /brief -->\n" + (
+        f"{found}\n\n{acct}" if dispositions_last else f"{acct}\n\n{found}"
+    )
+
+
+def stages(inv, text_by_stage):
+    return a.reconcile(inv, text_by_stage, text_by_stage["report"])
+
+
+def test_a_finders_gap_note_is_not_incomplete_raw_input():
+    steps = raw([F])
+    steps[a.LANES[0]] += "\n\nGap: unverified. I could not see which models are configured, so I left this out."
+    assert a.inventory(steps, {"head": HEAD, "attempt": "a"})["gaps"] == []
+    # the signals that really mean a cut-short array still count
+    for signal in ("FINDER_STATUS: blocked", "TRUNCATED", "Lane hard-stopped at max_turns: 40"):
+        cut = raw([F])
+        cut[a.LANES[0]] += f"\n{signal}"
+        assert a.inventory(cut, {"head": HEAD, "attempt": "a"})["gaps"] == [f"{a.LANES[0]}: incomplete raw input"]
+
+
+@pytest.mark.parametrize("last", [False, True])
+def test_the_accounting_object_in_a_json_fence_before_or_after_the_findings(last):
+    inv, rows = prepared()
+    text = json_fenced(rows, dispositions_last=last)
+    assert a.dispositions(text) == []
+    assert a.array(text) == rows
+    assert stages(inv, {s: text for s in a.STAGES})["complete"]
+
+
+def test_a_json_fenced_disposition_is_read_so_the_finding_is_not_silently_dropped():
+    inv, _rows = prepared()
+    rid = next(iter(inv["raw"]))
+    gone = [{"raw_ids": [rid], "disposition": "out-of-scope", "reason": "not this diff", "evidence": "x.py:9"}]
+    result = stages(inv, {s: json_fenced([], gone) for s in a.STAGES})
+    assert result["complete"], result["gaps"]
+
+
+def test_a_truncated_final_findings_draft_still_invalidates_the_stage():
+    inv, rows = prepared()
+    broken = json_fenced(rows) + '\n```json\n[{"file": "x.py", "line": 3,'
+    assert a.array(broken) is None
+    assert any("missing or malformed" in g for g in stages(inv, {s: broken for s in a.STAGES})["gaps"])
+
+
+def test_a_merged_survivor_without_finding_id_is_named_by_its_first_raw_id():
+    inv, _rows = prepared([F, dict(F, claim="Same bug, other lane wording")])
+    ids = sorted(inv["raw"])
+    merged = [dict(F, raw_ids=ids, verdict="confirmed", accounting_reason="merged duplicates")]
+    assert stages(inv, {s: output(merged) for s in a.STAGES})["complete"]
+    # a finding_id that is not one of the row's own ids is still a gap
+    foreign = [dict(merged[0], finding_id="elsewhere")]
+    assert any("survivor identity" in g for g in stages(inv, {s: output(foreign) for s in a.STAGES})["gaps"])
+
+
+def test_restating_a_disposition_in_other_words_is_not_a_change_but_flipping_it_is():
+    inv, _rows = prepared()
+    rid = next(iter(inv["raw"]))
+
+    def gone(kind, reason):
+        return [{"raw_ids": [rid], "disposition": kind, "reason": reason, "evidence": "x.py:9"}]
+
+    reworded = {
+        "synthesize": output([], gone("out-of-scope", "The route is not touched by the residual diff.")),
+        "verify": output([], gone("out-of-scope", "The route is not touched by this PR's diff.")),
+        "report": output([], gone("out-of-scope", "Not touched by this PR.")),
+    }
+    assert stages(inv, reworded)["complete"]
+    flipped = dict(reworded, report=output([], gone("refuted", "Not touched by this PR.")))
+    assert f"report: changed disposition {rid}" in stages(inv, flipped)["gaps"]
+
+
+def test_evidence_rewording_needs_no_reason_but_severity_file_or_line_does():
+    inv, rows = prepared()
+    sharpened = [dict(rows[0], evidence="quote (x.py:3)")]
+    assert stages(inv, {s: output(sharpened) for s in a.STAGES})["complete"]
+    for field, value in (("severity", "major"), ("line", 9), ("file", "y.py")):
+        moved = [dict(rows[0], **{field: value})]
+        gaps = stages(inv, {s: output(moved) for s in a.STAGES})["gaps"]
+        assert any("unexplained transformation" in g for g in gaps), field
+
+
+def test_the_verifiers_note_explains_its_change_after_synthesis():
+    inv, rows = prepared()
+    regraded = [dict(rows[0], severity="nit", note="Re-read x.py: the guard makes this cosmetic.")]
+    text = {"synthesize": output(rows), "verify": output(regraded), "report": output(regraded)}
+    assert stages(inv, text)["complete"]
+    # …but synthesis must still give an accounting_reason of its own
+    early = {s: output(regraded) for s in a.STAGES}
+    assert "synthesize: unexplained transformation" in " ".join(stages(inv, early)["gaps"])

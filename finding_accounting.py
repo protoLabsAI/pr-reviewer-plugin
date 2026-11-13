@@ -34,7 +34,11 @@ def array(output, *, allow_malformed=False):
                 in_fence = False
         else:
             in_fence = True
-            if language in ("", "json"):
+            # The accounting object written as a json fence AFTER the findings (#351) is not a
+            # findings draft: skip a fence that holds a well-formed `{"dispositions": [...]}`.
+            # Anything else — a truncated or malformed final draft — still becomes the candidate
+            # and still invalidates the stage.
+            if language in ("", "json") and _disposition_block(text, fence) is None:
                 candidate = fence
     try:
         if candidate is not None:
@@ -64,8 +68,12 @@ def inventory(steps, binding):
         if rows is None:
             result["gaps"].append(f"{lane}: missing or malformed raw array")
             continue
+        # Signals that the lane's raw ARRAY may be cut short. A finder's `Gap:` note ("could not
+        # check X, left it out") is not one: the array it wrote is whole, and the note already
+        # reaches the report and its coverage line. Counting it here made 48% of structural
+        # rounds "incomplete" on Vera (#351: 67 of 140 runs since 2026-11-11).
         if re.search(
-            r"(?m)^.*hard-stopped at max_turns:|^FINDER_STATUS: blocked|^PROTOPATCH (?:UNAVAILABLE|PARTIAL)|^Gap: |^protoPatch structural pass partial|^TRUNCATED",
+            r"(?m)^.*hard-stopped at max_turns:|^FINDER_STATUS: blocked|^PROTOPATCH (?:UNAVAILABLE|PARTIAL)|^protoPatch structural pass partial|^TRUNCATED",
             output,
             re.I,
         ):
@@ -89,13 +97,10 @@ def inventory(steps, binding):
     return result
 
 
-def dispositions(output):
-    text = str(output or "")
-    blocks = list(re.finditer(r"(?m)^```accounting[ \t]*\n", text))
+def _disposition_block(text, fence):
+    """`dispositions` of the object in `fence`, or None when it does not hold a well-formed one."""
     try:
-        if not blocks:
-            return None
-        payload = text[blocks[-1].end() :].lstrip()
+        payload = text[fence.end() :].lstrip()
         data, end = json.JSONDecoder().raw_decode(payload)
         if not payload[end:].lstrip().startswith("```"):
             return None
@@ -103,6 +108,26 @@ def dispositions(output):
         return rows if isinstance(rows, list) else None
     except (ValueError, TypeError):
         return None
+
+
+def dispositions(output):
+    """The stage's dispositions list, or None when it emitted no well-formed accounting object.
+
+    The recipe asks for "a separate fenced `accounting` JSON object", which models write both as
+    an ```accounting fence and as an ordinary ```json fence holding `{"dispositions": [...]}`
+    (every structural round on Vera after v0.71.0 did the latter, so each read as "missing"
+    and properly disposed findings read as silently dropped — #351). Both are accepted; the
+    LAST ```accounting fence wins, else the last json/bare fence whose payload is an OBJECT
+    with a `dispositions` list. A findings array is a list, so it can never be taken for one."""
+    text = str(output or "")
+    tagged = list(re.finditer(r"(?m)^```accounting[ \t]*\n", text))
+    if tagged:
+        return _disposition_block(text, tagged[-1])
+    for fence in reversed(list(re.finditer(r"(?m)^```(?:json)?[ \t]*\n", text))):
+        rows = _disposition_block(text, fence)
+        if rows is not None:
+            return rows
+    return None
 
 
 def reconcile(accounting, steps, output, *, history=()):
@@ -162,7 +187,10 @@ def reconcile(accounting, steps, output, *, history=()):
             if not isinstance(ids, list) or not ids or any(not isinstance(i, str) for i in ids):
                 result["gaps"].append(f"{stage}: finding missing raw identities")
                 continue
-            target = row.get("finding_id")
+            # `finding_id` names the survivor; a merge that leaves it out is named by its first raw
+            # id (deterministic, and always one of its own). A finding_id that names an id the row
+            # does not carry, or one another survivor already took, is still a gap.
+            target = row.get("finding_id", ids[0])
             if not isinstance(target, str) or target not in ids or target in targets:
                 result["gaps"].append(f"{stage}: invalid or duplicate survivor identity")
             targets.add(target if isinstance(target, str) else "")
@@ -172,12 +200,22 @@ def reconcile(accounting, steps, output, *, history=()):
                 if rid in settled:
                     result["gaps"].append(f"{stage}: resurrected disposition {rid}")
                 if before is not None:
-                    changed = any(before.get(k) != row.get(k) for k in ("severity", "file", "line", "evidence"))
-                    if changed and not (
-                        isinstance(row.get("accounting_reason"), str)
-                        and row["accounting_reason"].strip()
-                        and row.get("evidence")
-                    ):
+                    # Severity, file and line are the decision; they need a stated reason to move.
+                    # Evidence text is re-checked verbatim against the code by grounding after the
+                    # report, and every rewording is kept in `transitions` below, so an evidence-only
+                    # edit stays traceable without one (#351: 1 of 4 live rounds was incomplete for
+                    # nothing but a synthesizer re-phrasing a structural finding's evidence).
+                    changed = any(before.get(k) != row.get(k) for k in ("severity", "file", "line"))
+                    # The verifier states what it changed and why in its own `note` (its contract
+                    # is `verdict` + `note`), so after synthesis a note explains a change as well
+                    # as `accounting_reason` does (#351: a verifier that sharpened a citation to
+                    # `PROTO.md:112` read as an "unexplained transformation").
+                    why = (
+                        row.get("accounting_reason")
+                        if stage == "synthesize"
+                        else (row.get("accounting_reason") or row.get("note"))
+                    )
+                    if changed and not (isinstance(why, str) and why.strip() and row.get("evidence")):
                         result["gaps"].append(f"{stage}: unexplained transformation {rid}")
                     result["transitions"].append(
                         {"stage": stage, "raw_id": rid, "target": target, "before": before, "after": row}
@@ -201,7 +239,11 @@ def reconcile(accounting, steps, output, *, history=()):
             ):
                 result["gaps"].append(f"{stage}: unreasoned disposition")
             for rid in ids:
-                if rid in settled and settled[rid] != item:
+                # A later stage must not FLIP a disposition (out-of-scope → refuted, or back into
+                # the findings — the resurrection check above). Restating its reason in other
+                # words is not a flip: every later stage re-emits the block, and models paraphrase
+                # (#351: 21 "changed disposition" gaps on one round, every one the same kind).
+                if rid in settled and settled[rid].get("disposition") != item.get("disposition"):
                     result["gaps"].append(f"{stage}: changed disposition {rid}")
                 settled[rid] = item
                 result["transitions"].append(
