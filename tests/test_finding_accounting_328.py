@@ -969,3 +969,12 @@ def test_raising_severity_needs_no_reason_but_lowering_it_does():
 
     assert unverified("major") == []
     assert any("unexplained transformation" in g for g in unverified("nit"))
+
+
+@pytest.mark.parametrize("severity", [["major"], {"level": "major"}, None, 3])
+def test_an_unhashable_or_odd_severity_is_a_gap_not_a_crash(severity):
+    inv, rows = prepared()
+    odd = [dict(rows[0], severity=severity)]
+    result = reconciled(inv, {s: output(odd) for s in a.STAGES})
+    assert any("malformed survivor fields" in g for g in result["gaps"])
+    assert any("unexplained transformation" in g for g in a.unverifying(result))

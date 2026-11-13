@@ -234,8 +234,10 @@ def reconcile(accounting, steps, output, *, history=()):
                         new = row.get(field)
                         if before.get(field) == new or any(m.get(field) == new for m in merged):
                             return False
-                        if field == "severity" and _SEVERITY_RANK.get(new, -1) > _SEVERITY_RANK.get(
-                            before.get(field), 99
+                        # str(): a model may emit a list or dict here; an unknown value ranks as no
+                        # upgrade, so it still needs a reason rather than crashing the round.
+                        if field == "severity" and _SEVERITY_RANK.get(str(new), -1) > _SEVERITY_RANK.get(
+                            str(before.get(field)), 99
                         ):
                             return False
                         return True
