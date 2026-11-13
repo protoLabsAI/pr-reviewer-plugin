@@ -399,6 +399,36 @@ def test_the_scope_block_names_both_sets_and_carries_the_delta():
     assert "rewrote history" in inc.render_scope_block(plan, 2, None, 10_000)
 
 
+def test_the_carried_lead_counts_only_surviving_carries():
+    # #325: the lead names the surviving carry count and the prior head, and supersedes
+    # the model-written brief beneath it.
+    plan = select_scope(
+        {"head": H0, "findings": [PRIOR_MINOR]},
+        _rows(ROWS_H1),
+        _rows(ROWS_H0),
+        prior_recipe=STRUCTURAL,
+        recipe=STRUCTURAL,
+    )
+    lead = inc.render_carried_lead(plan)
+    assert lead.startswith(f"**1 finding(s) carried forward from `{H0[:12]}` still stand**")
+    assert "this line supersedes it" in lead
+    # No lead when the flag is off (no plan), the round is full, nothing was carried, or
+    # every carry was dropped at this head.
+    assert inc.render_carried_lead(None) == ""
+    assert inc.render_carried_lead(Plan.full("summon")) == ""
+    nothing = select_scope(
+        {"head": H0, "findings": [PRIOR_MAJOR]},  # the one prior sits on an in-scope file
+        _rows(ROWS_H1),
+        _rows(ROWS_H0),
+        prior_recipe=STRUCTURAL,
+        recipe=STRUCTURAL,
+    )
+    assert nothing.carried == [] and inc.render_carried_lead(nothing) == ""
+    dropped = Plan(mode="scoped", prior_head=H0, carried=[{"a": 1}])
+    inc.drop_ungrounded_carries(dropped, [{"a": 1, "ungrounded": True}])
+    assert inc.render_carried_lead(dropped) == ""
+
+
 def test_telemetry_is_absent_when_the_flag_is_off_and_estimates_the_saving():
     assert inc.telemetry_fields(None) == {}
     assert inc.telemetry_fields(Plan.full("summon")) == {"incremental": "full:summon"}
@@ -473,6 +503,7 @@ async def test_round_two_reviews_only_the_delta_and_carries_the_rest(tmp_path):
     assert any(f["file"] == "pkg/engine.py" and f["severity"] == "major" for f in posted)
     body = gh.reviews_posted[-1]["body"]
     assert "Incremental re-review (#313): 2 of 4 file(s)" in body
+    assert f"**1 finding(s) carried forward from `{H0[:12]}` still stand**" in body  # the #325 lead
     [row] = _events(d, "reviewed")
     assert row["incremental"] == "scoped"
     assert (row["files_reviewed"], row["files_carried"], row["carried_kept"], row["carried_dropped"]) == (2, 2, 1, 0)
@@ -500,6 +531,38 @@ async def test_a_carry_whose_evidence_is_gone_at_head_is_dropped(tmp_path):
     assert row["carried_kept"] == 0 and row["carried_dropped"] == 1
     assert outcome == "reviewed:WARN"  # this legacy runner supplies no native raw inventory
     assert "complete=false" in gh.reviews_posted[-1]["body"]
+    # Every carry was dropped, so the body carries no #325 lead.
+    assert "carried forward from" not in gh.reviews_posted[-1]["body"]
+
+
+async def test_a_surviving_carry_leads_the_body_above_a_clean_brief(tmp_path):
+    """#325 (protoAgent#4908 r2): the panel sees only this round's in-scope findings, so its
+    brief called the round clean while a carried minor made it WARN. The code-authored lead
+    must sit ABOVE that brief and supersede it."""
+
+    class CleanBriefRunner(CapturingRunner):
+        async def __call__(self, name, inputs):
+            self.inputs.append(dict(inputs))
+            return {
+                "output": (
+                    "<!-- brief -->\nThe panel found no defects. No findings were raised. Clean.\n"
+                    "<!-- /brief -->\n\n```json\n[]\n```"
+                ),
+                "steps": {},
+                "failed": [],
+            }
+
+    gh = IncGH(reviews=[_prior_review(H0, [PRIOR_MINOR])])
+    runner = CleanBriefRunner([])
+    d = make(tmp_path, gh=gh, runner=runner, cfg={"incremental_review": True})
+    outcome = await d.handle_pr_event("o/r", 1, H1, "synchronize")
+    assert outcome.startswith("reviewed:")
+    body = gh.reviews_posted[-1]["body"]
+    lead = f"**1 finding(s) carried forward from `{H0[:12]}` still stand**"
+    assert lead in body and "this line supersedes it" in body
+    assert body.index(lead) < body.index("The panel found no defects.")  # above the brief
+    [carried] = [f for f in _posted_findings(gh) if f.get("carried_by") == inc.CARRIED_BY]
+    assert carried["file"] == "pkg/render.py"
 
 
 @pytest.mark.parametrize(
