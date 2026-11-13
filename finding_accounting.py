@@ -12,6 +12,7 @@ import json
 import re
 
 LANES = ("find_correctness", "find_removed_behavior", "find_crossfile", "find_conventions", "find_structural")
+_SEVERITY_RANK = {"nit": 0, "minor": 1, "major": 2, "blocker": 3}
 STAGES = ("synthesize", "verify", "report")
 
 
@@ -216,7 +217,32 @@ def reconcile(accounting, steps, output, *, history=()):
                         return str(value or "").strip()
 
                     blanked = bool(_text(before.get("evidence"))) and not _text(row.get("evidence"))
-                    changed = blanked or any(before.get(k) != row.get(k) for k in ("severity", "file", "line"))
+                    # A merge explains itself: a row that folds several raw findings together may
+                    # take its file, line or severity from any of them (#355 review: all three
+                    # "unexplained" moves on 40 live rounds were merges taking a sibling's line, or a
+                    # nit merged into a minor). Raising severity never hides anything. A downgrade,
+                    # or a move to a value none of the merged findings had, still needs a reason.
+                    merged = [
+                        result["raw"][i]["finding"]
+                        for i in ids
+                        if isinstance(i, str)
+                        and i in result["raw"]
+                        and isinstance(result["raw"][i].get("finding"), dict)
+                    ]
+
+                    def moved(field):
+                        new = row.get(field)
+                        if before.get(field) == new or any(m.get(field) == new for m in merged):
+                            return False
+                        # str(): a model may emit a list or dict here; an unknown value ranks as no
+                        # upgrade, so it still needs a reason rather than crashing the round.
+                        if field == "severity" and _SEVERITY_RANK.get(str(new), -1) > _SEVERITY_RANK.get(
+                            str(before.get(field)), 99
+                        ):
+                            return False
+                        return True
+
+                    changed = blanked or any(moved(k) for k in ("severity", "file", "line"))
                     # Only `accounting_reason` explains a move, at every stage. The verifier's `note`
                     # does not: it is on every verified row, so accepting it would excuse any regrade
                     # (#352 review). The live case that needed it was an evidence-only edit, which no
@@ -262,7 +288,142 @@ def reconcile(accounting, steps, output, *, history=()):
         if len(covered) != len(actual):
             result["gaps"].append(f"{stage}: duplicate raw identities")
     result["complete"] = not result["gaps"]
+    result["losses"] = losses(result, steps, output)
     return result
+
+
+_RAW_ID = re.compile(r"^([a-z_]+):([0-9a-f]{8,64})(?::(\d+))?$")
+
+
+def _edits(a, b, cap=2):
+    """Levenshtein distance between two short strings, stopping early past `cap`."""
+    if abs(len(a) - len(b)) > cap:
+        return cap + 1
+    row = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        prev, row[0] = row[0], i
+        best = row[0]
+        for j, cb in enumerate(b, 1):
+            prev, row[j] = row[j], min(row[j] + 1, row[j - 1] + 1, prev + (ca != cb))
+            best = min(best, row[j])
+        if best > cap:
+            return cap + 1
+    return row[-1]
+
+
+def resolve_id(rid, raw):
+    """The raw id a model meant by `rid`: itself, else the ONE raw id of the same lane whose hash is
+    within two edits (#354: of 40 live rounds, every id a stage "lost" was the same finding copied
+    with one inserted or transposed hex digit). None when it names no current raw finding."""
+    if not isinstance(rid, str):
+        return None
+    if rid in raw:
+        return rid
+    m = _RAW_ID.match(rid)
+    if not m:
+        return None
+    hits = []
+    for candidate in raw:
+        c = _RAW_ID.match(candidate)
+        if c and c[1] == m[1] and (m[3] is None or m[3] == c[3]) and _edits(m[2], c[2]) <= 2:
+            hits.append(candidate)
+    return hits[0] if len(hits) == 1 else None
+
+
+def losses(result, steps, output):
+    """Raw findings this round PROVABLY dropped: a finding a stage carried (or, before synthesis,
+    the raw inventory) that the next readable stage neither carries nor disposes of (#354).
+
+    The narrow, reliable core of the reconciliation, and the only part that gates by default
+    (`finding_accounting_gate: losses`). Deliberately NOT a loss: a later stage that does not
+    restate an earlier disposition (a disposition stands once made), an id copied with a typo
+    (`resolve_id`), and a stage whose rows carry no ids at all — that stage proves nothing either
+    way, so it neither convicts nor clears what was in flight. An unreadable intermediate stage
+    is skipped (what was in flight is judged at the next one); an unreadable REPORT with findings
+    in flight IS a loss — a truncated final draft may have dropped them."""
+    raw = set(result.get("raw") or {})
+    alive, settled, out = set(raw), set(), []
+    for stage in STAGES:
+        text = output if stage == "report" else steps.get(stage)
+        rows = array(text)
+        rejected = dispositions(text) or []
+        if rows is None:
+            # An unreadable intermediate stage proves nothing: what was in flight is judged at the
+            # next readable one (on mythxengine#929 a verifier wrote an invalid JSON escape while
+            # the report carried all three findings). Only an unreadable REPORT is a loss — nothing
+            # after it can show the findings survived.
+            if stage == "report" and alive - settled:
+                out.append(f"report: findings array unreadable with {len(alive - settled)} finding(s) in flight")
+            continue
+
+        def ids(item):
+            value = item.get("raw_ids") if isinstance(item, dict) else None
+            return value if isinstance(value, list) else []
+
+        carried = {resolve_id(i, raw) for row in rows for i in ids(row)} - {None}
+        settled |= {resolve_id(i, raw) for d in rejected for i in ids(d)} - {None}
+        if any(not ids(row) for row in rows):
+            alive = carried | (alive - settled)
+            continue
+        dropped = sorted(alive - carried - settled)
+        if dropped:
+            out.append(f"{stage}: dropped with no disposition: {', '.join(dropped)}")
+        alive = carried
+    return out
+
+
+# Under `finding_accounting_gate: losses` (the default) the trail's gaps fall in three classes:
+#
+#  - INTEGRITY (the round is incomplete AND unverified): what the trail can prove went wrong with a
+#    finding — a provable drop (`losses`), a severity/file/line move or emptied evidence with no
+#    reason, a disposition flipped, resurrected or given without a reason, a verifier that left
+#    survivors unannotated, the dispatcher's own omissions, seeded inputs that were stale or got
+#    changed, an inventory that never existed.
+#  - COVERAGE (incomplete, NOT unverified): a finder lane's raw input was cut short, malformed or
+#    degraded. A verify re-run cannot recover a lane, so this must not send the head to the
+#    unverified re-run (#354: every head of mythxengine#924 hit the structural feature cap) — it
+#    caps the verdict at WARN like any other coverage gap.
+#  - AUDIT (decides nothing): id bookkeeping — rows without their ids, a later stage not restating
+#    an earlier disposition, ids copied with a typo, a missing or unreadable accounting object.
+#    On 40 live rounds this was every gap #329's `all` held on, and none was a lost finding.
+_INTEGRITY_GAPS = (
+    "unexplained transformation",
+    "resurrected disposition",
+    "changed disposition",
+    "unreasoned disposition",
+    "incomplete survivor verification",
+    "stale or foreign finder inputs",
+    "runner changed seeded finder outputs",
+    "native inventory unavailable",
+)
+
+
+def _is_lane_gap(gap):
+    return any(gap.startswith(f"{lane}:") for lane in LANES)
+
+
+def unverifying(accounting, mode="losses"):
+    """The accounting gaps that mark the round UNVERIFIED under `mode` (`all`, `losses`, `off`)."""
+    if not isinstance(accounting, dict) or mode == "off":
+        return []
+    gaps = [g for g in accounting.get("gaps") or [] if isinstance(g, str)]
+    if mode == "all":
+        return gaps
+    integrity = [
+        g for g in gaps if not _is_lane_gap(g) and (g.startswith("final:") or any(k in g for k in _INTEGRITY_GAPS))
+    ]
+    return [g for g in accounting.get("losses") or [] if isinstance(g, str)] + integrity
+
+
+def blocking(accounting, mode="losses"):
+    """The accounting gaps that mark the round INCOMPLETE under `mode`: the unverifying ones plus,
+    under `losses`, a finder lane whose raw input was cut short, malformed or degraded."""
+    if not isinstance(accounting, dict) or mode == "off":
+        return []
+    if mode == "all":
+        return unverifying(accounting, mode)
+    lanes = [g for g in accounting.get("gaps") or [] if isinstance(g, str) and _is_lane_gap(g)]
+    return unverifying(accounting, mode) + lanes
 
 
 def coverage(result, recipe, *, history=()):

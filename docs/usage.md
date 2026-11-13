@@ -119,8 +119,9 @@ and most decisive first:
    FAILs: it stops arming blocks while keeping the formal seat, promotion and backfill.
 3. **Promote.** The [approve-on-green](promotion.md) path. When it holds at `hold:unverified`
    (the verifier flaked), the sweep runs **one** fresh round for that head, queued and budgeted
-   like a backfill, skipped on a paused PR. If that is unverified too, it stops: `QA panel` reads
-   "Verifier failed twice, summon @vera review or push" and the operator is escalated once.
+   like a backfill, skipped on a paused PR. If that is unverified too, it stops: `QA panel` concludes
+   `neutral`, "Unverified twice — not blocking" (auto-approve stays withheld, the merge is not
+   blocked; #354), and the operator is escalated once. `@vera review` or a push runs it again.
 
 A PR that was just backfilled skips 2 and 3 for that pass. Every held check names its `hold:*`
 reason in the summary.

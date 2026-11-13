@@ -218,14 +218,19 @@ def _check_for(
         # cleared. The sweep schedules ONE fresh round for the head on its own (#220); if
         # that one is unverified too it stops, and the title says what a human must do.
         if verify_retry == "exhausted":
+            # Nothing re-runs this head any more, so an `in_progress` required check here had no
+            # way out but a new commit — and when the cause is deterministic (#354: every head of
+            # mythxengine#924, 4 pushes of the same tree) not even that. Neutral, exactly like an
+            # incomplete pass (#130): not cleared (auto-approve stays withheld), not failed, and it
+            # stops blocking the merge. The posted verdict and its findings still stand.
             return CheckRun(
-                IN_PROGRESS,
-                None,
-                "Verifier failed twice — summon @vera review or push",
+                COMPLETED,
+                NEUTRAL,
+                "Unverified twice — not blocking",
                 "The panel's verdict for this head was posted without a completed verification "
-                "pass (`hold:unverified`), and the automatic re-run came back unverified too, "
-                "so the panel stopped retrying this head. Comment `@vera review` to run it "
-                "again, or push a new commit.",
+                "pass (`hold:unverified`), and the automatic re-run came back unverified too. "
+                "Auto-approve is withheld; the merge is not. The verdict and its findings are in "
+                "the review. Comment `@vera review` to run the panel again, or push a new commit.",
             )
         return CheckRun(
             IN_PROGRESS,
