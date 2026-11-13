@@ -12,8 +12,13 @@ Prior-review recall reads our marker line out of the PR's posted reviews (GitHub
 the store, ADR 0078 D5); the recalled findings JSON becomes the recipe's
 `prior_findings` input (delta re-review).
 
-Fail-closed exhaustion (D3): a run with ANY failed panel step posts nothing and
-escalates to the operator inbox — a partial panel must never produce a verdict.
+Fail-closed exhaustion (D3): after the retry is spent, a run posts nothing and escalates
+to the operator inbox when a CRITICAL step (synthesize/verify/report) failed, any
+non-finder step failed, or EVERY finder failed — a partial panel with no delivering finder
+must never produce a verdict. A single finder lane that still fails after the retry while
+the other lanes deliver is the one exception (#357): it is carried as a coverage Gap (like
+an overran lane, #176) — the round posts a WARN-capped, complete=false verdict, not an
+exhausted round.
 
 Blocking verdicts (formal mode) go out only against terminal CI — the same #863
 policy the github-plugin tools enforce against the MODEL, enforced here in code for
@@ -4229,6 +4234,31 @@ class Dispatcher:
                 self.telemetry.emit(
                     "panel_step_timeout", repo=repo, pr=pr, sha=head, steps=step_timed_out, attempt=attempt
                 )
+            # A finder lane that still FAILED after the retry is spent (#357) — not a
+            # context overrun (handled above), just a lane that errored while the others
+            # delivered. On the LAST attempt ONLY, when every failed step is a finder lane
+            # AND at least one finder lane did deliver, move the failed lanes to `degraded`:
+            # the round carries them as a coverage Gap — the same posture as an overran lane
+            # — and continues to the verdict path. Retrying was already tried; re-rolling all
+            # five finders once more re-draws the same dice (10+ times in one day a single
+            # lane failed while the rest delivered). A critical step (synthesize/verify/
+            # report), any non-finder step, or EVERY finder failing is still D3 exhaustion
+            # below — a partial panel with no delivering finder never synthesizes a verdict.
+            if (
+                last
+                and failed
+                and all(str(s).startswith(FINDER_STEP_PREFIX) for s in failed)
+                and any(str(s).startswith(FINDER_STEP_PREFIX) and s not in failed for s in steps_now)
+            ):
+                finder_failed = list(failed)
+                failed = []
+                result = {
+                    **result,
+                    "failed": failed,
+                    "degraded": [*(result.get("degraded") or []), *finder_failed],
+                    "finder_failed": finder_failed,
+                }
+                self.telemetry.emit("finder_failed", repo=repo, pr=pr, sha=head, lanes=finder_failed, attempt=attempt)
             undelivered = (
                 []
                 if failed
@@ -4510,6 +4540,9 @@ class Dispatcher:
         )
         # The same signals as one record, for the coverage cap and note below (#117).
         overran = [str(s) for s in (result.get("overran") or [])]
+        # Finder lanes that still failed after the retry (#357) — carried as a Gap, like an
+        # overran lane, so a PASS is capped to WARN and promotion is held (no new cap).
+        finder_failed = [str(s) for s in (result.get("finder_failed") or [])]
         gaps = coverage_gaps(
             degraded,
             incomplete_finders,
@@ -4519,6 +4552,7 @@ class Dispatcher:
             overran=overran,
             structural_partial=structural_partial,
             lane_reasons=lane_repo_gaps,
+            failed_lanes=finder_failed,
         )
         accounting = _accounting.coverage(result, recipe, history=history)
         if report_lost and accounting["supported"] and accounting["complete"]:
@@ -5165,6 +5199,9 @@ class Dispatcher:
             brief_borrowed=(brief_source == "synthesize") or None,
             report_truncated=truncated or None,
             overran=overran or None,
+            # Finder lanes that failed after the retry and were carried as a Gap (#357), like
+            # `overran` — None when every lane that ran delivered, so an A/B reads off this.
+            finder_failed=finder_failed or None,
             # The model the correctness/removed-behavior lanes ran on this round (#318); None
             # when they ran on the default model, so an A/B reads straight off this field.
             deep_model=str(result.get("deep_model") or "") or None,
