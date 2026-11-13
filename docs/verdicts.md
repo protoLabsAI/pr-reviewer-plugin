@@ -134,6 +134,14 @@ Both used to parse as `[]`, so a lost payload posted PASS.
   If it still delivers nothing: no review posted, `protoReview` red ("QA panel incomplete, no
   verdict"), the operator escalated, an `exhaustion` event with `undelivered: [...]`, and the
   sweep's backfill retries later. A missing `FINDER_STATUS` line alone never voids a lane.
+- **One failed finder lane degrades; every finder failing voids.** A critical step
+  (synthesize / verify / report), any non-finder step, or *every* finder failing is still D3
+  exhaustion — no verdict, the absent-payload ending above. But a single `find_*` lane that still
+  errors after the panel retry, while at least one other finder delivered, is carried as a
+  coverage Gap instead of exhausting the round: the lane joins `degraded`, PASS caps at **WARN**,
+  `complete=false` (promotion holds), and the round posts. A `finder_failed` telemetry event names
+  the dropped `lanes` (plus `repo`, `pr`, `sha`, `attempt`), and the `reviewed` row carries a
+  `finder_failed` field listing them — `null` when every lane that ran delivered (#357).
 - **A coverage gap caps a clean PASS at WARN.** Any lane the engine timed out, any LLM finder that
   did not declare `FINDER_STATUS: reviewed`, or a structural relay that was unavailable or cut short:
   `complete=false` (promotion holds), a code-authored coverage line above the brief naming each lane

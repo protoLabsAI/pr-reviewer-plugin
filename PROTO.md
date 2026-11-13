@@ -8,7 +8,10 @@ Read this before touching any file. It is the canonical reference for coding age
 
 A **standalone protoAgent plugin** that provides deterministic PR review for protoAgent's QA tier. The governing contracts are:
 
-- **ADR 0078** — phases, guards, fail-closed posture (gate D3: a raising panel step voids the whole review)
+- **ADR 0078** — phases, guards, fail-closed posture (gate D3: a failed critical step —
+  synthesize / verify / report — a failed non-finder step, or *every* finder failing voids the
+  whole review; one finder lane that still fails after the panel retry while the others deliver is
+  carried as a coverage Gap and caps the verdict, #357)
 - **ADR 0077** — findings convention; `source` attribution on every finding
 
 The plugin exposes tools to a protoAgent host but ships and tests independently — no protoAgent checkout is required to run the test suite.
