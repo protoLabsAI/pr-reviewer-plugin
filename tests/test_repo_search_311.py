@@ -438,3 +438,37 @@ async def test_a_git_without_pcre_falls_back_to_extended_regex(tmp_path):
 
     out = await _searcher(root, sha, run_git=run_git).search("helper", PR, REPO)
     assert modes == ["-P", "-E"] and out.startswith(rs.RESULTS) and "regex (ERE)" in out
+
+
+# ── a matched line longer than asyncio's stream limit (#337) ───────────────────────────────────
+
+
+async def test_a_hit_on_a_line_past_the_stream_limit_is_cut_not_an_error(tmp_path):
+    # `StreamReader.readline()` raises `ValueError: Separator is found, but chunk is longer than
+    # limit` past 64 KiB and discards the data: the whole search failed, the other hits with it.
+    huge = "needle " + "x" * 200_000
+    root, sha = _repo(tmp_path, {"dist/bundle.min.js": huge + "\n", "src/a.py": "needle = 1\n", "src/z.py": "needle\n"})
+    out = await _searcher(root, sha).search("needle", PR, REPO)
+    assert "ValueError" not in out and "unexpected" not in out
+    assert "dist/bundle.min.js:1:" in out and "[line cut]" in out
+    assert "src/a.py:1:" in out and "src/z.py:1:" in out  # the hits after the long line survive
+    assert len(out) < 4000
+
+
+async def test_stdout_lines_reads_any_length_and_any_chunking():
+    class Chunks:
+        def __init__(self, *chunks):
+            self.chunks = list(chunks)
+
+        async def read(self, n):
+            return self.chunks.pop(0) if self.chunks else b""
+
+    async def lines(*chunks, keep=8):
+        return [line async for line in rs._stdout_lines(Chunks(*chunks), keep)]
+
+    assert await lines(b"a\nbb\n") == [b"a", b"bb"]
+    assert await lines(b"a\nb", b"b\n", b"tail") == [b"a", b"bb", b"tail"]  # split mid-line, no final newline
+    assert await lines(b"0123456789abc\nx\n") == [b"01234567", b"x"]  # cut to `keep`, the rest dropped
+    assert await lines(b"01234", b"56789", b"abc\n", b"y\n") == [b"01234567", b"y"]  # a long line across chunks
+    assert await lines(b"\n\nq\n") == [b"", b"", b"q"]
+    assert await lines() == []

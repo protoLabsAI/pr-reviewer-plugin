@@ -71,6 +71,8 @@ MAX_RESULTS_CAP = 100
 DEFAULT_MAX_FILES = 200  # paths per listing (a 152-entry changelog.d fits)
 MAX_FILES_CAP = 500
 LINE_CHARS = 240  # a match line past this is cut, with a marker
+RAW_LINE_BYTES = 8192  # of one line of git output; far past any path + line number + LINE_CHARS
+_READ_CHUNK = 65536
 OUTPUT_CHARS = 12_000  # a whole result past this is cut at a line boundary
 PATTERN_CHARS = 500
 GIT_TIMEOUT_S = 20
@@ -147,6 +149,37 @@ async def _default_resolve_head(repo: str, pr: int) -> str:
     return refs[0]
 
 
+async def _stdout_lines(stream, keep: int = RAW_LINE_BYTES):
+    """The stream's lines without their newline, each cut to its first `keep` bytes.
+
+    `StreamReader.readline()` raises on a line longer than the stream limit (64 KiB) and throws
+    the data away, which failed the whole search whenever one hit sat on a minified bundle or a
+    generated JSON line (#337). Reading in chunks has no such limit; a long line costs `keep`
+    bytes of memory and still yields its file, line number and the start of its text."""
+    line = bytearray()
+    pending = False  # bytes seen since the last newline
+    while True:
+        chunk = await stream.read(_READ_CHUNK)
+        if not chunk:
+            if pending:
+                yield bytes(line)
+            return
+        start = 0
+        while start < len(chunk):
+            end = chunk.find(b"\n", start)
+            stop = len(chunk) if end < 0 else end
+            room = keep - len(line)
+            if room > 0:
+                line += chunk[start : min(stop, start + room)]
+            if end < 0:
+                pending = True
+                break
+            yield bytes(line)
+            line.clear()
+            pending = False
+            start = end + 1
+
+
 async def _default_run_git(args: list[str], max_lines: int, timeout_s: int) -> tuple[int, list[str], str, bool]:
     """Run `git <args>`, reading at most `max_lines` stdout lines: (rc, lines, stderr, cut).
     `cut` = the reader stopped early and killed git, which is a complete-enough success, not an
@@ -164,14 +197,11 @@ async def _default_run_git(args: list[str], max_lines: int, timeout_s: int) -> t
     async def read() -> None:
         nonlocal cut
         assert proc.stdout is not None
-        while True:
-            raw = await proc.stdout.readline()
-            if not raw:
-                return
+        async for raw in _stdout_lines(proc.stdout):
             if len(lines) >= max_lines:
                 cut = True
                 return
-            lines.append(raw.decode(errors="replace").rstrip("\n"))
+            lines.append(raw.decode(errors="replace"))
 
     try:
         await asyncio.wait_for(read(), timeout=timeout_s)
