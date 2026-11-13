@@ -448,6 +448,7 @@ def parse_numstat(out: str) -> dict[str, int]:
     return lines
 
 
+BASE_SOURCE_FILES_MAX = 200  # merge-base texts read per plan; past it the base side stays unknown
 _HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
 
@@ -572,6 +573,18 @@ class FeaturePlan:
         return text
 
 
+def _route_pattern(route) -> re.Pattern | None:
+    """A pattern for a feature's route as test code spells it: `GET /items/{id}` matches
+    `/items/42` and an f-string's `/items/{item_id}`. None when the route has no usable path
+    (a bare `/` would match everything)."""
+    path = str(route or "").strip().split(" ")[-1]
+    if not path.startswith("/") or len(path.strip("/")) < 2:
+        return None
+    path = path.rstrip("/")  # `/items/` is called as `/items`, `/items/` and `/items/3` alike
+    parts = re.split(r"\{[^{}/]*\}", path)
+    return re.compile("[^/\\s\"'?#]+".join(re.escape(part) for part in parts) + r"(?![\w-])")
+
+
 def sibling_features(
     features: list[dict],
     changed_lines: dict[str, int],
@@ -588,9 +601,13 @@ def sibling_features(
     feature is a sibling only when ALL of this holds — anything short of it leaves the feature
     ranked as touched, exactly as before:
 
-      - it owns at least one changed file, and no changed source file reaches it as context;
       - every changed file it owns is Python the planner could parse at head, with the diff's line
         ranges known, and holds at least one of the feature's entrypoint symbols;
+      - every changed source file that reaches it as CONTEXT (#346) is such a Python file too, the
+        text that change touches there mentions neither the feature's entrypoint symbols nor its
+        route (a changed test of this handler counts against it), and the names it touches are
+        carried into the feature's own files as seeds (a handler calling a changed helper of a
+        context module is touched);
       - each of those symbols is a definition in that file, and `touched_symbols` says the diff
         touches none of them — not directly, not through a changed helper, constant or import they
         reference, on EITHER side of the diff: what the base side's removed lines touched (a deleted
@@ -602,46 +619,77 @@ def sibling_features(
     nothing can be proven. Ranges are widened by one line each way, so a change at a definition's
     edge still counts against it. Never raises."""
     try:
-        from .symbol_scope import touched_symbols
+        from .symbol_scope import touched_source, touched_symbols
 
         if not ranges or base_ranges is None:
             return set()
         changed = set(changed_lines)
         signal = {p for p in changed if not is_low_signal(p)}
-        scopes: dict[str, tuple[set[str], set[str]] | None] = {}
+        analysed: dict[tuple[str, frozenset[str]], tuple[set[str], set[str], str] | None] = {}
 
-        def scope(path: str):
-            if path not in scopes:
-                scopes[path] = None
-                if path.endswith((".py", ".pyi")) and ranges.get(path):
-                    seeds: set[str] = set()
-                    if base_ranges.get(path):
-                        before = read_base(path) if read_base is not None else None
-                        removed = touched_symbols(before, [(a - 1, b + 1) for a, b in base_ranges[path]])
-                        if removed is None:
-                            return None  # the base side is unknown: nothing in this file is provable
-                        seeds = removed[0]
-                    source = read_source(path)
-                    if source is not None:
-                        widened = [(a - 1, b + 1) for a, b in ranges[path]]
-                        scopes[path] = touched_symbols(source, widened, seeds)
-            return scopes[path]
+        def analyse(path: str, seeds: frozenset[str] = frozenset()):
+            """(touched names, definition names, touched text) of one Python file at head, the
+            base side and `seeds` (names its changed context touched) counted in — or None."""
+            key = (path, seeds)
+            if key in analysed:
+                return analysed[key]
+            analysed[key] = None
+            if not path.endswith((".py", ".pyi")) or (path in changed and not ranges.get(path)):
+                return None
+            names, text = set(seeds), ""
+            if base_ranges.get(path):
+                before = read_base(path) if read_base is not None else None
+                gone = [(a - 1, b + 1) for a, b in base_ranges[path]]
+                removed = touched_symbols(before, gone)
+                if removed is None:
+                    return None  # the base side is unknown: nothing in this file is provable
+                names |= removed[0]
+                text = touched_source(before, gone, removed[0]) or ""
+            source = read_source(path)
+            widened = [(a - 1, b + 1) for a, b in ranges.get(path) or []]
+            found = touched_symbols(source, widened, names)
+            if found is None:
+                return None
+            here = touched_source(source, widened, found[0])
+            if here is None:
+                return None
+            analysed[key] = (found[0], found[1], f"{text}\n{here}")
+            return analysed[key]
 
         out: set[str] = set()
         for feature in features:
             owned = _paths(feature.get("ownedFiles")) & changed
-            if not owned or ((_paths(feature.get("contextFiles")) & signal) - owned):
+            context = (_paths(feature.get("contextFiles")) & signal) - owned
+            if not owned and not context:
                 continue
             symbols: dict[str, set[str]] = {}
+            mentions: list[re.Pattern] = []
             for entry in feature.get("entrypoints") or []:
                 if isinstance(entry, dict) and entry.get("path") and entry.get("symbol"):
                     name = re.split(r"[.:]", str(entry["symbol"]).strip())[-1]
                     symbols.setdefault(_norm_path(str(entry["path"])), set()).add(name)
+                    mentions.append(re.compile(rf"(?<![\w]){re.escape(name)}(?![\w])"))
+                    route = _route_pattern(entry.get("route"))
+                    if route is not None:
+                        mentions.append(route)
+            if not symbols or not owned <= set(symbols):
+                continue  # no entrypoint symbol, or a changed file it owns holds none: file-level
+            # Changed files that reach the feature as CONTEXT (#346): what they touch is carried
+            # into the feature's own files as seeds (it calls a changed helper of theirs), and the
+            # touched text is searched for the feature's handler or route (a changed test of it).
+            seeds: set[str] = set()
             untouched = True
-            for path in owned:
-                names = symbols.get(path)
-                found = scope(path) if names else None
-                if not found or not names <= found[1] or names & found[0]:
+            for path in sorted(context):
+                found = analyse(path)
+                if found is None or any(m.search(found[2]) for m in mentions):
+                    untouched = False
+                    break
+                seeds |= found[0]
+            for path, names in sorted(symbols.items()) if untouched else ():
+                if path not in changed and not seeds:
+                    continue  # its own file is unchanged and nothing it could reference changed
+                found = analyse(path, frozenset(seeds))
+                if found is None or not names <= found[1] or names & found[0]:
                     untouched = False
                     break
             if untouched:
@@ -1249,10 +1297,10 @@ class ProtoPatchRunner:
             if rc != 0:
                 return set()
             head_ranges, base_ranges = parse_hunk_ranges(out)
-            owned = {p for f in features for p in _paths(f.get("ownedFiles"))}
-            wanted = sorted(p for p in base_ranges if p in head_ranges and p in owned and p.endswith((".py", ".pyi")))
+            listed = {p for f in features for key in ("ownedFiles", "contextFiles") for p in _paths(f.get(key))}
+            wanted = sorted(p for p in base_ranges if p in head_ranges and p in listed and p.endswith((".py", ".pyi")))
             before: dict[str, str] = {}
-            if wanted:
+            if wanted and len(wanted) <= BASE_SOURCE_FILES_MAX:
                 rc, merge_base, _err = await run(["-C", str(checkout), "merge-base", base_sha, "HEAD"])
                 merge_base = merge_base.strip()
                 if rc == 0 and re.fullmatch(r"[0-9a-f]{40,64}", merge_base):
