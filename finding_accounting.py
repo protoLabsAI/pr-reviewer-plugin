@@ -205,23 +205,18 @@ def reconcile(accounting, steps, output, *, history=()):
                     # report, and every rewording is kept in `transitions` below, so an evidence-only
                     # edit stays traceable without one (#351: 1 of 4 live rounds was incomplete for
                     # nothing but a synthesizer re-phrasing a structural finding's evidence).
-                    # BLANKING evidence is a move too: grounding passes a finding with no quotes
-                    # (grounding fails open on a finding with no quotes), so a stage that
-                    # empties it would leave nothing to check (#352 review).
-                    blanked = (
-                        bool(str(before.get("evidence") or "").strip()) and not str(row.get("evidence") or "").strip()
-                    )
+                    # BLANKING evidence is a move too: grounding fails open on a finding with no
+                    # quotes, so a stage that empties it would leave nothing to check (#352 review).
+                    def _text(value):
+                        return str(value or "").strip()
+
+                    blanked = bool(_text(before.get("evidence"))) and not _text(row.get("evidence"))
                     changed = blanked or any(before.get(k) != row.get(k) for k in ("severity", "file", "line"))
-                    # The verifier states what it changed and why in its own `note` (its contract
-                    # is `verdict` + `note`), so after synthesis a note explains a change as well
-                    # as `accounting_reason` does (#351: a verifier that sharpened a citation to
-                    # `PROTO.md:112` read as an "unexplained transformation").
-                    why = (
-                        row.get("accounting_reason")
-                        if stage == "synthesize"
-                        else (row.get("accounting_reason") or row.get("note"))
-                    )
-                    if changed and not (isinstance(why, str) and why.strip() and row.get("evidence")):
+                    # Only `accounting_reason` explains a move, at every stage. The verifier's `note`
+                    # does not: it is on every verified row, so accepting it would excuse any regrade
+                    # (#352 review). The live case that needed it was an evidence-only edit, which no
+                    # longer needs a reason at all.
+                    if changed and not (_text(row.get("accounting_reason")) and _text(row.get("evidence"))):
                         result["gaps"].append(f"{stage}: unexplained transformation {rid}")
                     result["transitions"].append(
                         {"stage": stage, "raw_id": rid, "target": target, "before": before, "after": row}

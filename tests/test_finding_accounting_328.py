@@ -761,11 +761,20 @@ def test_evidence_rewording_needs_no_reason_but_severity_file_or_line_does():
         assert any("unexplained transformation" in g for g in gaps), field
 
 
-def test_the_verifiers_note_explains_its_change_after_synthesis():
+def test_only_an_accounting_reason_explains_a_move_at_any_stage():
+    # The verifier writes a `note` on every row it verifies, so a note cannot be what excuses a
+    # regrade — it would excuse all of them (#352 review).
     inv, rows = prepared()
     regraded = [dict(rows[0], severity="nit", note="Re-read x.py: the guard makes this cosmetic.")]
     text = {"synthesize": output(rows), "verify": output(regraded), "report": output(regraded)}
+    assert "verify: unexplained transformation" in " ".join(stages(inv, text)["gaps"])
+    reasoned = [dict(regraded[0], accounting_reason="the guard at x.py:2 makes this cosmetic")]
+    text = {"synthesize": output(rows), "verify": output(reasoned), "report": output(reasoned)}
     assert stages(inv, text)["complete"]
-    # …but synthesis must still give an accounting_reason of its own
-    early = {s: output(regraded) for s in a.STAGES}
-    assert "synthesize: unexplained transformation" in " ".join(stages(inv, early)["gaps"])
+
+
+def test_a_reason_does_not_excuse_evidence_left_as_whitespace():
+    inv, rows = prepared()
+    moved = [dict(rows[0], severity="nit", accounting_reason="regraded", evidence="   ")]
+    gaps = stages(inv, {s: output(moved) for s in a.STAGES})["gaps"]
+    assert any("unexplained transformation" in g for g in gaps)
