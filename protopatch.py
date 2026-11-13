@@ -580,6 +580,7 @@ def _route_pattern(route) -> re.Pattern | None:
     path = str(route or "").strip().split(" ")[-1]
     if not path.startswith("/") or len(path.strip("/")) < 2:
         return None
+    path = path.rstrip("/")  # `/items/` is called as `/items`, `/items/` and `/items/3` alike
     parts = re.split(r"\{[^{}/]*\}", path)
     return re.compile("[^/\\s\"'?#]+".join(re.escape(part) for part in parts) + r"(?![\w-])")
 

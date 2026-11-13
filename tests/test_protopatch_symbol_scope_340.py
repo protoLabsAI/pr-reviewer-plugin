@@ -396,6 +396,10 @@ def test_a_changed_context_file_the_planner_cannot_analyse_keeps_the_feature_tou
         ("DELETE /items/{id}", 'client.get("/items")', False),
         ("POST /api/config/providers/{pid}/models", '"/api/config/providers/p1/models"', True),
         ("POST /api/config/providers/{pid}/models", '"/api/config/providers"', False),
+        ("GET /items/", 'client.get("/items")', True),  # a route registered with a trailing slash
+        ("GET /items/", 'client.get("/items/")', True),
+        ("GET /items/", 'client.get("/items/3")', True),
+        ("GET /items/", 'client.get("/itemsets")', False),
         ("GET /", "anything /", None),
         (None, "x", None),
         ("", "x", None),
