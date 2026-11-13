@@ -832,6 +832,14 @@ def _env_repos() -> list[str]:
     return [r for r in re.split(r"[,\s]+", os.environ.get("PR_REVIEWER_REPOS", "").strip()) if r]
 
 
+def _repo_set(value) -> set[str]:
+    """Case-folded `owner/name` entries from a YAML list or a comma/whitespace-separated
+    string (the separators `PR_REVIEWER_REPOS` accepts), so matching is case-insensitive
+    and the cfg list, a cfg comma string and the env variable all parse to the same set."""
+    parts = value if isinstance(value, (list, tuple, set)) else [value]
+    return {token.lower() for part in parts for token in re.split(r"[,\s]+", str(part or "").strip()) if token}
+
+
 def _age_s(stamp) -> float | None:
     """Seconds since an ISO-8601 GitHub timestamp, or None when it is absent or unreadable."""
     text = str(stamp or "").strip()
@@ -2022,6 +2030,25 @@ class Dispatcher:
         if "incremental_review" in cfg:
             return str(cfg["incremental_review"]).strip().lower() in ("true", "1", "yes", "on")
         return _env_bool("PR_REVIEWER_INCREMENTAL_REVIEW", False)
+
+    @property
+    def incremental_review_repos(self) -> set[str]:
+        """The #313 A/B allowlist: the `owner/name` repos `incremental_review` applies to,
+        case-folded. Empty (the default): the flag governs every repo, so existing configs
+        are unchanged. Read each round, like the flag, so a change needs no restart."""
+        cfg = self.cfg
+        if "incremental_review_repos" in cfg:
+            return _repo_set(cfg["incremental_review_repos"])
+        return _repo_set(os.environ.get("PR_REVIEWER_INCREMENTAL_REVIEW_REPOS", ""))
+
+    def incremental_review_for(self, repo: str) -> bool:
+        """Whether THIS repo's re-rounds run the #313 incremental path: the flag is on AND
+        the allowlist, when non-empty, names the repo. An off-list repo takes exactly the
+        flag-off path — `_incremental_plan` returns None before any read."""
+        if not self.incremental_review:
+            return False
+        allowed = self.incremental_review_repos
+        return not allowed or str(repo or "").strip().lower() in allowed
 
     @property
     def deep_finder_model(self) -> str:
@@ -5400,10 +5427,10 @@ class Dispatcher:
         epic: bool,
         force: bool,
     ) -> _inc.Plan | None:
-        """The #313 plan for this round: None when the flag is off (today's path, untouched),
-        otherwise a scoped or a full plan. Every read that fails returns a FULL plan. Never
-        raises: a planning bug reviews the whole PR."""
-        if not self.incremental_review:
+        """The #313 plan for this round: None when the flag is off or the allowlist skips
+        this repo (today's path, untouched), otherwise a scoped or a full plan. Every read
+        that fails returns a FULL plan. Never raises: a planning bug reviews the whole PR."""
+        if not self.incremental_review_for(repo):
             return None
         try:
             if force:
