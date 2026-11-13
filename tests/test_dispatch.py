@@ -5868,7 +5868,7 @@ async def test_a_second_unverified_round_escalates_once_and_says_so_on_the_check
     await d.reconcile_pr("o/r", 1, backfill_budget=1)
     await d.reconcile_pr("o/r", 1, backfill_budget=1)
     assert ran == []  # no third round
-    assert "Verifier failed twice — summon @vera review or push" in _qa_check_titles(gh)
+    assert "Unverified twice — not blocking" in _qa_check_titles(gh)
     summary = next(p["output[summary]"] for p in gh.posted if "/check-runs" in p.get("url", ""))
     assert "hold:unverified" in summary  # the reason rides in the summary too
     assert len(inbox) == 1 and "verifier failed twice" in inbox[0][0]

@@ -215,7 +215,7 @@ async def test_dispatcher_malformed_final_fence_holds_coverage_and_verification(
         return result
 
     gh = RoutedGH(pr_facts=facts(changed_files=6, additions=150))
-    d = make(tmp_path, gh=gh, runner=runner, cfg={"grounding": False})
+    d = make(tmp_path, gh=gh, runner=runner, cfg={"grounding": False, "finding_accounting_gate": "all"})
     outcome = await d.handle_pr_event("o/r", 1, HEAD, "opened")
     assert outcome.startswith("reviewed:"), outcome
     body = gh.reviews_posted[-1]["body"]
@@ -787,3 +787,100 @@ def test_a_reason_does_not_excuse_evidence_left_as_whitespace():
     moved = [dict(rows[0], severity="nit", accounting_reason="regraded", evidence="   ")]
     gaps = stages(inv, {s: output(moved) for s in a.STAGES})["gaps"]
     assert any("unexplained transformation" in g for g in gaps)
+
+
+# ── the default gate: provable losses only (#354) ──────────────────────────────────────────────
+# Under #329's `all`, 20 of the 40 live structural rounds of 2026-11-13 were held unverified for
+# gaps that lost nothing, and the unverified re-run (verify only) could never clear them: every
+# head of mythxengine#924 ended "Verifier failed twice". `losses` holds 0 of those 40, and still
+# holds a round that provably dropped a finding.
+
+
+def reconciled(inv, steps_by_stage):
+    return a.reconcile(inv, steps_by_stage, steps_by_stage["report"])
+
+
+def test_the_default_gate_ignores_bookkeeping_that_loses_nothing():
+    inv, tagged = prepared([F, dict(F, claim="Second defect", line=8)])
+    first, second = sorted(inv["raw"])
+    rows = [next(r for r in tagged if r["raw_ids"] == [first])]  # keep `first`, dispose of `second`
+    gone = [{"raw_ids": [second], "disposition": "out-of-scope", "reason": "not this diff", "evidence": "x.py:8"}]
+    untagged = [dict(rows[0], raw_ids=None, finding_id=None)]
+    typo = [dict(rows[0], raw_ids=[first[:-6] + "0" + first[-6:]], finding_id=None)]  # one inserted hex digit
+    for case in (
+        # synthesis disposes of one finding; verify and report do not restate the disposition
+        {"synthesize": output(rows[:1], gone), "verify": output(rows[:1]), "report": output(rows[:1])},
+        # a stage whose rows carry no ids at all proves nothing either way
+        {"synthesize": output(untagged, gone), "verify": output(rows[:1], gone), "report": output(rows[:1], gone)},
+        # an id copied with a typo is the same finding
+        {"synthesize": output(typo, gone), "verify": output(typo, gone), "report": output(typo, gone)},
+        # an intermediate stage left its array unreadable; the report still carries both outcomes
+        {
+            "synthesize": output(rows[:1], gone),
+            "verify": "VERIFY_STATUS: annotated n=1\n```json\n[{",
+            "report": output(rows[:1], gone),
+        },
+    ):
+        result = reconciled(inv, case)
+        assert a.blocking(result, "losses") == [], result["losses"]
+        assert a.blocking(result, "all")  # …which #329's strict mode held
+
+
+def test_the_default_gate_still_holds_a_provably_dropped_finding():
+    inv, rows = prepared([F, dict(F, claim="Second defect", line=8)])
+    # verify silently keeps one of two survivors, with no disposition for the other
+    dropped = {"synthesize": output(rows), "verify": output(rows[:1]), "report": output(rows[:1])}
+    assert any("verify: dropped with no disposition" in g for g in a.blocking(reconciled(inv, dropped)))
+    # a truncated final report with findings in flight
+    cut = {"synthesize": output(rows), "verify": output(rows), "report": "```json\n[{"}
+    assert any(g.startswith("report: findings array unreadable") for g in a.blocking(reconciled(inv, cut)))
+    # the dispatcher's own unexplained omission (`finalize`) and an absent inventory
+    assert a.blocking({"gaps": ["final: unexplained omission x"], "losses": []}) == ["final: unexplained omission x"]
+    assert a.blocking({"gaps": ["native inventory unavailable or malformed"]})
+
+
+def test_gate_modes():
+    acc = {"gaps": ["synthesize: finding missing raw identities"], "losses": []}
+    assert a.blocking(acc, "all") == acc["gaps"]
+    assert a.blocking(acc, "losses") == [] and a.blocking(acc, "off") == []
+    assert a.blocking({"gaps": ["final: unexplained omission x"], "losses": ["verify: dropped"]}, "off") == []
+
+
+@pytest.mark.parametrize(
+    ("value", "mode"),
+    [
+        (None, "losses"),
+        ("losses", "losses"),
+        ("all", "all"),
+        (True, "all"),
+        ("off", "off"),
+        (False, "off"),
+        ("junk", "losses"),
+    ],
+)
+def test_the_gate_setting(tmp_path, value, mode):
+    cfg = {} if value is None else {"finding_accounting_gate": value}
+    assert make(tmp_path, cfg=cfg).finding_accounting_gate == mode
+
+
+async def test_a_round_with_only_bookkeeping_gaps_posts_complete_and_verified(tmp_path):
+    native = NativeRunner(rows=[F, dict(F, claim="Second defect", line=8)])
+
+    async def runner(recipe, inputs, *, seed_outputs=None):
+        result = await native(recipe, inputs, seed_outputs=seed_outputs)
+        if "finding_accounting" in inputs:
+            for stage in ("synthesize", "verify"):
+                rows = a.array(result["steps"][stage])
+                for row in rows:
+                    row.pop("finding_id", None)
+                    row["raw_ids"] = []  # the stage dropped every id; its findings are all there
+                tail = "\nVERIFY_STATUS: annotated n=2" if stage == "verify" else ""
+                result["steps"][stage] = output(rows) + tail
+        return result
+
+    gh = RoutedGH(pr_facts=facts(changed_files=6))
+    d = make(tmp_path, gh=gh, runner=runner, cfg={"grounding": False})
+    assert (await d.handle_pr_event("o/r", 1, HEAD, "opened")).startswith("reviewed:")
+    marker = parse_verdict_marker(gh.reviews_posted[-1]["body"])
+    assert marker["complete"] and marker["verified"]
+    assert "Raw finding accounting: incomplete" in gh.reviews_posted[-1]["body"]  # still on the record

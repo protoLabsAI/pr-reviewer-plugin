@@ -262,7 +262,104 @@ def reconcile(accounting, steps, output, *, history=()):
         if len(covered) != len(actual):
             result["gaps"].append(f"{stage}: duplicate raw identities")
     result["complete"] = not result["gaps"]
+    result["losses"] = losses(result, steps, output)
     return result
+
+
+_RAW_ID = re.compile(r"^([a-z_]+):([0-9a-f]{8,64})(?::(\d+))?$")
+
+
+def _edits(a, b, cap=2):
+    """Levenshtein distance between two short strings, stopping early past `cap`."""
+    if abs(len(a) - len(b)) > cap:
+        return cap + 1
+    row = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        prev, row[0] = row[0], i
+        best = row[0]
+        for j, cb in enumerate(b, 1):
+            prev, row[j] = row[j], min(row[j] + 1, row[j - 1] + 1, prev + (ca != cb))
+            best = min(best, row[j])
+        if best > cap:
+            return cap + 1
+    return row[-1]
+
+
+def resolve_id(rid, raw):
+    """The raw id a model meant by `rid`: itself, else the ONE raw id of the same lane whose hash is
+    within two edits (#354: of 40 live rounds, every id a stage "lost" was the same finding copied
+    with one inserted or transposed hex digit). None when it names no current raw finding."""
+    if not isinstance(rid, str):
+        return None
+    if rid in raw:
+        return rid
+    m = _RAW_ID.match(rid)
+    if not m:
+        return None
+    hits = []
+    for candidate in raw:
+        c = _RAW_ID.match(candidate)
+        if c and c[1] == m[1] and (m[3] is None or m[3] == c[3]) and _edits(m[2], c[2]) <= 2:
+            hits.append(candidate)
+    return hits[0] if len(hits) == 1 else None
+
+
+def losses(result, steps, output):
+    """Raw findings this round PROVABLY dropped: a finding a stage carried (or, before synthesis,
+    the raw inventory) that the next readable stage neither carries nor disposes of (#354).
+
+    The narrow, reliable core of the reconciliation, and the only part that gates by default
+    (`finding_accounting_gate: losses`). Deliberately NOT a loss: a later stage that does not
+    restate an earlier disposition (a disposition stands once made), an id copied with a typo
+    (`resolve_id`), and a stage whose rows carry no ids at all — that stage proves nothing either
+    way, so it neither convicts nor clears what was in flight. An unreadable intermediate stage
+    is skipped (what was in flight is judged at the next one); an unreadable REPORT with findings
+    in flight IS a loss — a truncated final draft may have dropped them."""
+    raw = set(result.get("raw") or {})
+    alive, settled, out = set(raw), set(), []
+    for stage in STAGES:
+        text = output if stage == "report" else steps.get(stage)
+        rows = array(text)
+        rejected = dispositions(text) or []
+        if rows is None:
+            # An unreadable intermediate stage proves nothing: what was in flight is judged at the
+            # next readable one (on mythxengine#929 a verifier wrote an invalid JSON escape while
+            # the report carried all three findings). Only an unreadable REPORT is a loss — nothing
+            # after it can show the findings survived.
+            if stage == "report" and alive - settled:
+                out.append(f"report: findings array unreadable with {len(alive - settled)} finding(s) in flight")
+            continue
+        carried = {resolve_id(i, raw) for row in rows for i in (row.get("raw_ids") or [])} - {None}
+        settled |= {resolve_id(i, raw) for d in rejected if isinstance(d, dict) for i in (d.get("raw_ids") or [])} - {
+            None
+        }
+        if any(not isinstance(row.get("raw_ids"), list) or not row.get("raw_ids") for row in rows):
+            alive = carried | (alive - settled)
+            continue
+        dropped = sorted(alive - carried - settled)
+        if dropped:
+            out.append(f"{stage}: dropped with no disposition: {', '.join(dropped)}")
+        alive = carried
+    return out
+
+
+# What `finding_accounting_gate: losses` (the default) gates on: provable drops, the dispatcher's
+# own unexplained omissions (`finalize`, code-side and exact), a verifier that left surviving
+# findings unannotated (`verification_ran` over the survivors — a verification check, not id
+# bookkeeping), a lane whose raw array could not be read at all, and an inventory that never
+# existed. None of these fired on the 40 live rounds of 2026-11-13. Everything else is audit trail.
+_BLOCKING_GAPS = ("final:", "native inventory unavailable", "verify: incomplete survivor verification")
+
+
+def blocking(accounting, mode="losses"):
+    """The accounting gaps that decide the round under `mode` (`all`, `losses`, `off`)."""
+    if not isinstance(accounting, dict) or mode == "off":
+        return []
+    gaps = [g for g in accounting.get("gaps") or [] if isinstance(g, str)]
+    if mode == "all":
+        return gaps
+    lanes = [g for g in gaps if g.endswith("missing or malformed raw array")]
+    return list(accounting.get("losses") or []) + lanes + [g for g in gaps if g.startswith(_BLOCKING_GAPS)]
 
 
 def coverage(result, recipe, *, history=()):

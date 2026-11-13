@@ -2012,6 +2012,35 @@ class Dispatcher:
         return bool(cfg["evidence_guard"]) if "evidence_guard" in cfg else _env_bool("PR_REVIEWER_EVIDENCE_GUARD", True)
 
     @property
+    def finding_accounting_gate(self) -> str:
+        """Which raw-finding-accounting gaps (#329) decide a round: `losses` (default), `all`, `off`.
+
+        `all` is the #329 behaviour: any gap marks the round incomplete and unverified. On 40 live
+        structural rounds (2026-11-13) 20 had gaps and none was a lost finding — rows without their
+        ids, a verifier not restating synthesis' dispositions, ids copied with a typo, an honest
+        structural feature-cap partial — and since `verified=false` sends a head to the unverified
+        re-run, which re-runs verify only, every head of a large PR ended "Verifier failed twice"
+        with its required check stuck (#354). `losses` gates only on what the trail can PROVE was
+        dropped (`finding_accounting.blocking`): 0 of those 40 rounds, while a verifier that
+        silently drops a finding is still caught. `off` decides nothing. In every mode the trail
+        is still computed, emitted and rendered."""
+        cfg = self.cfg
+        raw = (
+            cfg["finding_accounting_gate"]
+            if "finding_accounting_gate" in cfg
+            else os.environ.get("PR_REVIEWER_FINDING_ACCOUNTING_GATE", "")
+        )
+        mode = str(raw).strip().lower()
+        if mode in ("all", "true", "1", "yes", "on"):
+            return "all"
+        if mode in ("off", "false", "0", "no", "none"):
+            return "off"
+        return "losses"
+
+    def _accounting_blocks(self, accounting) -> list[str]:
+        return _accounting.blocking(accounting, self.finding_accounting_gate)
+
+    @property
     def epic_attestation(self) -> bool:
         """Review only the residual of an `epic/*` → default-branch PR (see `epic.py`)."""
         cfg = self.cfg
@@ -4515,8 +4544,8 @@ class Dispatcher:
             _accounting.dispose(
                 accounting, row, "refuted", "validated prior refutation on unchanged code", row.get("refuted_before")
             )
-        if accounting["gaps"]:
-            gaps["finding_accounting"] = "; ".join(accounting["gaps"])
+        if blocks := self._accounting_blocks(accounting):
+            gaps["finding_accounting"] = "; ".join(blocks)
             complete = False
         isolation_gaps = dict(result.get("isolation_gaps") or {})
         gaps.update({f"context:{sid}": why for sid, why in isolation_gaps.items()})
@@ -4901,8 +4930,8 @@ class Dispatcher:
         # zero-finding round holds a standing block exactly as a clean one would. A gap
         # never softens a FAIL and never withholds the verdict — it caps PASS at WARN.
         _accounting.finalize(accounting, output, reported)
-        if accounting["gaps"]:
-            gaps["finding_accounting"] = "; ".join(accounting["gaps"])
+        if blocks := self._accounting_blocks(accounting):
+            gaps["finding_accounting"] = "; ".join(blocks)
             complete = False
         finding_verdict = verdict
         verdict = coverage_verdict(verdict, gaps)
@@ -5020,7 +5049,7 @@ class Dispatcher:
             return await self._abandon_ended(repo, pr, head, ended, "posting", review_check_id)
         round_verified = (
             not isolation_gaps
-            and not accounting["gaps"]
+            and not self._accounting_blocks(accounting)
             and verification_ran(str(steps_out.get("verify") or ""), reported)
         )
         posted = await self._post_verdict(
@@ -5870,8 +5899,8 @@ class Dispatcher:
             self.telemetry.emit("superseded", repo=repo, pr=pr, sha=head, verdict=verdict)
         if accounting is not None:
             _accounting.finalize(accounting, accounting.get("report_findings") or [], findings, stage="posted")
-            if accounting["gaps"]:
-                coverage_gaps = {**(coverage_gaps or {}), "finding_accounting": "; ".join(accounting["gaps"])}
+            if blocks := self._accounting_blocks(accounting):
+                coverage_gaps = {**(coverage_gaps or {}), "finding_accounting": "; ".join(blocks)}
                 complete = verified = False
                 verdict = coverage_verdict(verdict, coverage_gaps)
         body = render_verdict_body(

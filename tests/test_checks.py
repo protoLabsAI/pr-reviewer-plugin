@@ -421,8 +421,10 @@ def test_an_unverified_hold_says_a_re_run_is_coming_then_what_to_do_when_it_fail
     assert pending.status == "in_progress" and "re-running" in pending.title
     assert "hold:unverified" in pending.summary
     gave_up = check_for(HOLD_UNVERIFIED, verdict="PASS", verify_retry="exhausted")
-    assert gave_up.title == "Verifier failed twice — summon @vera review or push"
-    assert gave_up.status == "in_progress" and "hold:unverified" in gave_up.summary
+    # #354: nothing re-runs the head any more, so the required check concludes instead of
+    # blocking the merge forever — neutral, like an incomplete pass (#130).
+    assert gave_up.title == "Unverified twice — not blocking"
+    assert (gave_up.status, gave_up.conclusion) == ("completed", "neutral") and "hold:unverified" in gave_up.summary
 
 
 def test_every_hold_names_its_reason_in_the_summary():
