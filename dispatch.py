@@ -484,6 +484,7 @@ def _accounting_runner(runner, *, invoke=None):
     async def run(recipe, inputs, **kwargs):
         nonlocal current, lane_seeds, finder_context, finder_gaps
         if recipe != "code-review-structural":
+            kwargs.pop("authored", None)  # ours, for `_invoke_runner`; never the host runner's
             return await runner(recipe, inputs, **kwargs)
         seed_source = kwargs.pop("seed_source", None)
         seeds = dict(kwargs.pop("seed_outputs", {}) or {})
@@ -2305,14 +2306,25 @@ class Dispatcher:
 
     # ── plumbing ──────────────────────────────────────────────────────────────
 
-    async def _invoke_runner(self, runner, recipe, inputs, *, seed_source=None, **kwargs):
-        """Keep legacy signatures, and bind evidence at every physical runner return."""
+    async def _invoke_runner(self, runner, recipe, inputs, *, seed_source=None, authored=(), **kwargs):
+        """Keep legacy signatures, and bind evidence at every physical runner return.
+
+        `authored` names seeded steps whose text the DISPATCHER wrote (`restate_findings` for the
+        prior re-check and the verify re-run). No model run produced them, so the host can never
+        link them to a source run and the contract always reads their origin as unknown — on
+        mythxengine#953 r3 (2026-11-13) that one gap marked a round "Runner independence
+        unverified". Independence is a property of the steps that RUN (the verifier here), and a
+        code-built input does not compromise it; so for these steps, and only these, a
+        seed-origin gap is not a gap. Any other gap on them still is."""
         if getattr(runner, "_accounting_physical_validation", False):
-            return await runner(recipe, inputs, seed_source=seed_source, **kwargs)
+            return await runner(recipe, inputs, seed_source=seed_source, authored=authored, **kwargs)
         if seed_source and _accepts_keyword(runner, "seed_run_id") and seed_source.get("run_id"):
             kwargs["seed_run_id"] = seed_source["run_id"]
         result = await runner(recipe, inputs, **kwargs)
         gaps = validate_result(result, seed_outputs=kwargs.get("seed_outputs"), seed_source=seed_source)
+        for sid in set(authored or ()) & set(gaps):
+            if "seed origin" in str(gaps[sid]):
+                del gaps[sid]
         receipts = result.get("tool_receipts")
         execution = receipts.get("execution_id") if isinstance(receipts, dict) else None
         # A tracing session is intentionally shared; a physical execution may not be.
@@ -6422,7 +6434,9 @@ class Dispatcher:
         for attempt in range(1, self.verify_reruns + 1):
             try:
                 async with asyncio.timeout(self.panel_attempt_timeout_s):
-                    again = await self._invoke_runner(runner, recipe, inputs, seed_outputs=seeded, seed_source=result)
+                    again = await self._invoke_runner(
+                        runner, recipe, inputs, seed_outputs=seeded, seed_source=result, authored={"synthesize"}
+                    )
             except Exception as exc:  # noqa: BLE001 — a failed re-run leaves the original round
                 log.warning("[pr-reviewer] %s#%s verify re-run %d failed: %s", repo, pr, attempt, exc)
                 break
@@ -6609,7 +6623,7 @@ class Dispatcher:
             try:
                 async with asyncio.timeout(self.panel_attempt_timeout_s):
                     again = await self._invoke_runner(
-                        runner, recipe, inputs, seed_outputs=seeded, seed_source=seed_source
+                        runner, recipe, inputs, seed_outputs=seeded, seed_source=seed_source, authored={"synthesize"}
                     )
             except Exception as exc:  # noqa: BLE001 — a failed re-check leaves the priors as they were
                 log.warning("[pr-reviewer] %s#%s prior re-check failed: %s", repo, pr, exc)

@@ -332,3 +332,60 @@ def test_check_summary_names_context_coverage_without_claiming_a_missing_lane():
     summary = Dispatcher._review_check_summary("WARN", [], {"context:verify": "Gap: isolation"})
     assert "independence is unverified" in summary
     assert "did not complete" not in summary
+
+
+# ── dispatcher-authored seeds (mythxengine#953 r3, 2026-11-13) ─────────────────────────────────
+# The prior re-check and the verify re-run seed `synthesize` with text the dispatcher writes
+# (`restate_findings`). No run produced it, so its origin always reads unknown, and that one gap
+# marked a live round "Runner independence unverified".
+
+
+def _authored_seed(source):
+    data = seed_result(source)
+    data["review_context"]["steps"]["find_bugs"]["origin"] = "unknown"  # code-built: no source run
+    return data
+
+
+async def test_a_seed_the_dispatcher_wrote_is_not_an_isolation_gap(tmp_path):
+    source = result()
+
+    async def host(recipe, inputs, *, seed_outputs, seed_run_id):
+        return _authored_seed(source)
+
+    dispatcher = make(tmp_path, native_context=False)
+    kwargs = dict(seed_outputs={"find_bugs": "restated"}, seed_source=source)
+    assert "find_bugs" in (await dispatcher._invoke_runner(host, "review", {}, **kwargs))["isolation_gaps"]
+    authored = await dispatcher._invoke_runner(host, "review", {}, authored={"find_bugs"}, **kwargs)
+    assert authored["isolation_gaps"] == {}
+
+
+async def test_authorship_waives_only_the_seed_origin_gap_of_that_step(tmp_path):
+    source = result()
+
+    async def host(recipe, inputs, *, seed_outputs, seed_run_id):
+        data = _authored_seed(source)
+        data["review_context"]["steps"]["verify"]["status"] = "unknown"  # the step that RAN is unobserved
+        return data
+
+    dispatcher = make(tmp_path, native_context=False)
+    gaps = (
+        await dispatcher._invoke_runner(
+            host, "review", {}, seed_outputs={"find_bugs": "restated"}, seed_source=source, authored={"find_bugs"}
+        )
+    )["isolation_gaps"]
+    assert "find_bugs" not in gaps and "verify" in gaps
+
+
+async def test_the_accounting_wrapper_never_hands_authored_to_the_host_runner(tmp_path):
+    from pr_reviewer.dispatch import _accounting_runner
+
+    seen = {}
+
+    async def host(recipe, inputs, **kwargs):
+        seen.update(kwargs)
+        return {"steps": {}, "output": ""}
+
+    dispatcher = make(tmp_path, native_context=False)
+    wrapped = _accounting_runner(host, invoke=dispatcher._invoke_runner)
+    await dispatcher._invoke_runner(wrapped, "code-review", {}, authored={"synthesize"})
+    assert "authored" not in seen
