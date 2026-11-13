@@ -68,12 +68,17 @@ def inventory(steps, binding):
         if rows is None:
             result["gaps"].append(f"{lane}: missing or malformed raw array")
             continue
-        # Signals that the lane's raw ARRAY may be cut short. A finder's `Gap:` note ("could not
-        # check X, left it out") is not one: the array it wrote is whole, and the note already
-        # reaches the report and its coverage line. Counting it here made 48% of structural
-        # rounds "incomplete" on Vera (#351: 67 of 140 runs since 2026-11-11).
+        # Signals that the lane's raw ARRAY may be cut short or never produced. The machinery's
+        # own `Gap:` lines are such signals: a faithfully relayed structural outage or partial
+        # pass (protopatch `GAP_LINE_PREFIX` / `GAP_PARTIAL_PREFIX`, which a relay writes INSTEAD of
+        # the PROTOPATCH header) and the workflow engine's step time-budget cut-off. A finder's
+        # own `Gap:` note ("could not check X, left it out") is not: the array it wrote is whole,
+        # and the note already reaches the report. Counting every `Gap:` line made 48% of
+        # structural rounds "incomplete" on Vera (#351: 67 of 140 runs since 2026-11-11).
         if re.search(
-            r"(?m)^.*hard-stopped at max_turns:|^FINDER_STATUS: blocked|^PROTOPATCH (?:UNAVAILABLE|PARTIAL)|^protoPatch structural pass partial|^TRUNCATED",
+            r"(?m)^.*hard-stopped at max_turns:|^FINDER_STATUS: blocked|^PROTOPATCH (?:UNAVAILABLE|PARTIAL)"
+            r"|^protoPatch structural pass partial|^TRUNCATED"
+            r"|^Gap: structural pass (?:unavailable|partial)|^Gap: step \S+ exceeded its \S+ time budget",
             output,
             re.I,
         ):

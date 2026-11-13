@@ -694,7 +694,16 @@ def test_a_finders_gap_note_is_not_incomplete_raw_input():
     steps[a.LANES[0]] += "\n\nGap: unverified. I could not see which models are configured, so I left this out."
     assert a.inventory(steps, {"head": HEAD, "attempt": "a"})["gaps"] == []
     # the signals that really mean a cut-short array still count
-    for signal in ("FINDER_STATUS: blocked", "TRUNCATED", "Lane hard-stopped at max_turns: 40"):
+    for signal in (
+        "FINDER_STATUS: blocked",
+        "TRUNCATED",
+        "Lane hard-stopped at max_turns: 40",
+        # the machinery's own Gap lines (#352 review): a relayed structural outage / partial pass,
+        # and the workflow engine's step time-budget cut-off
+        "Gap: structural pass unavailable — clawpatch exit 4 (provider)",
+        "Gap: structural pass partial — 12 of 20 features reviewed",
+        "Gap: step 'find_crossfile' exceeded its 900s time budget and was cut off — no result",
+    ):
         cut = raw([F])
         cut[a.LANES[0]] += f"\n{signal}"
         assert a.inventory(cut, {"head": HEAD, "attempt": "a"})["gaps"] == [f"{a.LANES[0]}: incomplete raw input"]
