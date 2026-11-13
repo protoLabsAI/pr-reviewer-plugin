@@ -626,3 +626,44 @@ def test_seeded_retry_uses_retained_finder_adoption(fault):
         composite["context_adoptions"]["find_bugs"]["tool_receipts"] = {}
     gaps = validate_result(retry, seed_source=composite)
     assert bool(gaps) is bool(fault)
+
+
+async def test_the_barrier_seeds_exactly_what_the_first_run_persisted_343(tmp_path):
+    """The host links a seeded step to its source run only when the seeded text EQUALS what that
+    run persisted (`run_state.seed`); anything else gets `origin: "unknown"`. The barrier used to
+    append an id-annotated block to every finder output before seeding it, so on a real host every
+    lane of every structural round read "seed origin unknown or contradictory" (#343). This fake
+    applies the host's rule instead of granting the origin unconditionally."""
+    from tests.runner_fixtures import native_runner
+
+    native = native_runner(NativeRunner())
+    persisted: dict[str, dict] = {}
+    seeded: list[dict] = []
+
+    async def runner(recipe, inputs, *, seed_outputs=None, seed_run_id=None):
+        result = await native(recipe, inputs, seed_outputs=seed_outputs)
+        if not persisted:
+            persisted[result["run_id"]] = copy.deepcopy(result)
+            return result
+        seeded.append(dict(seed_outputs))
+        source = persisted.get(seed_run_id)
+        result["review_context"].pop("previous_executions", None)
+        result["tool_receipts"].pop("previous_executions", None)
+        for lane in a.LANES:
+            envelope = result["review_context"]["steps"][lane]
+            envelope["origin"] = "unknown"
+            if source is not None and source["steps"].get(lane) == seed_outputs.get(lane):
+                original = source["review_context"]["steps"][lane]
+                envelope["origin"] = {k: original[k] for k in ("run_id", "step_id", "execution_id")}
+        return result
+
+    d = make(tmp_path)
+    wrapped = _accounting_runner(runner, invoke=d._invoke_runner)
+    result = await d._invoke_runner(wrapped, "code-review-structural", {"head_sha": HEAD})
+
+    [first] = persisted.values()
+    assert seeded == [{lane: first["steps"][lane] for lane in a.LANES}]  # byte for byte
+    assert result["isolation_gaps"] == {}
+    assert a.coverage(result, "code-review-structural")["complete"]
+    # the ids still reach the synthesizer: every raw finding is in the inventory input it is given
+    assert [v["finding"] for v in result["finding_accounting"]["raw"].values()] == [F]
