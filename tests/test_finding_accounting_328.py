@@ -755,7 +755,7 @@ def test_evidence_rewording_needs_no_reason_but_severity_file_or_line_does():
     inv, rows = prepared()
     sharpened = [dict(rows[0], evidence="quote (x.py:3)")]
     assert stages(inv, {s: output(sharpened) for s in a.STAGES})["complete"]
-    for field, value in (("severity", "major"), ("line", 9), ("file", "y.py")):
+    for field, value in (("severity", "major"), ("line", 9), ("file", "y.py"), ("evidence", ""), ("evidence", "  ")):
         moved = [dict(rows[0], **{field: value})]
         gaps = stages(inv, {s: output(moved) for s in a.STAGES})["gaps"]
         assert any("unexplained transformation" in g for g in gaps), field

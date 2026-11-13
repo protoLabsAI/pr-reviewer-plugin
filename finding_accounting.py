@@ -205,7 +205,13 @@ def reconcile(accounting, steps, output, *, history=()):
                     # report, and every rewording is kept in `transitions` below, so an evidence-only
                     # edit stays traceable without one (#351: 1 of 4 live rounds was incomplete for
                     # nothing but a synthesizer re-phrasing a structural finding's evidence).
-                    changed = any(before.get(k) != row.get(k) for k in ("severity", "file", "line"))
+                    # BLANKING evidence is a move too: grounding passes a finding with no quotes
+                    # (grounding fails open on a finding with no quotes), so a stage that
+                    # empties it would leave nothing to check (#352 review).
+                    blanked = (
+                        bool(str(before.get("evidence") or "").strip()) and not str(row.get("evidence") or "").strip()
+                    )
+                    changed = blanked or any(before.get(k) != row.get(k) for k in ("severity", "file", "line"))
                     # The verifier states what it changed and why in its own `note` (its contract
                     # is `verdict` + `note`), so after synthesis a note explains a change as well
                     # as `accounting_reason` does (#351: a verifier that sharpened a citation to
