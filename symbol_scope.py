@@ -27,7 +27,8 @@ line ranges alone: the NAMES a change touches —
 It over-includes on purpose: names are matched as bare identifiers and attribute names, so a
 changed `get` touches everything that says `.get`. The caller only ever uses the answer to rank a
 feature LOWER when it is provably untouched, so a wrong "touched" costs one review and a wrong
-"untouched" could cost a finding. Self-contained (no host or plugin imports) and never raises.
+"untouched" could cost a finding. `touched_source` gives the text of what a change touches, for
+asking whether a changed context file (a test, a registry) mentions another file's handler. Self-contained (no host or plugin imports) and never raises.
 """
 
 from __future__ import annotations
@@ -164,4 +165,27 @@ def touched_symbols(source: str, ranges, seeds=()) -> tuple[set[str], set[str]] 
                     grew = True
         return touched, known
     except Exception:  # noqa: BLE001 — SyntaxError, RecursionError, a hostile file: unknown, never a crash
+        return None
+
+
+def touched_source(source: str, ranges, touched) -> str | None:
+    """The text a change in this file is "about": every line of a definition named in `touched`
+    (the answer of `touched_symbols`, closure included) plus the changed lines themselves.
+
+    Used for the REVERSE question the names cannot answer — does the changed part of a test or a
+    registry mention some other file's handler or route? None when the file cannot be analysed."""
+    try:
+        if source is None or len(source) > MAX_SOURCE_BYTES:
+            return None
+        lines = source.splitlines()
+        keep: set[int] = set()
+        for a, b in ranges or []:
+            keep.update(range(max(int(a), 1), min(int(b), len(lines)) + 1))
+        names = set(touched or ())
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, _DEFS) and node.name in names:
+                lo, hi = _span(node)
+                keep.update(range(max(lo, 1), min(hi, len(lines)) + 1))
+        return "\n".join(lines[i - 1] for i in sorted(keep))
+    except Exception:  # noqa: BLE001 — unknown, never a crash
         return None

@@ -61,8 +61,13 @@ handlers while leaving out an edited one, and marking a 60-line PR incomplete on
 A feature is a **sibling** when the diff provably touches none of its own code. All of this must
 hold; anything short of it ranks the feature as touched:
 
-- it owns a changed file, and no changed source file reaches it as context;
 - every changed file it owns is Python that parses at head and holds one of its entrypoint symbols;
+- every changed source file that reaches it as *context* (its test module, a helper it imports) is
+  such a Python file too; the text that change touches there mentions neither the feature's
+  entrypoint symbol nor its route (`/items/{id}` matches `/items/42` and an f-string's
+  `/items/{x}`), and the names it touches, carried into the feature's own files, reach none of its
+  symbols. The mention check reads text, it does not evaluate it — a test that builds its URL
+  elsewhere is not seen; the changed test is still reviewed by the feature that owns it;
 - the diff touches none of those symbols — not a line of the definition (decorators included) or of
   anything nested in it, not the signature / bases / decorators of a class or factory that holds it,
   not a condition that guards it, and not a helper, constant, closure variable or import the

@@ -11,7 +11,9 @@ cap chose among them by feature id. Measured on protoAgent, 2026-11-12/13 (cap 3
 Now a feature whose own code the diff provably does not touch is a SIBLING: ranked after every
 touched feature, still reviewed while the cap has room, and — when the cap leaves it out — stated
 in the header instead of making the pass partial. Anything the planner cannot prove stays ranked
-as touched, and `structural_symbol_scope: false` is the rollback.
+as touched, and `structural_symbol_scope: false` is the rollback. A changed file that reaches a
+feature as context (its test module, a helper it imports) counts against it only when that change
+mentions the feature's handler or route, or touches a name the handler uses (#346).
 """
 
 from __future__ import annotations
@@ -32,7 +34,7 @@ from pr_reviewer.protopatch import (
     read_head_source,
     sibling_features,
 )
-from pr_reviewer.symbol_scope import MAX_SOURCE_BYTES, touched_symbols
+from pr_reviewer.symbol_scope import MAX_SOURCE_BYTES, touched_source, touched_symbols
 
 SHA_HEAD = "a" * 40
 SHA_BASE = "b" * 40
@@ -275,15 +277,141 @@ def test_anything_the_planner_cannot_prove_is_ranked_as_touched(case):
     assert siblings(features, lines, ranges, sources) == set()
 
 
-def test_a_changed_source_file_in_context_or_a_second_owned_file_keeps_a_feature_touched():
+def test_a_second_owned_file_without_an_entrypoint_keeps_a_feature_touched():
     hunk = [(line_of("save(body)"),) * 2]
-    by_context = route("feat_ctx", "_health", context=("api/models.py",))
     two_files = route("feat_two", "_health", owned=["api/routes.py", "api/models.py"])
     alone = route("feat_alone", "_health")
     lines = {"api/routes.py": 1, "api/models.py": 4}
     ranges = {"api/routes.py": hunk, "api/models.py": [(1, 4)]}
     sources = {**SOURCES, "api/models.py": "X = 1\n"}
-    assert siblings([by_context, two_files, alone], lines, ranges, sources) == {"feat_alone"}
+    assert siblings([two_files, alone], lines, ranges, sources) == {"feat_alone"}
+
+
+# ── changed files that reach a feature as context (#346) ───────────────────────────────────────
+
+TESTS = """\
+import pytest
+
+BASE = "/items"
+
+
+def test_list(client):
+    assert client.get("/items").status_code == 200
+
+
+def test_add_requires_admin(client):
+    assert client.post(BASE, json={}).status_code == 403
+
+
+def test_delete(client):
+    item = 7
+    assert client.delete(f"/items/{item}").status_code == 204
+
+
+def test_health_handler_directly():
+    from api.routes import _health
+
+    assert _health
+"""
+
+WITH_TESTS = [
+    {**route("feat_route_list", "_list_items", context=("tests/test_routes.py",)), "route": None},
+    route("feat_route_add", "_add_item", context=("tests/test_routes.py",)),
+    route("feat_route_delete", "_delete_item", context=("tests/test_routes.py",)),
+    route("feat_route_health", "_health", context=("tests/test_routes.py",)),
+]
+for _feature, _route in zip(
+    WITH_TESTS, ["GET /items", "POST /items", "DELETE /items/{id}", "GET /health"], strict=True
+):
+    _feature["entrypoints"][0]["route"] = _route
+
+
+def with_tests(test_needle, routes_needle=None, tests=TESTS):
+    lines = {"tests/test_routes.py": 1}
+    ranges = {"tests/test_routes.py": [(line_of(test_needle, tests),) * 2]}
+    if routes_needle:
+        lines["api/routes.py"] = 1
+        ranges["api/routes.py"] = [(line_of(routes_needle),) * 2]
+    return siblings(WITH_TESTS, lines, ranges, {**SOURCES, "tests/test_routes.py": tests})
+
+
+def test_a_changed_test_counts_only_against_the_handler_it_exercises():
+    # The test of DELETE changed: its text names the route `/items/{item}`, which is DELETE's
+    # `/items/{id}` — and, being a longer spelling of `/items`, the list and add routes too.
+    assert with_tests("item = 7") == {"feat_route_health"}
+    # The test that imports `_health` by name changed: only the health handler is touched.
+    assert with_tests("assert _health") == {"feat_route_list", "feat_route_add", "feat_route_delete"}
+
+
+def test_a_changed_test_constant_counts_against_the_routes_its_text_spells():
+    # `BASE` is used by the add test, so the closure pulls that test's text in next to the changed
+    # line itself: `"/items"` is the list and add routes. DELETE's `/items/{id}` is not spelled
+    # anywhere in that text — the reverse rule reads text, it does not evaluate it.
+    assert with_tests('BASE = "/items"') == {"feat_route_delete", "feat_route_health"}
+
+
+def test_a_handler_edit_and_an_unrelated_test_edit_leave_the_other_handlers_siblings():
+    found = with_tests("assert _health", routes_needle="save(body)")
+    assert found == {"feat_route_list", "feat_route_delete"}  # `add` by its own code, `health` by its test
+
+
+def test_names_a_changed_context_module_touches_reach_the_handlers_that_use_them():
+    store = "def load():\n    return []\n\n\ndef save(row):\n    return row\n\n\ndef unused():\n    return 0\n"
+    features = [route(f["featureId"], f["entrypoints"][0]["symbol"], context=("store.py",)) for f in FEATURES]
+    sources = {**SOURCES, "store.py": store}
+
+    def changed(needle):
+        at = line_of(needle, store)
+        return siblings(features, {"store.py": 1}, {"store.py": [(at, at)]}, sources)
+
+    # `_list_items` calls `load`; nothing in routes.py calls `unused`; `routes.py` itself is unchanged
+    assert changed("return []") == {"feat_route_add", "feat_route_delete", "feat_route_health"}
+    assert changed("return 0") == {f["featureId"] for f in features}
+    assert changed("return row") == {"feat_route_list", "feat_route_health"}
+
+
+@pytest.mark.parametrize("case", ["not-python", "unparseable", "unreadable", "no-ranges", "home-unreadable"])
+def test_a_changed_context_file_the_planner_cannot_analyse_keeps_the_feature_touched(case):
+    path = "web/client.ts" if case == "not-python" else "store.py"
+    features = [route("feat_route_health", "_health", context=(path,))]
+    sources = {**SOURCES, path: "def broken(:\n" if case == "unparseable" else "def load():\n    return 1\n"}
+    ranges = {path: [(2, 2)]}
+    if case == "unreadable":
+        del sources[path]
+    elif case == "no-ranges":
+        ranges = {"elsewhere.py": [(1, 1)]}
+    elif case == "home-unreadable":
+        del sources["api/routes.py"]  # the change touches `load`, so the handler's own file must be read
+    assert siblings(features, {path: 1}, ranges, sources) == set()
+
+
+@pytest.mark.parametrize(
+    ("route_spec", "text", "hit"),
+    [
+        ("GET /items", 'client.get("/items")', True),
+        ("GET /items", 'client.get("/items/3")', True),  # a longer spelling: over-inclusion is fine
+        ("GET /items", 'client.get("/itemsets")', False),
+        ("DELETE /items/{id}", 'client.delete(f"/items/{item}")', True),
+        ("DELETE /items/{id}", 'client.delete("/items/42")', True),
+        ("DELETE /items/{id}", 'client.get("/items")', False),
+        ("POST /api/config/providers/{pid}/models", '"/api/config/providers/p1/models"', True),
+        ("POST /api/config/providers/{pid}/models", '"/api/config/providers"', False),
+        ("GET /", "anything /", None),
+        (None, "x", None),
+        ("", "x", None),
+    ],
+)
+def test_route_patterns_match_the_way_tests_spell_a_route(route_spec, text, hit):
+    pattern = pp._route_pattern(route_spec)
+    assert (pattern is None) if hit is None else (bool(pattern.search(text)) is hit)
+
+
+def test_touched_source_is_the_changed_lines_and_every_touched_definition():
+    at = line_of('BASE = "/items"', TESTS)
+    names, _known = touched_symbols(TESTS, [(at, at)])
+    text = touched_source(TESTS, [(at, at)], names)
+    assert 'BASE = "/items"' in text and "def test_add_requires_admin" in text and "test_delete" not in text
+    assert touched_source("def broken(:\n", [(1, 1)], set()) is None
 
 
 def test_a_reader_that_raises_ranks_everything_as_touched():
