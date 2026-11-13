@@ -114,11 +114,12 @@ config:
                                # the diff touches that the cap leaves out make the pass PARTIAL (a coverage gap,
                                # WARN cap), never a silent drop. Lockfiles / generated files / dependency manifests never pull a
                                # feature in as context. 0 = no cap.
-  finding_accounting_gate: losses # which raw-finding-accounting gaps (#329) hold a structural round
-                               # (incomplete + unverified): `losses` = only a provably dropped finding
-                               # (#354; 0 of 40 live rounds, while #329's `all` held 20, none for a real
-                               # loss, and the verify-only re-run could never clear them). `all` = any
-                               # gap, the #329 behaviour. `off` = audit trail only.
+  finding_accounting_gate: losses # which raw-finding-accounting gaps (#329) hold a structural round.
+                               # `losses`: integrity gaps (a provably dropped finding, an unexplained move,
+                               # a flipped/unreasoned disposition, stale seeded inputs) -> incomplete AND
+                               # unverified; a finder lane's coverage gap -> incomplete only; id bookkeeping
+                               # -> nothing (#354: under `all` 20 of 40 live rounds held, none for a real
+                               # loss). `all` = any gap, the #329 behaviour. `off` = audit trail only.
   structural_plan: true        # false = let `clawpatch ci --since` pick the features (pre-#232; the rollback)
   structural_symbol_scope: true # rank the features the diff touches ahead of SIBLINGS (#340): features that own
                                # a changed file while the diff provably touches none of their own code (one

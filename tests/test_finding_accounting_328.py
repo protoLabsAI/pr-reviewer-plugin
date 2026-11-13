@@ -764,7 +764,7 @@ def test_evidence_rewording_needs_no_reason_but_severity_file_or_line_does():
     inv, rows = prepared()
     sharpened = [dict(rows[0], evidence="quote (x.py:3)")]
     assert stages(inv, {s: output(sharpened) for s in a.STAGES})["complete"]
-    for field, value in (("severity", "major"), ("line", 9), ("file", "y.py"), ("evidence", ""), ("evidence", "  ")):
+    for field, value in (("severity", "nit"), ("line", 9), ("file", "y.py"), ("evidence", ""), ("evidence", "  ")):
         moved = [dict(rows[0], **{field: value})]
         gaps = stages(inv, {s: output(moved) for s in a.STAGES})["gaps"]
         assert any("unexplained transformation" in g for g in gaps), field
@@ -884,3 +884,88 @@ async def test_a_round_with_only_bookkeeping_gaps_posts_complete_and_verified(tm
     marker = parse_verdict_marker(gh.reviews_posted[-1]["body"])
     assert marker["complete"] and marker["verified"]
     assert "Raw finding accounting: incomplete" in gh.reviews_posted[-1]["body"]  # still on the record
+
+
+# ── the #355 review: integrity holds, a lane is coverage, odd input never crashes ─────────────
+
+
+def test_an_unexplained_move_or_a_flipped_disposition_still_holds_under_the_default():
+    inv, rows = prepared([F, dict(F, claim="Second defect", line=8)])
+    first, second = sorted(inv["raw"])
+    keep = next(r for r in rows if r["raw_ids"] == [first])
+    downgraded = dict(keep, severity="nit")  # a minor quietly made a nit, no accounting_reason
+    blanked = dict(keep, evidence="")
+    gone = [{"raw_ids": [second], "disposition": "out-of-scope", "reason": "not this diff", "evidence": "x.py:8"}]
+    flipped = [dict(gone[0], disposition="refuted")]
+    unreasoned = [dict(gone[0], reason="")]
+    for case in (
+        {
+            "synthesize": output([downgraded], gone),
+            "verify": output([downgraded], gone),
+            "report": output([downgraded], gone),
+        },
+        {"synthesize": output([blanked], gone), "verify": output([blanked], gone), "report": output([blanked], gone)},
+        {"synthesize": output([keep], gone), "verify": output([keep], flipped), "report": output([keep], flipped)},
+        {"synthesize": output([keep], unreasoned), "verify": output([keep]), "report": output([keep])},
+    ):
+        result = reconciled(inv, case)
+        assert a.unverifying(result), result["gaps"]
+        assert set(a.unverifying(result)) <= set(a.blocking(result))
+
+
+def test_a_finder_lanes_coverage_gap_is_incomplete_but_not_unverified():
+    acc = {
+        "gaps": [
+            "find_structural: incomplete raw input",
+            "find_correctness: truncated raw input (status count differs)",
+            "find_crossfile: execution failed or degraded",
+        ],
+        "losses": [],
+    }
+    assert a.blocking(acc) == acc["gaps"]
+    assert a.unverifying(acc) == []
+    assert a.unverifying(acc, "all") == acc["gaps"]  # #329's strict mode unverifies on any gap
+
+
+def test_seeded_rerun_integrity_gaps_unverify():
+    for gap in ("seeded rerun: stale or foreign finder inputs", "runner changed seeded finder outputs"):
+        assert a.unverifying({"gaps": [gap], "losses": []}) == [gap]
+
+
+@pytest.mark.parametrize("value", [1, "x", {"a": 1}, None, [None, 3, {"k": 1}]])
+def test_losses_never_crashes_on_odd_raw_ids(value):
+    inv, rows = prepared()
+    odd = [dict(rows[0], raw_ids=value)]
+    gone = [{"raw_ids": value, "disposition": "refuted", "reason": "r", "evidence": "e"}]
+    result = reconciled(inv, {s: output(odd, gone) for s in a.STAGES})
+    assert isinstance(result["losses"], list)
+
+
+def test_a_blank_gate_setting_is_the_default_not_off(tmp_path):
+    assert make(tmp_path, cfg={"finding_accounting_gate": None}).finding_accounting_gate == "losses"
+
+
+def test_a_merge_may_take_a_merged_siblings_line_or_severity_and_severity_may_rise():
+    a_row = dict(F, line=331, severity="nit")
+    b_row = dict(F, claim="Same defect, other lane", line=333, severity="minor")
+    inv, _rows = prepared([a_row, b_row])
+    ids = sorted(inv["raw"])
+
+    def unverified(row):
+        return a.unverifying(reconciled(inv, {s: output([row]) for s in a.STAGES}))
+
+    # the merged row takes the sibling's line and the higher of the two severities: explained
+    assert unverified(dict(b_row, raw_ids=ids, verdict="confirmed")) == []
+    # a line neither merged finding had still needs a reason
+    moved = dict(b_row, line=9, raw_ids=ids, verdict="confirmed")
+    assert any("unexplained transformation" in g for g in unverified(moved))
+
+
+def test_raising_severity_needs_no_reason_but_lowering_it_does():
+    inv, rows = prepared()  # one `minor`
+
+    def unverified(severity):
+        return a.unverifying(reconciled(inv, {s: output([dict(rows[0], severity=severity)]) for s in a.STAGES}))
+
+    assert unverified("major") == []
+    assert any("unexplained transformation" in g for g in unverified("nit"))

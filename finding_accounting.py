@@ -12,6 +12,7 @@ import json
 import re
 
 LANES = ("find_correctness", "find_removed_behavior", "find_crossfile", "find_conventions", "find_structural")
+_SEVERITY_RANK = {"nit": 0, "minor": 1, "major": 2, "blocker": 3}
 STAGES = ("synthesize", "verify", "report")
 
 
@@ -216,7 +217,30 @@ def reconcile(accounting, steps, output, *, history=()):
                         return str(value or "").strip()
 
                     blanked = bool(_text(before.get("evidence"))) and not _text(row.get("evidence"))
-                    changed = blanked or any(before.get(k) != row.get(k) for k in ("severity", "file", "line"))
+                    # A merge explains itself: a row that folds several raw findings together may
+                    # take its file, line or severity from any of them (#355 review: all three
+                    # "unexplained" moves on 40 live rounds were merges taking a sibling's line, or a
+                    # nit merged into a minor). Raising severity never hides anything. A downgrade,
+                    # or a move to a value none of the merged findings had, still needs a reason.
+                    merged = [
+                        result["raw"][i]["finding"]
+                        for i in ids
+                        if isinstance(i, str)
+                        and i in result["raw"]
+                        and isinstance(result["raw"][i].get("finding"), dict)
+                    ]
+
+                    def moved(field):
+                        new = row.get(field)
+                        if before.get(field) == new or any(m.get(field) == new for m in merged):
+                            return False
+                        if field == "severity" and _SEVERITY_RANK.get(new, -1) > _SEVERITY_RANK.get(
+                            before.get(field), 99
+                        ):
+                            return False
+                        return True
+
+                    changed = blanked or any(moved(k) for k in ("severity", "file", "line"))
                     # Only `accounting_reason` explains a move, at every stage. The verifier's `note`
                     # does not: it is on every verified row, so accepting it would excuse any regrade
                     # (#352 review). The live case that needed it was an evidence-only edit, which no
@@ -329,11 +353,14 @@ def losses(result, steps, output):
             if stage == "report" and alive - settled:
                 out.append(f"report: findings array unreadable with {len(alive - settled)} finding(s) in flight")
             continue
-        carried = {resolve_id(i, raw) for row in rows for i in (row.get("raw_ids") or [])} - {None}
-        settled |= {resolve_id(i, raw) for d in rejected if isinstance(d, dict) for i in (d.get("raw_ids") or [])} - {
-            None
-        }
-        if any(not isinstance(row.get("raw_ids"), list) or not row.get("raw_ids") for row in rows):
+
+        def ids(item):
+            value = item.get("raw_ids") if isinstance(item, dict) else None
+            return value if isinstance(value, list) else []
+
+        carried = {resolve_id(i, raw) for row in rows for i in ids(row)} - {None}
+        settled |= {resolve_id(i, raw) for d in rejected for i in ids(d)} - {None}
+        if any(not ids(row) for row in rows):
             alive = carried | (alive - settled)
             continue
         dropped = sorted(alive - carried - settled)
@@ -343,23 +370,58 @@ def losses(result, steps, output):
     return out
 
 
-# What `finding_accounting_gate: losses` (the default) gates on: provable drops, the dispatcher's
-# own unexplained omissions (`finalize`, code-side and exact), a verifier that left surviving
-# findings unannotated (`verification_ran` over the survivors — a verification check, not id
-# bookkeeping), a lane whose raw array could not be read at all, and an inventory that never
-# existed. None of these fired on the 40 live rounds of 2026-11-13. Everything else is audit trail.
-_BLOCKING_GAPS = ("final:", "native inventory unavailable", "verify: incomplete survivor verification")
+# Under `finding_accounting_gate: losses` (the default) the trail's gaps fall in three classes:
+#
+#  - INTEGRITY (the round is incomplete AND unverified): what the trail can prove went wrong with a
+#    finding — a provable drop (`losses`), a severity/file/line move or emptied evidence with no
+#    reason, a disposition flipped, resurrected or given without a reason, a verifier that left
+#    survivors unannotated, the dispatcher's own omissions, seeded inputs that were stale or got
+#    changed, an inventory that never existed.
+#  - COVERAGE (incomplete, NOT unverified): a finder lane's raw input was cut short, malformed or
+#    degraded. A verify re-run cannot recover a lane, so this must not send the head to the
+#    unverified re-run (#354: every head of mythxengine#924 hit the structural feature cap) — it
+#    caps the verdict at WARN like any other coverage gap.
+#  - AUDIT (decides nothing): id bookkeeping — rows without their ids, a later stage not restating
+#    an earlier disposition, ids copied with a typo, a missing or unreadable accounting object.
+#    On 40 live rounds this was every gap #329's `all` held on, and none was a lost finding.
+_INTEGRITY_GAPS = (
+    "unexplained transformation",
+    "resurrected disposition",
+    "changed disposition",
+    "unreasoned disposition",
+    "incomplete survivor verification",
+    "stale or foreign finder inputs",
+    "runner changed seeded finder outputs",
+    "native inventory unavailable",
+)
 
 
-def blocking(accounting, mode="losses"):
-    """The accounting gaps that decide the round under `mode` (`all`, `losses`, `off`)."""
+def _is_lane_gap(gap):
+    return any(gap.startswith(f"{lane}:") for lane in LANES)
+
+
+def unverifying(accounting, mode="losses"):
+    """The accounting gaps that mark the round UNVERIFIED under `mode` (`all`, `losses`, `off`)."""
     if not isinstance(accounting, dict) or mode == "off":
         return []
     gaps = [g for g in accounting.get("gaps") or [] if isinstance(g, str)]
     if mode == "all":
         return gaps
-    lanes = [g for g in gaps if g.endswith("missing or malformed raw array")]
-    return list(accounting.get("losses") or []) + lanes + [g for g in gaps if g.startswith(_BLOCKING_GAPS)]
+    integrity = [
+        g for g in gaps if not _is_lane_gap(g) and (g.startswith("final:") or any(k in g for k in _INTEGRITY_GAPS))
+    ]
+    return [g for g in accounting.get("losses") or [] if isinstance(g, str)] + integrity
+
+
+def blocking(accounting, mode="losses"):
+    """The accounting gaps that mark the round INCOMPLETE under `mode`: the unverifying ones plus,
+    under `losses`, a finder lane whose raw input was cut short, malformed or degraded."""
+    if not isinstance(accounting, dict) or mode == "off":
+        return []
+    if mode == "all":
+        return unverifying(accounting, mode)
+    lanes = [g for g in accounting.get("gaps") or [] if isinstance(g, str) and _is_lane_gap(g)]
+    return unverifying(accounting, mode) + lanes
 
 
 def coverage(result, recipe, *, history=()):

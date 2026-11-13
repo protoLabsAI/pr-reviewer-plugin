@@ -2020,25 +2020,30 @@ class Dispatcher:
         ids, a verifier not restating synthesis' dispositions, ids copied with a typo, an honest
         structural feature-cap partial — and since `verified=false` sends a head to the unverified
         re-run, which re-runs verify only, every head of a large PR ended "Verifier failed twice"
-        with its required check stuck (#354). `losses` gates only on what the trail can PROVE was
-        dropped (`finding_accounting.blocking`): 0 of those 40 rounds, while a verifier that
-        silently drops a finding is still caught. `off` decides nothing. In every mode the trail
-        is still computed, emitted and rendered."""
+        with its required check stuck (#354). `losses` splits the gaps (`finding_accounting`):
+        integrity gaps (a provable drop, an unexplained move, a flipped or unreasoned disposition,
+        stale seeded inputs, …) make the round incomplete AND unverified; a finder lane's coverage
+        gap makes it incomplete only; id bookkeeping decides nothing. `off` decides nothing. In
+        every mode the trail is still computed, emitted and rendered."""
         cfg = self.cfg
-        raw = (
-            cfg["finding_accounting_gate"]
-            if "finding_accounting_gate" in cfg
-            else os.environ.get("PR_REVIEWER_FINDING_ACCOUNTING_GATE", "")
-        )
+        raw = cfg.get("finding_accounting_gate")
+        if raw is None:  # unset, or a blank YAML key: the default, never `off`
+            raw = os.environ.get("PR_REVIEWER_FINDING_ACCOUNTING_GATE", "")
         mode = str(raw).strip().lower()
         if mode in ("all", "true", "1", "yes", "on"):
             return "all"
-        if mode in ("off", "false", "0", "no", "none"):
+        if mode in ("off", "false", "0", "no"):
             return "off"
         return "losses"
 
     def _accounting_blocks(self, accounting) -> list[str]:
+        """Accounting gaps that make the round incomplete (see `finding_accounting.blocking`)."""
         return _accounting.blocking(accounting, self.finding_accounting_gate)
+
+    def _accounting_unverifies(self, accounting) -> list[str]:
+        """The subset that also makes it unverified — never a finder lane's coverage gap, which a
+        verify re-run cannot recover (#354)."""
+        return _accounting.unverifying(accounting, self.finding_accounting_gate)
 
     @property
     def epic_attestation(self) -> bool:
@@ -5049,7 +5054,7 @@ class Dispatcher:
             return await self._abandon_ended(repo, pr, head, ended, "posting", review_check_id)
         round_verified = (
             not isolation_gaps
-            and not self._accounting_blocks(accounting)
+            and not self._accounting_unverifies(accounting)
             and verification_ran(str(steps_out.get("verify") or ""), reported)
         )
         posted = await self._post_verdict(
@@ -5901,7 +5906,9 @@ class Dispatcher:
             _accounting.finalize(accounting, accounting.get("report_findings") or [], findings, stage="posted")
             if blocks := self._accounting_blocks(accounting):
                 coverage_gaps = {**(coverage_gaps or {}), "finding_accounting": "; ".join(blocks)}
-                complete = verified = False
+                complete = False
+                if self._accounting_unverifies(accounting):
+                    verified = False
                 verdict = coverage_verdict(verdict, coverage_gaps)
         body = render_verdict_body(
             repo=repo,
