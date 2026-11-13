@@ -44,14 +44,37 @@ So the plugin plans the features:
   `package-lock.json`, `pnpm-lock.yaml`, `THIRD_PARTY_LICENSES.md`, `changelog.d/`, `pyproject.toml`,
   `package.json`, `Cargo.toml`, `requirements*.txt`, …) **never pulls a feature in as context**. Its
   findings are confined to the diff anyway.
-- The remaining features are **ranked** by changed lines in files they own, then in their context
-  files, and at most `structural_max_features` (default 16; `0` = no cap) are reviewed.
-- **Features the cap leaves out are a coverage gap**, never a silent drop. The pass comes back
-  partial (`N of M features reviewed — feature cap reached …`, `structural_reason: feature-cap`),
-  the round is incomplete, and the verdict is capped at WARN.
+- The remaining features are **ranked**: features the diff touches before *siblings* (below), then
+  by changed lines in files they own, then in their context files. At most
+  `structural_max_features` (default 16; `0` = no cap) are reviewed.
+- **A touched feature the cap leaves out is a coverage gap**, never a silent drop. The pass comes
+  back partial (`N of M features reviewed — feature cap reached …`,
+  `structural_reason: feature-cap`), the round is incomplete, and the verdict is capped at WARN.
+
+### Siblings
+
+clawpatch maps one feature per route handler, and each handler owns its whole file. File ownership
+therefore cannot tell the two handlers a PR edits from the twenty-three it does not: they all tie
+on changed lines, and the cap used to choose among them by feature id — reviewing untouched
+handlers while leaving out an edited one, and marking a 60-line PR incomplete on every round.
+
+A feature is a **sibling** when the diff provably touches none of its own code. All of this must
+hold; anything short of it ranks the feature as touched:
+
+- it owns a changed file, and no changed source file reaches it as context;
+- every changed file it owns is Python that parses at head and holds one of its entrypoint symbols;
+- the diff touches none of those symbols — not a line of the definition (decorators included), and
+  not a helper, constant, closure variable or import the definition references, transitively.
+
+Siblings are still reviewed while the cap has room: a review of an untouched handler is what
+notices that a check added to two handlers is missing from the third. But siblings the cap leaves
+out are **not** a coverage gap. The header says how many (`… N more own a changed file but the diff
+touches none of their own code — not reviewed`), the pass is complete, and the verdict is not
+capped. `structural_symbol_scope: false` restores file-only ranking and gaps.
 
 Every pass writes a `structural_plan` telemetry event: features mapped / eligible / selected /
-dropped / out of scope, and per planned feature its owned and context changed lines, file count,
+dropped / out of scope, `siblings` and `dropped_siblings` (a planned sibling carries
+`"sibling": true`), and per planned feature its owned and context changed lines, file count,
 prompt size, `elapsed_s` and how it ended (`finished`, `error`, `killed` = in flight at the kill,
 `not-started`). That tells an over-planned pass from a hang without the container log. Under
 [epic attestation](epic-attestation.md) the plan, selection and confinement use the residual files

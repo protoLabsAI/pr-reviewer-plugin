@@ -111,10 +111,17 @@ config:
                                # also raise time_budget_s (the wall clock is fixed). 0 = clawpatch's own
                                # default (no --jobs): the rollback switch. Clamped to 10.
   structural_max_features: 16  # features reviewed per structural pass (#232), ranked by changed lines. Features
-                               # the cap leaves out make the pass PARTIAL (a coverage gap, WARN cap), never a
-                               # silent drop. Lockfiles / generated files / dependency manifests never pull a
+                               # the diff touches that the cap leaves out make the pass PARTIAL (a coverage gap,
+                               # WARN cap), never a silent drop. Lockfiles / generated files / dependency manifests never pull a
                                # feature in as context. 0 = no cap.
   structural_plan: true        # false = let `clawpatch ci --since` pick the features (pre-#232; the rollback)
+  structural_symbol_scope: true # rank the features the diff touches ahead of SIBLINGS (#340): features that own
+                               # a changed file while the diff provably touches none of their own code (one
+                               # feature per route handler, each owning the whole routes file). The cap spends
+                               # itself on touched features first, and leaving siblings out no longer makes
+                               # the pass PARTIAL — the header and `structural_plan.dropped_siblings` say how
+                               # many. Python only; anything not provable ranks as touched. false = rank by
+                               # file ownership alone and count every capped feature as a gap (the rollback).
   structural_result_cache: true # memoize per-feature structural results (#312): a selected feature whose
                                # owned+context head blobs, engine version, model and plugin version are
                                # unchanged since a COMPLETED review is served from a JSON store next to the
@@ -155,6 +162,7 @@ settings:
   - {key: structural_jobs, label: "protoPatch concurrent feature reviews (0 = engine default)", type: int}
   - {key: structural_max_features, label: "protoPatch features per pass (0 = no cap)", type: int}
   - {key: structural_plan, label: "protoPatch: plugin plans the features (off = clawpatch --since)", type: bool}
+  - {key: structural_symbol_scope, label: "protoPatch: rank features the diff touches first (off = by file only)", type: bool}
   - {key: model, label: "protoPatch model override", type: string}
 
 # The webhook page-load can't carry a bearer — the HMAC inside the handler is the

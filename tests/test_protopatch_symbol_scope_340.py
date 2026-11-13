@@ -1,0 +1,404 @@
+"""The structural plan ranks the features a diff TOUCHES ahead of those that only share a file (#340).
+
+clawpatch maps one feature per route handler and each handler owns its whole file, so after a
+six-line change every handler of that file was eligible, tied on changed lines, and the per-pass
+cap chose among them by feature id. Measured on protoAgent, 2026-11-12/13 (cap 32):
+
+  - #5173 (4 files, ~90 lines, 48 eligible): both rounds left out `_watch_update`, a handler the PR
+    edits, while reviewing 30 it never touched;
+  - #5169 (6 files, 50-65 lines, 36 eligible): `complete: false` / WARN on all five rounds.
+
+Now a feature whose own code the diff provably does not touch is a SIBLING: ranked after every
+touched feature, still reviewed while the cap has room, and — when the cap leaves it out — stated
+in the header instead of making the pass partial. Anything the planner cannot prove stays ranked
+as touched, and `structural_symbol_scope: false` is the rollback.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+
+import pr_reviewer.protopatch as pp
+import pytest
+from pr_reviewer.protopatch import (
+    FEATURE_CAP_REASON,
+    PARTIAL_PREFIX,
+    STRUCTURAL_GAP_MARKERS,
+    ProtoPatchRunner,
+    plan_features,
+    read_head_source,
+    sibling_features,
+)
+from pr_reviewer.symbol_scope import MAX_SOURCE_BYTES, touched_symbols
+
+SHA_HEAD = "a" * 40
+SHA_BASE = "b" * 40
+
+ROUTES = """\
+import json
+from store import load, save
+
+LIMIT = 10
+
+
+def _check(scope):
+    return scope == "admin"
+
+
+def _fmt(row):
+    return json.dumps(row)
+
+
+def register(app, cfg):
+    plane = cfg["plane"]
+
+    @app.get("/items")
+    async def _list_items():
+        return [_fmt(r) for r in load()][:LIMIT]
+
+    @app.post("/items")
+    async def _add_item(body, scope):
+        if not _check(scope):
+            raise PermissionError(plane)
+        save(body)
+
+    @app.delete("/items/{id}")
+    async def _delete_item(id):
+        save(None)
+
+    @app.get("/health")
+    async def _health():
+        return "ok"
+
+    app.add_api_route("/legacy", _health)
+"""
+
+
+def line_of(needle: str, source: str = ROUTES) -> int:
+    return next(i for i, text in enumerate(source.splitlines(), 1) if needle in text)
+
+
+def touched(*needles: str, source: str = ROUTES) -> set[str]:
+    result = touched_symbols(source, [(line_of(n, source), line_of(n, source)) for n in needles])
+    assert result is not None
+    return result[0]
+
+
+# ── which definitions a diff touches ───────────────────────────────────────────────────────────
+
+
+def test_a_change_inside_one_handler_touches_that_handler_and_its_factory_only():
+    names = touched("save(body)")
+    assert "_add_item" in names
+    assert not names & {"_list_items", "_delete_item", "_health", "_check", "_fmt"}
+
+
+def test_a_changed_decorator_touches_its_handler():
+    assert "_delete_item" in touched('@app.delete("/items/{id}")')
+    assert "_add_item" not in touched('@app.delete("/items/{id}")')
+
+
+def test_a_changed_helper_touches_every_handler_that_calls_it():
+    names = touched('return scope == "admin"')
+    assert {"_check", "_add_item"} <= names
+    assert not names & {"_list_items", "_delete_item", "_health"}
+
+
+def test_a_changed_module_constant_or_import_touches_what_references_it():
+    assert "_list_items" in touched("LIMIT = 10") and "_add_item" not in touched("LIMIT = 10")
+    by_import = touched("from store import load, save")
+    assert {"_list_items", "_add_item", "_delete_item"} <= by_import and "_health" not in by_import
+    # `import json` reaches `_list_items` through the helper it calls: the closure is transitive
+    assert {"_fmt", "_list_items"} <= touched("import json")
+
+
+def test_a_changed_closure_variable_touches_the_handlers_that_read_it():
+    names = touched('plane = cfg["plane"]')
+    assert "_add_item" in names and not names & {"_list_items", "_delete_item", "_health"}
+
+
+def test_a_changed_registration_line_touches_the_handler_it_names():
+    assert "_health" in touched('app.add_api_route("/legacy", _health)')
+
+
+def test_a_change_in_no_definition_touches_nothing():
+    blank = ROUTES.splitlines().index("") + 1
+    result = touched_symbols(ROUTES, [(blank, blank)])
+    assert result is not None and result[0] == set()
+    assert {"register", "_list_items", "_add_item", "_delete_item", "_health", "_check", "_fmt"} == result[1]
+
+
+@pytest.mark.parametrize("source", ["def broken(:\n", "x" * (MAX_SOURCE_BYTES + 1), None])
+def test_a_file_that_cannot_be_analysed_is_unknown_never_a_crash(source):
+    assert touched_symbols(source, [(1, 1)]) is None
+
+
+def test_methods_are_definitions_too():
+    source = "class Api:\n    def get(self):\n        return 1\n\n    def put(self):\n        return 2\n"
+    names, known = touched_symbols(source, [(3, 3)])
+    assert "get" in names and "put" not in names and {"Api", "get", "put"} <= known
+
+
+# ── which features are siblings ────────────────────────────────────────────────────────────────
+
+
+def route(fid, symbol, path="api/routes.py", context=("pyproject.toml",), owned=None):
+    return {
+        "featureId": fid,
+        "title": fid,
+        "kind": "route",
+        "entrypoints": [{"path": path, "symbol": symbol}],
+        "ownedFiles": [{"path": p, "reason": "x"} for p in (owned or [path])],
+        "contextFiles": [{"path": p, "reason": "x"} for p in context],
+    }
+
+
+FEATURES = [
+    route("feat_route_list", "_list_items"),
+    route("feat_route_add", "_add_item"),
+    route("feat_route_delete", "_delete_item"),
+    route("feat_route_health", "_health"),
+]
+SOURCES = {"api/routes.py": ROUTES}
+
+
+def siblings(features, lines, ranges, sources=SOURCES):
+    return sibling_features(features, lines, ranges, sources.get)
+
+
+def test_only_the_handlers_the_diff_leaves_alone_are_siblings():
+    hunk = [(line_of("save(body)"), line_of("save(body)"))]
+    found = siblings(FEATURES, {"api/routes.py": 1}, {"api/routes.py": hunk})
+    assert found == {"feat_route_list", "feat_route_delete", "feat_route_health"}
+
+
+def test_a_changed_helper_keeps_its_callers_out_of_the_siblings():
+    hunk = [(line_of('return scope == "admin"'),) * 2]
+    assert "feat_route_add" not in siblings(FEATURES, {"api/routes.py": 1}, {"api/routes.py": hunk})
+
+
+def test_a_deletion_at_a_handlers_edge_counts_against_it():
+    # `git diff --unified=0` reports a pure deletion as the line BEFORE it; the widened range reaches
+    # the handler whose first line went.
+    before = line_of('@app.delete("/items/{id}")') - 1
+    found = siblings(FEATURES, {"api/routes.py": 1}, {"api/routes.py": [(before, before)]})
+    assert "feat_route_delete" not in found
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["no-ranges", "file-has-no-ranges", "unreadable", "unparseable", "not-python", "unknown-symbol", "no-entrypoint"],
+)
+def test_anything_the_planner_cannot_prove_is_ranked_as_touched(case):
+    hunk = [(line_of("save(body)"),) * 2]
+    features, lines, ranges, sources = FEATURES, {"api/routes.py": 1}, {"api/routes.py": hunk}, dict(SOURCES)
+    if case == "no-ranges":
+        ranges = None
+    elif case == "file-has-no-ranges":
+        ranges = {"other.py": hunk}
+    elif case == "unreadable":
+        sources = {}
+    elif case == "unparseable":
+        sources = {"api/routes.py": "def broken(:\n"}
+    elif case == "not-python":
+        features = [route("feat_ts", "listItems", path="web/routes.ts")]
+        lines, ranges, sources = {"web/routes.ts": 1}, {"web/routes.ts": hunk}, {"web/routes.ts": ROUTES}
+    elif case == "unknown-symbol":
+        features = [route("feat_gone", "_renamed_away")]
+    elif case == "no-entrypoint":
+        features = [{**route("feat_lib", "_health"), "entrypoints": []}]
+    assert siblings(features, lines, ranges, sources) == set()
+
+
+def test_a_changed_source_file_in_context_or_a_second_owned_file_keeps_a_feature_touched():
+    hunk = [(line_of("save(body)"),) * 2]
+    by_context = route("feat_ctx", "_health", context=("api/models.py",))
+    two_files = route("feat_two", "_health", owned=["api/routes.py", "api/models.py"])
+    alone = route("feat_alone", "_health")
+    lines = {"api/routes.py": 1, "api/models.py": 4}
+    ranges = {"api/routes.py": hunk, "api/models.py": [(1, 4)]}
+    sources = {**SOURCES, "api/models.py": "X = 1\n"}
+    assert siblings([by_context, two_files, alone], lines, ranges, sources) == {"feat_alone"}
+
+
+def test_a_reader_that_raises_ranks_everything_as_touched():
+    def boom(path):
+        raise RuntimeError("disk")
+
+    assert sibling_features(FEATURES, {"api/routes.py": 1}, {"api/routes.py": [(1, 1)]}, boom) == set()
+
+
+def test_the_head_reader_refuses_what_is_not_a_regular_file_inside_the_checkout(tmp_path):
+    checkout = tmp_path / "co"
+    checkout.mkdir()
+    (checkout / "ok.py").write_text("x = 1\n")
+    (tmp_path / "secret.py").write_text("token = 1\n")
+    os.symlink(tmp_path / "secret.py", checkout / "link.py")
+    (checkout / "big.py").write_text("x" * (MAX_SOURCE_BYTES + 1))
+    assert read_head_source(checkout, "ok.py") == "x = 1\n"
+    assert read_head_source(checkout, "link.py") is None
+    assert read_head_source(checkout, "../secret.py") is None
+    assert read_head_source(checkout, "big.py") is None
+    assert read_head_source(checkout, "missing.py") is None
+
+
+# ── the plan ───────────────────────────────────────────────────────────────────────────────────
+
+
+def test_touched_features_rank_ahead_of_siblings_whatever_their_ids():
+    plan = plan_features(FEATURES, {"api/routes.py": 6}, cap=2, siblings={"feat_route_add", "feat_route_delete"})
+    # by id alone the cap of 2 would keep `add` and `delete`; the touched ones come first instead
+    assert [f["id"] for f in plan.selected] == ["feat_route_health", "feat_route_list"]
+    assert [f["id"] for f in plan.eligible[2:]] == ["feat_route_add", "feat_route_delete"]
+    assert plan.eligible[2]["sibling"] is True and "sibling" not in plan.eligible[0]
+    assert (plan.dropped, plan.dropped_siblings, plan.gap, plan.siblings, plan.required) == (2, 2, 0, 2, 2)
+    assert "over the per-pass cap" not in plan.summary().split(";")[0]
+    assert "2 more own a changed file but the diff touches none of their own code" in plan.summary()
+
+
+def test_a_touched_feature_over_the_cap_is_still_a_gap():
+    plan = plan_features(FEATURES, {"api/routes.py": 6}, cap=1, siblings={"feat_route_delete"})
+    assert (plan.dropped, plan.dropped_siblings, plan.gap, plan.required) == (3, 1, 2, 3)
+    assert ", 2 over the per-pass cap of 1" in plan.summary() and "1 more own a changed file" in plan.summary()
+
+
+def test_without_siblings_the_plan_is_what_it_was():
+    plan = plan_features(FEATURES, {"api/routes.py": 6}, cap=2)
+    assert [f["id"] for f in plan.selected] == ["feat_route_add", "feat_route_delete"]
+    assert (plan.dropped, plan.gap, plan.dropped_siblings, plan.required) == (2, 2, 0, 4)
+
+
+# ── end to end through the runner ──────────────────────────────────────────────────────────────
+
+
+class Recorder:
+    def __init__(self):
+        self.events: list[tuple[str, dict]] = []
+
+    def emit(self, event, **fields):
+        self.events.append((event, fields))
+
+
+@pytest.fixture(autouse=True)
+def env(monkeypatch):
+    monkeypatch.setenv("GATEWAY_API_KEY", "gk")
+    monkeypatch.setenv("GITHUB_TOKEN", "ghtok")
+    monkeypatch.delenv("CLAWPATCH_GATEWAY_TIMEOUT_MS", raising=False)
+
+    async def fake_run_gh(args, timeout=30):
+        return (0, f"{SHA_HEAD} {SHA_BASE}", "") if args[:1] == ["api"] else (0, "", "")
+
+    monkeypatch.setattr(pp, "run_gh", fake_run_gh)
+
+
+def make_git(files: dict[str, str], hunks: dict[str, list[tuple[int, int]]]):
+    """A checkout holding `files`, whose diff changes `hunks` (head-side line ranges)."""
+
+    async def run_git(args, timeout_s=180):
+        if args[0] == "clone":
+            for path, text in files.items():
+                target = Path(args[-1]) / path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(text)
+        if "--numstat" in args:
+            return 0, "".join(f"{sum(b - a + 1 for a, b in h)}\t0\t{p}\n" for p, h in hunks.items()), ""
+        if "--unified=0" in args:
+            out = ""
+            for path, ranges in hunks.items():
+                out += f"+++ b/{path}\n" + "".join(f"@@ -{a},1 +{a},{b - a + 1} @@\n" for a, b in ranges)
+            return 0, out, ""
+        if "diff" in args:
+            return 0, "".join(f"{p}\n" for p in hunks), ""
+        return 0, "", ""
+
+    return run_git
+
+
+class FakeClawpatch:
+    def __init__(self, features):
+        self.features = features
+        self.listed: list[str] = []
+
+    async def __call__(self, args, cwd, env, budget_s):
+        state = Path(args[args.index("--state-dir") + 1])
+        if "init" in args:
+            return 0, "{}", "", False
+        if "map" in args:
+            (state / "features").mkdir(parents=True, exist_ok=True)
+            for f in self.features:
+                (state / "features" / f"{f['featureId']}.json").write_text(json.dumps({**f, "status": "pending"}))
+            return 0, "{}", "", False
+        self.listed = Path(args[args.index("--feature-list") + 1]).read_text().split()
+        (state / "runs").mkdir(exist_ok=True)
+        (state / "runs" / "20261113T000000-aaaaaa.json").write_text(json.dumps({"claimedFeatureIds": self.listed}))
+        stderr = ""
+        for fid in self.listed:
+            rec = next(f for f in self.features if f["featureId"] == fid)
+            (state / "features" / f"{fid}.json").write_text(json.dumps({**rec, "status": "reviewed"}))
+            stderr += f"clawpatch review feature-start index=1 total=1 feature={fid} title=t\n"
+            stderr += f"clawpatch review feature-done index=1 total=1 feature={fid} findings=0 elapsed=90s\n"
+        return 0, "{}", stderr, False
+
+
+def run(tmp_path, features, hunks, cfg=None, files=SOURCES):
+    claw, tele = FakeClawpatch(features), Recorder()
+    base = {"checkout_root": str(tmp_path / "co"), "state_root": str(tmp_path / "st"), "default_repo": ""}
+    base["structural_result_cache"] = False
+    runner = ProtoPatchRunner(
+        {**base, **(cfg or {})}, run_git=make_git(files, hunks), run_clawpatch=claw, telemetry=tele
+    )
+    return runner, claw, tele
+
+
+EDIT_HEALTH = {"api/routes.py": [(line_of('return "ok"'), line_of('return "ok"'))]}
+
+
+async def test_the_cap_reviews_the_edited_handler_and_leaving_siblings_out_is_a_complete_pass(tmp_path):
+    # Feature ids sort `add` < `delete` < `health` < `list`: by file ownership alone a cap of 2
+    # reviews `add` and `delete` and leaves out `health` — the one handler this diff edits (#5173).
+    runner, claw, tele = run(tmp_path, FEATURES, EDIT_HEALTH, cfg={"structural_max_features": 2})
+    out = await runner.review(5173, "o/r")
+
+    assert claw.listed == ["feat_route_health", "feat_route_add"]
+    assert not out.startswith(PARTIAL_PREFIX) and not any(m in out for m in STRUCTURAL_GAP_MARKERS)
+    assert "plan: 2 of 4 eligible feature(s) of 4 mapped; 2 more own a changed file but the diff touches none" in out
+    [(_, row)] = tele.events
+    assert row["outcome"] == "complete" and row["reason"] is None
+    assert (row["eligible"], row["selected"], row["dropped"]) == (4, 2, 2)
+    assert (row["siblings"], row["dropped_siblings"]) == (3, 2)
+    assert [f.get("sibling") for f in row["features"]] == [None, True]
+
+
+async def test_a_cap_below_the_touched_features_is_still_partial_and_counts_only_them(tmp_path):
+    hunks = {"api/routes.py": [(line_of('return scope == "admin"'),) * 2, (line_of('return "ok"'),) * 2]}
+    runner, claw, tele = run(tmp_path, FEATURES, hunks, cfg={"structural_max_features": 1})
+    out = await runner.review(1, "o/r")
+
+    assert claw.listed == ["feat_route_add"]  # touched: `add` (through `_check`) and `health`
+    assert out.startswith(PARTIAL_PREFIX)
+    assert "1 of 2 features reviewed" in out.splitlines()[0]
+    assert f"{FEATURE_CAP_REASON}: the 1 features with the most changed lines were reviewed, 1 were not" in out
+    [(_, row)] = tele.events
+    assert row["outcome"] == "partial" and row["reason"] == "feature-cap"
+    assert (row["dropped"], row["dropped_siblings"]) == (3, 2)
+
+
+@pytest.mark.parametrize("value", [False, "false", "off", "0"])
+async def test_the_rollback_switch_ranks_and_gaps_by_file_ownership_again(tmp_path, value):
+    cfg = {"structural_max_features": 2, "structural_symbol_scope": value}
+    runner, claw, tele = run(tmp_path, FEATURES, EDIT_HEALTH, cfg=cfg)
+    out = await runner.review(5173, "o/r")
+
+    assert claw.listed == ["feat_route_add", "feat_route_delete"]
+    assert out.startswith(PARTIAL_PREFIX) and "2 of 4 features reviewed" in out.splitlines()[0]
+    [(_, row)] = tele.events
+    assert row["outcome"] == "partial" and (row["siblings"], row["dropped_siblings"]) == (0, 0)
+
+
+async def test_under_the_cap_every_sibling_is_still_reviewed(tmp_path):
+    runner, claw, _ = run(tmp_path, FEATURES, EDIT_HEALTH)
+    out = await runner.review(1, "o/r")
+    assert claw.listed[0] == "feat_route_health" and sorted(claw.listed) == sorted(f["featureId"] for f in FEATURES)
+    assert "plan: 4 of 4 eligible feature(s)" in out and "not reviewed" not in out

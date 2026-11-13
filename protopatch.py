@@ -448,6 +448,24 @@ def parse_numstat(out: str) -> dict[str, int]:
     return lines
 
 
+def read_head_source(checkout: Path, path: str) -> str | None:
+    """The text of one file of the checked-out head, for the symbol scope (#340) — None when it is
+    not a regular file inside the checkout (a symlink a PR added must not point the parser
+    elsewhere), is too large, or cannot be read."""
+    try:
+        from .symbol_scope import MAX_SOURCE_BYTES
+
+        root = Path(checkout).resolve()
+        target = root / path
+        if target.is_symlink() or not target.is_file():
+            return None
+        if not target.resolve().is_relative_to(root) or target.stat().st_size > MAX_SOURCE_BYTES:
+            return None
+        return target.read_text(errors="replace")
+    except (OSError, ValueError):
+        return None
+
+
 def read_feature_records(state_dir: Path) -> list[dict]:
     """The features `clawpatch map` wrote to `<state>/features/`. Unreadable records are skipped."""
     out: list[dict] = []
@@ -466,11 +484,17 @@ def _paths(entries) -> set[str]:
 
 
 class FeaturePlan:
-    """Which features one structural pass reviews, and why (#232)."""
+    """Which features one structural pass reviews, and why (#232).
+
+    `eligible` is ranked: features the diff touches first, then SIBLINGS — features that own a
+    changed file while the diff provably touches none of their own code (#340, `sibling_features`).
+    The cap therefore always spends itself on the touched ones first, and what it leaves out is one
+    of two different things: a touched feature (`gap` — a coverage gap, the pass is partial) or a
+    sibling (`dropped_siblings` — depth not taken, stated in the header, the pass is complete)."""
 
     def __init__(self, mapped: int, eligible: list[dict], cap: int | None, low_signal_only: int, low_signal_files):
         self.mapped = mapped
-        self.eligible = eligible  # ranked, most changed lines first
+        self.eligible = eligible  # ranked: touched before siblings, then most changed lines first
         self.cap = cap
         self.selected = eligible if cap is None else eligible[:cap]
         self.low_signal_only = low_signal_only  # matched ONLY through a lockfile/manifest as context
@@ -480,10 +504,34 @@ class FeaturePlan:
     def dropped(self) -> int:
         return len(self.eligible) - len(self.selected)
 
+    @property
+    def siblings(self) -> int:
+        return sum(1 for f in self.eligible if f.get("sibling"))
+
+    @property
+    def dropped_siblings(self) -> int:
+        return sum(1 for f in self.eligible[len(self.selected) :] if f.get("sibling"))
+
+    @property
+    def gap(self) -> int:
+        """Features the diff touches that the cap left unreviewed — the only kind of drop that
+        makes a pass partial."""
+        return self.dropped - self.dropped_siblings
+
+    @property
+    def required(self) -> int:
+        """The denominator of "N of M features reviewed": everything but the left-out siblings."""
+        return len(self.eligible) - self.dropped_siblings
+
     def summary(self) -> str:
         text = f"plan: {len(self.selected)} of {len(self.eligible)} eligible feature(s) of {self.mapped} mapped"
-        if self.dropped:
-            text += f", {self.dropped} over the per-pass cap of {self.cap}"
+        if self.gap:
+            text += f", {self.gap} over the per-pass cap of {self.cap}"
+        if self.dropped_siblings:
+            text += (
+                f"; {self.dropped_siblings} more own a changed file but the diff touches none of their own "
+                f"code — not reviewed (per-pass cap of {self.cap}; depth, not a coverage gap)"
+            )
         if self.low_signal_only:
             text += (
                 f"; {self.low_signal_only} more depend on the diff only through a lockfile or dependency "
@@ -492,13 +540,83 @@ class FeaturePlan:
         return text
 
 
-def plan_features(features: list[dict], changed_lines: dict[str, int], cap: int | None) -> FeaturePlan:
+def sibling_features(
+    features: list[dict],
+    changed_lines: dict[str, int],
+    ranges: dict[str, list[tuple[int, int]]] | None,
+    read_source,
+) -> set[str]:
+    """Ids of the features that own a changed file while the diff PROVABLY touches none of their
+    own code (#340).
+
+    clawpatch maps one feature per route handler and each handler owns its whole file, so file
+    ownership alone cannot tell the two handlers a PR edits from the twenty-three it does not. A
+    feature is a sibling only when ALL of this holds — anything short of it leaves the feature
+    ranked as touched, exactly as before:
+
+      - it owns at least one changed file, and no changed source file reaches it as context;
+      - every changed file it owns is Python the planner could parse at head, with the diff's line
+        ranges known, and holds at least one of the feature's entrypoint symbols;
+      - each of those symbols is a definition in that file, and `touched_symbols` says the diff
+        touches none of them — not directly, not through a changed helper, constant or import they
+        reference.
+
+    `read_source(path)` returns the head text of a file or None. Ranges are widened by one line
+    each way, so a pure deletion at a definition's edge still counts against it. Never raises."""
+    try:
+        from .symbol_scope import touched_symbols
+
+        if not ranges:
+            return set()
+        changed = set(changed_lines)
+        signal = {p for p in changed if not is_low_signal(p)}
+        scopes: dict[str, tuple[set[str], set[str]] | None] = {}
+
+        def scope(path: str):
+            if path not in scopes:
+                scopes[path] = None
+                if path.endswith((".py", ".pyi")) and ranges.get(path):
+                    source = read_source(path)
+                    if source is not None:
+                        widened = [(a - 1, b + 1) for a, b in ranges[path]]
+                        scopes[path] = touched_symbols(source, widened)
+            return scopes[path]
+
+        out: set[str] = set()
+        for feature in features:
+            owned = _paths(feature.get("ownedFiles")) & changed
+            if not owned or ((_paths(feature.get("contextFiles")) & signal) - owned):
+                continue
+            symbols: dict[str, set[str]] = {}
+            for entry in feature.get("entrypoints") or []:
+                if isinstance(entry, dict) and entry.get("path") and entry.get("symbol"):
+                    name = re.split(r"[.:]", str(entry["symbol"]).strip())[-1]
+                    symbols.setdefault(_norm_path(str(entry["path"])), set()).add(name)
+            untouched = True
+            for path in owned:
+                names = symbols.get(path)
+                found = scope(path) if names else None
+                if not found or not names <= found[1] or names & found[0]:
+                    untouched = False
+                    break
+            if untouched:
+                out.add(str(feature["featureId"]))
+        return out
+    except Exception:  # noqa: BLE001 — an analysis fault ranks every feature as touched, never raises
+        log.exception("[pr-reviewer] structural symbol scope failed; ranking by file only")
+        return set()
+
+
+def plan_features(
+    features: list[dict], changed_lines: dict[str, int], cap: int | None, siblings: set[str] | None = None
+) -> FeaturePlan:
     """Rank the features a diff touches and keep the top `cap` (None = all).
 
     Eligible: the feature OWNS a changed file, or lists a changed file that is not low-signal as
-    context. Ranked by changed lines in owned files that are not low-signal, then by changed lines in
-    such context files, then by feature id (deterministic). A feature that owns only a low-signal
-    file (the config feature for `pyproject.toml`) stays eligible, ranked last."""
+    context. Ranked: features in `siblings` (see `sibling_features`) after every other one; then by
+    changed lines in owned files that are not low-signal, then by changed lines in such context
+    files, then by feature id (deterministic). A feature that owns only a low-signal file (the
+    config feature for `pyproject.toml`) stays eligible, ranked last among the touched ones."""
     changed = set(changed_lines)
     signal = {p for p in changed if not is_low_signal(p)}
     eligible: list[dict] = []
@@ -520,7 +638,9 @@ def plan_features(features: list[dict], changed_lines: dict[str, int], cap: int 
                 "files": len(_paths(feature.get("ownedFiles")) | _paths(feature.get("contextFiles"))),
             }
         )
-    eligible.sort(key=lambda f: (-f["owned_lines"], -f["context_lines"], f["id"]))
+        if siblings and eligible[-1]["id"] in siblings:
+            eligible[-1]["sibling"] = True
+    eligible.sort(key=lambda f: (bool(f.get("sibling")), -f["owned_lines"], -f["context_lines"], f["id"]))
     return FeaturePlan(len(features), eligible, cap, low_signal_only, low_signal_files)
 
 
@@ -889,6 +1009,13 @@ class ProtoPatchRunner:
         self.max_features = structural_max_features(self.cfg.get("structural_max_features"))  # None = no cap
         # False = the pre-#232 path: `clawpatch ci --since <base>` picks the features (the rollback switch).
         self.plan_features = str(self.cfg.get("structural_plan", "")).strip().lower() not in ("false", "0", "no", "off")
+        # False = rank by file ownership alone and count every capped feature as a gap (pre-#340).
+        self.symbol_scope = str(self.cfg.get("structural_symbol_scope", "")).strip().lower() not in (
+            "false",
+            "0",
+            "no",
+            "off",
+        )
         # Per-feature structural results reused across passes when nothing a feature's prompt
         # depends on changed (#312). None = `structural_result_cache: false`, the off switch:
         # every planned feature runs, exactly as before.
@@ -1054,7 +1181,11 @@ class ProtoPatchRunner:
             # plan built from an incomplete diff must never decide that nothing needs reviewing.
             for path in changed:
                 lines.setdefault(_norm_path(path), 1)
-            return plan_features(features, lines, self.max_features)
+            siblings: set[str] = set()
+            if self.symbol_scope:
+                ranges = await self._changed_ranges(checkout, base_sha)
+                siblings = sibling_features(features, lines, ranges, lambda path: read_head_source(checkout, path))
+            return plan_features(features, lines, self.max_features, siblings)
         except Exception:  # noqa: BLE001 — a failed plan falls back to the pre-#232 path, never raises
             log.exception("[pr-reviewer] structural plan failed; using --since")
             return None
@@ -1328,6 +1459,8 @@ class ProtoPatchRunner:
                 eligible=len(plan.eligible),
                 selected=len(plan.selected),
                 dropped=plan.dropped,
+                siblings=plan.siblings,
+                dropped_siblings=plan.dropped_siblings,
                 low_signal_only=plan.low_signal_only,
                 low_signal_files=plan.low_signal_files[:20] or None,
             )
@@ -1428,18 +1561,20 @@ class ProtoPatchRunner:
                     )
                     continue
                 return await self._cut_short(reason, reason, attempt, **render, elapsed=time.monotonic() - started)
-            if plan is not None and plan.dropped:
-                # Every planned feature finished, but the plan itself left some out: a coverage gap,
-                # never a complete pass (the fail-open this guards: a capped pass reading as clean).
-                # A cache hit counts as reviewed — its findings are in the pass — just not re-run.
+            if plan is not None and plan.gap:
+                # Every planned feature finished, but the plan itself left out features the diff
+                # touches: a coverage gap, never a complete pass (the fail-open this guards: a capped
+                # pass reading as clean). A cache hit counts as reviewed — its findings are in the
+                # pass — just not re-run. Left-out SIBLINGS (#340) are not a gap: the diff touches
+                # none of their own code, the header says how many, and the pass is complete.
                 done = pass_coverage(state_dir)
                 return await self._render_findings(
                     **render,
                     elapsed=time.monotonic() - started,
                     partial=(
-                        f"{(done[0] if done else len(to_run)) + len(cached)} of {len(plan.eligible)} features reviewed",
+                        f"{(done[0] if done else len(to_run)) + len(cached)} of {plan.required} features reviewed",
                         f"{FEATURE_CAP_REASON}: the {len(plan.selected)} features with the most changed lines "
-                        f"were reviewed, {plan.dropped} were not (structural_max_features={plan.cap})",
+                        f"were reviewed, {plan.gap} were not (structural_max_features={plan.cap})",
                     ),
                 )
             return await self._render_findings(**render, elapsed=time.monotonic() - started)
@@ -1470,7 +1605,8 @@ class ProtoPatchRunner:
         findings are not lost. With nothing finished it is the outage it always was. Never raises.
 
         With a plan (#232) the denominator is every ELIGIBLE feature, not just the planned ones, so a
-        pass that was both capped and cut short says how much of the diff's features it really covered.
+        pass that was both capped and cut short says how much of the diff's features it really covered
+        (left-out siblings, which the diff does not touch, are not in it — #340).
         A result-cache hit (#312) counts as reviewed on both sides of the fraction: its findings are
         already in hand, so a pass cut short after serving hits still returns them as a partial."""
         cached = render.get("cached") or []
@@ -1480,7 +1616,7 @@ class ProtoPatchRunner:
             if finished > 0:
                 plan = render.get("plan")
                 claimed = (coverage[1] if coverage else 0) + len(cached)
-                total = max(claimed, len(plan.eligible)) if plan is not None else claimed
+                total = max(claimed, plan.required) if plan is not None else claimed
                 return await self._render_findings(
                     **render,
                     partial=(
