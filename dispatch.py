@@ -37,6 +37,7 @@ import logging
 import math
 import os
 import re
+import sys
 import time
 import uuid
 from collections import deque
@@ -446,6 +447,31 @@ async def _review_session(key: str):
             yield
 
 
+# The module the host loads github-plugin under (`graph/plugins/loader.py::_plugin_module_name`).
+_GITHUB_PLUGIN_GH_ISSUE = "protoagent_plugin_github.gh_issue"
+
+
+def _github_repo_scope(repo: str):
+    """Make the round's repo the default for every github-plugin tool call the round makes (#367).
+
+    Vera reviews 170 repos with `github.default_repo: ""`, so a `github_*` call that omits `repo`
+    resolved to `github.repos[0]` — protoAgent — and a finder reviewing mythxengine#966 read
+    protoAgent's CHANGELOG and pyproject. github-plugin >= 0.12.0 exposes
+    `scoped_default_repo(repo)`, a context-variable scope that follows the round into the
+    subagents it starts; an explicit `repo` still wins, so `lane_repo_violation` still catches a
+    lane that NAMES the wrong repo. Looked up at call time, never imported: an older github
+    plugin (or none, in the test suite) runs the round unscoped — the guard stays the backstop."""
+    module = sys.modules.get(_GITHUB_PLUGIN_GH_ISSUE)
+    factory = getattr(module, "scoped_default_repo", None) if module is not None else None
+    if not callable(factory) or not repo:
+        return contextlib.nullcontext()
+    try:
+        return factory(repo)
+    except Exception:  # noqa: BLE001 — a broken seam must never stop a review
+        log.warning("[pr-reviewer] github repo scope unavailable; the round runs unscoped", exc_info=True)
+        return contextlib.nullcontext()
+
+
 def _in_review_session(runner, repo: str, pr: int, head: str):
     """`runner`, with every call made inside one session keyed on repo + PR + head.
 
@@ -458,8 +484,12 @@ def _in_review_session(runner, repo: str, pr: int, head: str):
 
     @functools.wraps(runner)
     async def scoped(*args, **kwargs):
-        async with _review_session(key):
-            return await runner(*args, **kwargs)
+        # The same wrapper scopes github-plugin's default repo to this round (#367): every pass
+        # of the round — retries, verify re-runs, the prior re-check, the fallback panel — runs
+        # through it.
+        with _github_repo_scope(repo):
+            async with _review_session(key):
+                return await runner(*args, **kwargs)
 
     return scoped
 
