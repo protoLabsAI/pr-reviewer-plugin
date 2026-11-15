@@ -451,7 +451,23 @@ async def _review_session(key: str):
 _GITHUB_PLUGIN_GH_ISSUE = "protoagent_plugin_github.gh_issue"
 
 
-def _github_repo_scope(repo: str):
+# Review-session keys whose passes ran inside github-plugin's round scope. Set only once the scope
+# was actually ENTERED, so the lane guard never trusts a scope that failed (#370 review).
+_GITHUB_SCOPED: dict[str, None] = {}
+
+
+def _review_key(repo: str, pr, head: str) -> str:
+    return f"pr-review:{repo}#{pr}@{head}"
+
+
+def _github_round_scoped(repo: str, pr, head: str) -> bool:
+    """Did this round's passes run inside github-plugin's scope? Then a `github_*` call that omitted
+    `repo` resolved to the round's repo, and the lane guard judges it so (#367)."""
+    return _review_key(repo, pr, head) in _GITHUB_SCOPED
+
+
+@contextlib.contextmanager
+def _github_repo_scope(repo: str, key: str = ""):
     """Make the round's repo the default for every github-plugin tool call the round makes (#367).
 
     Vera reviews 170 repos with `github.default_repo: ""`, so a `github_*` call that omits `repo`
@@ -460,16 +476,22 @@ def _github_repo_scope(repo: str):
     `scoped_default_repo(repo)`, a context-variable scope that follows the round into the
     subagents it starts; an explicit `repo` still wins, so `lane_repo_violation` still catches a
     lane that NAMES the wrong repo. Looked up at call time, never imported: an older github
-    plugin (or none, in the test suite) runs the round unscoped — the guard stays the backstop."""
+    plugin (or none, in the test suite) runs the round unscoped — the guard stays the backstop.
+    `key` (the review-session key) is recorded only when the scope was entered."""
     module = sys.modules.get(_GITHUB_PLUGIN_GH_ISSUE)
     factory = getattr(module, "scoped_default_repo", None) if module is not None else None
-    if not callable(factory) or not repo:
-        return contextlib.nullcontext()
-    try:
-        return factory(repo)
-    except Exception:  # noqa: BLE001 — a broken seam must never stop a review
-        log.warning("[pr-reviewer] github repo scope unavailable; the round runs unscoped", exc_info=True)
-        return contextlib.nullcontext()
+    stack = contextlib.ExitStack()
+    entered = False
+    if callable(factory) and repo:
+        try:
+            stack.enter_context(factory(repo))
+            entered = True
+        except Exception:  # noqa: BLE001 — a broken seam must never stop a review
+            log.warning("[pr-reviewer] github repo scope unavailable; the round runs unscoped", exc_info=True)
+    if entered and key:
+        _remember(_GITHUB_SCOPED, key)
+    with stack:
+        yield
 
 
 def _in_review_session(runner, repo: str, pr: int, head: str):
@@ -480,14 +502,17 @@ def _in_review_session(runner, repo: str, pr: int, head: str):
     gateway needs the id stable to pin a lane. `functools.wraps` keeps the signature
     visible, so `_accepts_keyword(runner, "seed_outputs" | "on_step")` still sees through it.
     """
-    key = f"pr-review:{repo}#{pr}@{head}"
+    key = _review_key(repo, pr, head)
+    # A new round starts unscoped on the record: only a scope THIS round enters marks it, so a
+    # stale mark from an earlier round of the same head can never vouch for this one (#370 review).
+    _GITHUB_SCOPED.pop(key, None)
 
     @functools.wraps(runner)
     async def scoped(*args, **kwargs):
         # The same wrapper scopes github-plugin's default repo to this round (#367): every pass
         # of the round — retries, verify re-runs, the prior re-check, the fallback panel — runs
         # through it.
-        with _github_repo_scope(repo):
+        with _github_repo_scope(repo, key):
             async with _review_session(key):
                 return await runner(*args, **kwargs)
 
@@ -4455,7 +4480,10 @@ class Dispatcher:
         for s in LLM_FINDER_STEPS:
             if s not in steps_out or s in degraded:
                 continue
-            why = lane_repo_violation(lane_calls.get(s) or [], repo, self.agent_default_repo)
+            # Under github-plugin's round scope (#367) a repo-less call resolved to THIS repo, so an
+            # omission is judged against it; a call that NAMES another repo is still a violation.
+            default = repo if _github_round_scoped(repo, pr, head) else self.agent_default_repo
+            why = lane_repo_violation(lane_calls.get(s) or [], repo, default)
             if why:
                 lane_repo_gaps[s] = why
         if lane_repo_gaps:
