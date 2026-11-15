@@ -135,3 +135,23 @@ def test_only_an_entered_scope_is_recorded_for_its_round(github_plugin):
         pass
     assert _github_round_scoped("o/r", 1, "h1")
     assert not _github_round_scoped("o/r", 1, "other-head")
+
+
+def test_a_new_round_does_not_inherit_an_earlier_rounds_scope_mark(github_plugin, monkeypatch):
+    from pr_reviewer.dispatch import _github_round_scoped
+
+    async def runner(recipe, inputs):
+        return "ran"
+
+    import asyncio as _asyncio
+
+    _asyncio.run(_in_review_session(runner, "o/r", 1, "h")("r", {}))
+    assert _github_round_scoped("o/r", 1, "h")
+    # the next round of the same head, on a host whose seam now raises: no inherited mark
+    monkeypatch.setitem(
+        sys.modules, _GITHUB_PLUGIN_GH_ISSUE, types.SimpleNamespace(scoped_default_repo=lambda r: 1 / 0)
+    )
+    again = _in_review_session(runner, "o/r", 1, "h")
+    assert not _github_round_scoped("o/r", 1, "h")
+    _asyncio.run(again("r", {}))
+    assert not _github_round_scoped("o/r", 1, "h")

@@ -503,6 +503,9 @@ def _in_review_session(runner, repo: str, pr: int, head: str):
     visible, so `_accepts_keyword(runner, "seed_outputs" | "on_step")` still sees through it.
     """
     key = _review_key(repo, pr, head)
+    # A new round starts unscoped on the record: only a scope THIS round enters marks it, so a
+    # stale mark from an earlier round of the same head can never vouch for this one (#370 review).
+    _GITHUB_SCOPED.pop(key, None)
 
     @functools.wraps(runner)
     async def scoped(*args, **kwargs):
