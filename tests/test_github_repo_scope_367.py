@@ -79,3 +79,34 @@ def test_a_scope_that_raises_never_stops_a_review(monkeypatch):
     monkeypatch.setitem(sys.modules, _GITHUB_PLUGIN_GH_ISSUE, types.SimpleNamespace(scoped_default_repo=broken))
     with _github_repo_scope("o/r"):
         pass
+
+
+# ── the lane guard judges an omitted repo against the round when the scope is active ──────────
+
+
+async def test_under_the_scope_an_omitted_repo_is_a_clean_pass_and_a_named_other_repo_is_not(tmp_path, github_plugin):
+    from tests.dispatch_helpers import make
+    from tests.test_dispatch import _events
+    from tests.test_lane_repo_binding_279 import BOUND, HEAD, OTHER, PR, _clean_runner_with, _gh
+
+    cfg = {"repos": [BOUND], "default_repo": OTHER, "shadow_mode": False}
+    omitted = {"find_removed_behavior": [{"tool": "github_read_pr_file", "args": {"number": PR, "path": "a.ts"}}]}
+    d = make(tmp_path / "a", cfg=cfg, gh=_gh(), runner=_clean_runner_with(omitted))
+    assert (await d.handle_pr_event(BOUND, PR, HEAD, "opened")) == "reviewed:PASS"
+    assert not _events(tmp_path / "a", "lane_repo_unbound")
+
+    named = {"find_removed_behavior": [{"tool": "search_pr_repo", "repo": OTHER, "pattern": "x"}]}
+    d = make(tmp_path / "b", cfg=cfg, gh=_gh(), runner=_clean_runner_with(named))
+    assert (await d.handle_pr_event(BOUND, PR, HEAD, "opened")) == "reviewed:WARN"
+    assert _events(tmp_path / "b", "lane_repo_unbound")
+
+
+async def test_without_the_scope_an_omitted_repo_is_still_flagged(tmp_path, monkeypatch):
+    from tests.dispatch_helpers import make
+    from tests.test_lane_repo_binding_279 import BOUND, HEAD, OTHER, PR, _clean_runner_with, _gh
+
+    monkeypatch.delitem(sys.modules, _GITHUB_PLUGIN_GH_ISSUE, raising=False)
+    cfg = {"repos": [BOUND], "default_repo": OTHER, "shadow_mode": False}
+    omitted = {"find_removed_behavior": [{"tool": "github_read_pr_file", "args": {"number": PR}}]}
+    d = make(tmp_path, cfg=cfg, gh=_gh(), runner=_clean_runner_with(omitted))
+    assert (await d.handle_pr_event(BOUND, PR, HEAD, "opened")) == "reviewed:WARN"

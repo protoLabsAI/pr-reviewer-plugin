@@ -451,6 +451,14 @@ async def _review_session(key: str):
 _GITHUB_PLUGIN_GH_ISSUE = "protoagent_plugin_github.gh_issue"
 
 
+def _github_scope_supported() -> bool:
+    """Does the loaded github-plugin offer `scoped_default_repo` (>= 0.12.0)? When it does, every
+    pass of a round runs inside the round's scope (`_in_review_session`), so a `github_*` call
+    that omitted `repo` resolved to the round's repo — the lane guard must judge it so."""
+    module = sys.modules.get(_GITHUB_PLUGIN_GH_ISSUE)
+    return callable(getattr(module, "scoped_default_repo", None)) if module is not None else False
+
+
 def _github_repo_scope(repo: str):
     """Make the round's repo the default for every github-plugin tool call the round makes (#367).
 
@@ -4455,7 +4463,10 @@ class Dispatcher:
         for s in LLM_FINDER_STEPS:
             if s not in steps_out or s in degraded:
                 continue
-            why = lane_repo_violation(lane_calls.get(s) or [], repo, self.agent_default_repo)
+            # Under github-plugin's round scope (#367) a repo-less call resolved to THIS repo, so an
+            # omission is judged against it; a call that NAMES another repo is still a violation.
+            default = repo if _github_scope_supported() else self.agent_default_repo
+            why = lane_repo_violation(lane_calls.get(s) or [], repo, default)
             if why:
                 lane_repo_gaps[s] = why
         if lane_repo_gaps:
