@@ -110,3 +110,28 @@ async def test_without_the_scope_an_omitted_repo_is_still_flagged(tmp_path, monk
     omitted = {"find_removed_behavior": [{"tool": "github_read_pr_file", "args": {"number": PR}}]}
     d = make(tmp_path, cfg=cfg, gh=_gh(), runner=_clean_runner_with(omitted))
     assert (await d.handle_pr_event(BOUND, PR, HEAD, "opened")) == "reviewed:WARN"
+
+
+async def test_a_scope_that_fails_to_enter_leaves_the_guard_strict(tmp_path, monkeypatch):
+    # The plugin offers the seam but it raises: the round runs unscoped, so an omitted repo
+    # really did resolve to the agent default and must still be flagged (#370 review).
+    from tests.dispatch_helpers import make
+    from tests.test_lane_repo_binding_279 import BOUND, HEAD, OTHER, PR, _clean_runner_with, _gh
+
+    def broken(repo):
+        raise RuntimeError("boom")
+
+    monkeypatch.setitem(sys.modules, _GITHUB_PLUGIN_GH_ISSUE, types.SimpleNamespace(scoped_default_repo=broken))
+    cfg = {"repos": [BOUND], "default_repo": OTHER, "shadow_mode": False}
+    omitted = {"find_removed_behavior": [{"tool": "github_read_pr_file", "args": {"number": PR}}]}
+    d = make(tmp_path, cfg=cfg, gh=_gh(), runner=_clean_runner_with(omitted))
+    assert (await d.handle_pr_event(BOUND, PR, HEAD, "opened")) == "reviewed:WARN"
+
+
+def test_only_an_entered_scope_is_recorded_for_its_round(github_plugin):
+    from pr_reviewer.dispatch import _github_round_scoped, _review_key
+
+    with _github_repo_scope("o/r", _review_key("o/r", 1, "h1")):
+        pass
+    assert _github_round_scoped("o/r", 1, "h1")
+    assert not _github_round_scoped("o/r", 1, "other-head")

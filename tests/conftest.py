@@ -131,3 +131,14 @@ def _no_checkout_clones(monkeypatch):
         return None
 
     monkeypatch.setattr(absence, "default_resolver", lambda cfg: _no_checkout)
+
+
+@pytest.fixture(autouse=True)
+def _clear_github_scoped_rounds():
+    """`dispatch._GITHUB_SCOPED` records which review rounds ran inside github-plugin's scope
+    (#367); module state, so one test's round must not make another's look scoped."""
+    import pr_reviewer.dispatch as _d
+
+    _d._GITHUB_SCOPED.clear()
+    yield
+    _d._GITHUB_SCOPED.clear()
