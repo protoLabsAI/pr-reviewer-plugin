@@ -1,7 +1,7 @@
 """docs/promotion.md documents the draft→ready lifecycle contract (issue #98).
 
-Docs-as-code: undrafting a watched PR hands it to the QA panel, which arms native
-squash auto-merge on a promoted current PASS. That contract is nowhere in code to
+Docs-as-code: undrafting a watched PR hands it to the QA panel, which can arm native
+squash auto-merge on an opted-in, promoted current PASS. That contract is nowhere in code to
 assert against, so we assert the doc states it — and, crucially, that the wording
 does NOT imply a PASS bypasses the stale-head / completeness / CI / unresolved-thread
 guards `promotion_decision` enforces.
@@ -51,10 +51,17 @@ def test_readme_says_draft_prs_are_skipped():
 
 def test_readme_says_ready_pr_can_arm_squash_auto_merge_on_pass():
     # r2: an eligible ready-for-review PR with a promoted current PASS can have native
-    # squash auto-merge armed by the panel.
+    # squash auto-merge armed by the panel only with opt-in.
     assert "ready for review" in CONTRACT or "ready-for-review" in CONTRACT
     assert "squash auto-merge" in CONTRACT or ("squash" in CONTRACT and "auto-merge" in CONTRACT)
     assert "pass" in CONTRACT
+    for text in (CONTRACT_FLAT, (ROOT / "README.md").read_text().lower()):
+        assert "opt-in" in text
+        assert "auto_merge_repos" in text
+        assert "auto_merge_label" in text
+        assert "auto-merge" in text
+        assert "squash auto-merge" in text
+        assert "`main`" in text
 
 
 def test_readme_tells_operators_to_keep_unshippable_prs_draft():
