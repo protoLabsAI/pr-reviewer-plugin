@@ -8,8 +8,10 @@ findings contract [ADR 0077](https://github.com/protoLabsAI/protoAgent/blob/main
 A GitHub App delivers PR events to this plugin. For each one it runs a **five-finder
 review panel** (four LLM finders plus a non-LLM structural engine, [protoPatch](https://github.com/protoLabsAI/protoPatch)),
 dedups and ranks the findings, **independently verifies** each one, checks the claims
-against the actual code, and posts a verdict: `PASS`, `WARN` or `FAIL`. Optionally it then
-approves and arms auto-merge when everything is green.
+against the actual code, and posts a verdict: `PASS`, `WARN` or `FAIL`. With approve-on-green
+enabled, it approves when everything is green. Arming squash auto-merge is opt-in: the PR must
+target `main` and either its repo is in `auto_merge_repos` or it carries the `auto_merge_label`
+label (default `auto-merge`).
 
 ## What you get
 
@@ -23,13 +25,17 @@ approves and arms auto-merge when everything is green.
 - **Enforceable checks.** `QA panel` and `protoReview` check runs a ruleset can require, so
   an unreviewed merge shows up as red. See [checks](docs/checks.md).
 - **Approve-on-green.** A complete, verified, current PASS with green CI and no open threads
-  is approved and queued for squash auto-merge. See [promotion](docs/promotion.md).
+  is approved. Squash auto-merge is opt-in, only for `main`-targeting PRs whose repo is in
+  `auto_merge_repos` or which carry the `auto_merge_label` label (default `auto-merge`).
+  See [promotion](docs/promotion.md).
 - **Comment commands.** `@vera review`, `pause`, `resume`, `help`. See [usage](docs/usage.md).
 - **Shadow mode by default.** It ships disabled, and when enabled it only comments until you
   say otherwise.
 
-> **Undrafting a PR is the act of shipping it.** On a watched repo, marking a PR ready for
-> review hands it to the panel, and a current, complete PASS can arm squash auto-merge.
+> **Undrafting a PR hands it to the panel.** On a watched repo, a current, complete PASS
+> approves it once the promotion guards pass. Squash auto-merge is opt-in: it is armed only
+> for `main`-targeting PRs whose repo is in `auto_merge_repos` or which carry the
+> `auto_merge_label` label (default `auto-merge`).
 > Keep a PR in draft until it is ready to land. Draft PRs are skipped and can never promote.
 > The full contract, including every guard a PASS must clear, is in [promotion](docs/promotion.md).
 

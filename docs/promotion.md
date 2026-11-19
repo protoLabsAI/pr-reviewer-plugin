@@ -2,19 +2,21 @@
 
 ## The draft → ready contract
 
-**Undrafting a PR is the act of shipping it.** On a repository this plugin watches, a PR's
-draft state is its merge gate.
+**Undrafting a PR hands it to the panel.** On a repository this plugin watches, keeping a PR
+in draft holds it out of the review and promotion pipeline.
 
 - **Draft PRs are skipped by the panel.** A draft is dropped before the panel runs, by the same
   eligibility gate that skips a closed or locked conversation (telemetered `pr-not-eligible`,
   `why=draft`). No review is posted, no verdict is produced, and nothing can promote while the PR
   stays draft.
 - **Marking a PR ready for review hands it to the QA pipeline.** The draft → ready transition is a
-  review trigger. On a watched, `main`-targeting PR the panel runs, and once it posts a
+  review trigger. On a watched PR the panel runs, and once it posts a
   **current, complete PASS** and the promotion guards are all green, approve-on-green posts a
-  formal APPROVE **and arms native GitHub squash auto-merge** (`gh pr merge --auto --squash`).
-  Arming is best-effort and scoped to `main`-targeting PRs (stacked PRs are excluded). A repo with
-  auto-merge disabled simply declines.
+  formal APPROVE. **Arming native GitHub squash auto-merge is opt-in**
+  (`gh pr merge --auto --squash`): the PR must target `main` AND either its repo is in
+  `auto_merge_repos` (default empty) OR it carries the `auto_merge_label` label (default
+  `auto-merge`; an empty string disables the label path). Arming is best-effort; stacked PRs
+  targeting other branches are excluded. A repo with auto-merge disabled simply declines.
 
 So the practical contract is: **undraft a PR only when it is ready to ship, not when you merely
 want eyes on it.**
@@ -35,7 +37,8 @@ Auto-merge is armed only when a clear PASS or WARN verdict clears **every** fail
   `QA panel` reads "Re-review in progress" meanwhile. The converse is handled when that round
   posts: a FAIL dismisses our earlier approval, writes `QA panel` red and turns off GitHub
   auto-merge on the PR (escalated if GitHub refuses) at once, rather than leaving an APPROVED
-  review and a green check standing beside the FAIL until the next sweep;
+  review and a green check standing beside the FAIL until the next sweep. **A FAIL disarms
+  auto-merge on every repo, whether or not the repo or PR opted in**;
 - the pass was **verified** (the verify pass ran) over **complete** coverage. Every finder lane
   delivered a full pass; none timed out, came back blocked or without its status line, or found its
   structural engine down. An incomplete pass is "nobody looked", not "nothing there", and holds;
