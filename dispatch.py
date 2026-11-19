@@ -1719,6 +1719,48 @@ class Dispatcher:
         )
 
     @property
+    def auto_merge_repos(self) -> list[str]:
+        """Repos (`owner/name`) whose main-targeting PRs get native auto-merge ARMED on
+        promotion. Default EMPTY: arming is opt-in, because the App installation covers
+        every repo and an armed PASS merges while the author may still hold unpushed work.
+
+        Read like `repos`: a YAML list or a comma/space/newline string, and config wins
+        only when NON-empty — the manifest seeds `auto_merge_repos: []`, which must still
+        fall through to PR_REVIEWER_AUTO_MERGE_REPOS. This list only ever ARMS; a FAIL
+        disarms on every repo regardless (`_disarm_auto_merge`).
+        """
+        value = self.cfg.get("auto_merge_repos")
+        parts = value if isinstance(value, (list, tuple, set)) else [value]
+        listed = [t for part in parts for t in re.split(r"[,\s]+", str(part or "").strip()) if t]
+        return listed or [
+            r for r in re.split(r"[,\s]+", os.environ.get("PR_REVIEWER_AUTO_MERGE_REPOS", "").strip()) if r
+        ]
+
+    @property
+    def auto_merge_label(self) -> str:
+        """The PR label that opts ONE PR into auto-merge arming on any repo. A present
+        config value wins over PR_REVIEWER_AUTO_MERGE_LABEL — including the empty string,
+        which turns the label path off."""
+        cfg = self.cfg
+        if "auto_merge_label" in cfg:
+            return str(cfg["auto_merge_label"] or "").strip()
+        return os.environ.get("PR_REVIEWER_AUTO_MERGE_LABEL", "auto-merge").strip()
+
+    def _auto_merge_opt_in(self, repo: str, facts: dict) -> str:
+        """Why promotion may arm auto-merge on this PR: `repo` (listed in
+        `auto_merge_repos`), `label` (the PR carries `auto_merge_label`) or `none`.
+        Both matches are case-insensitive, as GitHub's repo and label names are; an
+        unreadable or absent label list is no opt-in."""
+        if repo.lower() in _repo_set(self.auto_merge_repos):
+            return "repo"
+        label = self.auto_merge_label.lower()
+        labels = facts.get("labels")
+        if label and isinstance(labels, (list, tuple)):
+            if label in {str(name or "").strip().lower() for name in labels}:
+                return "label"
+        return "none"
+
+    @property
     def qa_check(self) -> bool:
         """Publish the `QA panel` check run (checks.py) alongside the verdict review.
 
@@ -6905,13 +6947,16 @@ class Dispatcher:
             return "error:approve-failed"
         self._promote_failures.pop(backoff_key, None)
         armed = False
-        if str(facts.get("base_ref") or "") == "main":
+        opt_in = self._auto_merge_opt_in(repo, facts)
+        if str(facts.get("base_ref") or "") == "main" and opt_in != "none":
             # Quinn's last step: arm native squash auto-merge — but only onto main
-            # (stacked PRs excluded; #901's scope lesson). Best-effort: a repo with
-            # auto-merge disabled just declines.
+            # (stacked PRs excluded; #901's scope lesson) and only where the repo
+            # (`auto_merge_repos`) or the PR (`auto_merge_label`) opted in: the App can
+            # now write Contents everywhere, so an un-asked arm would merge any PASS.
+            # Best-effort: a repo with auto-merge disabled just declines.
             rc2, _o, _e = await self._run_gh(["pr", "merge", str(pr), "--repo", repo, "--auto", "--squash"], timeout=30)
             armed = rc2 == 0
-        self.telemetry.emit("promoted", repo=repo, pr=pr, sha=head, auto_merge_armed=armed)
+        self.telemetry.emit("promoted", repo=repo, pr=pr, sha=head, auto_merge_armed=armed, auto_merge_opt_in=opt_in)
         return PROMOTE
 
     # ── the dispatch-path `protoReview` check (#95) ───────────────────────────

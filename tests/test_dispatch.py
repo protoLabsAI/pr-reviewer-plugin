@@ -2395,13 +2395,17 @@ async def test_allow_self_review_lifts_the_rail_for_testing_only(tmp_path):
 async def test_promotion_arms_auto_merge_on_main_only(tmp_path):
     green = [{"status": "completed", "conclusion": "success"}]
     gh = RoutedGH(pr_facts=facts(), reviews=[review_row(HEAD, "PASS")], checks=green)
-    d = make(tmp_path, cfg={"shadow_mode": False, "promotion_owner": True}, gh=gh)
+    # Arming is opt-in (off by default): this repo opts in through `auto_merge_repos`.
+    owner = {"shadow_mode": False, "promotion_owner": True, "auto_merge_repos": ["o/r"]}
+    d = make(tmp_path, cfg=owner, gh=gh)
     assert (await d.evaluate_promotion("o/r", 1)) == "promote"
     merges = [c for c in gh.calls if c[0] == "pr" and "merge" in c]
     assert merges and "--auto" in merges[0] and "--squash" in merges[0]
+    promoted = [e for e in d.telemetry.read_all() if e.get("event") == "promoted"]
+    assert promoted[-1]["auto_merge_armed"] is True and promoted[-1]["auto_merge_opt_in"] == "repo"
 
     gh2 = RoutedGH(pr_facts=facts(base_ref="develop"), reviews=[review_row(HEAD, "PASS")], checks=green)
-    d2 = make(tmp_path, cfg={"shadow_mode": False, "promotion_owner": True}, gh=gh2)
+    d2 = make(tmp_path / "stacked", cfg=owner, gh=gh2)
     assert (await d2.evaluate_promotion("o/r", 1)) == "promote"
     assert not [c for c in gh2.calls if c[0] == "pr" and "merge" in c]  # stacked PR: never armed
 
