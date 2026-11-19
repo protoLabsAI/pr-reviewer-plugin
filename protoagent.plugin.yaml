@@ -70,6 +70,12 @@ config:
   shadow_mode: true            # true = every verdict posts as a COMMENT review (never blocks)
   promotion_owner: false       # true (AND shadow_mode false) = this agent owns COMMENTED→APPROVE
                                # promotion for its repos; two promoters racing double-merges
+  auto_merge_repos: []         # repos (owner/name) where promotion ARMS native squash auto-merge
+                               # on every main-targeting PR. Empty (the default) = arm nowhere;
+                               # falls back to PR_REVIEWER_AUTO_MERGE_REPOS. A FAIL still
+                               # DISARMS auto-merge on every repo, listed or not.
+  auto_merge_label: "auto-merge"  # a PR carrying this label opts in on ANY repo; "" turns the
+                               # label path off (env: PR_REVIEWER_AUTO_MERGE_LABEL)
   qa_check: true               # publish the `QA panel` check run (the verdict as a gate a
                                # ruleset can require). Needs App perm Checks: read & write;
                                # written only where this agent owns promotion.
@@ -159,6 +165,8 @@ settings:
   - {key: repos, label: "Managed repos (owner/name) — empty = the App installation's scope", type: string_list}
   - {key: shadow_mode, label: "Shadow mode (verdicts as comments only)", type: bool}
   - {key: promotion_owner, label: "Own approve-on-green promotion (formal mode only)", type: bool}
+  - {key: auto_merge_repos, label: "Arm auto-merge on PASS for these repos (owner/name) — empty = none", type: string_list}
+  - {key: auto_merge_label, label: "PR label that opts a PR into auto-merge on PASS — empty = off", type: string}
   - {key: webhook_secret, label: "GitHub webhook secret", type: secret}
   - {key: app_id, label: "GitHub App ID (App identity)", type: string}
   - {key: app_private_key, label: "GitHub App private key (PEM)", type: secret}
