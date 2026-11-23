@@ -1600,6 +1600,8 @@ class Dispatcher:
         # lands after the running evaluation read its facts is never lost.
         self._gate_refreshes: dict[str, asyncio.Task] = {}
         self._gate_dirty: set[str] = set()
+        # First observed hold per repo#pr@head; bounded and retained through fallback.
+        self._record_first_hold: dict[str, float] = {}
         # repo#pr@head keys whose one automatic unverified re-run (#220) this process has
         # started / whose exhaustion it has escalated — so a re-run that crashes without
         # posting cannot be re-scheduled every sweep tick, and an escalation fires once.
@@ -2775,7 +2777,7 @@ class Dispatcher:
         )
         return scope
 
-    async def _record_outcome(self, repo: str, pr: int, facts: dict, head: str):
+    async def _record_outcome(self, repo: str, pr: int, facts: dict, head: str, *, publish_hold: bool = True):
         """(decision, rule, status description) for a PR a reviewer of record owns (#318), or
         None when no configured rule's label is on the PR. Reads only for a labelled PR."""
         from .record import decide, match
@@ -2796,22 +2798,62 @@ class Dispatcher:
             row = json.loads(out) if rc == 0 and out.strip() else {}
         except json.JSONDecodeError:
             row = {}
-        if rc != 0:
-            # Unreadable: hold. A wrong "absent" here would spend a panel the record owns.
-            return "hold-pending", rule, "status unreadable"
-        state = (row or {}).get("state")
+        row = row if isinstance(row, dict) else {}
+        state = row.get("state")
         age = None
-        if not state:
+        if not state and rc == 0:
             rc2, out2, _ = await self._run_gh(["api", f"repos/{repo}/commits/{head}", "--jq", ".commit.committer.date"])
             age = _age_s(out2) if rc2 == 0 else None
-        decision = decide(
-            state,
-            age,
-            rule.grace_s,
-            status_age_s=_age_s((row or {}).get("updated_at")),
-            pending_grace_s=rule.pending_grace_s,
+        status_age = _age_s(row.get("updated_at"))
+        key = f"{repo}#{pr}@{head}"
+        now = time.time()
+        first_hold = self._record_first_hold.get(key, now)
+        # A failed commit-date read must not restart the grace on every sweep.
+        effective_age = age if age is not None else max(0, now - first_hold)
+        decision = (
+            "hold-pending"
+            if rc != 0
+            else decide(
+                state,
+                effective_age,
+                rule.grace_s,
+                status_age_s=status_age,
+                pending_grace_s=rule.pending_grace_s,
+            )
         )
-        return decision, rule, str((row or {}).get("description") or "")
+        if decision.startswith("hold-"):
+            self._record_first_hold.setdefault(key, now)
+            if len(self._record_first_hold) > 1024:
+                for old in list(self._record_first_hold)[:-512]:
+                    del self._record_first_hold[old]
+            if decision == "hold-failed":
+                summary = f"{rule.who} reported failure; its fix round owns this PR"
+            elif decision == "hold-pending" and (rc != 0 or status_age is None):
+                # Preserve the fail-closed status-read guard; no known expiry to promise.
+                summary = f"Waiting for {rule.who} — status age unreadable; checking again next sweep"
+            else:
+                from datetime import datetime, timezone
+
+                remaining = (
+                    rule.pending_grace_s - status_age if decision == "hold-pending" else rule.grace_s - effective_age
+                )
+                deadline = datetime.fromtimestamp(now + max(0, remaining), timezone.utc).strftime("%H:%M UTC")
+                summary = f"Waiting for {rule.who} — falls back to Vera’s panel at {deadline}"
+            if publish_hold and not self.shadow:
+                await self._publish_qa_check(repo, head, CheckRun(COMPLETED, NEUTRAL, summary, summary))
+        # Keep the first observation after fallback too: backfill checks again in _review.
+        self.telemetry.emit(
+            "reviewer_of_record",
+            repo=repo,
+            pr=pr,
+            sha=head,
+            decision=decision,
+            record=rule.who,
+            status=rule.status,
+            head_age_s=age,
+            status_age_s=status_age,
+        )
+        return decision, rule, "status unreadable" if rc != 0 else str(row.get("description") or "")
 
     async def _post_attested(
         self, repo: str, pr: int, head: str, scope: _epic.EpicScope, history: list[dict], diff_id: str | None
@@ -4034,15 +4076,6 @@ class Dispatcher:
             record = await self._record_outcome(repo, pr, facts, head)
             if record is not None:
                 decision, rule, desc = record
-                self.telemetry.emit(
-                    "reviewer_of_record",
-                    repo=repo,
-                    pr=pr,
-                    sha=head,
-                    decision=decision,
-                    record=rule.who,
-                    status=rule.status,
-                )
                 if decision == "pass":
                     from .record import attested_brief
 
@@ -6906,19 +6939,23 @@ class Dispatcher:
         # early return, so a hold is what the check reports too. It deliberately does not
         # wait on the APPROVE below: the check states what the PANEL concluded about this
         # head, which is true whether or not the courtesy review posts.
-        await self._publish_qa_check(
-            repo,
-            head,
-            check_for(
-                decision,
-                # The latest verdict FOR THIS HEAD — a stale one is not this head's.
-                verdict=(latest["verdict"] if latest and latest["head"] == head else None),
-                unresolved=obs.unresolved_threads,
-                panel_unresolved=panel_unresolved,
-                # Whether the automatic re-run for an unverified head is still to come (#220).
-                verify_retry=verify_retry_state(ours, head) if decision == HOLD_UNVERIFIED else "",
-            ),
-        )
+        record = None
+        if not obs.round_in_flight and not any(r["head"] == head for r in ours):
+            record = await self._record_outcome(repo, pr, facts, head)
+        if record is None or not record[0].startswith("hold-"):
+            await self._publish_qa_check(
+                repo,
+                head,
+                check_for(
+                    decision,
+                    # The latest verdict FOR THIS HEAD — a stale one is not this head's.
+                    verdict=(latest["verdict"] if latest and latest["head"] == head else None),
+                    unresolved=obs.unresolved_threads,
+                    panel_unresolved=panel_unresolved,
+                    # Whether the automatic re-run for an unverified head is still to come (#220).
+                    verify_retry=verify_retry_state(ours, head) if decision == HOLD_UNVERIFIED else "",
+                ),
+            )
         if decision != PROMOTE:
             # Recheck every guard before re-arming an approved head after a hold.
             # The existing approval remains deduplicated.
@@ -7297,7 +7334,7 @@ class Dispatcher:
         if any(r["head"] == head for r in ours):
             return None  # a verdict for the CURRENT head exists — nothing to backfill
         # A reviewer of record still owns this head (#318): don't take a panel slot to hold.
-        record = await self._record_outcome(repo, pr, facts, head)
+        record = await self._record_outcome(repo, pr, facts, head, publish_hold=not self._round_in_flight(repo, pr))
         if record is not None and record[0].startswith("hold-"):
             return None
         return head
