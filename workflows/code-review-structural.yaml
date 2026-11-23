@@ -178,9 +178,7 @@ steps:
       ## Searching the repo (issue #311)
       `search_pr_repo` and `list_pr_repo_files` read a checkout of THIS PR's
       head commit — pass `pr={{inputs.pr}}` and `repo="{{inputs.repo}}"`. They
-      are the only search that sees this PR: `search_files`, `find_files`,
-      `list_dir` and `read_file` point at an unrelated, empty local workspace,
-      and their "no matches" means nothing. A claim that something is absent or
+      are the only search that sees this PR. A claim that something is absent or
       universal — "no test covers X", "`f` is never called / dead", "no `x.py`
       exists", "every entry under `d/` is named Y" — is about the whole repo:
       back it with one of these calls and put the call (pattern, path) and its
@@ -260,9 +258,7 @@ steps:
       ## Searching the repo (issue #311)
       `search_pr_repo` and `list_pr_repo_files` read a checkout of THIS PR's
       head commit — pass `pr={{inputs.pr}}` and `repo="{{inputs.repo}}"`. They
-      are the only search that sees this PR: `search_files`, `find_files`,
-      `list_dir` and `read_file` point at an unrelated, empty local workspace,
-      and their "no matches" means nothing. A claim that something is absent or
+      are the only search that sees this PR. A claim that something is absent or
       universal — "no test covers X", "`f` is never called / dead", "no `x.py`
       exists", "every entry under `d/` is named Y" — is about the whole repo:
       back it with one of these calls and put the call (pattern, path) and its
