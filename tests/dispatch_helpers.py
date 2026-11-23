@@ -190,6 +190,16 @@ class RoutedGH(FakeGH):
         if "/compare/" in joined:
             return (0, json.dumps(self.compare), "") if self.compare is not None else (1, "", "404")
         if "/files" in joined:
+            if "patch_size" in joined:
+                return (
+                    0,
+                    "\n".join(
+                        json.dumps({"filename": path, "status": "modified", "patch_size": 0})
+                        for path in self.files.splitlines()
+                        if path
+                    ),
+                    "",
+                )
             return 0, self.files, ""
         if "/reviews" in joined:
             if self.reviews_rc:

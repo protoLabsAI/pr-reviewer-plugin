@@ -23,6 +23,7 @@ except (OSError, yaml.YAMLError, KeyError, TypeError) as exc:
 def test_recipe_shape():
     assert RECIPE["name"] == "code-review-structural"
     assert {i["name"] for i in RECIPE["inputs"]} == {
+        "selected_paths",
         "finding_accounting",
         "finder_timeout",
         "synth_timeout",
@@ -314,3 +315,11 @@ def test_raw_accounting_is_separate_and_reaches_each_transition():
         assert "raw_ids" in prompt and "finding_id" in prompt
         assert "accounting_reason" in prompt
         assert "separate from prior_dispositions" in prompt
+
+
+def test_every_finder_receives_file_selection():
+    assert next(i for i in RECIPE["inputs"] if i["name"] == "selected_paths")["default"] == "null"
+    for sid, step in STEPS.items():
+        if sid.startswith("find_"):
+            assert "{{inputs.selected_paths}}" in step["prompt"]
+            assert "Review only these files" in step["prompt"]

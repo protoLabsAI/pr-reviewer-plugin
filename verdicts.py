@@ -1620,6 +1620,7 @@ def render_verdict_body(
     lanes: int = 0,
     reaffirmed_from: str = "",
     disposition_token: str = "",
+    file_selection: list | None = None,
 ) -> str:
     """The comment body, ASSEMBLED — marker line (machine), header (human), the brief,
     the dispositions table, the findings table + machine-readable array, then the
@@ -1705,6 +1706,8 @@ def render_verdict_body(
         sections.append("> ⚠️ The report pass was cut off at its turn limit — this round's findings may be incomplete.")
     if coverage_gaps:
         sections.append(f"> ⚠️ {render_coverage_note(coverage_gaps, lanes)}")
+    if selection_note := render_selection_note(file_selection):
+        sections.append(selection_note)
     if carried_lead:
         sections.append(f"> ⚠️ {carried_lead}")
     if brief:
@@ -1717,6 +1720,9 @@ def render_verdict_body(
     if dispositions:
         sections.append(f"### Prior requests\n\n{render_dispositions_table(dispositions)}")
     sections.append(render_findings_block(findings, covered=not coverage_gaps))
+    if file_selection:
+        record = json.dumps(selection_record(file_selection)).replace("<", r"\u003c").replace(">", r"\u003e")
+        sections.append(f"<!-- protoagent-qa-selection {record} -->")
     return "\n\n".join(s for s in sections if s) + f"{footnote}{notes}"
 
 

@@ -5934,3 +5934,123 @@ def test_remembered_keys_are_bounded_and_drop_the_oldest():
         _remember(keys, f"k{i}")
     assert len(keys) == 512
     assert "k1024" in keys and "k0" not in keys and "k513" in keys and "k512" not in keys
+
+
+class SelectionGH(RoutedGH):
+    def __init__(self, rows, *, file_error=False, attributes=None):
+        super().__init__(pr_facts=facts())
+        self.rows = rows
+        self.file_error = file_error
+        self.attributes = attributes
+
+    async def __call__(self, args, timeout=30):
+        if len(args) > 1 and args[1].endswith("/files"):
+            self.calls.append(args)
+            if self.file_error:
+                return 1, "", "unavailable"
+            return 0, "\n".join(json.dumps(row) for row in self.rows), ""
+        if len(args) > 1 and "/contents/.gitattributes?" in args[1]:
+            import base64
+
+            self.calls.append(args)
+            if self.attributes is None:
+                return 1, "", "404"
+            return 0, base64.b64encode(self.attributes.encode()).decode(), ""
+        return await super().__call__(args, timeout)
+
+
+@pytest.mark.parametrize(
+    "rows,cfg,attributes,selected,excluded,label",
+    [
+        (
+            [("uv.lock", "modified", 100), ("app.py", "modified", 20)],
+            {},
+            None,
+            ["app.py"],
+            [{"file": "uv.lock", "reason": "excluded:path"}],
+            "lockfile",
+        ),
+        (
+            [("huge.py", "modified", 101), ("app.py", "modified", 100)],
+            {"max_patch_chars": 100},
+            None,
+            ["app.py"],
+            [{"file": "huge.py", "reason": "too-large"}],
+            "too large",
+        ),
+        (
+            [("gen.py", "modified", 1), ("app.py", "modified", 1)],
+            {},
+            "*.py linguist-generated\napp.py -linguist-generated",
+            ["app.py"],
+            [{"file": "gen.py", "reason": "excluded:generated"}],
+            "generated",
+        ),
+        (
+            [("custom.txt", "modified", 1), ("gone.py", "removed", 1)],
+            {"exclude_paths": ["*.txt"]},
+            None,
+            [],
+            [{"file": "custom.txt", "reason": "excluded:path"}, {"file": "gone.py", "reason": "deleted"}],
+            "deleted",
+        ),
+    ],
+)
+@pytest.mark.parametrize("structural", [False, True])
+async def test_file_selection_dispatch_and_post(tmp_path, rows, cfg, attributes, selected, excluded, label, structural):
+    gh = SelectionGH(
+        [dict(filename=path, status=status, patch_size=size) for path, status, size in rows],
+        attributes=attributes,
+    )
+    seen = {}
+
+    async def runner(name, inputs):
+        seen.update(inputs)
+        return accounted_empty_panel({"output": "```json\n[]\n```", "steps": _panel_steps(), "failed": []})
+
+    if structural:
+        gh.pr_facts["changed_files"] = 4
+    d = make(tmp_path, cfg=cfg, gh=gh, runner=runner)
+    assert await d.handle_pr_event("o/r", 1, HEAD, "opened") == "reviewed:PASS"
+    from pr_reviewer.protopatch import structural_scope
+
+    assert structural_scope("o/r", 1, HEAD) == frozenset(selected)
+    row = _events(tmp_path, "reviewed")[-1]
+    assert row["recipe"] == ("code-review-structural" if structural else "code-review")
+    assert json.loads(seen["selected_paths"]) == selected
+    body = gh.reviews_posted[0]["body"]
+    assert label in body
+    assert f"{len(excluded)} file" in body
+    for row in excluded:
+        assert row["file"] in body
+    assert _events(tmp_path, "reviewed")[-1]["excluded_files"] == excluded
+    record = body.split("<!-- protoagent-qa-selection ", 1)[1].split(" -->", 1)[0]
+    assert json.loads(record) == excluded
+    assert len([a for a in gh.calls if a[1].endswith("/files")]) == 1
+    assert all(f"?ref={HEAD}" in a[1] for a in gh.calls if "/contents/.gitattributes?" in a[1])
+
+
+@pytest.mark.parametrize("unreadable", [True, False])
+async def test_file_selection_fallback_and_paths(tmp_path, unreadable):
+    gh = SelectionGH([{"filename": "app.py", "status": "modified", "patch_size": 1}], file_error=unreadable)
+    runner, seen = capturing_runner()
+    d = make(tmp_path, gh=gh, runner=runner)
+    await d.handle_pr_event("o/r", 1, HEAD, "opened")
+    if unreadable:
+        assert "selected_paths" not in seen["inputs"]
+    else:
+        assert json.loads(seen["inputs"]["selected_paths"]) == ["app.py"]
+    assert "excluded from review" not in gh.reviews_posted[0]["body"]
+    assert _events(tmp_path, "reviewed")[-1]["excluded_files"] == []
+    assert await d._changed_paths("o/r", 1) == ([] if unreadable else ["app.py"])
+
+
+def test_selection_config_defaults_and_precedence(tmp_path, monkeypatch):
+    from pr_reviewer.selection import DEFAULT_MAX_PATCH_CHARS
+
+    monkeypatch.setenv("PR_REVIEWER_MAX_PATCH_CHARS", "123")
+    assert make(tmp_path / "env").max_patch_chars == 123
+    assert make(tmp_path / "cfg", cfg={"max_patch_chars": 456}).max_patch_chars == 456
+    for value in (None, "bad", 0, -1):
+        assert make(tmp_path / str(value), cfg={"max_patch_chars": value}).max_patch_chars == DEFAULT_MAX_PATCH_CHARS
+    assert make(tmp_path / "bad-list", cfg={"exclude_paths": "*.py"}).exclude_paths == []
