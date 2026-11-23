@@ -323,3 +323,15 @@ def test_every_finder_receives_file_selection():
         if sid.startswith("find_"):
             assert "{{inputs.selected_paths}}" in step["prompt"]
             assert "Review only these files" in step["prompt"]
+
+
+def test_every_llm_finder_lists_the_files_it_reviewed():
+    """#385: `FINDER_STATUS: reviewed` alone cannot tell a lane that read half the PR
+    from one that read it all — each LLM finder must also name the files it read."""
+    from pr_reviewer.dispatch import LLM_FINDER_STEPS
+
+    for sid in LLM_FINDER_STEPS:
+        prompt = STEPS[sid]["prompt"]
+        assert "REVIEWED_FILES: <path>, <path>, ..." in prompt, sid
+        # Emitted next to (just before) the status line, which stays the final line.
+        assert prompt.index("REVIEWED_FILES:") > prompt.index("FINDER_STATUS: reviewed"), sid
