@@ -6054,3 +6054,60 @@ def test_selection_config_defaults_and_precedence(tmp_path, monkeypatch):
     for value in (None, "bad", 0, -1):
         assert make(tmp_path / str(value), cfg={"max_patch_chars": value}).max_patch_chars == DEFAULT_MAX_PATCH_CHARS
     assert make(tmp_path / "bad-list", cfg={"exclude_paths": "*.py"}).exclude_paths == []
+
+
+@pytest.mark.parametrize(
+    "reports,uncovered,known",
+    [
+        (["app.py", "app.py", "none", "none"], ["other.py"], True),
+        (["app.py", "other.py", "none", "none"], [], True),
+        ([None, None, None, None], [], False),
+        (["none", "none", "none", "none"], ["app.py", "other.py"], True),
+    ],
+)
+async def test_selected_file_coverage_caps_clean_round(tmp_path, reports, uncovered, known):
+    gh = SelectionGH(
+        [
+            {"filename": path, "status": status, "patch_size": size}
+            for path, status, size in [
+                ("app.py", "modified", 10),
+                ("other.py", "modified", 10),
+                ("uv.lock", "modified", 10),
+                ("gen.py", "modified", 10),
+                ("gone.py", "removed", 10),
+                ("huge.py", "modified", 101),
+            ]
+        ],
+        attributes="gen.py linguist-generated",
+    )
+    gh.pr_facts["changed_files"] = 6
+
+    async def runner(name, inputs):
+        assert json.loads(inputs["selected_paths"]) == ["app.py", "other.py"]
+        steps = _panel_steps()
+        for lane, report in zip(LLM_LANES, reports):
+            if report is not None:
+                steps[lane] += f"\nREVIEWED_FILES: {report}"
+        # Only LLM finders can establish file coverage.
+        steps["find_structural"] += "\nREVIEWED_FILES: app.py, other.py"
+        return accounted_empty_panel({"output": CLEAN_REPORT, "failed": [], "steps": steps})
+
+    d = make(tmp_path, cfg={"shadow_mode": False, "max_patch_chars": 100}, gh=gh, runner=runner)
+    verdict = "WARN" if uncovered else "PASS"
+    assert await d.handle_pr_event("o/r", 1, HEAD, "opened") == f"reviewed:{verdict}"
+    body = gh.reviews_posted[0]["body"]
+    assert f"verdict={verdict}" in body
+    from pr_reviewer.verdicts import parse_verdict_marker
+
+    assert parse_verdict_marker(body)["complete"] is (not uncovered)
+    coverage = next((line for line in body.splitlines() if "Coverage incomplete" in line), "")
+    assert bool(coverage) == bool(uncovered)
+    for path in uncovered:
+        assert f"`{path}`" in coverage
+    for path in ("uv.lock", "gen.py", "gone.py", "huge.py"):
+        assert path not in coverage
+    row = _events(tmp_path, "reviewed")[-1]
+    assert row["uncovered_files"] == uncovered
+    assert row["file_coverage_known"] is known
+    assert row["complete"] is (not uncovered)
+    assert len([a for a in gh.calls if a[1].endswith("/files")]) == 1

@@ -1226,3 +1226,20 @@ def test_selection_record_rows_for_non_selected_files():
         {"file": "big.py", "reason": "too-large"},
     ]
     assert selection_record(select_files([ChangedFile("app.py", "modified", 10)])) == []
+
+
+@pytest.mark.parametrize("incomplete", [[], ["find_crossfile"]])
+def test_uncovered_files_are_named_without_counting_them_as_lanes(incomplete):
+    from pr_reviewer.verdicts import render_coverage_note
+
+    gaps = coverage_gaps([], incomplete, False, uncovered_files=["app.py", "pkg/other.py"])
+    assert gaps["files"] == "no finder reported reviewing: `app.py`, `pkg/other.py`"
+    assert coverage_verdict(PASS, gaps) == WARN
+    note = render_coverage_note(gaps, lanes=5)
+    assert "Coverage incomplete" in note
+    assert "`app.py`" in note and "`pkg/other.py`" in note
+    if incomplete:
+        assert "1 of 5 review lane(s)" in note
+    else:
+        assert "review lane(s)" not in note
+    assert coverage_gaps([], [], False, uncovered_files=[]) == {}

@@ -1375,6 +1375,7 @@ def coverage_gaps(
     structural_partial: bool = False,
     lane_reasons: dict[str, str] | None = None,
     failed_lanes: list[str] | None = None,
+    uncovered_files: list[str] | None = None,
 ) -> dict[str, str]:
     """{lane: why} for every lane that did not deliver a full pass — the signals the
     dispatcher already records (`degraded`, `incomplete_finders`, the structural lane
@@ -1386,7 +1387,9 @@ def coverage_gaps(
     that repo, not the blanket reason, so the coverage note says which codebase it read.
 
     `failed_lanes` (#357) are finder lanes that still errored after the retry while the
-    other lanes delivered — carried as a coverage Gap, not an exhausted round."""
+    other lanes delivered — carried as a coverage Gap, not an exhausted round.
+    `uncovered_files` names selected files no LLM finder reported reviewing; these
+    cap coverage too, but are not counted as missing lanes."""
     lane_reasons = lane_reasons or {}
     gaps = {str(s): "hit its time budget" for s in (degraded or [])}
     for s in overran or []:
@@ -1405,6 +1408,8 @@ def coverage_gaps(
         gaps.setdefault("find_structural", f"{why}: {structural_reason}" if structural_reason else why)
     if verify_undelivered:
         gaps.setdefault("verify", "returned no findings array and no status line — the verify pass did not run")
+    if uncovered_files:
+        gaps["files"] = "no finder reported reviewing: " + ", ".join(f"`{p}`" for p in uncovered_files)
     return gaps
 
 
@@ -1454,6 +1459,12 @@ def render_coverage_note(gaps: dict[str, str] | None, lanes: int = 0) -> str:
             "findings are recorded below as unverified carried debt; a PASS is capped at WARN and "
             "promotion is held."
         )
+    if "files" in gaps:
+        others = {sid: why for sid, why in gaps.items() if sid != "files"}
+        prefix = (
+            render_coverage_note(others, lanes) if others else "**Coverage incomplete — this is not a clean pass.**"
+        )
+        return prefix + f" Selected files {gaps['files']}. A PASS is capped at WARN."
     context = {sid: why for sid, why in gaps.items() if sid.startswith("context:")}
     if context:
         lanes_note = render_coverage_note({sid: why for sid, why in gaps.items() if sid not in context}, lanes)
