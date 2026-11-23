@@ -23,12 +23,14 @@ from pr_reviewer.verdicts import (
     format_stage_causes,
     identifier_tokens,
     merge_carried_findings,
+    parse_reviewed_files,
     parse_verdict_marker,
     render_verdict_body,
     report_hard_stopped,
     stage_causes,
     structural_relay_ok,
     undelivered_stages,
+    unreviewed_selected,
     verdict_for,
     verification_ran,
     verify_delivered,
@@ -652,6 +654,65 @@ def test_a_finder_that_declares_blocked_did_not_complete():
     """Explicit self-report of failure — even if it also emitted a findings block."""
     output = "```json\n[]\n```\nFINDER_STATUS: blocked reason=every file read 404ed"
     assert finder_completed(output) is False
+
+
+# ── REVIEWED_FILES: which files a lane read (#385) ─────────────────────────────
+
+
+def test_reviewed_files_parses_a_comma_separated_line():
+    assert parse_reviewed_files("```json\n[]\n```\nREVIEWED_FILES: a.py, b.py\nFINDER_STATUS: reviewed n=0") == {
+        "a.py",
+        "b.py",
+    }
+
+
+def test_reviewed_files_strips_backticks_whitespace_and_prefixes():
+    out = "REVIEWED_FILES:  `./a.py` ,`b/pkg/b.py`, a/c.py ,  ./d.py,\n"
+    assert parse_reviewed_files(out) == {"a.py", "pkg/b.py", "c.py", "d.py"}
+    # The whole line wrapped in a code span still counts.
+    assert parse_reviewed_files("`REVIEWED_FILES: x.py`") == {"x.py"}
+
+
+def test_reviewed_files_absent_is_none_and_empty_is_empty():
+    assert parse_reviewed_files("```json\n[]\n```\nFINDER_STATUS: reviewed n=0") is None
+    assert parse_reviewed_files("") is None
+    assert parse_reviewed_files(None) is None
+    # Present but naming nothing: the lane said it read nothing — not the same as silence.
+    assert parse_reviewed_files("REVIEWED_FILES:\nFINDER_STATUS: reviewed n=0") == set()
+    assert parse_reviewed_files("REVIEWED_FILES: none") == set()
+
+
+def test_unreviewed_selected_is_the_selected_files_no_lane_covered():
+    lanes = {"find_correctness": {"a.py"}, "find_crossfile": {"b.py"}}
+    assert unreviewed_selected(["a.py", "b.py", "c.py"], lanes) == (["c.py"], True)
+    # Any iterable of lane sets works; a silent lane does not count against coverage.
+    assert unreviewed_selected(["c.py", "a.py", "b.py"], [{"a.py"}, None, {"b.py"}]) == (["c.py"], True)
+    assert unreviewed_selected(["./a.py", "b.py"], [{"a.py", "b.py"}]) == ([], True)
+
+
+def test_unreviewed_selected_is_sorted_and_normalises_both_sides():
+    assert unreviewed_selected(["z.py", "m.py", "./a.py"], [{"b/m.py"}]) == (["a.py", "z.py"], True)
+
+
+def test_unreviewed_selected_is_unknown_when_no_lane_emitted_the_line():
+    """An older recipe, or a model that dropped the line: unknown, not every file a gap."""
+    assert unreviewed_selected(["a.py", "b.py", "c.py"], {"x": None, "y": None}) == ([], False)
+    assert unreviewed_selected(["a.py"], []) == ([], False)
+    assert unreviewed_selected(["a.py"], None) == ([], False)
+
+
+def test_unreviewed_selected_flags_every_file_when_lanes_reported_reading_none():
+    assert unreviewed_selected(["a.py", "b.py"], [set()]) == (["a.py", "b.py"], True)
+
+
+def test_finder_completed_ignores_the_reviewed_files_line():
+    """A missing (or present) REVIEWED_FILES line never changes completion."""
+    for status in ("FINDER_STATUS: reviewed n=0", "FINDER_STATUS: blocked reason=x", ""):
+        base = f"```json\n[]\n```\n{status}"
+        with_line = f"```json\n[]\n```\nREVIEWED_FILES: a.py, b.py\n{status}"
+        assert finder_completed(base) == finder_completed(with_line), status
+    assert finder_completed("```json\n[]\n```\nREVIEWED_FILES: a.py\nFINDER_STATUS: reviewed n=0") is True
+    assert finder_completed("```json\n[]\n```\nREVIEWED_FILES: a.py\n") is False
 
 
 def test_structural_relay_with_a_findings_fence_is_ok():

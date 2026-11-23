@@ -235,6 +235,12 @@ steps:
         complete a real pass. Say briefly what stopped you (e.g. "reads of
         the PR's own changed files erroring", "out of turns before finishing").
 
+      On the line just before that status line, also emit exactly one line
+      `REVIEWED_FILES: <path>, <path>, ...` listing every changed file you
+      actually read for this angle — repo-relative paths, comma-separated. List
+      only what you read, not what you were given: a file you skipped must not
+      appear, so the panel can tell which selected files no lane covered.
+
       A 404 on a path you GUESSED is not a blocker — it is an answer: that
       file does not exist at that ref. Looking for a `__version__` module and
       finding none tells you there is no such module to update; record it in
@@ -318,6 +324,12 @@ steps:
       - `FINDER_STATUS: blocked reason=<short reason>` — you could not
         complete a real pass. Say briefly what stopped you (e.g. "reads of
         the PR's own changed files erroring", "out of turns before finishing").
+
+      On the line just before that status line, also emit exactly one line
+      `REVIEWED_FILES: <path>, <path>, ...` listing every changed file you
+      actually read for this angle — repo-relative paths, comma-separated. List
+      only what you read, not what you were given: a file you skipped must not
+      appear, so the panel can tell which selected files no lane covered.
 
       A 404 on a path you GUESSED is not a blocker — it is an answer: that
       file does not exist at that ref. Looking for a `__version__` module and
@@ -412,6 +424,12 @@ steps:
         complete a real pass. Say briefly what stopped you (e.g. "reads of
         the PR's own changed files erroring", "out of turns before finishing").
 
+      On the line just before that status line, also emit exactly one line
+      `REVIEWED_FILES: <path>, <path>, ...` listing every changed file you
+      actually read for this angle — repo-relative paths, comma-separated. List
+      only what you read, not what you were given: a file you skipped must not
+      appear, so the panel can tell which selected files no lane covered.
+
       A 404 on a path you GUESSED is not a blocker — it is an answer: that
       file does not exist at that ref. Looking for a `__version__` module and
       finding none tells you there is no such module to update; record it in
@@ -504,6 +522,12 @@ steps:
       - `FINDER_STATUS: blocked reason=<short reason>` — you could not
         complete a real pass. Say briefly what stopped you (e.g. "reads of
         the PR's own changed files erroring", "out of turns before finishing").
+
+      On the line just before that status line, also emit exactly one line
+      `REVIEWED_FILES: <path>, <path>, ...` listing every changed file you
+      actually read for this angle — repo-relative paths, comma-separated. List
+      only what you read, not what you were given: a file you skipped must not
+      appear, so the panel can tell which selected files no lane covered.
 
       A 404 on a path you GUESSED is not a blocker — it is an answer: that
       file does not exist at that ref. Looking for a `__version__` module and

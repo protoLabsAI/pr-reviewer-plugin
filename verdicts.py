@@ -963,6 +963,66 @@ def finder_completed(output: str) -> bool:
     return bool(_FINDER_STATUS_LINE.search(text)) and any(b.lstrip().startswith("[") for b in fenced_blocks(text))
 
 
+# ── which files a lane read (#385) ─────────────────────────────────────────────
+# `FINDER_STATUS: reviewed` says a lane finished; it does not say it read the whole PR.
+# Each LLM finder also names the files it read in a `REVIEWED_FILES:` line, so a lane that
+# skipped half of a 40-file PR can be told from one that covered it. The line is a
+# coverage REPORT only — `finder_completed` never reads it, so its absence voids nothing.
+
+REVIEWED_FILES_PREFIX = "REVIEWED_FILES:"
+# Tolerates a line the model wrapped in a code span, bulleted or quoted.
+_REVIEWED_FILES_LINE = re.compile(r"^[\s`*>-]*REVIEWED_FILES:(.*)$", re.MULTILINE)
+_NO_FILES = frozenset({"none", "(none)", "n/a", "-"})
+
+
+def _norm_reviewed_path(path: str) -> str:
+    path = path.strip().strip("`'\"").strip()
+    while True:
+        stripped = path.removeprefix("./").removeprefix("a/").removeprefix("b/")
+        if stripped == path:
+            break
+        path = stripped
+    return path.removeprefix("/")
+
+
+def parse_reviewed_files(output: str) -> set[str] | None:
+    """The paths a finder's `REVIEWED_FILES:` line names, or None when it emitted no such line.
+
+    Paths are comma-separated; whitespace and backticks around each are dropped, and a
+    leading `./` or diff-style `a/` / `b/` is removed. Several lines are unioned. A line
+    present but naming nothing (or `none`) is an empty set — the lane said it read
+    nothing — which is distinct from None, the lane said nothing at all.
+    """
+    found: set[str] | None = None
+    for match in _REVIEWED_FILES_LINE.finditer(output or ""):
+        found = set() if found is None else found
+        for token in match.group(1).split(","):
+            path = _norm_reviewed_path(token)
+            if path and path.lower() not in _NO_FILES:
+                found.add(path)
+    return found
+
+
+def unreviewed_selected(selected: object, lanes: object) -> tuple[list[str], bool]:
+    """The selected paths no lane reported reading, and whether that is known.
+
+    `lanes` is each lane's `parse_reviewed_files` result (a dict of them, or any
+    iterable). A file is covered when ANY lane names it — the union across lanes. Returns
+    `(gaps, known)`: `gaps` is the sorted list of uncovered selected paths. When NO lane
+    emitted the line (an older recipe, a model that dropped it) coverage is unknown —
+    `([], False)` — rather than every file a gap, the same rule by which a missing status
+    line alone never voids a lane.
+    """
+    values = lanes.values() if isinstance(lanes, dict) else (lanes or ())
+    reported = [s for s in values if s is not None]
+    if not reported:
+        return [], False
+    covered = {_norm_reviewed_path(str(p)) for s in reported for p in s}
+    wanted = {_norm_path(str(p)) for p in (selected or ()) if str(p).strip()}
+    # Both sides go through the same normaliser, so a real `a/...` path still matches.
+    return sorted(p for p in wanted if p and _norm_reviewed_path(p) not in covered), True
+
+
 def mentions_any(text: str, markers: str | tuple[str, ...]) -> bool:
     """Is any of `markers` in `text`? A bare string is one marker; empty markers never match."""
     options = (markers,) if isinstance(markers, str) else tuple(markers or ())
