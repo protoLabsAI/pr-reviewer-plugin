@@ -83,7 +83,7 @@ def register(registry) -> None:
     machinery = False
     try:
         from .dispatch import Dispatcher, sweep_loop
-        from .telemetry import Telemetry
+        from .telemetry import Telemetry, parse_retention_days
         from .webhook import build_routers
 
         live = registry.live_config if hasattr(registry, "live_config") else (lambda: cfg)
@@ -94,11 +94,13 @@ def register(registry) -> None:
             # dispatcher — its chokepoint, backfills and round caps are the state that
             # must stay singular — and just refresh the config it was booted with.
             telemetry = shared["telemetry"]
+            telemetry.retention_days = parse_retention_days(cfg.get("telemetry_retention_days"))
             dispatcher = shared["dispatcher"]
             dispatcher.rebind_config(cfg, live)
             log.info("[pr-reviewer] re-registered: reusing the running dispatcher (issue #198)")
         else:
-            telemetry = Telemetry(home)
+            # Day-files older than this are pruned once per UTC day from `emit()` (#372).
+            telemetry = Telemetry(home, retention_days=parse_retention_days(cfg.get("telemetry_retention_days")))
             # The dispatcher resolves its knobs through the SAME live view the webhook
             # secret already used (issue #11) — `repos`, `shadow_mode`, the kill switches.
             # Snapshotting them meant an operator flipping the gate through Settings got a
