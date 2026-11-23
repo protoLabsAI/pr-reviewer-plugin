@@ -200,6 +200,7 @@ from .verdicts import (
     nearby_structural,
     overrun_lanes,
     parse_hunks,
+    parse_reviewed_files,
     parse_verdict_marker,
     pre_existing_dedup_key,
     render_nearby_footnote,
@@ -211,6 +212,7 @@ from .verdicts import (
     stage_causes,
     structural_relay_ok,
     undelivered_stages,
+    unreviewed_selected,
     verdict_for,
     verification_ran,
     verifier_contradicts_synthesis,
@@ -4287,8 +4289,8 @@ class Dispatcher:
             max_patch_chars=self.max_patch_chars,
             gitattributes=await self._selection_attributes(repo, head) if changed_files else "",
         )
+        selected = selected_paths(file_selection)
         if changed_files is not None:
-            selected = selected_paths(file_selection)
             inputs["selected_paths"] = json.dumps(selected)
             structural_paths = set(selected)
             if epic_scope is not None:
@@ -4675,7 +4677,13 @@ class Dispatcher:
         # Every gap gets a class (never None): see `structural_outage`.
         structural_class, structural_detail = structural_outage(structural_out) if structural_gap else ("", "")
         structural_unavailable = structural_gap and not structural_partial
-        complete = not structural_gap and not degraded and not incomplete_finders
+        uncovered_files, file_coverage_known = unreviewed_selected(
+            selected,
+            [parse_reviewed_files(str(steps_out.get(s) or "")) for s in LLM_FINDER_STEPS],
+        )
+        # A failed file-list read cannot establish per-file coverage.
+        file_coverage_known = file_coverage_known and changed_files is not None
+        complete = not structural_gap and not degraded and not incomplete_finders and not uncovered_files
         lanes = len({str(s) for s in (*steps_out, *degraded) if str(s).startswith(FINDER_STEP_PREFIX)})
         output = str(result.get("output") or "")
         # The raw output is read for BLOCKS and never published as text (protoAgent#2439
@@ -4792,6 +4800,7 @@ class Dispatcher:
             structural_partial=structural_partial,
             lane_reasons=lane_repo_gaps,
             failed_lanes=finder_failed,
+            uncovered_files=uncovered_files,
         )
         accounting = _accounting.coverage(result, recipe, history=history)
         if report_lost and accounting["supported"] and accounting["complete"]:
@@ -5480,6 +5489,8 @@ class Dispatcher:
             slowest_step=(max(timings, key=timings.get) if timings else None),
             degraded=degraded or None,
             incomplete_finders=incomplete_finders or None,
+            uncovered_files=uncovered_files,
+            file_coverage_known=file_coverage_known,
             complete=complete,
             structural_unavailable=structural_unavailable or None,
             # WHY the structural lane was out, as a countable class (#205): a clawpatch
