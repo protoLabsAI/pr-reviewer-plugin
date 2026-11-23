@@ -356,16 +356,23 @@ DIFF_CHAR_BUDGET = 200_000
 def ineligible_reason(facts: dict | None) -> str | None:
     """Why this PR cannot be reviewed, or None if it can.
 
-    Four conditions used to collapse into one opaque `pr-not-eligible`, and one of
+    Conditions, in order: `facts-unreadable`, `not-open`, `archived`, `draft`,
+    `locked`. They used to collapse into one opaque `pr-not-eligible`, and one of
     them (`locked`) skipped silently in the sweep with no telemetry at all — so
     "ignored because the conversation is locked" was indistinguishable from "never
     seen". That is the same invisibility that let a duplicate-review loop run 2.5h
     and a 422 loop run all evening: the system knew, and never said.
+
+    `archived` (issue #366): an archived repo is read-only, so GitHub refuses every
+    write with `422 Repository was archived so is read-only` — the panel would run in
+    full, post nothing, and the PR would be reported UNREVIEWED. Never start.
     """
     if not facts:
         return "facts-unreadable"
     if facts.get("state") != "open":
         return "not-open"
+    if facts.get("archived"):
+        return "archived"
     if facts.get("draft"):
         return "draft"
     if facts.get("locked"):
@@ -2631,7 +2638,7 @@ class Dispatcher:
                 "{head: .head.sha, base_ref: .base.ref, state: .state, merged: .merged, draft: .draft, locked: .locked, "
                 "changed_files: .changed_files, additions: .additions, deletions: .deletions, title: .title, body: .body, "
                 "author: .user.login, head_ref: .head.ref, head_repo: .head.repo.full_name, "
-                "base_sha: .base.sha, default_branch: .base.repo.default_branch, "
+                "base_sha: .base.sha, default_branch: .base.repo.default_branch, archived: .base.repo.archived, "
                 "labels: [.labels[].name], auto_merge: (.auto_merge != null)}",
             ],
         )
@@ -7275,6 +7282,8 @@ class Dispatcher:
             self.telemetry.emit("drop", repo=repo, pr=pr, reason=DROP_PR_NOT_ELIGIBLE, why=why, action=BACKFILL_ACTION)
             if why == "locked":
                 log.info("[pr-reviewer] %s#%s is locked — GitHub refuses reviews there; skipping", repo, pr)
+            elif why == "archived":
+                log.info("[pr-reviewer] %s#%s is in an archived repo — GitHub refuses writes there; skipping", repo, pr)
             return None
         head = str(facts["head"])
         ours = await self._our_reviews(repo, pr)
