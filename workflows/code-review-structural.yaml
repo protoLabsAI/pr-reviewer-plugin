@@ -317,7 +317,8 @@ steps:
       means "the repo is inaccessible" — the diff you were given came from it.
 
   - id: find_crossfile
-    subagent: review-finder
+    # review-finder-pr: the host finder holding only PR-head read tools (#335).
+    subagent: review-finder-pr
     timeout: "{{inputs.finder_timeout}}"
     prompt: |
       Review PR #{{inputs.pr}} in repo "{{inputs.repo}}" at head SHA
@@ -346,9 +347,7 @@ steps:
       ## Searching the repo (issue #311)
       `search_pr_repo` and `list_pr_repo_files` read a checkout of THIS PR's
       head commit — pass `pr={{inputs.pr}}` and `repo="{{inputs.repo}}"`. They
-      are the only search that sees this PR: `search_files`, `find_files`,
-      `list_dir` and `read_file` point at an unrelated, empty local workspace,
-      and their "no matches" means nothing. A claim that something is absent or
+      are the only search that sees this PR. A claim that something is absent or
       universal — "no test covers X", "`f` is never called / dead", "no `x.py`
       exists", "every entry under `d/` is named Y" — is about the whole repo:
       back it with one of these calls and put the call (pattern, path) and its
@@ -407,7 +406,8 @@ steps:
       means "the repo is inaccessible" — the diff you were given came from it.
 
   - id: find_conventions
-    subagent: review-finder
+    # review-finder-pr: the host finder holding only PR-head read tools (#335).
+    subagent: review-finder-pr
     timeout: "{{inputs.finder_timeout}}"
     prompt: |
       Review PR #{{inputs.pr}} in repo "{{inputs.repo}}" at head SHA
@@ -436,9 +436,7 @@ steps:
       ## Searching the repo (issue #311)
       `search_pr_repo` and `list_pr_repo_files` read a checkout of THIS PR's
       head commit — pass `pr={{inputs.pr}}` and `repo="{{inputs.repo}}"`. They
-      are the only search that sees this PR: `search_files`, `find_files`,
-      `list_dir` and `read_file` point at an unrelated, empty local workspace,
-      and their "no matches" means nothing. A claim that something is absent or
+      are the only search that sees this PR. A claim that something is absent or
       universal — "no test covers X", "`f` is never called / dead", "no `x.py`
       exists", "every entry under `d/` is named Y" — is about the whole repo:
       back it with one of these calls and put the call (pattern, path) and its
@@ -575,7 +573,8 @@ steps:
       protoPatch finding, or a claim that is merely similar in topic.
 
   - id: verify
-    subagent: verifier
+    # review-verifier: the host verifier holding only PR-head read tools (#335).
+    subagent: review-verifier
     timeout: "{{inputs.verify_timeout}}"
     depends_on: [synthesize]
     prompt: |
@@ -704,10 +703,8 @@ steps:
          repo at head SHA "{{inputs.head_sha}}" for the named symbol, test or path
          (the test directory, the callers, the import sites) with
          `search_pr_repo(pattern, pr={{inputs.pr}}, repo="{{inputs.repo}}", path=...)`
-         or `list_pr_repo_files` — the only search that sees this PR's head
-         (`search_files` / `find_files` read an unrelated, empty workspace) —
-         and write in your
-         note WHAT you searched and WHERE, e.g. "searched tests/ for `call(`: no
+         or `list_pr_repo_files` — the only search that sees this PR's head —
+         and write in your note WHAT you searched and WHERE, e.g. "searched tests/ for `call(`: no
          use outside conftest.py". A reference found refutes the claim. If you
          could not search (a `SEARCH ERROR`, or no search tool), the finding is
          `uncertain`, never `confirmed`. A claim that something holds EVERYWHERE
