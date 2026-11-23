@@ -127,7 +127,11 @@ so concurrent reviews of one repo cannot fail each other's feature claims (`exit
 locked`), one PR's findings cannot surface on another that touches the same file, and a redeploy
 that kills a run leaves no lock behind. A successful pass deletes its dir. A failed one keeps it for
 a postmortem and it is pruned after 6 h (and at startup). What persists stays in the repo's own
-dir: `refuted.json` and `provider-failures/` (captures of unusable model replies).
+dir: `refuted.json` and `provider-failures/` (captures of unusable model replies). Captures are kept
+for 30 days: the same prune deletes `provider-failures/` files older than that (never the dir
+itself, which live scratch dirs symlink to). It also removes the per-repo working dirs left from
+before per-pass state (`reports/`, `features/`, `findings/`, `runs/`, `locks/`, `locks-stale/`,
+`patches/`), which nothing reads any more. `<state_root>/llm-refutations/` is never swept.
 
 ## Partial results
 

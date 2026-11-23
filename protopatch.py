@@ -1027,6 +1027,14 @@ def attribute_findings(records: list[dict], scopes: dict[str, set[str]]) -> tupl
 SCRATCH_DIRNAME = "scratch"
 # A scratch dir kept for a postmortem (its run failed) is dropped once it is this old.
 SCRATCH_KEEP_FAILED_S = 6 * 3600
+# Per-repo working dirs from before the per-pass scratch dir (#223/#225): nothing reads or writes
+# them any more, so the prune removes any it finds directly under a repo dir (#373).
+LEGACY_REPO_DIRS = ("reports", "features", "findings", "runs", "locks", "locks-stale", "patches")
+# Provider-failure captures are kept for diagnosis, but not forever: files older than this go (#373).
+PROVIDER_FAILURES_KEEP_S = 30 * 86400
+# Siblings of the repo dirs under the state root that are NOT repo dirs (refutations.py's LLM store,
+# keyed `<owner>/<name>.json` — an owner named like a legacy dir must never be swept).
+_NON_REPO_STATE_DIRS = frozenset({"llm-refutations"})
 
 
 # The residual paths of an epic PR reviewed by its residual only (#273), keyed by the
@@ -1080,6 +1088,35 @@ def set_bound_repo(repo: str, pr: int) -> None:
 def bound_repo(pr: int) -> str:
     """The repo the round for this PR is bound to, or `""` when none is (a direct tool call)."""
     return _BOUND_REPOS.get(int(pr), "")
+
+
+def _prune_repo_leftovers(repo_dir: Path, now: float) -> int:
+    """Remove `repo_dir`'s pre-#223 working dirs and its stale provider-failure captures (#373).
+
+    Touches nothing else: `scratch/`, `refuted.json` and the `provider-failures/` dir itself (live
+    scratch dirs symlink to it) stay. Returns the number of entries removed; never raises."""
+    removed = 0
+    for name in LEGACY_REPO_DIRS:
+        legacy = repo_dir / name
+        try:
+            if legacy.is_dir() and not legacy.is_symlink():
+                shutil.rmtree(legacy, ignore_errors=True)
+                removed += 1
+        except OSError:
+            continue
+    captures = repo_dir / "provider-failures"
+    try:
+        entries = list(captures.iterdir()) if captures.is_dir() and not captures.is_symlink() else []
+    except OSError:
+        entries = []
+    for f in entries:
+        try:
+            if f.is_file() and not f.is_symlink() and now - f.stat().st_mtime > PROVIDER_FAILURES_KEEP_S:
+                f.unlink()
+                removed += 1
+        except OSError:
+            continue
+    return removed
 
 
 class ProtoPatchRunner:
@@ -1209,12 +1246,16 @@ class ProtoPatchRunner:
     def _prune_scratch(self, repo_dir: Path | None = None) -> int:
         """Drop scratch state dirs kept for a postmortem once they are `SCRATCH_KEEP_FAILED_S`
         old — for one repo, or (at startup) every repo, which also clears dirs a redeploy
-        orphaned mid-run. Best-effort, never raises."""
+        orphaned mid-run. Each visited repo dir also loses its pre-#223 `LEGACY_REPO_DIRS` and
+        any `provider-failures/` capture older than `PROVIDER_FAILURES_KEEP_S` (#373).
+        Best-effort, never raises."""
         removed = 0
         try:
             dirs = [repo_dir] if repo_dir is not None else [d for d in self.state_root.glob("*") if d.is_dir()]
             now = time.time()
             for d in dirs:
+                if d.name in _NON_REPO_STATE_DIRS:
+                    continue
                 for scratch in (d / SCRATCH_DIRNAME).glob("*"):
                     try:
                         if now - scratch.stat().st_mtime > SCRATCH_KEEP_FAILED_S:
@@ -1222,6 +1263,7 @@ class ProtoPatchRunner:
                             removed += 1
                     except OSError:
                         continue
+                removed += _prune_repo_leftovers(d, now)
         except Exception:  # noqa: BLE001 — maintenance is best-effort, never fatal
             log.exception("[pr-reviewer] scratch state prune failed")
         return removed
