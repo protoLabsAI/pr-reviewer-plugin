@@ -48,6 +48,7 @@ def host(monkeypatch):
     base = _Cfg(name="review-finder")
     mod = types.ModuleType("graph.subagents.config")
     mod.REVIEW_FINDER_CONFIG = base
+    mod.VERIFIER_CONFIG = _Cfg(name="verifier")
     mod.SUBAGENT_REGISTRY = registry
     mod.SubagentConfig = _Cfg
     for name in ("graph", "graph.subagents"):
@@ -162,7 +163,7 @@ def test_the_deep_lanes_are_the_two_the_recipe_routes():
 
 def test_get_subagents_registers_the_deep_finder(host):
     names = [s.name for s in subagents.get_subagents()]
-    assert names == ["structural-finder", "review-finder-deep"]
+    assert names == ["structural-finder", "review-finder-deep", "review-finder-pr", "review-verifier"]
 
 
 def test_module_has_no_host_import_at_import_time():
