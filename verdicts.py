@@ -1414,6 +1414,56 @@ def render_coverage_note(gaps: dict[str, str] | None, lanes: int = 0) -> str:
     )
 
 
+def _selection_label(decision: object) -> str:
+    from .selection import DELETED, EXCLUDED_GENERATED, LOCKFILE_NAMES, TOO_LARGE
+
+    reason = getattr(decision, "reason", "")
+    rule = getattr(decision, "rule", "")
+    if reason == DELETED:
+        return "deleted"
+    if reason == EXCLUDED_GENERATED:
+        return "generated"
+    if reason == TOO_LARGE:
+        return "too large"
+    if rule in LOCKFILE_NAMES:
+        return "lockfile"
+    if rule == "*.min.js":
+        return "minified"
+    return f"excluded path `{rule}`" if rule else "excluded path"
+
+
+def render_selection_note(decisions: list | None) -> str:
+    """The code-authored coverage line for files the panel set aside (#385).
+
+    "N file(s) excluded from review", grouped by reason in precedence order, every path
+    named — each `too-large` file individually with its patch size, so a file is never
+    silently dropped. Empty when every file was selected. Not a coverage gap: this note
+    never feeds `coverage_gaps` / `coverage_verdict`."""
+    from .selection import REASONS, SELECTED, TOO_LARGE
+
+    skipped = [d for d in decisions or () if getattr(d, "reason", SELECTED) != SELECTED]
+    if not skipped:
+        return ""
+    groups: dict[str, list[str]] = {}
+    order = {reason: i for i, reason in enumerate(REASONS)}
+    for d in sorted(skipped, key=lambda d: order.get(d.reason, len(order))):
+        name = f"`{d.path}`"
+        if d.reason == TOO_LARGE:
+            name += f" {d.patch_size:,}-char patch"
+        groups.setdefault(_selection_label(d), []).append(name)
+    listed = "; ".join(f"{label} ({', '.join(names)})" for label, names in groups.items())
+    noun = "file" if len(skipped) == 1 else "files"
+    return f"{len(skipped)} {noun} excluded from review: {listed}."
+
+
+def selection_record(decisions: list | None) -> list[dict]:
+    """The hidden-record form of the selection: one `{file, reason}` row per file that
+    was not selected, in input order."""
+    from .selection import SELECTED
+
+    return [{"file": d.path, "reason": d.reason} for d in decisions or () if getattr(d, "reason", SELECTED) != SELECTED]
+
+
 def verify_delivered(verify_output: str) -> bool:
     """Did the verify step hand anything back? The one question `verification_ran` cannot
     ask on a clean round (#151).

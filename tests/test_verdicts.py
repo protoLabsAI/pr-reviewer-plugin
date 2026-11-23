@@ -1100,3 +1100,68 @@ def test_camel_case_identifiers_tell_two_defects_apart():
         {"file": "a.ts", "line": 14, "severity": "major", "claim": "resolveDefaultTest ignores the timeout it is given"}
     ]
     assert [f["line"] for f in merge_carried_findings(fresh, other)] == [10, 14]
+
+
+def test_selection_note_names_excluded_lockfile():
+    from pr_reviewer.selection import ChangedFile, select_files
+    from pr_reviewer.verdicts import render_selection_note
+
+    decisions = select_files([ChangedFile("uv.lock", "modified", 10), ChangedFile("app.py", "modified", 10)])
+    note = render_selection_note(decisions)
+    assert note.startswith("1 file excluded from review:")
+    assert "lockfile (`uv.lock`)" in note
+    assert "app.py" not in note
+
+
+def test_selection_note_names_every_too_large_file():
+    from pr_reviewer.selection import ChangedFile, select_files
+    from pr_reviewer.verdicts import render_selection_note
+
+    decisions = select_files(
+        [
+            ChangedFile("big.py", "modified", 80_000),
+            ChangedFile("app.py", "modified", 10),
+            ChangedFile("huge.py", "added", 90_000),
+            ChangedFile("old.py", "removed", 5),
+        ],
+        max_patch_chars=50_000,
+    )
+    note = render_selection_note(decisions)
+    assert note.startswith("3 files excluded from review:")
+    assert "`big.py` 80,000-char patch" in note
+    assert "`huge.py` 90,000-char patch" in note
+    assert "deleted (`old.py`)" in note
+    assert note.index("deleted") < note.index("too large")
+
+
+def test_selection_note_empty_when_all_selected():
+    from pr_reviewer.selection import ChangedFile, select_files
+    from pr_reviewer.verdicts import render_selection_note
+
+    assert render_selection_note(select_files([ChangedFile("app.py", "modified", 10)])) == ""
+    assert render_selection_note([]) == ""
+    assert render_selection_note(None) == ""
+
+
+def test_selection_record_rows_for_non_selected_files():
+    from pr_reviewer.selection import ChangedFile, select_files
+    from pr_reviewer.verdicts import selection_record
+
+    decisions = select_files(
+        [
+            ChangedFile("uv.lock", "modified", 10),
+            ChangedFile("app.py", "modified", 10),
+            ChangedFile("gen/x.py", "modified", 10),
+            ChangedFile("old.py", "removed", 10),
+            ChangedFile("big.py", "modified", 999),
+        ],
+        gitattributes="gen/** linguist-generated",
+        max_patch_chars=100,
+    )
+    assert selection_record(decisions) == [
+        {"file": "uv.lock", "reason": "excluded:path"},
+        {"file": "gen/x.py", "reason": "excluded:generated"},
+        {"file": "old.py", "reason": "deleted"},
+        {"file": "big.py", "reason": "too-large"},
+    ]
+    assert selection_record(select_files([ChangedFile("app.py", "modified", 10)])) == []
