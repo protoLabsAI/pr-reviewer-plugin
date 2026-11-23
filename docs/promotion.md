@@ -17,6 +17,10 @@ in draft holds it out of the review and promotion pipeline.
   `auto_merge_repos` (default empty) OR it carries the `auto_merge_label` label (default
   `auto-merge`; an empty string disables the label path). Arming is best-effort; stacked PRs
   targeting other branches are excluded. A repo with auto-merge disabled simply declines.
+  The `merge-hold` label (case-insensitive, ignoring surrounding whitespace) blocks arming;
+  the APPROVE review/verdict still posts. On reconciliation, a held open PR with auto-merge
+  enabled is disarmed best-effort. Removing the label lets the next sweep arm normally,
+  after rechecking promotion conditions, without posting a duplicate APPROVE.
 
 So the practical contract is: **undraft a PR only when it is ready to ship, not when you merely
 want eyes on it.**

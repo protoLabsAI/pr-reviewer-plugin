@@ -41,6 +41,7 @@ import sys
 import time
 import uuid
 from collections import deque
+from dataclasses import replace
 from pathlib import Path
 from urllib.parse import quote
 
@@ -51,6 +52,7 @@ from . import incremental as _inc
 from . import repo_search as _repo_search
 from .absence_search import AbsenceSearcher, render_absence_search_footnote
 from .approve import (
+    HOLD_ALREADY_PROMOTED,
     HOLD_NO_CLEAR_VERDICT,
     HOLD_NOT_OWNER,
     HOLD_ROUND_IN_FLIGHT,
@@ -243,6 +245,14 @@ _SUPERSEDE_CHECK_PHASES = ("synthesize", "verify")
 # neighbouring hold so a degradation is VISIBLE in telemetry: the 2026-08-17 loop ran
 # 2.5h without a single log line naming the read failure that caused it.
 HOLD_REVIEWS_UNREADABLE = "hold:reviews-unreadable"
+HOLD_MERGE_HOLD = "hold:merge-hold"
+MERGE_HOLD_LABEL = "merge-hold"
+
+
+def merge_held(facts: dict) -> bool:
+    """Whether the PR carries the operator's merge hold label."""
+    return any(str(label).strip().lower() == MERGE_HOLD_LABEL for label in facts.get("labels") or [])
+
 
 # Posting a verdict is the LAST step of the most expensive thing this plugin does, and
 # it used to be the only step with no retry — a transient refusal discarded the whole
@@ -2621,7 +2631,8 @@ class Dispatcher:
                 "{head: .head.sha, base_ref: .base.ref, state: .state, merged: .merged, draft: .draft, locked: .locked, "
                 "changed_files: .changed_files, additions: .additions, deletions: .deletions, title: .title, body: .body, "
                 "author: .user.login, head_ref: .head.ref, head_repo: .head.repo.full_name, "
-                "base_sha: .base.sha, default_branch: .base.repo.default_branch, labels: [.labels[].name]}",
+                "base_sha: .base.sha, default_branch: .base.repo.default_branch, "
+                "labels: [.labels[].name], auto_merge: (.auto_merge != null)}",
             ],
         )
         if rc != 0:
@@ -6902,6 +6913,15 @@ class Dispatcher:
             ),
         )
         if decision != PROMOTE:
+            # Recheck every guard before re-arming an approved head after a hold.
+            # The existing approval remains deduplicated.
+            if (
+                decision == HOLD_ALREADY_PROMOTED
+                and facts.get("auto_merge") is False
+                and not merge_held(facts)
+                and promotion_decision(replace(obs, verdict_promoted=False)) == PROMOTE
+            ):
+                await self._arm_promotion_auto_merge(repo, pr, facts)
             return decision
         verdict = clear["verdict"] if clear else PASS
         # A promoted WARN carries its findings forward (issue #22). Otherwise the PR
@@ -6946,9 +6966,14 @@ class Dispatcher:
                 )
             return "error:approve-failed"
         self._promote_failures.pop(backoff_key, None)
+        await self._arm_promotion_auto_merge(repo, pr, facts)
+        return PROMOTE
+
+    async def _arm_promotion_auto_merge(self, repo: str, pr: int, facts: dict) -> None:
         armed = False
+        held = merge_held(facts)
         opt_in = self._auto_merge_opt_in(repo, facts)
-        if str(facts.get("base_ref") or "") == "main" and opt_in != "none":
+        if not held and str(facts.get("base_ref") or "") == "main" and opt_in != "none":
             # Quinn's last step: arm native squash auto-merge — but only onto main
             # (stacked PRs excluded; #901's scope lesson) and only where the repo
             # (`auto_merge_repos`) or the PR (`auto_merge_label`) opted in: the App can
@@ -6956,8 +6981,15 @@ class Dispatcher:
             # Best-effort: a repo with auto-merge disabled just declines.
             rc2, _o, _e = await self._run_gh(["pr", "merge", str(pr), "--repo", repo, "--auto", "--squash"], timeout=30)
             armed = rc2 == 0
-        self.telemetry.emit("promoted", repo=repo, pr=pr, sha=head, auto_merge_armed=armed, auto_merge_opt_in=opt_in)
-        return PROMOTE
+        self.telemetry.emit(
+            "promoted",
+            repo=repo,
+            pr=pr,
+            sha=facts["head"],
+            auto_merge_armed=armed,
+            auto_merge_opt_in=opt_in,
+            merge_held=held,
+        )
 
     # ── the dispatch-path `protoReview` check (#95) ───────────────────────────
 
@@ -7422,6 +7454,23 @@ class Dispatcher:
         while self._backfills:
             await asyncio.gather(*list(self._backfills), return_exceptions=True)
 
+    async def _disarm_merge_hold(self, repo: str, pr: int) -> None:
+        """Best-effort enforcement before any reconcile backfill or promotion work."""
+        if self.shadow or not self.promotion_owner:
+            return
+        try:
+            facts = await self._pr_facts(repo, pr)
+            if not facts or facts.get("state") != "open" or facts.get("merged"):
+                return
+            if not merge_held(facts) or not facts.get("auto_merge"):
+                return
+            self.telemetry.emit("promotion", repo=repo, pr=pr, sha=facts.get("head"), decision=HOLD_MERGE_HOLD)
+            rc, _out, err = await self._run_gh(["pr", "merge", str(pr), "--repo", repo, "--disable-auto"], timeout=30)
+            if rc != 0:
+                log.warning("[pr-reviewer] merge-hold disarm on %s#%s failed: %s", repo, pr, err[-300:])
+        except Exception:  # noqa: BLE001 — a failed disarm must not stop reconciliation
+            log.warning("[pr-reviewer] merge-hold disarm on %s#%s failed", repo, pr, exc_info=True)
+
     async def reconcile_pr(
         self, repo: str, pr: int, *, backfill_budget: int = 0, detach_backfill: bool = False
     ) -> tuple[str, int]:
@@ -7434,6 +7483,7 @@ class Dispatcher:
         A backfilled PR skips 2 and 3 this pass: the fresh review just posted its own
         verdict through the normal path, and the next tick sees the settled state.
         """
+        await self._disarm_merge_hold(repo, pr)
         if backfill_budget > 0:
             head = await self.needs_backfill(repo, pr)
             if head and (wait := self._exhaustion_backoff_left(repo, pr, head)) > 0:
