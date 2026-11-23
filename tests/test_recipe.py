@@ -40,6 +40,7 @@ def test_recipe_shape():
         "pr_description",
         "existing_threads",
         "review_scope",
+        "review_rules",
     }
     assert RECIPE["output"] == "{{steps.report.output}}"
 
@@ -335,3 +336,15 @@ def test_every_llm_finder_lists_the_files_it_reviewed():
         assert "REVIEWED_FILES: <path>, <path>, ..." in prompt, sid
         # Emitted next to (just before) the status line, which stays the final line.
         assert prompt.index("REVIEWED_FILES:") > prompt.index("FINDER_STATUS: reviewed"), sid
+
+
+def test_only_the_conventions_finder_reads_the_path_scoped_rules():
+    """#386: the rules block is a base-ref, server-rendered input for the conventions lane only."""
+    decl = next(i for i in RECIPE["inputs"] if i["name"] == "review_rules")
+    assert decl["default"] == "(none)"
+    assert "BASE ref" in decl["description"]
+    readers = {sid for sid, step in STEPS.items() if "{{inputs.review_rules}}" in step.get("prompt", "")}
+    assert readers == {"find_conventions"}
+    prompt = STEPS["find_conventions"]["prompt"]
+    assert "ONLY to the files listed with it" in prompt
+    assert "came from the BASE ref, not the PR head" in prompt
