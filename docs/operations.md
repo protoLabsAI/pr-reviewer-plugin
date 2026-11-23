@@ -3,7 +3,8 @@
 ## Telemetry
 
 Every decision writes a JSON line to `<state home>/telemetry/<day>.jsonl` (state home is
-`state_root`, else `PR_REVIEWER_HOME`, else `~/.protoagent/pr-reviewer`). Event kinds you will
+`state_root`, else `PR_REVIEWER_HOME`, else `~/.protoagent/pr-reviewer`). Day-files older than
+[`telemetry_retention_days`](configuration.md#storage) (default 90) are deleted once per UTC day. Event kinds you will
 meet most:
 
 | Event | |

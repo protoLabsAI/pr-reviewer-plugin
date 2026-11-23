@@ -126,6 +126,7 @@ See [structural](structural.md) for what each does.
 |---|---|---|---|
 | `checkout_root` | `""` | | Empty = `~/.protoagent/pr-reviewer/checkouts` |
 | `state_root` | `""` | `PR_REVIEWER_HOME` | Empty = `~/.protoagent/pr-reviewer`. The state home also holds [telemetry](operations.md#telemetry) and per-repo clawpatch state |
+| `telemetry_retention_days` | `90` | | Days of [telemetry](operations.md#telemetry) day-files to keep. Files dated (by filename, UTC) more than this many days before today are deleted, at most once per UTC day, on the next write. Today's file is never deleted. `0` or negative disables pruning; unset or unparseable = `90` |
 | `checkout_ttl_s` | `3600` | | Cache entry freshness window (about a token lifetime) |
 | `checkout_max_entries` | `50` | | LRU prune cap |
 | `checkout_max_bytes` | `5000000000` | | LRU prune cap (5 GB) |
