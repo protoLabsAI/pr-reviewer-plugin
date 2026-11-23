@@ -3637,8 +3637,10 @@ async def test_the_head_read_is_pinned_to_the_immutable_head_sha(tmp_path):
     runner, _seen = capturing_runner(FABRICATED_REPORT)
     d = make(tmp_path, cfg={"shadow_mode": False}, gh=gh, runner=runner)
     await d.handle_pr_event("o/r", 1, HEAD, "opened")
-    assert gh.contents_calls, "the verifier's contextual read never ran"
-    assert all(f"ref={HEAD}" in c for c in gh.contents_calls)  # pinned to the reviewed head
+    # Policy reads intentionally use base; every code read must still use the reviewed head.
+    code_reads = [c for c in gh.contents_calls if "/contents/.protoreview/rules.yaml?" not in c]
+    assert code_reads, "the verifier's contextual read never ran"
+    assert all(f"ref={HEAD}" in c for c in code_reads)  # pinned to the reviewed head
     assert not any(c.split("?")[0].endswith("/contents/x.py") and "ref=" not in c for c in gh.contents_calls)
 
 
