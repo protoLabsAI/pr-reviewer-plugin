@@ -143,13 +143,53 @@ def test_deep_lane_prompts_drop_the_workspace_warning_but_keep_the_pr_search():
         assert "search_pr_repo" in prompt and "list_pr_repo_files" in prompt, sid
 
 
-def test_host_defined_lanes_keep_their_workspace_warning():
+LANE_SUBAGENTS = {
+    "find_correctness": "review-finder-deep",
+    "find_removed_behavior": "review-finder-deep",
+    "find_crossfile": "review-finder-pr",
+    "find_conventions": "review-finder-pr",
+    "verify": "review-verifier",
+}
+
+
+def test_every_lane_and_the_verifier_run_on_a_plugin_pr_head_copy():
     steps = _steps()
-    for sid in ("find_crossfile", "find_conventions"):
-        assert steps[sid]["subagent"] == "review-finder", sid
-        assert "unrelated, empty local workspace" in steps[sid]["prompt"], sid
-    assert steps["verify"]["subagent"] == "verifier"
-    assert "(`search_files` / `find_files` read an unrelated, empty workspace)" in steps["verify"]["prompt"]
+    assert {sid: steps[sid]["subagent"] for sid in LANE_SUBAGENTS} == LANE_SUBAGENTS
+
+
+def test_no_step_prompt_mentions_the_empty_workspace():
+    steps = _steps()
+    for sid, step in steps.items():
+        prompt = step.get("prompt", "")
+        assert "empty local workspace" not in prompt, sid
+        assert "empty workspace" not in prompt, sid
+    for sid in LANE_SUBAGENTS:
+        prompt = steps[sid]["prompt"]
+        assert "search_pr_repo" in prompt and "list_pr_repo_files" in prompt, sid
+        assert "pr={{inputs.pr}}" in prompt and "SEARCH ERROR" in prompt, sid
+
+
+def test_every_lane_subagent_is_registered_with_only_pr_head_reads(new_host):
+    mod = sys.modules["graph.subagents.config"]
+    mod.VERIFIER_CONFIG = _NewCfg(
+        name="verifier",
+        system_prompt="verify prompt",
+        tools=["github_pr_diff", "read_file", "find_files", "search_files", "list_dir", "github_read_file"],
+    )
+    by_name = {cfg.name: cfg for cfg in subagents.get_subagents()}
+    steps = _steps()
+    lane_ids = [sid for sid, s in steps.items() if sid.startswith("find_") or sid == "verify"]
+    assert set(LANE_SUBAGENTS) <= set(lane_ids)
+    for sid in lane_ids:
+        name = steps[sid]["subagent"]
+        assert name in by_name, (sid, name)
+        if sid == "find_structural":
+            continue  # the protoPatch relay holds only protopatch_review (asserted above)
+        cfg = by_name[name]
+        assert cfg.inherit_read_tools is False, name
+        for tool in ("search_files", "find_files", "list_dir", "read_file"):
+            assert tool not in cfg.tools, (name, tool)
+        assert "search_pr_repo" in cfg.tools, name
 
 
 @pytest.mark.parametrize("cfg_cls", [_NewCfg, _OldCfg])
