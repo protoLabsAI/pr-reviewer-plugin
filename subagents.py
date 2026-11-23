@@ -115,8 +115,8 @@ that edits its payload corrupts the panel. A clean (empty) result is a good resu
         **_completion_contract(SubagentConfig),
         **_narrow_tools(SubagentConfig),
     )
-    deep = deep_finder()
-    return [structural_finder, *([deep] if deep is not None else [])]
+    copies = (deep_finder(), pr_finder(), review_verifier())
+    return [structural_finder, *(cfg for cfg in copies if cfg is not None)]
 
 
 DEEP_FINDER_NAME = "review-finder-deep"
@@ -140,36 +140,60 @@ def deep_finder():
     `None` on a host without `REVIEW_FINDER_CONFIG`. The recipe then names a subagent the
     host does not have, which is why the manifest's `min_protoagent_version` covers it.
     """
+    return _review_copy(
+        "REVIEW_FINDER_CONFIG",
+        DEEP_FINDER_NAME,
+        "The code-review panel's correctness and removed-behavior lanes: the same "
+        "review-finder, registered separately so those lanes can run on their own model "
+        "(pr_reviewer.deep_finder_model).",
+        model="",
+    )
+
+
+def pr_finder():
+    """The cross-file and conventions finder copy, or None without its host config."""
+    return _review_copy(
+        "REVIEW_FINDER_CONFIG",
+        "review-finder-pr",
+        "The code-review panel's cross-file and conventions lanes, with explicit PR-head read tools.",
+    )
+
+
+def review_verifier():
+    """The panel verifier copy, or None without its host config."""
+    return _review_copy(
+        "VERIFIER_CONFIG",
+        "review-verifier",
+        "The code-review panel's verifier, with explicit PR-head read tools.",
+    )
+
+
+def _review_copy(source: str, name: str, description: str, **overrides):
+    """Copy a host config without mutating it; narrow reads on hosts supporting opt-out."""
     from dataclasses import fields, replace
 
     try:
-        from graph.subagents.config import REVIEW_FINDER_CONFIG
-    except Exception:  # noqa: BLE001 — an older host: no deep lane, nothing else changes
+        from graph.subagents import config
+
+        cfg = getattr(config, source)
+    except Exception:  # noqa: BLE001 — an older host: omit only the unavailable copy
         return None
-    kwargs = {
-        "name": DEEP_FINDER_NAME,
-        "description": (
-            "The code-review panel's correctness and removed-behavior lanes: the same "
-            "review-finder, registered separately so those lanes can run on their own model "
-            "(pr_reviewer.deep_finder_model)."
-        ),
-        "model": "",
-    }
-    if "lead_visible" in {f.name for f in fields(REVIEW_FINDER_CONFIG)}:
+    kwargs = {"name": name, "description": description, **overrides}
+    if "lead_visible" in {f.name for f in fields(cfg)}:
         kwargs["lead_visible"] = False
-    narrow = _narrow_tools(type(REVIEW_FINDER_CONFIG))
+    narrow = _narrow_tools(type(cfg))
     if narrow:
         kwargs.update(narrow)
-        kwargs["tools"] = _deep_lane_tools(getattr(REVIEW_FINDER_CONFIG, "tools", None))
-    return replace(REVIEW_FINDER_CONFIG, **kwargs)
+        kwargs["tools"] = _deep_lane_tools(getattr(cfg, "tools", None))
+    return replace(cfg, **kwargs)
 
 
 # The lead's local-workspace read tools. On a hosted lead they point at an empty project, so a
 # search there answers "(no matches)" for code the PR does contain (#311 counted 24 such false
-# absences). The deep lanes must not hold them.
+# absences). The review copies must not hold them.
 _WORKSPACE_READ_TOOLS = frozenset({"search_files", "find_files", "list_dir", "read_file", "list_projects"})
 
-# What the deep lanes read the PR with: its diff and files over GitHub, and a search of its
+# What the review copies read the PR with: its diff and files over GitHub, and a search of its
 # head commit (#316). Before #335 the two search tools reached the lanes only through the
 # host's read-tool inheritance, which also brought the workspace tools above.
 _DEEP_LANE_REQUIRED_TOOLS = (
@@ -182,7 +206,7 @@ _DEEP_LANE_REQUIRED_TOOLS = (
 
 
 def _deep_lane_tools(host_tools) -> list[str]:
-    """The deep lane's explicit tool list (#335): the host finder's own tools, minus the
+    """A review copy's explicit tool list (#335): the host finder's own tools, minus the
     empty-workspace reads, plus the PR-head tools — in order, each once."""
     out: list[str] = []
     for name in [*(host_tools or ()), *_DEEP_LANE_REQUIRED_TOOLS]:

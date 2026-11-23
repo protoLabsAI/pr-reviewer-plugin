@@ -1,4 +1,4 @@
-"""#335: `review-finder-deep` reads the PR only through PR-head tools, not the lead's
+"""#335: plugin review copies read the PR through PR-head tools, not the lead's
 empty-workspace reads, whose "(no matches)" used to read as evidence of absence."""
 
 from __future__ import annotations
@@ -43,6 +43,7 @@ class _OldCfg:
     tools: list = field(default_factory=lambda: ["github_pr_diff", "read_file"])
     model: str = ""
     max_turns: int = 30
+    allow_skill_emission: bool = True
 
 
 def _install(monkeypatch, cfg_cls, base):
@@ -149,3 +150,74 @@ def test_host_defined_lanes_keep_their_workspace_warning():
         assert "unrelated, empty local workspace" in steps[sid]["prompt"], sid
     assert steps["verify"]["subagent"] == "verifier"
     assert "(`search_files` / `find_files` read an unrelated, empty workspace)" in steps["verify"]["prompt"]
+
+
+@pytest.mark.parametrize("cfg_cls", [_NewCfg, _OldCfg])
+def test_registered_review_copies_preserve_host_contracts(monkeypatch, cfg_cls):
+    from copy import deepcopy
+
+    finder = cfg_cls(
+        name="review-finder",
+        model="finder-model",
+        tools=[*WORKSPACE, "github_get_pr", *PR_HEAD, "search_pr_repo"],
+    )
+    verifier = cfg_cls(
+        name="verifier",
+        model="verifier-model",
+        system_prompt="verify prompt",
+        max_turns=17,
+        tools=[*WORKSPACE, "github_get_commit_diff", *PR_HEAD, "github_pr_diff"],
+    )
+    _install(monkeypatch, cfg_cls, finder)
+    sys.modules["graph.subagents.config"].VERIFIER_CONFIG = verifier
+    originals = deepcopy((finder, verifier))
+    registered = subagents.get_subagents()
+    assert [cfg.name for cfg in registered] == [
+        "structural-finder",
+        "review-finder-deep",
+        "review-finder-pr",
+        "review-verifier",
+    ]
+    assert registered[0].tools == ["protopatch_review"]
+    if cfg_cls is _NewCfg:
+        assert registered[0].inherit_read_tools is False
+    for cfg, source in zip(registered[1:], (finder, finder, verifier), strict=True):
+        assert cfg is not source
+        assert cfg.description != source.description
+        assert cfg.system_prompt == source.system_prompt
+        assert cfg.max_turns == source.max_turns
+        assert cfg.allow_skill_emission == source.allow_skill_emission
+        assert cfg.model == ("" if cfg.name == "review-finder-deep" else source.model)
+        if cfg_cls is _NewCfg:
+            assert cfg.lead_visible is False
+            assert cfg.inherit_read_tools is False
+            assert cfg.completion_check == source.completion_check
+            assert cfg.completion_contract == source.completion_contract
+            assert not set(WORKSPACE).intersection(cfg.tools)
+            assert all(cfg.tools.count(tool) == 1 for tool in PR_HEAD)
+            assert cfg.tools == list(dict.fromkeys(t for t in source.tools if t not in WORKSPACE))
+            assert cfg.tools is not source.tools
+        else:
+            assert "inherit_read_tools" not in {f.name for f in fields(cfg)}
+            assert cfg.tools == source.tools
+    assert (finder, verifier) == originals
+
+
+@pytest.mark.parametrize(
+    ("missing", "expected"),
+    [
+        ("VERIFIER_CONFIG", ["structural-finder", "review-finder-deep", "review-finder-pr"]),
+        ("REVIEW_FINDER_CONFIG", ["structural-finder", "review-verifier"]),
+    ],
+)
+def test_missing_source_omits_only_its_copies(monkeypatch, missing, expected):
+    _install(monkeypatch, _NewCfg, _NewCfg(name="review-finder"))
+    mod = sys.modules["graph.subagents.config"]
+    mod.VERIFIER_CONFIG = _NewCfg(name="verifier")
+    delattr(mod, missing)
+    assert [cfg.name for cfg in subagents.get_subagents()] == expected
+    if missing == "VERIFIER_CONFIG":
+        assert subagents.review_verifier() is None
+    else:
+        assert subagents.deep_finder() is None
+        assert subagents.pr_finder() is None
