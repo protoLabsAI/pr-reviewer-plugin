@@ -131,6 +131,12 @@ def deep_finder():
     dispatch, so `deep_lanes.apply` sets this object's `model` per round. With no model set
     it resolves like `review-finder` does, so registering it changes nothing on its own.
 
+    On a host with read-tool inheritance (protoAgent#4471) the copy opts out of it and
+    carries an explicit tool list instead (#335): the host finder's tools without the
+    empty-workspace reads (`search_files`, `find_files`, `list_dir`, `read_file`,
+    `list_projects`), plus `search_pr_repo` / `list_pr_repo_files`, which used to arrive
+    only through that inheritance. An older host has no such field, so there nothing changes.
+
     `None` on a host without `REVIEW_FINDER_CONFIG`. The recipe then names a subagent the
     host does not have, which is why the manifest's `min_protoagent_version` covers it.
     """
@@ -151,4 +157,35 @@ def deep_finder():
     }
     if "lead_visible" in {f.name for f in fields(REVIEW_FINDER_CONFIG)}:
         kwargs["lead_visible"] = False
+    narrow = _narrow_tools(type(REVIEW_FINDER_CONFIG))
+    if narrow:
+        kwargs.update(narrow)
+        kwargs["tools"] = _deep_lane_tools(getattr(REVIEW_FINDER_CONFIG, "tools", None))
     return replace(REVIEW_FINDER_CONFIG, **kwargs)
+
+
+# The lead's local-workspace read tools. On a hosted lead they point at an empty project, so a
+# search there answers "(no matches)" for code the PR does contain (#311 counted 24 such false
+# absences). The deep lanes must not hold them.
+_WORKSPACE_READ_TOOLS = frozenset({"search_files", "find_files", "list_dir", "read_file", "list_projects"})
+
+# What the deep lanes read the PR with: its diff and files over GitHub, and a search of its
+# head commit (#316). Before #335 the two search tools reached the lanes only through the
+# host's read-tool inheritance, which also brought the workspace tools above.
+_DEEP_LANE_REQUIRED_TOOLS = (
+    "github_pr_diff",
+    "github_read_pr_file",
+    "github_read_file",
+    "search_pr_repo",
+    "list_pr_repo_files",
+)
+
+
+def _deep_lane_tools(host_tools) -> list[str]:
+    """The deep lane's explicit tool list (#335): the host finder's own tools, minus the
+    empty-workspace reads, plus the PR-head tools — in order, each once."""
+    out: list[str] = []
+    for name in [*(host_tools or ()), *_DEEP_LANE_REQUIRED_TOOLS]:
+        if name not in _WORKSPACE_READ_TOOLS and name not in out:
+            out.append(name)
+    return out

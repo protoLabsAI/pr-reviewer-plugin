@@ -50,7 +50,11 @@ entry is named Y") where it makes it.
   `PATH MATCHES NO FILES` (nothing searched) and `SEARCH ERROR` (the search did not run, and says
   it is *not* evidence of absence).
 - Marked `access: read`, so the host's read-tool inheritance (protoAgent ≥ 0.213.0) binds it to
-  the review finders and the verifier. The checkout starts building when the round opens.
+  the host-defined `review-finder` and `verifier`. `review-finder-deep` (the correctness and
+  removed-behavior lanes) opts out of that inheritance and gets `search_pr_repo` and
+  `list_pr_repo_files` from its explicit tool list instead, without the lead's `search_files`,
+  `find_files`, `list_dir`, `read_file` and `list_projects`, which read an unrelated, empty
+  workspace (#335). The checkout starts building when the round opens.
 
 ## `list_pr_repo_files`
 

@@ -417,7 +417,10 @@ def test_every_finder_and_the_verifier_are_told_to_search_the_pr_head():
         prompt = steps[sid]["prompt"]
         assert "search_pr_repo" in prompt and "list_pr_repo_files" in prompt, sid
         assert "pr={{inputs.pr}}" in prompt and 'repo="{{inputs.repo}}"' in prompt, sid
-        assert "`search_files`" in prompt, sid  # named as the tool that does NOT see the PR
+    # The host-defined lanes still hold the workspace tools, so they are warned off them by
+    # name. The deep lanes no longer have them (#335), so their prompts no longer name them.
+    for sid in ("find_crossfile", "find_conventions", "verify"):
+        assert "`search_files`" in steps[sid]["prompt"], sid  # the tool that does NOT see the PR
     for sid in ("find_correctness", "find_removed_behavior", "find_crossfile", "find_conventions"):
         prompt = steps[sid]["prompt"]
         assert "SEARCH ERROR" in prompt and "not a finding" in prompt, sid
