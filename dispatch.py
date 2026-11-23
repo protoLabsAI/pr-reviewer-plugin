@@ -50,6 +50,7 @@ from . import epic as _epic
 from . import finding_accounting as _accounting
 from . import incremental as _inc
 from . import repo_search as _repo_search
+from . import review_rules as _review_rules
 from .absence_search import AbsenceSearcher, render_absence_search_footnote
 from .approve import (
     HOLD_ALREADY_PROMOTED,
@@ -4264,6 +4265,10 @@ class Dispatcher:
             "head_sha": head,
             "base_ref": str(facts.get("base_ref") or ""),
         }
+        rules_paths = [p for p in confine_paths if not inc_scoped or p in inc.in_scope]
+        rules_block = await self._review_rules_block(repo, pr, inputs["base_ref"], rules_paths)
+        if rules_block:
+            inputs["review_rules"] = rules_block
         if epic_scope is not None:
             inputs["review_scope"] = _epic.render_scope_block(epic_scope)
         # The structural pass is reached through a tool the model calls with (pr, repo) only, so its
@@ -5576,6 +5581,38 @@ class Dispatcher:
             return None
         sha = out.strip()
         return sha if re.fullmatch(r"[0-9a-f]{7,40}", sha) else None
+
+    async def _review_rules_block(self, repo: str, pr: int, base_ref: str, paths: list[str]) -> str:
+        """Optional policy from the server-resolved base; no rules failure can void a round."""
+        import base64
+
+        try:
+            if not base_ref:
+                raise ValueError("base ref unavailable")
+            # Unlike _read_blobs, preserve status so only a missing file is silent.
+            rc, raw, err = await self._run_gh(
+                [
+                    "api",
+                    f"repos/{repo}/contents/.protoreview/rules.yaml?ref={quote(base_ref, safe='')}",
+                    "--jq",
+                    '(.encoding // "") + "\\u0000" + (.content // "")',
+                ]
+            )
+            if rc != 0:
+                if re.search(r"\b404\b", err):
+                    return ""
+                raise ValueError(f"rules read failed (rc {rc}): {err}")
+            encoding, separator, payload = raw.partition("\x00")
+            if not separator or encoding.strip() != "base64":
+                raise ValueError("rules read returned no base64 content")
+            text = base64.b64decode(payload).decode("utf-8")
+            rules = _review_rules.parse_rules(text)
+            return _review_rules.render_rules_block(_review_rules.group_by_rule(rules, paths))
+        except Exception as exc:  # noqa: BLE001 — optional policy must never fail the round
+            reason = " ".join(f"{type(exc).__name__}: {exc}".split())[:200]
+            with contextlib.suppress(Exception):
+                self.telemetry.emit("review_rules_invalid", repo=repo, pr=pr, reason=reason)
+            return ""
 
     async def _read_blobs(self, repo: str, ref: str, paths) -> dict[str, str | None]:
         """{normalized path: text at `ref`}, None for anything that could not be read. Pinned

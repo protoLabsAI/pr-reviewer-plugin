@@ -58,6 +58,37 @@ unreadable attributes mark nothing generated. Deleted files are also set aside.
 The review names excluded files and reasons without treating exclusions as lane coverage
 gaps. An unreadable file list preserves unrestricted review and reports no exclusions.
 
+## Path-scoped review rules
+
+Add a YAML list in `.protoreview/rules.yaml` to supply conventions for specific paths:
+
+```yaml
+- paths: ["migrations/**"]
+  rule: Migrations are append-only; never edit a released migration.
+- paths: ["**/*.tsx", "web/"]
+  rule: Components must use typed props.
+```
+
+Each entry requires a non-empty list of glob strings in `paths` and non-empty text in
+`rule`. Patterns match repository-relative POSIX paths, case-sensitively:
+`*` and `?` stay within a path segment, and `[...]` matches a character class.
+A whole-segment `**` spans directories; `**/*.tsx` also matches root files.
+Bare patterns such as `*.tsx` match basenames at any depth. Patterns containing
+`/` are rooted at the repository; a leading `/` adds no extra anchoring.
+A trailing slash is a directory prefix (`web/` means `web/**`); a literal
+path containing a slash matches itself and its descendants.
+
+The dispatcher reads the file from the PR's server-resolved **base branch ref**, never
+its head: a PR cannot rewrite its own review rules. Each rule is passed to the conventions
+finder beside only its matching changed files; incremental and epic-residual rounds use
+only their in-scope paths. Identical rule text is grouped together. Other finder prompts
+do not consume this input.
+
+A missing file (404), empty rules, or no matching files adds no input and emits no error.
+Invalid YAML, invalid shapes, other read failures, or unexpected processing errors omit
+the rules input and emit `review_rules_invalid` telemetry with repo, PR, and a short reason.
+Rules-file failures never fail or void the review round.
+
 ## GitHub identity
 
 | Key | Default | Env | |
