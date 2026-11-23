@@ -46,6 +46,18 @@ never the main YAML.
 | `allow_self_review` | `false` | | **Testing only.** Lifts the never-review-your-own-PR rail |
 | `viewer_login` | `""` | `PR_REVIEWER_VIEWER_LOGIN` | Our own login, for the self-review rail. **Required on App auth** (e.g. `my-reviewer[bot]`); auto-detected with a PAT |
 
+## File selection
+
+| Key | Default | Env | |
+|---|---|---|---|
+| `exclude_paths` | `[]` | | Additional glob list, added to default lockfiles (`uv.lock`, `package-lock.json`, `pnpm-lock.yaml`, `Cargo.lock`, `go.sum`) and `*.min.js`. Basename globs match at any depth; globs with `/` match repository-relative paths. |
+| `max_patch_chars` | `50000` | `PR_REVIEWER_MAX_PATCH_CHARS` | Exclude files whose GitHub patch exceeds this character limit. Present config wins; invalid/nonpositive values use the default. Missing patches count as zero. |
+
+The root `.gitattributes` at the PR head supplies `linguist-generated` exclusions;
+unreadable attributes mark nothing generated. Deleted files are also set aside.
+The review names excluded files and reasons without treating exclusions as lane coverage
+gaps. An unreadable file list preserves unrestricted review and reports no exclusions.
+
 ## GitHub identity
 
 | Key | Default | Env | |

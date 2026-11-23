@@ -38,6 +38,8 @@ config:
   prior_recheck: true          # re-verify carried / re-listed prior blocker-majors at the new head,
                                # alone, before re-asserting them (#218, #220, #232). Env fallback:
                                # PR_REVIEWER_PRIOR_RECHECK.
+  exclude_paths: []          # extra globs added to default lockfile/minified exclusions
+  max_patch_chars: 50000     # per-file patch character limit
   finder_timeout_s: 0          # seconds each parallel finder may run (issue #93). 0 = the recipe's
                                # default (900). Calibrate to YOUR model: just above the slow finders'
                                # p95 (telemetry `step_s`). Clamped below the (clamped) panel_attempt_timeout.

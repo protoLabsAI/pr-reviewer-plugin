@@ -170,6 +170,7 @@ from .rounds import (
     verify_retry_state,
 )
 from .runner_contract import context_note, validate_result
+from .selection import DEFAULT_MAX_PATCH_CHARS, ChangedFile, select_files, selected_paths
 from .telemetry import REAFFIRM_DIFF, REAFFIRM_HEAD, REAFFIRM_MISS, REAFFIRM_RECORDED, VERIFY_CONTRADICTED, Telemetry
 from .trigger import structural_trigger
 from .verdicts import (
@@ -206,6 +207,7 @@ from .verdicts import (
     render_verdict_body,
     report_hard_stopped,
     restate_findings,
+    selection_record,
     stage_causes,
     structural_relay_ok,
     undelivered_stages,
@@ -2651,11 +2653,66 @@ class Dispatcher:
         except json.JSONDecodeError:
             return None
 
+    async def _changed_files(self, repo: str, pr: int) -> list[ChangedFile] | None:
+        """Read all paginated paths and selection metadata together; None means no restriction."""
+        try:
+            rc, out, _err = await self._run_gh(
+                [
+                    "api",
+                    f"repos/{repo}/pulls/{pr}/files",
+                    "--paginate",
+                    "--jq",
+                    '.[] | {filename, status, patch_size: ((.patch // "") | length)} | @json',
+                ]
+            )
+            if rc:
+                return None
+            rows = [json.loads(line) for line in out.splitlines() if line.strip()]
+            if any(
+                not isinstance(row, dict)
+                or not isinstance(row.get("filename"), str)
+                or not row["filename"].strip()
+                or not isinstance(row.get("status"), str)
+                for row in rows
+            ):
+                return None
+            return [ChangedFile(row["filename"], row["status"], int(row["patch_size"])) for row in rows]
+        except Exception:
+            return None
+
     async def _changed_paths(self, repo: str, pr: int) -> list[str]:
-        rc, out, _err = await self._run_gh(
-            ["api", f"repos/{repo}/pulls/{pr}/files", "--paginate", "--jq", ".[].filename"]
+        return [f.path for f in await self._changed_files(repo, pr) or ()]
+
+    async def _selection_attributes(self, repo: str, head: str) -> str:
+        import base64
+
+        try:
+            rc, out, _err = await self._run_gh(
+                ["api", f"repos/{repo}/contents/.gitattributes?ref={quote(head, safe='')}", "--jq", ".content"]
+            )
+            return base64.b64decode("".join(out.split()), validate=True).decode("utf-8") if rc == 0 else ""
+        except Exception:
+            return ""
+
+    @property
+    def exclude_paths(self) -> list[str]:
+        cfg = self.cfg
+        raw = cfg.get("exclude_paths", [])
+        return [x for x in raw if isinstance(x, str)] if isinstance(raw, list) else []
+
+    @property
+    def max_patch_chars(self) -> int:
+        cfg = self.cfg
+        raw = (
+            cfg["max_patch_chars"]
+            if "max_patch_chars" in cfg
+            else _env_int("PR_REVIEWER_MAX_PATCH_CHARS", DEFAULT_MAX_PATCH_CHARS)
         )
-        return [line.strip() for line in out.splitlines() if line.strip()] if rc == 0 else []
+        try:
+            value = int(raw)
+            return value if value > 0 else DEFAULT_MAX_PATCH_CHARS
+        except (TypeError, ValueError, OverflowError):
+            return DEFAULT_MAX_PATCH_CHARS
 
     async def _commit_tree(self, repo: str, ref: str) -> str | None:
         """The Git tree SHA of `ref`'s commit — one Merkle root over the WHOLE tree, or None.
@@ -4024,7 +4081,8 @@ class Dispatcher:
                     "drop", repo=repo, pr=pr, sha=head, reason=DROP_PAUSED, model_retries=self._round_retries()
                 )
                 return f"drop:{DROP_PAUSED}"
-        paths = await self._changed_paths(repo, pr)
+        changed_files = await self._changed_files(repo, pr)
+        paths = [f.path for f in changed_files or ()]
         # The PR's size rides on the dispatch / reviewed / exhaustion rows: a PR too large for
         # the lanes' budgets exhausts on every head (issue #116), and a "too large" threshold
         # can only be measured, not guessed — nothing recorded size against outcome before.
@@ -4221,6 +4279,24 @@ class Dispatcher:
             residual = await self._residual_patches(repo, inc.prior_head, head)
             inputs["review_scope"] = _inc.render_scope_block(inc, round_number, residual, self.diff_char_budget)
             set_structural_scope(repo, pr, head, sorted(inc.in_scope))
+        # One result per round feeds the recipe and the published exclusion record.
+        # Keep paths/confine_paths intact: exclusion is neither a lane gap nor confinement.
+        file_selection = select_files(
+            changed_files or (),
+            extra_exclude_globs=self.exclude_paths,
+            max_patch_chars=self.max_patch_chars,
+            gitattributes=await self._selection_attributes(repo, head) if changed_files else "",
+        )
+        if changed_files is not None:
+            selected = selected_paths(file_selection)
+            inputs["selected_paths"] = json.dumps(selected)
+            structural_paths = set(selected)
+            if epic_scope is not None:
+                structural_paths.intersection_update(epic_scope.residual_paths)
+            if inc_scoped:
+                structural_paths.intersection_update(inc.in_scope)
+            if selection_record(file_selection):
+                set_structural_scope(repo, pr, head, sorted(structural_paths))
         if self.finder_timeout_s:
             inputs["finder_timeout"] = self.finder_timeout_s  # else the recipe's default (#93)
         if self.synthesize_timeout_s:
@@ -5282,6 +5358,7 @@ class Dispatcher:
             hold_blocks=bool(dropped_finding) or bool(unaccounted) or bool(deferred) or bool(report_lost),
             complete=complete,
             coverage_gaps=gaps,
+            file_selection=file_selection,
             lanes=lanes,
             review_check_id=review_check_id,
             # Did anything actually CHECK these findings? Empty over a clean panel is
@@ -5343,6 +5420,7 @@ class Dispatcher:
             verdict=verdict,
             round=round_number,
             **size,
+            excluded_files=selection_record(file_selection),
             findings=len(findings),
             notes=len(notes),
             held=bool(dropped_finding) or bool(unaccounted) or bool(deferred) or bool(report_lost),
@@ -6087,6 +6165,7 @@ class Dispatcher:
         reaffirmed_from: str = "",
         disposition_token: str = "",
         accounting: dict | None = None,
+        file_selection: list | None = None,
     ) -> bool:
         # Immediately before posting — the last moment a mid-round push can be caught.
         # The marker keeps the PINNED head on purpose: the round ran against it, and
@@ -6130,6 +6209,7 @@ class Dispatcher:
             stale_note=stale_note,
             diff_id=diff_id or "",
             coverage_gaps=coverage_gaps,
+            file_selection=file_selection,
             lanes=lanes,
             reaffirmed_from=reaffirmed_from,
             disposition_token=disposition_token,
